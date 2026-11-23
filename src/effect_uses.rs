@@ -85,34 +85,94 @@ fn object_agents(fighter: &str) -> Vec<String> {
 /// effect macro that makes one and the bone name after it (the third name of a flip macro,
 /// whose second is the effect for the other facing), in every branch (a left-facing fighter's
 /// `mario_fb_bullet_l` as well as the right's), sorted, once each.
+///
+/// A call is found with or without `macros::` in front: a moveset that glob-imports
+/// `smash_script::macros::*` writes `EFFECT(agent, …)`, and the game's dump never does.
 fn spawns(body: &str) -> Vec<(String, Option<String>)> {
+    let is_name_char = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_';
     let mut found: Vec<(String, Option<String>)> = body
         .lines()
-        .filter_map(|line| {
-            let (_, call) = line.split_once("macros::")?;
-            let (macro_name, args) = call.split_once('(')?;
-            let spawns = macro_name.contains("EFFECT")
-                && !["OFF", "DETACH", "REMOVE", "KILL", "SET_", "END"]
-                    .iter()
-                    .any(|word| macro_name.contains(word));
-            if !spawns {
-                return None;
-            }
-            let (_, rest) = args.split_once("Hash40::new(\"")?;
-            let (name, rest) = rest.split_once('"')?;
-            // A flip macro names the effect for the other facing second and the bone third.
-            let names_before_bone = if macro_name.contains("FLIP") { 2 } else { 1 };
-            let bone = rest
-                .split("Hash40::new(\"")
-                .nth(names_before_bone)
-                .and_then(|rest| rest.split_once('"'))
-                .map(|(bone, _)| bone.to_owned());
-            Some((name.to_owned(), bone))
+        // Only the code of a line: a commented-out spawn plays nothing.
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .flat_map(|line| {
+            line.match_indices('(').filter_map(move |(open, _)| {
+                let before = &line[..open];
+                let start = before
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !is_name_char(*c))
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                let macro_name = &before[start..];
+                // A whole upper-case name: `fooEFFECT(` or `x.EFFECT(` is not a macro call.
+                let whole = before[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+                let spawns = whole
+                    && macro_name.starts_with(|c: char| c.is_ascii_uppercase())
+                    && macro_name.contains("EFFECT")
+                    && !["OFF", "DETACH", "REMOVE", "KILL", "SET_", "END"]
+                        .iter()
+                        .any(|word| macro_name.contains(word));
+                if !spawns {
+                    return None;
+                }
+                // The effect is the argument after the agent.
+                let (_, rest) = line[open + 1..].split_once(',')?;
+                let rest = rest.trim_start().strip_prefix("Hash40::new(\"")?;
+                let (name, rest) = rest.split_once('"')?;
+                // A flip macro names the effect for the other facing second and the bone third.
+                let names_before_bone = if macro_name.contains("FLIP") { 2 } else { 1 };
+                let bone = rest
+                    .split("Hash40::new(\"")
+                    .nth(names_before_bone)
+                    .and_then(|rest| rest.split_once('"'))
+                    .map(|(bone, _)| bone.to_owned());
+                Some((name.to_owned(), bone))
+            })
         })
         .collect();
     found.sort();
     found.dedup();
     found
+}
+
+/// The uses a linked moveset's own scripts add, from [`crate::acmd_src::SourceIndex::
+/// fighter_script_bodies`]: an effect a move script of the fighter's spawns is that move's
+/// (`effect_attacklw3` is the move `attacklw3`), and one an object's script spawns is that
+/// object's (`pacman_bigpacman` is `bigpacman`). Without these, every effect a moveset adds
+/// read as one no move plays, since the game's scripts never name it.
+pub fn project_uses(fighter: &str, scripts: &[(String, String, String)]) -> Uses {
+    let mut uses = Uses::new();
+    for (agent, script, body) in scripts {
+        let object = (agent != fighter).then(|| {
+            agent
+                .strip_prefix(&format!("{fighter}_"))
+                .unwrap_or(agent)
+                .to_owned()
+        });
+        let script_name = object.is_none().then(|| {
+            crate::acmd::SCRIPT_PREFIXES
+                .iter()
+                .find_map(|prefix| script.strip_prefix(prefix))
+                .unwrap_or(script)
+                .to_owned()
+        });
+        for (effect, bone) in spawns(body) {
+            let found = EffectUse {
+                script: script_name.clone(),
+                object: object.clone(),
+                bone,
+            };
+            let list = uses
+                .entry(crate::app::effect_name_hash(&effect))
+                .or_default();
+            if !list.contains(&found) {
+                list.push(found);
+            }
+        }
+    }
+    uses
 }
 
 /// The objects a script creates ("FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL" is "fireball").
@@ -283,6 +343,54 @@ mod tests {
                     ArticleModule::set_visibility_whole(agent.module_accessor, \
                     *FIGHTER_MARIO_GENERATE_ARTICLE_DOKAN, false, x);";
         assert_eq!(created_objects(body), vec!["fireball".to_owned()]);
+    }
+
+    #[test]
+    fn bare_macro_calls_spawn_and_comments_do_not() {
+        let body = "frame(agent.lua_state_agent, 3.0);\n\
+                    if macros::is_excute(agent) {\n\
+                    EFFECT(agent, Hash40::new(\"carrot_pull\"), Hash40::new(\"top\"), 0, 0, 6.8, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, true);\n\
+                    LAST_EFFECT_SET_RATE(agent, 1.2);\n\
+                    // EFFECT(agent, Hash40::new(\"old_dust\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);\n\
+                    EFFECT_OFF_KIND(agent, Hash40::new(\"carrot_trail\"), false, false);\n\
+                    foo.EFFECT(agent, Hash40::new(\"method_call\"));\n\
+                    }\n";
+        assert_eq!(
+            spawns(body),
+            vec![("carrot_pull".to_owned(), Some("top".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn project_scripts_credit_their_move_or_object() {
+        let spawn = |name: &str| {
+            format!("macros::EFFECT_FOLLOW(agent, Hash40::new(\"{name}\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, true);")
+        };
+        let scripts = vec![
+            ("pacman".to_owned(), "effect_attacklw3".to_owned(), spawn("carrot_pull")),
+            ("pacman".to_owned(), "game_attacklw3".to_owned(), spawn("carrot_pull")),
+            ("pacman_bigpacman".to_owned(), "effect_specialnhop".to_owned(), spawn("fryguy_fire")),
+        ];
+        let uses = project_uses("pacman", &scripts);
+        let carrot = &uses[&crate::app::effect_name_hash("carrot_pull")];
+        assert_eq!(
+            carrot,
+            &vec![EffectUse {
+                script: Some("attacklw3".to_owned()),
+                object: None,
+                bone: Some("top".to_owned()),
+            }],
+            "one use however many of the move's scripts spawn it"
+        );
+        assert!(script_is_for_motion(carrot[0].script.as_deref().unwrap(), "attack_lw3"));
+        assert_eq!(
+            uses[&crate::app::effect_name_hash("fryguy_fire")],
+            vec![EffectUse {
+                script: None,
+                object: Some("bigpacman".to_owned()),
+                bone: Some("top".to_owned()),
+            }]
+        );
     }
 
     #[test]

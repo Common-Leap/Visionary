@@ -1775,10 +1775,20 @@ fn check_shape(subject: &str, stmts: &[AcmdStmt], clock: &mut f32, report: &mut 
                     );
                 }
                 // Only the statements the editor understands. Two identical collisions in one
-                // block are one collision; two identical raw calls may well be two articles.
+                // block are one collision; two identical raw calls may well be two articles, and
+                // so may two identical `ArticleModule` calls in any of the forms they are read
+                // as (two `shoot`s throw two objects).
                 let modelled: Vec<&ExcuteStmt> = inner
                     .iter()
-                    .filter(|stmt| !matches!(stmt, ExcuteStmt::Raw(_)))
+                    .filter(|stmt| {
+                        !matches!(
+                            stmt,
+                            ExcuteStmt::Raw(_)
+                                | ExcuteStmt::Article(_)
+                                | ExcuteStmt::ArticleLifecycle(_)
+                        ) && !matches!(stmt, ExcuteStmt::NativeCall(call)
+                            if call.callee.starts_with("ArticleModule::"))
+                    })
                     .collect();
                 let mut seen: BTreeMap<String, usize> = BTreeMap::new();
                 for stmt in modelled {
@@ -3260,6 +3270,62 @@ fn expression_real() { let _ = r###"fn game_string_fake() { }"###; }
         let text = messages(&report);
         for expected in ["the same call 2 times", "does not wait", "is empty"] {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
+        }
+    }
+
+    /// Two identical article calls in one block are two instances, not a slip: the second
+    /// `shoot` throws a second object.
+    #[test]
+    fn two_identical_article_shoots_are_not_a_repeated_call() {
+        let shoot = "ArticleModule::shoot(boma, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);";
+        let parsed = script(&format!(
+            "    frame(agent.lua_state_agent, 5.0);\n    if macros::is_excute(agent) {{\n        {shoot}\n        {shoot}\n    }}"
+        ));
+        let typed = parsed
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Excute(inner) => Some(inner),
+                _ => None,
+            })
+            .flatten()
+            .filter(|stmt| matches!(stmt, ExcuteStmt::Article(_)))
+            .count();
+        assert_eq!(typed, 2, "{:#?}", parsed.stmts);
+        let text = messages(&verify(&parsed));
+        assert!(!text.contains("the same call"), "{text}");
+    }
+
+    /// The same holds for the canonical spelling, read as the timeline's closed shoot form, and
+    /// for an article call kept as a typed native call.
+    #[test]
+    fn two_identical_canonical_and_native_article_calls_are_not_a_repeated_call() {
+        for (line, is_form) in [
+            (
+                "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+                (|stmt: &ExcuteStmt| matches!(stmt, ExcuteStmt::ArticleLifecycle(_))) as fn(&ExcuteStmt) -> bool,
+            ),
+            (
+                "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+                |stmt: &ExcuteStmt| matches!(stmt, ExcuteStmt::NativeCall(_)),
+            ),
+        ] {
+            let parsed = script(&format!(
+                "    frame(agent.lua_state_agent, 5.0);\n    if macros::is_excute(agent) {{\n        {line}\n        {line}\n    }}"
+            ));
+            let kept = parsed
+                .stmts
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    AcmdStmt::Excute(inner) => Some(inner),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|stmt| is_form(stmt))
+                .count();
+            assert_eq!(kept, 2, "{line}: {:#?}", parsed.stmts);
+            let text = messages(&verify(&parsed));
+            assert!(!text.contains("the same call"), "{line}: {text}");
         }
     }
 

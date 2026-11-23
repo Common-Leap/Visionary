@@ -246,3 +246,88 @@ pub fn injections_for(motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u6
         })
         .collect()
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArticleControlRule {
+    pub agent: String,
+    #[serde(flatten)]
+    pub rule: ControlRule,
+}
+
+static ARTICLE_RULES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Vec<ControlRule>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static HAVE_ARTICLE_INJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_article_rules(rules: Vec<ArticleControlRule>) -> Vec<(String, bool)> {
+    let mut statuses: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut by_agent: std::collections::HashMap<String, Vec<ControlRule>> =
+        std::collections::HashMap::new();
+    let mut any_inject = false;
+
+    for entry in rules {
+        let supported = *statuses
+            .entry(entry.agent.clone())
+            .or_insert_with(|| {
+                crate::slight::systems::article_notifier::resolve_article_agent(&entry.agent)
+                    .is_some()
+            });
+        if !supported {
+            continue;
+        }
+        if entry.rule.inject.is_some() {
+            any_inject = true;
+        }
+        by_agent.entry(entry.agent).or_default().push(entry.rule);
+    }
+
+    for list in by_agent.values_mut() {
+        let taken = std::mem::take(list);
+        *list = prepare_rules(taken);
+    }
+
+    let mut guard = loop {
+        if let Some(g) = ARTICLE_RULES.try_lock() {
+            break g;
+        }
+        core::hint::spin_loop();
+    };
+    *guard = by_agent;
+    HAVE_ARTICLE_INJECT.store(any_inject, Ordering::Release);
+    crate::slight::effect_viewer::acmd_hooks::reset_effect_injection_latches();
+    let mut out: Vec<(String, bool)> = statuses.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+pub fn any_inject_article() -> bool {
+    HAVE_ARTICLE_INJECT.load(Ordering::Acquire)
+}
+
+pub fn injections_for_article(
+    agent: &str,
+    motion: u64,
+) -> Vec<(usize, ControlInject, Option<i32>, u64)> {
+    let Some(map) = ARTICLE_RULES.try_lock() else {
+        return Vec::new();
+    };
+    let Some(rules) = map.get(agent) else {
+        return Vec::new();
+    };
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.inject.is_some() && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
+        })
+        .map(|(index, rule)| {
+            (
+                index,
+                rule.inject.clone().unwrap(),
+                rule.work_slot,
+                rule.identity,
+            )
+        })
+        .collect()
+}

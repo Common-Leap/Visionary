@@ -278,7 +278,12 @@ pub fn ship_folder(
             };
             if out.exists() {
                 if !crate::project_hub::same_file_contents(&path, &out) {
-                    kept.push(out.strip_prefix(dest).unwrap_or(&out).display().to_string());
+                    kept.push(
+                        out.strip_prefix(dest)
+                            .unwrap_or(&out)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
                 }
                 continue;
             }

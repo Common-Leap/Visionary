@@ -3,6 +3,7 @@
 // does not call directly. They are documented and audited in AUDIT.md.
 #![allow(dead_code)]
 
+mod offsets;
 #[cfg(not(feature = "mod_plugin"))]
 mod rust_extender;
 mod slight;
@@ -15,6 +16,11 @@ pub const PLUGIN_VERSION: &str = "0.1.0-slight-replica";
 #[cfg(feature = "mod_plugin")]
 #[skyline::main(name = "visionary_mod")]
 pub fn mod_plugin_main() {
+    // Offset-backed reads (the fighter-name table) need the game build first.
+    if offsets::initialize().is_none() {
+        skyline::println!("[visionary_mod] Unsupported SSBU version. Expected 13.0.4 or 13.0.5.");
+        return;
+    }
     slight::agent_extender::install();
     slight::main_smash::install_all();
 }
@@ -73,7 +79,16 @@ pub fn smashline_install() {
     std::panic::set_hook(Box::new(|info| {
         let _ = std::fs::write("sd:/slight/panic.txt", format!("{info}\n"));
     }));
-    skyline::println!("[SLight] Start preinstall");
+    let game_version = match offsets::initialize() {
+        Some(offsets::GameVersion::V13_0_4) => "13.0.4",
+        Some(offsets::GameVersion::V13_0_5) => "13.0.5",
+        None => {
+            skyline::println!("[SLight] Unsupported SSBU version. Expected 13.0.4 or 13.0.5.");
+            return;
+        }
+    };
+    skyline::println!("[SLight] Start preinstall on SSBU {game_version}");
+    skyline::println!("[SLight] plugin loader: {}", slight::loader::current().name());
     slight::smash_utils::ensure_slight_dirs();
     slight::diag::start_session();
     // The disabled set belongs in the boot log, not diag.txt: diag only flushes from the
@@ -82,8 +97,9 @@ pub fn smashline_install() {
     let _ = std::fs::write(
         format!("{}/effect_viewer_boot.txt", slight::smash_utils::ERROR_LOGS),
         format!(
-            "lib_effect_viewer v{PLUGIN_VERSION}\nbuild={}\ncopy={}\ndisabled={}\n",
+            "lib_effect_viewer v{PLUGIN_VERSION}\ngame={game_version}\nbuild={}\nloader={}\ncopy={}\ndisabled={}\n",
             slight::effect_viewer::live_eff::BUILD_TAG,
+            slight::loader::current().name(),
             if cfg!(feature = "exported") {
                 "mod"
             } else {

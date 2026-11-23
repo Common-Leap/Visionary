@@ -20,6 +20,16 @@ impl EffIndex {
     }
 }
 
+/// Every entry name an `.eff` file declares, as written. Skips the emitter, texture and entry
+/// conversion [`load_effect`] does, for callers that only need the names.
+pub fn entry_names(path: &Path) -> Result<Vec<String>> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file = effect_library::NamcoEffectFile::load(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(file.entry_names.clone())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorKey {
     pub frame: f32,

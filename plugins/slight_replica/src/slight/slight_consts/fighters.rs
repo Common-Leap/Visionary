@@ -199,10 +199,6 @@ pub fn name(kind: FighterKind) -> &'static str {
 
 /// Number of fighter-kind entries in the game's lowercase-name table.
 const FIGHTER_NAME_COUNT: usize = 118;
-/// `.text`-relative offset of the game's lowercase fighter-name table (array of `*const u8`
-/// C-string pointers). Same table/offset the loaded smashline 2 plugin reads
-/// (`LOWERCASE_FIGHTER_NAMES`), valid for the current SSBU version.
-const FIGHTER_NAMES_OFFSET: usize = 0x4f80e20;
 
 /// Resolve a game fighter-kind id (`utility::get_kind`) to its lowercase name (e.g. "mario",
 /// "donkey") by reading the game's own name table — the authoritative, version-correct source.
@@ -215,7 +211,7 @@ pub fn game_kind_name(kind: i32) -> Option<&'static str> {
         if text == 0 {
             return None;
         }
-        let ptr = *((text + FIGHTER_NAMES_OFFSET + 8 * kind as usize) as *const *const u8);
+        let ptr = *((text + crate::offsets::FIGHTER_NAMES.get() + 8 * kind as usize) as *const *const u8);
         if ptr.is_null() {
             return None;
         }

@@ -15,7 +15,7 @@
 //! reported, not guessed at. For "throw the original away and emit a fresh project",
 //! `mod_export` already exists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -55,6 +55,32 @@ impl MacroSite {
 /// both comment forms well enough not to be fooled by a macro name inside one, which is all
 /// the accuracy an argument-value rewrite needs.
 pub fn scan_macro_sites(text: &str, range: Range<usize>) -> Vec<MacroSite> {
+    let mut sites = scan_macro_sites_unscoped(text, range);
+    // A project helper standing for one macro call is presented as that call, exactly as the
+    // parser reads it (see `crate::project_helpers`). Arguments the helper fixes have no text
+    // of their own: they get an empty span at the call's `)`, which no edit is allowed to fill.
+    for site in &mut sites {
+        let Some(helper) = crate::project_helpers::in_scope(&site.name, site.args.len()) else {
+            continue;
+        };
+        let fixed = site.span.end.saturating_sub(1)..site.span.end.saturating_sub(1);
+        site.args = helper
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                crate::project_helpers::Slot::Param(index) => site.args[*index].clone(),
+                crate::project_helpers::Slot::Fixed(_) => fixed.clone(),
+                // The receiver is built from the agent argument; it is never edited.
+                crate::project_helpers::Slot::Accessor(index) => site.args[*index].clone(),
+            })
+            .collect();
+        site.name = helper.target;
+    }
+    sites
+}
+
+/// [`scan_macro_sites`] without the project-helper view: every call exactly as written.
+pub(crate) fn scan_macro_sites_unscoped(text: &str, range: Range<usize>) -> Vec<MacroSite> {
     const PREFIX: &str = "macros::";
     let bytes = text.as_bytes();
     let mut sites = Vec::new();
@@ -64,6 +90,20 @@ pub fn scan_macro_sites(text: &str, range: Range<usize>) -> Vec<MacroSite> {
         if let Some(next) = skip_rust_literal_or_comment(text, i) {
             i = next;
             continue;
+        }
+        // `ATTACK(agent, …)` with no `macros::` in front: a project that glob-imports
+        // `smash_script::macros::*` writes every call this way, and across the corpus that is
+        // most of them. The name span stands in for the prefix so the site is the same shape.
+        if let Some(name) = bare_macro_name_at(text, i, range.end) {
+            if let Some((args, close)) = split_call_args(text, name.end + 1, range.end) {
+                sites.push(MacroSite {
+                    name: text[name.clone()].to_string(),
+                    span: i..close + 1,
+                    args,
+                });
+                i = close + 1;
+                continue;
+            }
         }
         if !text[i..range.end].starts_with(PREFIX) {
             // A trail written in the raw `effect(*MA_MSC_CMD_…, …)` form is a rewritable call
@@ -105,6 +145,101 @@ pub fn scan_macro_sites(text: &str, range: Range<usize>) -> Vec<MacroSite> {
         i = close + 1;
     }
     sites
+}
+
+/// The name of an ACMD macro called WITHOUT a path at `i` (`ATTACK(agent, …)`), if one starts
+/// there.
+///
+/// smash_script's ACMD macros are all upper case, and nothing else an ACMD body calls is: lua
+/// constants are dereferenced (`*FOO`), never called, and types are CamelCase. So an upper-case
+/// identifier of at least four characters, directly followed by `(`, that is not itself the end
+/// of a path (`sv_animcmd::EFFECT(`), a method (`.ATTACK(`), a macro invocation (`FOO!(`) or a
+/// function being declared (`fn PLAY_RANDOM_SE(`), is a bare macro call. The parsers and the
+/// write-back scanner both use this one test, so they always agree on which calls exist.
+pub(crate) fn bare_macro_name_at(text: &str, i: usize, limit: usize) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    if i >= limit || !bytes[i].is_ascii_uppercase() || !text.is_char_boundary(i) {
+        return None;
+    }
+    if text[..i]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.' | '$' | '#'))
+    {
+        return None;
+    }
+    let mut end = i;
+    while end < limit && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_') {
+        end += 1;
+    }
+    if end - i < 4 || bytes.get(end) != Some(&b'(') {
+        return None;
+    }
+    let before = text[..i].trim_end();
+    if before.ends_with("fn")
+        && !before[..before.len() - 2]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(i..end)
+}
+
+/// `source` with every bare ACMD macro call given the `macros::` path the parsers look for.
+///
+/// Only the parsers' view changes: they match `macros::NAME(` throughout, and a project that
+/// writes `ATTACK(agent, …)` would otherwise read as nothing but raw lines. The file itself is
+/// never rewritten this way — write-back addresses calls through [`scan_macro_sites`], which
+/// recognises the bare spelling directly and edits only argument text.
+pub(crate) fn qualify_bare_macros(source: &str) -> std::borrow::Cow<'_, str> {
+    // ACMD macros take the agent first. Other upper-case calls (the named-argument msc forms
+    // such as `ATK_SET_SHIELD_SETOFF_MUL2(ID=3, …)`) are not `macros::` calls and stay as written.
+    let agent = crate::acmd::agent_param_name(source).unwrap_or_else(|| "agent".to_string());
+    let takes_agent = |open: usize| {
+        let args = &source[open + 1..];
+        let first = args.split([',', ')']).next().unwrap_or("").trim();
+        first == agent || first == "agent"
+    };
+    let mut inserts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(next) = skip_trivia(source, i) {
+            i = next;
+            continue;
+        }
+        if let Some(name) = bare_macro_name_at(source, i, source.len()) {
+            if takes_agent(name.end) {
+                inserts.push(i);
+            }
+            i = name.end;
+            continue;
+        }
+        if !source.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if inserts.is_empty() {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len() + inserts.len() * 8);
+    let mut last = 0;
+    for at in inserts {
+        out.push_str(&source[last..at]);
+        out.push_str("macros::");
+        last = at;
+    }
+    out.push_str(&source[last..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether `line` opens an `if …is_excute(…) {` block, however the project spells the path.
+pub(crate) fn opens_is_excute(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("if ") && trimmed.contains("is_excute(") && line.contains('{')
 }
 
 /// Every direct call to `name(...)` in `text[range]`, in document order.
@@ -218,7 +353,7 @@ pub fn raw_trail_line(line: &str) -> Option<MacroSite> {
 /// The scanners walk byte by byte, so `i` can land inside a multi-byte character — a
 /// non-ASCII identifier in the user's code is enough. A continuation byte can never start
 /// any of these, and returning early keeps the `&text[i..]` below from panicking on it.
-fn skip_trivia(text: &str, i: usize) -> Option<usize> {
+pub(crate) fn skip_trivia(text: &str, i: usize) -> Option<usize> {
     if !text.is_char_boundary(i) {
         return None;
     }
@@ -256,6 +391,27 @@ fn skip_trivia(text: &str, i: usize) -> Option<usize> {
         return Some(i + len);
     }
     None
+}
+
+/// Whether `text` ends inside a `/* … */` comment it opened and never closed.
+///
+/// The line-oriented parsers in `acmd` use this to keep a block comment that spans several lines
+/// together as one line, so the call it comments out is never read as code.
+pub(crate) fn ends_in_block_comment(text: &str) -> bool {
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if let Some(body) = text[i..].strip_prefix("/*") {
+            if !body.contains("*/") {
+                return true;
+            }
+        }
+        i = skip_trivia(text, i).unwrap_or(i + 1);
+    }
+    false
 }
 
 fn string_literal_len(rest: &str) -> usize {
@@ -361,6 +517,89 @@ pub struct ScriptSite {
     pub function: String,
     /// The `unsafe extern "C" fn …` item, from `fn` through its closing brace.
     pub span: Range<usize>,
+    /// Set when the registered function only forwards to another function in the project,
+    /// such as `game_attacks4reverse(agent) { game_attacks4_impl(agent, Facing::Reverse) }`.
+    pub delegate: Option<Delegate>,
+}
+
+/// One smashline status registration in the user's source: `.status(Main, KIND, f)` or
+/// `.on_start(f)`. Articles (fighter objects, projectiles) are agents like any other, so this
+/// is how an article's size, speed and life are found: they live in its status code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSite {
+    /// The status kind exactly as written (`*WEAPON_X_STATUS_KIND_SHOOT`, `0`); empty for `on_start`.
+    pub kind_expr: String,
+    /// The last path segment of the phase (`Pre`, `Main`, `End`, `Init`, `Exec`, ...), or `Start`
+    /// for `on_start`.
+    pub phase: String,
+    /// The Rust function registered.
+    pub function: String,
+    pub file: PathBuf,
+    /// The function item, from its line start through its closing brace.
+    pub span: Range<usize>,
+}
+
+/// A status registration the index saw but could not turn into a [`StatusSite`], kept so it is
+/// shown to the user rather than silently missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedStatus {
+    /// The agent, when it is known (a no-op status on a known agent, say).
+    pub agent_hint: Option<String>,
+    pub kind_expr: String,
+    pub phase: String,
+    pub file: PathBuf,
+    /// 1-based line of the registration.
+    pub line: usize,
+    /// One sentence on why no site was recorded.
+    pub reason: String,
+}
+
+/// The shared implementation a forwarding script calls, as this caller sees it.
+///
+/// The wrapper itself has no body worth showing, so reads use the callee's body with this
+/// caller's arguments substituted wherever that is statically certain. Writes are a different
+/// matter: a body shared by several scripts, or one shown with substituted values, does not
+/// correspond to any single span of source, so [`Delegate::write_refusal`] refuses it rather
+/// than letting one variant's edit silently change the others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delegate {
+    pub file: PathBuf,
+    /// The called function's name.
+    pub function: String,
+    /// The callee's whole item, from its line start through its closing brace.
+    pub span: Range<usize>,
+    /// How many indexed scripts run this same body: forwarding wrappers, plus the callee
+    /// itself when it is registered as a script too.
+    pub callers: usize,
+    /// The wrapper's header over the callee's body, with this caller's arguments resolved.
+    pub body: String,
+    /// Whether `body` differs from the callee's source because values were substituted.
+    pub substituted: bool,
+    /// Values that depend on this caller's arguments but could not be resolved statically.
+    pub unresolved: Vec<String>,
+}
+
+impl Delegate {
+    /// Why an edit to the script `script` (registered as `wrapper`) cannot be written back
+    /// into this callee, if it cannot.
+    pub fn write_refusal(&self, script: &str, wrapper: &str) -> Option<String> {
+        let location = format!("{} in {}", self.function, self.file.display());
+        if self.callers > 1 {
+            return Some(format!(
+                "{script}: {wrapper} forwards to {location}, which {} scripts share; an edit \
+                 here would change all of them, so edit the shared function directly",
+                self.callers
+            ));
+        }
+        if self.substituted || !self.unresolved.is_empty() {
+            return Some(format!(
+                "{script}: {wrapper} forwards to {location} with arguments the editor resolved \
+                 for display; writing back would replace the parameterized source, so edit the \
+                 shared function directly"
+            ));
+        }
+        None
+    }
 }
 
 /// One script identity found in more than one source function.
@@ -383,6 +622,33 @@ impl ScriptConflict {
             .map(|site| format!("{}::{}", site.file.display(), site.function))
             .collect::<Vec<_>>()
             .join(", ");
+        // Two copies of one project (a `dist/` source drop beside the live crate) is the usual
+        // cause, and the fix is to link the crate actually built rather than edit either file.
+        let crates: Vec<PathBuf> = self
+            .sites
+            .iter()
+            .filter_map(|site| {
+                site.file
+                    .ancestors()
+                    .find(|dir| dir.join("Cargo.toml").is_file())
+                    .map(Path::to_path_buf)
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if crates.len() > 1 {
+            return format!(
+                "{}: {} is defined by {} separate crates ({}) — link the folder of the one you build instead of the folder holding all of them",
+                self.fighter,
+                self.script,
+                crates.len(),
+                crates
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         format!(
             "{}: {} is ambiguous; found it in {} — resolve the duplicate before editing it",
             self.fighter, self.script, locations
@@ -407,6 +673,9 @@ pub struct ProjectScript {
     /// Categories the linked project defines more than once and therefore cannot be selected
     /// safely. These are deliberately not filled from the mirror.
     pub blocked: Vec<&'static str>,
+    /// Values in `body` that forward to a shared implementation and depend on arguments the
+    /// index could not resolve statically, one sentence each, for the status line.
+    pub notes: Vec<String>,
 }
 
 impl ProjectScript {
@@ -432,6 +701,42 @@ pub struct SourceIndex {
     pub files: Vec<PathBuf>,
     /// Duplicate script identities that were found but deliberately not selected.
     pub conflicts: Vec<ScriptConflict>,
+    /// The project's own `Hash40` shorthand macros (`cmn!`, `se!`, …). See [`crate::hash_macros`].
+    pub hash_macros: crate::hash_macros::HashMacros,
+    /// Numeric `const`s used as ACMD values. See [`crate::project_consts`].
+    pub consts: std::sync::Arc<crate::project_consts::ProjectConsts>,
+    /// Helper functions that stand for one macro call. See [`crate::project_helpers`].
+    pub helpers: std::sync::Arc<crate::project_helpers::ProjectHelpers>,
+    /// Params the moveset overrides in code (`landing_attack_air_frame_f: 8.0`), for frame data.
+    pub param_overrides: HashMap<String, f64>,
+    /// Scales each fighter's frame callback sets (`ModelModule::set_scale` and its siblings),
+    /// by fighter. See [`crate::fighter_scale`].
+    pub scales: HashMap<String, crate::fighter_scale::SourceScales>,
+    /// Hurtbox overrides each fighter's frame/init callback applies (`FighterUtil::set_hit_data`
+    /// or `set_hurtboxes`), by fighter. See [`crate::fighter_hurtboxes`].
+    pub hurtboxes: HashMap<String, Vec<crate::fighter_hurtboxes::SourceHurtbox>>,
+    /// A `fighter_param` `scale` the moveset overrides through `param_config`.
+    pub param_scale: Option<f32>,
+    /// Fighters the crate installs only on chosen costume slots: every `Agent::new("falco")`
+    /// it builds is narrowed with `.set_costume(…)`. Empoleon plays on Falco's c80–c87 this
+    /// way, so its scripts are that slot character's, and vanilla Falco's own slots keep the
+    /// game's. See [`scan_agent_gating`].
+    pub costume_gated: HashSet<String>,
+    /// Agent (`dedede_fireball`, `pacman`) -> the status scripts the project registers on it.
+    /// A registration on a parameter agent (`fn install(agent: &mut Agent)`) is attributed through
+    /// the module that installs it, as ACMD scripts are.
+    pub statuses: HashMap<String, Vec<StatusSite>>,
+    /// Status registrations that could not be attributed to an agent or a function.
+    pub unresolved_statuses: Vec<UnresolvedStatus>,
+}
+
+/// Project-wide facts the per-file indexing pass needs.
+#[derive(Default)]
+struct ProjectFacts {
+    /// How many ACMD-shaped functions share each name across the project.
+    definitions: HashMap<String, usize>,
+    /// Every script name some registration call names explicitly.
+    registered: HashSet<String>,
 }
 
 /// A script registration found anywhere in the selected project. The owning fighter is retained
@@ -441,6 +746,9 @@ pub struct SourceIndex {
 struct RegisteredScript {
     script: String,
     fighter: Option<String>,
+    /// The fighter is the agent the registration call is made on, not a guess from the
+    /// registering file's declarations.
+    exact: bool,
 }
 
 /// The same function text with its header renamed to `script`, when the project calls it
@@ -492,24 +800,94 @@ impl SourceIndex {
         // Two passes, because the conventional smashline layout splits the two halves of the
         // answer across files: `src/mario/mod.rs` says which fighter this is, and
         // `src/mario/acmd.rs` holds its scripts. Neither file can be indexed alone.
-        let sources: Vec<(PathBuf, String)> = files
+        let mut sources: Vec<(PathBuf, String)> = files
             .iter()
             .filter_map(|file| Some((file.clone(), std::fs::read_to_string(file).ok()?)))
             .collect();
+        let texts: HashMap<PathBuf, &str> = sources
+            .iter()
+            .map(|(file, text)| (file.clone(), text.as_str()))
+            .collect();
+        // Compiled files above the linked folder. A folder linked inside a crate
+        // (`src/emperte/`) is often told which fighter it is only by the crate root
+        // (`src/lib.rs` handing it `Agent::new("falco")`), so those files are read for who owns
+        // what, though their own scripts are not indexed.
+        let mut context: Vec<(PathBuf, String)> = Vec::new();
+        // Where a walk up from a script file stops looking for the module that names it.
+        let mut scope_root = root.to_path_buf();
+        if let Some(compiled) = compiled_files(root, &texts) {
+            // Cargo spells paths its own way (drive-letter case, separators); compare by key.
+            let keys: HashSet<String> =
+                compiled.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let built = |file: &PathBuf| keys.contains(&crate::cargo_project::path_key(file));
+            sources.retain(|(file, _)| built(file));
+            files.retain(built);
+            let linked: HashSet<String> =
+                files.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let mut outside: Vec<&PathBuf> = compiled
+                .iter()
+                .filter(|file| !linked.contains(&crate::cargo_project::path_key(file)))
+                .collect();
+            outside.sort();
+            for file in outside {
+                // Respell under the linked folder's own ancestors, so the scopes these files
+                // declare are the same paths the walk from a linked file meets.
+                let key = crate::cargo_project::path_key(file);
+                let Some((ancestor, depth)) = root.ancestors().skip(1).find_map(|ancestor| {
+                    let prefix = crate::cargo_project::path_key(ancestor);
+                    let prefix = prefix.trim_end_matches(['\\', '/']);
+                    let rest = key.strip_prefix(prefix)?;
+                    rest.starts_with(['\\', '/']).then(|| {
+                        (ancestor, rest.split(['\\', '/']).filter(|s| !s.is_empty()).count())
+                    })
+                }) else {
+                    continue;
+                };
+                let parts: Vec<_> = file.components().collect();
+                let Some(tail) = parts.len().checked_sub(depth).map(|start| &parts[start..]) else {
+                    continue;
+                };
+                let respelled = tail.iter().fold(ancestor.to_path_buf(), |dir, part| dir.join(part));
+                let Ok(text) = std::fs::read_to_string(&respelled) else {
+                    continue;
+                };
+                if scope_root.starts_with(ancestor) {
+                    scope_root = ancestor.to_path_buf();
+                }
+                context.push((respelled, text));
+            }
+        }
         // A fighter declaration in `src/fighters/mario/mod.rs` owns every nested module below
         // it, not only Rust files immediately beside it. Keep declarations as directory scopes
         // and resolve a function against its nearest ancestor scope below.
         let mut fighter_scopes: HashMap<PathBuf, Vec<String>> = HashMap::new();
         let mut project_wide: Vec<String> = Vec::new();
         let mut project_registrations: HashMap<String, Vec<RegisteredScript>> = HashMap::new();
-        for (file, text) in &sources {
+        let mut facts = ProjectFacts::default();
+        // Fighter → (constructions narrowed to costumes, constructions that are not).
+        let mut gating: HashMap<String, (usize, usize)> = HashMap::new();
+        for (file, text) in sources.iter().chain(&context) {
+            for function in scan_acmd_functions(text) {
+                *facts.definitions.entry(function.name).or_default() += 1;
+            }
+            for (fighter, gated) in scan_agent_gating(text) {
+                let counts = gating.entry(fighter).or_default();
+                if gated {
+                    counts.0 += 1;
+                } else {
+                    counts.1 += 1;
+                }
+            }
             let names = scan_fighter_names(text);
             for name in &names {
                 if !project_wide.contains(name) {
                     project_wide.push(name.clone());
                 }
             }
-            if let Some(dir) = file.parent() {
+            // Only a folder that declares something is a scope. An empty entry stopped
+            // `fighter_for_file`'s walk at the first folder holding any `.rs` file, so
+            // `pacman/acmd/tilts.rs` never reached the `pacman/` that owns it.
+            if let Some(dir) = file.parent().filter(|_| !names.is_empty()) {
                 let entry = fighter_scopes.entry(dir.to_path_buf()).or_default();
                 for name in &names {
                     if !entry.contains(name) {
@@ -517,18 +895,40 @@ impl SourceIndex {
                     }
                 }
             }
-            let registration_fighter = (names.len() == 1).then(|| names[0].clone());
-            for (script, function) in scan_acmd_registrations(text) {
+            // `pacman::install(pacman)` where `pacman` is that file's `Agent::new("pacman")`
+            // hands the whole `pacman` module to that fighter, even though the installing file
+            // declares several agents (Shy Guy's installs `pacman` and three articles).
+            for (module, fighter) in scan_install_routes(file, text) {
+                let entry = fighter_scopes.entry(module).or_default();
+                if !entry.contains(&fighter) {
+                    entry.push(fighter);
+                }
+            }
+            let sole_name = (names.len() == 1).then(|| names[0].clone());
+            let registrations = scan_registrations(text);
+            let last = last_registrations(&registrations);
+            for registration in &registrations {
+                facts.registered.insert(registration.script.to_string());
+                // Replaced by a later registration of the same agent and script in this file.
+                if last.get(&(registration.agent.clone(), registration.script))
+                    != Some(&registration.function)
+                {
+                    continue;
+                }
+                // The agent the call is made on beats the file's own declarations: a file that
+                // registers `falco` and `falco_cannon` scripts still knows which is which.
+                let fighter = registration.agent.clone().or_else(|| sole_name.clone());
                 let scripts = project_registrations
-                    .entry(function.to_string())
+                    .entry(registration.function.to_string())
                     .or_default();
                 if !scripts
                     .iter()
-                    .any(|known| known.script == script && known.fighter == registration_fighter)
+                    .any(|known| known.script == registration.script && known.fighter == fighter)
                 {
                     scripts.push(RegisteredScript {
-                        script: script.to_string(),
-                        fighter: registration_fighter.clone(),
+                        script: registration.script.to_string(),
+                        fighter,
+                        exact: registration.agent.is_some(),
                     });
                 }
             }
@@ -540,10 +940,87 @@ impl SourceIndex {
                 &fighter_scopes,
                 &project_wide,
                 &project_registrations,
+                &facts,
+                &scope_root,
             );
         }
+        index.resolve_delegates(&sources);
+        index.index_statuses(&sources, &fighter_scopes, &scope_root);
+        index.hash_macros =
+            crate::hash_macros::HashMacros::scan(sources.iter().map(|(_, text)| text.as_str()));
+        crate::hash_macros::set_current(index.hash_macros.clone());
+        index.consts = std::sync::Arc::new(crate::project_consts::ProjectConsts::scan(&sources));
+        index.helpers = std::sync::Arc::new(crate::project_helpers::ProjectHelpers::scan(
+            sources.iter().map(|(_, text)| text.as_str()),
+        ));
+        index.param_overrides = crate::frame_data::source_param_overrides(
+            sources.iter().map(|(_, text)| text.as_str()),
+        );
+        index.scales = crate::fighter_scale::scan(
+            &sources,
+            |file| fighter_for_file(file, &scope_root, &fighter_scopes),
+            &index.consts,
+        );
+        index.hurtboxes = crate::fighter_hurtboxes::scan(
+            &sources,
+            |file| fighter_for_file(file, &scope_root, &fighter_scopes),
+            &index.consts,
+        );
+        index.param_scale = crate::fighter_scale::param_config_scale(
+            sources.iter().map(|(_, text)| text.as_str()),
+        );
+        // One agent for every costume is enough to make the fighter's own slots modded too.
+        index.costume_gated = gating
+            .into_iter()
+            .filter(|(_, (gated, ungated))| *gated > 0 && *ungated == 0)
+            .map(|(fighter, _)| fighter)
+            .collect();
         index.files = files;
         Ok(index)
+    }
+
+    /// Whether the crate installs `fighter`'s scripts only on chosen costume slots.
+    #[cfg(test)]
+    pub fn is_costume_gated(&self, fighter: &str) -> bool {
+        self.costume_gated.contains(&normalize_fighter(fighter))
+    }
+
+    /// Every script the project has for `fighter` and for its objects (`pacman_bigpacman`), as
+    /// (agent, script name, body), the project's hash macros expanded so `Hash40::new` names
+    /// read as written in the game's own scripts. A forwarding script's body is what it runs.
+    pub fn fighter_script_bodies(&self, fighter: &str) -> Vec<(String, String, String)> {
+        let fighter = normalize_fighter(fighter);
+        let objects = format!("{fighter}_");
+        let unattributed = self.unattributed_scripts().is_some();
+        let mut texts: HashMap<&Path, Option<String>> = HashMap::new();
+        let mut out = Vec::new();
+        for (agent, table) in &self.fighters {
+            let own = *agent == fighter || (agent.is_empty() && unattributed);
+            if !own && !agent.starts_with(&objects) {
+                continue;
+            }
+            let agent = if own { &fighter } else { agent };
+            for (name, site) in &table.scripts {
+                let body = match &site.delegate {
+                    Some(delegate) => delegate.body.clone(),
+                    None => {
+                        let text = texts
+                            .entry(site.file.as_path())
+                            .or_insert_with(|| std::fs::read_to_string(&site.file).ok());
+                        // The span came from this file's text; a later edit can shrink it.
+                        let Some(source) = text.as_deref().and_then(|t| t.get(site.span.clone()))
+                        else {
+                            continue;
+                        };
+                        source.to_owned()
+                    }
+                };
+                let body = self.hash_macros.expand_in(&body).into_owned();
+                out.push((agent.clone(), name.clone(), body));
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Total number of indexed scripts, across every fighter.
@@ -662,6 +1139,30 @@ impl SourceIndex {
             })
     }
 
+    /// Why [`Self::script_source`] has nothing for this move, in a phrase for the status line —
+    /// the difference between "this project is not for that fighter" and "this move is not
+    /// modded" is the whole diagnosis when a modded move shows vanilla.
+    pub fn why_no_script(&self, fighter: &str, move_name: &str) -> String {
+        let wanted = normalize_fighter(fighter);
+        if self.script_count() == 0 && self.conflict_count() == 0 {
+            return "the linked source has no ACMD scripts".into();
+        }
+        if !self.has_fighter(fighter) {
+            let mut agents: Vec<&str> = self
+                .fighters
+                .keys()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty())
+                .collect();
+            agents.sort_unstable();
+            let shown = agents.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+            let more = agents.len().saturating_sub(6);
+            let more = if more > 0 { format!(" +{more}") } else { String::new() };
+            return format!("the linked source has no `{wanted}` scripts (it defines {shown}{more})");
+        }
+        format!("the linked source does not define {wanted}/{move_name}")
+    }
+
     /// The functions this project defines for a move, concatenated into one body the existing
     /// `acmd::parse_*` functions can read — the same shape the dumped scripts have — together
     /// with the list of categories that body actually covers.
@@ -674,6 +1175,7 @@ impl SourceIndex {
         let mut body = String::new();
         let mut covers: Vec<&'static str> = Vec::new();
         let mut blocked: Vec<&'static str> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         for prefix in crate::acmd::SCRIPT_PREFIXES {
             let trimmed = prefix.trim_end_matches('_');
             // `attack_s3_s` is `game_attacks3` upstream (except Ryu/Ken's real
@@ -698,10 +1200,52 @@ impl SourceIndex {
                 continue;
             }
             if let Some((name, site)) = resolved {
+                // A forwarding wrapper has no body of its own; show what it runs. The resolved
+                // text was built from the same snapshot as the span, at index time.
+                if let Some(delegate) = &site.delegate {
+                    let text = if prefix == "effect_" {
+                        let expanded = std::fs::read_to_string(&delegate.file)
+                            .ok()
+                            .map(|file_text| {
+                                expand_same_file_effect_helpers(&delegate.body, &file_text)
+                            })
+                            .unwrap_or_else(|| delegate.body.clone());
+                        unroll_string_array_loops(&expanded)
+                    } else {
+                        delegate.body.clone()
+                    };
+                    let text = self.hash_macros.expand_in(&text);
+                    let text = self.helpers.inline(&text);
+                    let text = self.consts.substitute(&text);
+                    body.push_str(&header_named(&text, &name));
+                    body.push_str("\n\n");
+                    covers.push(prefix);
+                    notes.extend(
+                        delegate
+                            .unresolved
+                            .iter()
+                            .map(|reason| format!("{name}: {reason}")),
+                    );
+                    continue;
+                }
                 if let Ok(text) = std::fs::read_to_string(&site.file) {
                     // The span came from this file's text; a concurrent edit can shrink it.
                     if let Some(source) = text.get(site.span.clone()) {
-                        body.push_str(&header_named(source, &name));
+                        let expanded = if prefix == "effect_" {
+                            unroll_string_array_loops(&expand_same_file_effect_helpers(
+                                source, &text,
+                            ))
+                        } else {
+                            source.to_string()
+                        };
+                        // `cmn!("swing_06")` reads as the name it hashes; the file keeps the
+                        // macro, and write-back puts edits back into it.
+                        let source = self.hash_macros.expand_in(&expanded);
+                        // `RUMBLE_HIT(agent, kind)` reads as the vanilla call it makes.
+                        let source = self.helpers.inline(&source);
+                        // `WALK_LW_DAMAGE` reads as its value; an edit to it goes to the const.
+                        let source = self.consts.substitute(&source);
+                        body.push_str(&header_named(&source, &name));
                         body.push_str("\n\n");
                         covers.push(prefix);
                     }
@@ -712,7 +1256,175 @@ impl SourceIndex {
             body,
             covers,
             blocked,
+            notes,
         })
+    }
+
+    /// Point every script whose function only forwards to another project function at that
+    /// function's body. See [`Delegate`].
+    fn resolve_delegates(&mut self, sources: &[(PathBuf, String)]) {
+        let mut functions: HashMap<String, Vec<(usize, PlainFunction)>> = HashMap::new();
+        let mut methods: MethodTable = HashMap::new();
+        for (file_at, (_, text)) in sources.iter().enumerate() {
+            let impls = scan_impl_blocks(text);
+            for function in scan_plain_functions(text) {
+                let owner = impls.iter().find(|(_, block)| {
+                    block.start < function.span.start && function.span.end <= block.end
+                });
+                if let Some((ty, _)) = owner {
+                    let Some(ty) = ty else {
+                        continue;
+                    };
+                    let takes_self = function
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.first())
+                        .is_some_and(|(name, _)| name == "self");
+                    if takes_self {
+                        let arms = parse_self_match(&text[function.body.clone()]);
+                        // Two impls defining the same method leave nothing certain to read.
+                        methods
+                            .entry((ty.clone(), function.name.clone()))
+                            .and_modify(|known| *known = None)
+                            .or_insert(arms);
+                    }
+                    continue;
+                }
+                functions
+                    .entry(function.name.clone())
+                    .or_default()
+                    .push((file_at, function));
+            }
+        }
+        let file_at: HashMap<&Path, usize> = sources
+            .iter()
+            .enumerate()
+            .map(|(at, (file, _))| (file.as_path(), at))
+            .collect();
+        let registered: HashSet<(PathBuf, String)> = self
+            .fighters
+            .values()
+            .flat_map(|table| table.scripts.values())
+            .map(|site| (site.file.clone(), site.function.clone()))
+            .collect();
+
+        struct Pending<'a> {
+            fighter: String,
+            script: String,
+            wrapper: ScriptSite,
+            forward: Forward,
+            callee: Result<(usize, &'a PlainFunction), String>,
+        }
+        let mut pending: Vec<Pending> = Vec::new();
+        for (fighter, table) in &self.fighters {
+            for (script, site) in &table.scripts {
+                let Some(&at) = file_at.get(site.file.as_path()) else {
+                    continue;
+                };
+                let Some(item) = sources[at].1.get(site.span.clone()) else {
+                    continue;
+                };
+                let Some(forward) = forwarding_call(item) else {
+                    continue;
+                };
+                // A call to something the project does not define is an ordinary one-line
+                // script (or a crate helper), not a wrapper the index can see through.
+                let callee = match functions.get(&forward.callee).map(Vec::as_slice) {
+                    None | Some([]) => continue,
+                    Some([(callee_at, callee)]) => {
+                        if *callee_at == at && callee.span.start == site.span.start {
+                            continue;
+                        }
+                        Ok((*callee_at, callee))
+                    }
+                    Some(many) => Err(format!(
+                        "forwards to {}, which the project defines {} times; the shared body \
+                         cannot be chosen safely",
+                        forward.callee,
+                        many.len()
+                    )),
+                };
+                pending.push(Pending {
+                    fighter: fighter.clone(),
+                    script: script.clone(),
+                    wrapper: site.clone(),
+                    forward,
+                    callee,
+                });
+            }
+        }
+
+        let mut callers: HashMap<(usize, usize), HashSet<(PathBuf, String)>> = HashMap::new();
+        for entry in &pending {
+            if let Ok((at, callee)) = entry.callee {
+                callers
+                    .entry((at, callee.span.start))
+                    .or_default()
+                    .insert((entry.wrapper.file.clone(), entry.wrapper.function.clone()));
+            }
+        }
+
+        let mut resolved = Vec::new();
+        for entry in pending {
+            let item = &sources[file_at[entry.wrapper.file.as_path()]].1[entry.wrapper.span.clone()];
+            let delegate = match entry.callee {
+                Err(reason) => Delegate {
+                    file: entry.wrapper.file.clone(),
+                    function: entry.forward.callee.clone(),
+                    span: entry.wrapper.span.clone(),
+                    callers: 0,
+                    body: item.to_string(),
+                    substituted: false,
+                    unresolved: vec![reason],
+                },
+                Ok((at, callee)) => {
+                    let (file, text) = &sources[at];
+                    let callee_body = &text[callee.body.clone()];
+                    let resolution = match &callee.params {
+                        Some(params) => resolve_shared_body(
+                            callee_body,
+                            params,
+                            &entry.forward.args,
+                            &entry.forward.params,
+                            &methods,
+                        ),
+                        None => Resolution {
+                            body: callee_body.to_string(),
+                            substituted: false,
+                            unresolved: vec![format!(
+                                "the parameter list of {} could not be read",
+                                callee.name
+                            )],
+                        },
+                    };
+                    let mut count = callers
+                        .get(&(at, callee.span.start))
+                        .map_or(0, HashSet::len);
+                    if registered.contains(&(file.clone(), callee.name.clone())) {
+                        count += 1;
+                    }
+                    Delegate {
+                        file: file.clone(),
+                        function: callee.name.clone(),
+                        span: callee.span.clone(),
+                        callers: count,
+                        body: format!("{}{}", &item[..entry.forward.open], resolution.body),
+                        substituted: resolution.substituted,
+                        unresolved: resolution.unresolved,
+                    }
+                }
+            };
+            resolved.push((entry.fighter, entry.script, delegate));
+        }
+        for (fighter, script, delegate) in resolved {
+            if let Some(site) = self
+                .fighters
+                .get_mut(&fighter)
+                .and_then(|table| table.scripts.get_mut(&script))
+            {
+                site.delegate = Some(delegate);
+            }
+        }
     }
 
     fn index_file(
@@ -722,6 +1434,8 @@ impl SourceIndex {
         fighter_scopes: &HashMap<PathBuf, Vec<String>>,
         project_wide: &[String],
         project_registrations: &HashMap<String, Vec<RegisteredScript>>,
+        facts: &ProjectFacts,
+        scope_root: &Path,
     ) {
         let functions = scan_acmd_functions(text);
         if functions.is_empty() {
@@ -730,30 +1444,74 @@ impl SourceIndex {
         // `agent.acmd("game_attackairn", game_attackairn, …)` names a script explicitly, as
         // does a `#[acmd_script(script = "…")]` attribute; a plain `fn game_attackairn` is
         // its own name by convention.
-        let mut named: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (script, function) in scan_acmd_registrations(text) {
-            let scripts = named.entry(function).or_default();
-            if !scripts.contains(&script) {
-                scripts.push(script);
+        //
+        // A script registered twice in one file runs whichever function was registered LAST
+        // (smashline keeps one function per script name), so only that one is the script.
+        let registrations = scan_registrations(text);
+        let winner = last_registrations(&registrations);
+        // Function → the (agent, script) pairs this file registers it as. The agent is `None`
+        // when the call is made on a parameter, and is then resolved from the file's scope.
+        let mut named: HashMap<&str, Vec<(Option<String>, String)>> = HashMap::new();
+        // Functions this file registers only to have the registration replaced: they run as
+        // nothing, and must not fall back to another file's registration or their own name.
+        let mut replaced: HashSet<&str> = HashSet::new();
+        for registration in &registrations {
+            let key = (registration.agent.clone(), registration.script);
+            if winner.get(&key) != Some(&registration.function) {
+                replaced.insert(registration.function);
+                continue;
+            }
+            let target = (registration.agent.clone(), registration.script.to_string());
+            let targets = named.entry(registration.function).or_default();
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
 
         for function in functions {
-            let registrations = project_registrations.get(function.name.as_str());
-            let script_names: Vec<String> = if let Some(script) = function.script.clone() {
-                vec![script]
-            } else if let Some(scripts) = named.get(function.name.as_str()) {
-                scripts.iter().map(|script| (*script).to_string()).collect()
+            // A status function (`fn stub(fighter: &mut L2CFighterCommon)`) is never an ACMD
+            // script, however a same-named ACMD helper elsewhere is registered.
+            let header_end = text[function.span.clone()]
+                .find('{')
+                .map_or(function.span.end, |n| function.span.start + n);
+            let header = &text[function.span.start..header_end];
+            if !header.contains("L2CAgentBase")
+                && ["L2CFighterCommon", "L2CWeaponCommon", "L2CFighterBase"]
+                    .iter()
+                    .any(|status_type| header.contains(status_type))
+            {
+                continue;
+            }
+            // Another file's registration names this function only when nothing else in the
+            // project shares its name: `stub` defined in two modules is two functions.
+            let registrations = project_registrations
+                .get(function.name.as_str())
+                .filter(|_| facts.definitions.get(&function.name).copied().unwrap_or(0) <= 1);
+            // `(agent, script)` per script this function is. A known agent is the call's own
+            // receiver; `None` falls back to the scopes below.
+            let targets: Vec<(Option<String>, String)> = if let Some(script) = function.script.clone() {
+                vec![(None, script)]
+            } else if let Some(targets) = named.get(function.name.as_str()) {
+                targets.clone()
+            } else if replaced.contains(function.name.as_str()) {
+                continue;
             } else if let Some(scripts) = registrations {
                 scripts
                     .iter()
-                    .map(|registered| registered.script.clone())
+                    .map(|registered| {
+                        let agent = registered.exact.then(|| registered.fighter.clone()).flatten();
+                        (agent, registered.script.clone())
+                    })
                     .collect()
             } else if ["game_", "effect_", "sound_", "expression_"]
                 .iter()
                 .any(|prefix| function.name.starts_with(prefix))
+                // Named like a script but never registered, while the project explicitly
+                // registers that script name to some other function: dead code, and the
+                // registered function is what the game runs.
+                && !facts.registered.contains(&function.name)
             {
-                vec![function.name.clone()]
+                vec![(None, function.name.clone())]
             } else {
                 continue;
             };
@@ -771,10 +1529,10 @@ impl SourceIndex {
                 fighters.dedup();
                 (fighters.len() == 1).then(|| fighters[0].clone())
             });
-            let Some(fighter) = function
+            let fallback = function
                 .fighter
                 .clone()
-                .or_else(|| fighter_for_file(file, &self.root, fighter_scopes))
+                .or_else(|| fighter_for_file(file, scope_root, fighter_scopes))
                 .or(registration_fighter)
                 .or_else(|| sole(project_wide))
                 // A folder of ACMD modules is often shared without the plugin's install
@@ -782,11 +1540,11 @@ impl SourceIndex {
                 // source set has no labels at all it is still one safely editable set. Store
                 // it under the empty sentinel; `script` exposes it only while it remains the
                 // sole set, so it can never silently bleed into a named multi-fighter project.
-                .or_else(|| project_wide.is_empty().then(String::new))
-            else {
-                continue;
-            };
-            for script_name in script_names {
+                .or_else(|| project_wide.is_empty().then(String::new));
+            for (agent, script_name) in targets {
+                let Some(fighter) = agent.or_else(|| fallback.clone()) else {
+                    continue;
+                };
                 self.record_script(
                     &fighter,
                     script_name,
@@ -794,10 +1552,136 @@ impl SourceIndex {
                         file: file.to_path_buf(),
                         function: function.name.clone(),
                         span: function.span.clone(),
+                        delegate: None,
                     },
                 );
             }
         }
+    }
+
+    /// Record every `.status(..)` / `.on_start(..)` registration. The agent is the call's own
+    /// receiver, else the module's fighter the way ACMD scripts find theirs (`status::install(agent)`
+    /// in a module that holds an `Agent::new`). The registered function is looked up in its own
+    /// file first, then project-wide when its name is defined exactly once. Whatever cannot be
+    /// resolved goes to `unresolved_statuses` with the reason.
+    fn index_statuses(
+        &mut self,
+        sources: &[(PathBuf, String)],
+        fighter_scopes: &HashMap<PathBuf, Vec<String>>,
+        scope_root: &Path,
+    ) {
+        let mut defined: HashMap<String, Vec<(usize, Range<usize>)>> = HashMap::new();
+        for (n, (_, text)) in sources.iter().enumerate() {
+            for function in scan_plain_functions(text) {
+                defined.entry(function.name).or_default().push((n, function.span));
+            }
+        }
+        for (n, (file, text)) in sources.iter().enumerate() {
+            for registration in scan_status_registrations(text) {
+                let line = text[..registration.at].matches('\n').count() + 1;
+                let agent = registration
+                    .agent
+                    .clone()
+                    .or_else(|| fighter_for_file(file, scope_root, fighter_scopes));
+                let unresolved = UnresolvedStatus {
+                    agent_hint: agent.clone(),
+                    kind_expr: registration.kind_expr.clone(),
+                    phase: registration.phase.clone(),
+                    file: file.clone(),
+                    line,
+                    reason: String::new(),
+                };
+                if registration.noop {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "registered as a no-op with noop_status!".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                }
+                let Some(agent) = agent else {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "the agent is a parameter and no single module installs it from an Agent::new, or several agents claim the module".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                };
+                if !is_identifier(&registration.function) {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "registered with a closure or expression, not a named function".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                }
+                let candidates = defined.get(&registration.function).map(Vec::as_slice).unwrap_or(&[]);
+                let own = candidates.iter().filter(|(at, _)| *at == n).collect::<Vec<_>>();
+                // `fly::bullet_seed_end` names the function in the `fly` module beside the
+                // registering file, however many other modules define the same name.
+                let in_module = registration.module.as_deref().map(|module| {
+                    let dir = file.parent().unwrap_or(Path::new(""));
+                    let stem_dir = file.with_extension("");
+                    candidates
+                        .iter()
+                        .filter(|(at, _)| {
+                            let path = &sources[*at].0;
+                            [dir, stem_dir.as_path()].iter().any(|base| {
+                                *path == base.join(format!("{module}.rs")) || *path == base.join(module).join("mod.rs")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                // A path that names no module beside the file (`super::status::f`, a `pub use`
+                // re-export, an inline `mod fly {}`) says nothing: the name alone decides.
+                let found = match (in_module.as_deref(), own.as_slice(), candidates) {
+                    (Some([one]), _, _) => Some((*one).clone()),
+                    (Some([_, _, ..]), _, _) => None,
+                    (_, [one], _) => Some((*one).clone()),
+                    (_, [], [one]) => Some(one.clone()),
+                    _ => None,
+                };
+                let Some((at, span)) = found else {
+                    let reason = if candidates.is_empty() {
+                        "the registered function is not defined in the project source".to_string()
+                    } else if registration.module.is_some() {
+                        format!(
+                            "the registered function name is defined in {} places, and its path doesn't say which",
+                            candidates.len()
+                        )
+                    } else {
+                        format!(
+                            "the registered function name is defined in {} places, none of them in the registering file",
+                            candidates.len()
+                        )
+                    };
+                    self.unresolved_statuses.push(UnresolvedStatus { reason, ..unresolved });
+                    continue;
+                };
+                let site = StatusSite {
+                    kind_expr: registration.kind_expr,
+                    phase: registration.phase,
+                    function: registration.function,
+                    file: sources[at].0.clone(),
+                    span,
+                };
+                let sites = self.statuses.entry(agent).or_default();
+                if !sites.contains(&site) {
+                    sites.push(site);
+                }
+            }
+        }
+    }
+
+    /// The status scripts registered on `agent`, each with its function's source text.
+    pub fn status_bodies(&self, agent: &str) -> Vec<(&StatusSite, String)> {
+        let Some(sites) = self.statuses.get(&normalize_fighter(agent)) else {
+            return Vec::new();
+        };
+        sites
+            .iter()
+            .filter_map(|site| {
+                let text = std::fs::read_to_string(&site.file).ok()?;
+                Some((site, text.get(site.span.clone())?.to_string()))
+            })
+            .collect()
     }
 
     fn record_script(&mut self, fighter: &str, script: String, site: ScriptSite) {
@@ -845,10 +1729,40 @@ fn fighter_for_file(
     root: &Path,
     fighter_scopes: &HashMap<PathBuf, Vec<String>>,
 ) -> Option<String> {
+    // A module written as a single file (`pacman.rs`) is its own scope.
+    if let Some(names) = fighter_scopes.get(file) {
+        if !names.is_empty() {
+            return (names.len() == 1).then(|| names[0].clone());
+        }
+    }
     let mut directory = file.parent()?;
     loop {
         if let Some(names) = fighter_scopes.get(directory) {
-            return (names.len() == 1).then(|| names[0].clone());
+            if names.len() == 1 {
+                return Some(names[0].clone());
+            }
+            // Fighter kinds never contain `_`; `falco_arwing` is an article. A folder whose
+            // files declare a fighter's articles beside it (`specials.rs` registers the
+            // `falco_cannon` shots, `misc.rs` the `falco_arwing` entry) still holds that
+            // fighter's own scripts, and one declaring only articles doesn't own its other
+            // files at all: keep walking to the module that names the fighter. A folder
+            // named for the mod (`emperte/`) rather than the fighter is then still Falco's.
+            // `Agent::new("fighter")` / `("weapon")` is smashline's agent for every fighter or
+            // weapon: its registrations name it as their receiver, and it owns no module (King
+            // Boo's `status/` holds one beside the statuses it installs on `dedede`).
+            let generic = |name: &str| matches!(name, "fighter" | "weapon");
+            let fighters: Vec<&String> =
+                names.iter().filter(|name| !name.contains('_') && !generic(name)).collect();
+            match fighters.as_slice() {
+                [] => {}
+                [fighter] if names.iter().all(|name| {
+                    *name == **fighter || name.starts_with(&format!("{fighter}_")) || generic(name)
+                }) =>
+                {
+                    return Some((*fighter).clone());
+                }
+                _ => return None,
+            }
         }
         if directory == root {
             return None;
@@ -857,11 +1771,434 @@ fn fighter_for_file(
     }
 }
 
+/// Modules handed an agent: `(module path on disk, fighter)` for each `path::to::f(agent)` call
+/// in `text` whose argument is an `Agent::new("…")`, directly or through a `let` binding.
+///
+/// The module path is given both as a directory (`…/pacman`) and as a file (`…/pacman.rs`),
+/// since either layout declares the same module; [`fighter_for_file`] looks for both.
+fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
+    let text = &without_comments(text);
+    let mut bound: HashMap<String, String> = HashMap::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let rest = text[search..].trim_start();
+        let Some(name) = rest
+            .strip_prefix('"')
+            .and_then(|r| r.find('"').map(|end| r[..end].to_string()))
+        else {
+            continue;
+        };
+        // The statement this constructor sits in: `let [mut] VAR = [&mut] [path::]Agent::new(…`.
+        let stmt_start = text[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+        let head = text[stmt_start..at].trim();
+        if let Some(binding) = head.strip_prefix("let ") {
+            let binding = binding.trim_start().strip_prefix("mut ").unwrap_or(binding).trim_start();
+            let end = ident_end(binding, 0);
+            if end > 0 && binding[end..].trim_start().starts_with('=') {
+                bound.insert(binding[..end].to_string(), normalize_fighter(&name));
+            }
+        }
+    }
+    let module_dir = match file.file_name().and_then(|n| n.to_str()) {
+        Some("mod.rs" | "lib.rs" | "main.rs") => file.parent().map(Path::to_path_buf),
+        _ => file
+            .parent()
+            .zip(file.file_stem())
+            .map(|(parent, stem)| parent.join(stem)),
+    };
+    let Some(module_dir) = module_dir else {
+        return Vec::new();
+    };
+    let crate_dir = file.ancestors().skip(1).find(|dir| {
+        dir.join("lib.rs").is_file() || dir.join("main.rs").is_file()
+    });
+    let mut routes = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) || !is_ident_byte(bytes[i]) || (i > 0 && is_ident_byte(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        // A path `a::b::f(`, read segment by segment.
+        let mut segments: Vec<&str> = Vec::new();
+        let mut at = i;
+        loop {
+            let end = ident_end(text, at);
+            if end == at {
+                break;
+            }
+            segments.push(&text[at..end]);
+            at = end;
+            if text[at..].starts_with("::") {
+                at += 2;
+                continue;
+            }
+            break;
+        }
+        if segments.len() < 2 || bytes.get(at) != Some(&b'(') {
+            i = at.max(i + 1);
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, at + 1, text.len()) else {
+            i = at + 1;
+            continue;
+        };
+        let fighter = args.iter().find_map(|span| {
+            let arg = text[span.clone()].trim();
+            let arg = arg.strip_prefix("&mut").unwrap_or(arg).trim_start();
+            let arg = arg.strip_prefix('&').unwrap_or(arg).trim_start();
+            if let Some(name) = bound.get(arg) {
+                return Some(name.clone());
+            }
+            let inner = arg.split("Agent::new(").nth(1)?.trim_start().strip_prefix('"')?;
+            Some(normalize_fighter(&inner[..inner.find('"')?]))
+        });
+        if let Some(fighter) = fighter {
+            let modules = &segments[..segments.len() - 1];
+            let mut dir = module_dir.clone();
+            let mut ok = true;
+            for (index, segment) in modules.iter().enumerate() {
+                match *segment {
+                    "self" if index == 0 => {}
+                    "super" => match dir.parent() {
+                        Some(parent) => dir = parent.to_path_buf(),
+                        None => ok = false,
+                    },
+                    "crate" if index == 0 => match crate_dir {
+                        Some(root) => dir = root.to_path_buf(),
+                        None => ok = false,
+                    },
+                    // A type or an external crate (`smashline::…`) is not a module of ours.
+                    s if s.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => ok = false,
+                    s => dir = dir.join(s),
+                }
+            }
+            if ok && dir != module_dir {
+                if dir.is_dir() || dir.with_extension("rs").is_file() {
+                    routes.push((dir.with_extension("rs"), fighter.clone()));
+                    routes.push((dir, fighter));
+                }
+            }
+        }
+        i = close + 1;
+    }
+    routes
+}
+
+/// Each `Agent::new("…")` in `text`, with whether it is narrowed to costume slots:
+/// `.set_costume(…)` in the constructor's own chain, or called later on the variable it was
+/// bound to, directly (`agent.set_costume(…)`) or through a rebinding (`let agent =
+/// agent.set_costume(…);`, Empoleon's spelling). `common` hooks every fighter and is skipped.
+///
+/// A costume list handed in through a function parameter is not followed; the agent then
+/// reads as ungated, which keeps the fighter's own slots credited, as before.
+fn scan_agent_gating(text: &str) -> Vec<(String, bool)> {
+    let text = &without_comments(text);
+    let boundaries = statement_boundaries(text);
+    // `(receiver, offset)` for each `.set_costume(` call.
+    let gated_receivers: Vec<(&str, usize)> = {
+        let mut receivers = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = text[search..].find(".set_costume(") {
+            let at = search + rel;
+            search = at + 1;
+            let head = text[statement_start(&boundaries, at)..at].trim_start();
+            let head = head
+                .strip_prefix("let ")
+                .and_then(|rest| rest.split_once('=').map(|(_, value)| value))
+                .unwrap_or(head)
+                .trim_start();
+            let head = head.strip_prefix("&mut").unwrap_or(head).trim_start();
+            let head = head.strip_prefix('&').unwrap_or(head).trim_start();
+            let head = head.strip_prefix('*').unwrap_or(head).trim_start();
+            let end = ident_end(head, 0);
+            if end > 0 {
+                receivers.push((&head[..end], at));
+            }
+        }
+        receivers
+    };
+    let mut found = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let Some(fighter) = agent_literal(&text[at..]) else {
+            continue;
+        };
+        if fighter.is_empty() || fighter == "common" {
+            continue;
+        }
+        let end = chain_end(text, at);
+        let mut gated = text[at..end].contains(".set_costume(");
+        if !gated {
+            let head = text[statement_start(&boundaries, at)..at].trim();
+            if let Some(binding) = head.strip_prefix("let ") {
+                let binding = binding.trim_start();
+                let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim_start();
+                let name_end = ident_end(binding, 0);
+                // Only later in the binding's own block: another function's `agent` is not it.
+                let scope = at..block_end(text, at);
+                gated = name_end > 0
+                    && gated_receivers.iter().any(|(receiver, offset)| {
+                        *receiver == &binding[..name_end] && scope.contains(offset)
+                    });
+            }
+        }
+        found.push((fighter, gated));
+    }
+    found
+}
+
+/// The `}` closing the block `start` sits in, or the end of `text`.
+fn block_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    text.len()
+}
+
+/// Where the expression starting at `start` ends: its `;`, the `}` closing the block it is
+/// the tail of, or the end of `text`.
+fn chain_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    text.len()
+}
+
 /// Visionary names fighters after the dump folder (`mario`); ACMD attributes and
 /// `Agent::new` calls often spell the same character `fighter_mario`.
 fn normalize_fighter(name: &str) -> String {
     let name = name.trim().to_ascii_lowercase();
     name.strip_prefix("fighter_").unwrap_or(&name).to_string()
+}
+
+/// The files a crate under `root` actually compiles, or `None` when `root` holds no crate.
+///
+/// Moveset folders routinely carry source the build never sees: a `srcOLD/` kept as a backup, a
+/// `dist/` copy of a release's source, a `.zip` extracted beside the real tree, vanilla reference
+/// dumps. All of it defines the same script names as the live code, so indexing it turned every
+/// move into a "found in two places" conflict (Waluigi: all 96 scripts) or, worse, would let an
+/// edit land in a file that is never built. Rust says exactly which files are in a crate — the
+/// `mod` tree under `src/lib.rs` / `src/main.rs` — so that is what decides it.
+///
+/// A folder with no `Cargo.toml` anywhere (a loose set of ACMD files someone shared) keeps the
+/// old behaviour: every `.rs` file counts.
+fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet<PathBuf>> {
+    let mut crate_roots: Vec<PathBuf> = Vec::new();
+    // Cargo knows exactly which crates the workspace builds, wherever their roots are. The
+    // folder walk below is for when it cannot be asked: no cargo, or a loose folder of files.
+    if let Some(project) = crate::cargo_project::CargoProject::discover(root) {
+        crate_roots.extend(project.crate_roots().cloned());
+    }
+    if crate_roots.is_empty() {
+        // The linked folder may be a crate's `src/` or `plugin/`, with the manifest above it.
+        let mut manifests: Vec<PathBuf> = texts
+            .keys()
+            .filter_map(|file| {
+                let mut dir = file.parent();
+                while let Some(d) = dir {
+                    if d.join("Cargo.toml").is_file() {
+                        return Some(d.to_path_buf());
+                    }
+                    if d == root {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+                None
+            })
+            .collect();
+        let mut ancestor = Some(root);
+        for _ in 0..4 {
+            let Some(dir) = ancestor else { break };
+            let manifest = dir.join("Cargo.toml");
+            if manifest.is_file() {
+                // A plain package builds only itself: a crate nested inside it (a
+                // `plugin(old)/` backup with its own manifest) is not a workspace member, and
+                // cargo never compiles it.
+                let toml = std::fs::read_to_string(&manifest).unwrap_or_default();
+                if toml.contains("[package]") && !toml.contains("[workspace]") {
+                    manifests.clear();
+                }
+                manifests.push(dir.to_path_buf());
+                break;
+            }
+            ancestor = dir.parent();
+        }
+        manifests.sort();
+        manifests.dedup();
+        for manifest in &manifests {
+            let toml = std::fs::read_to_string(manifest.join("Cargo.toml")).unwrap_or_default();
+            // `[lib] path = "…"` relocates the crate root; take it when given.
+            let custom = toml
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("path"))
+                .filter_map(|line| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"')))
+                .filter(|path| path.ends_with(".rs"))
+                .map(|path| manifest.join(path))
+                .collect::<Vec<_>>();
+            crate_roots.extend(custom);
+            for name in ["src/lib.rs", "src/main.rs"] {
+                crate_roots.push(manifest.join(name));
+            }
+        }
+    }
+    crate_roots.retain(|path| path.is_file());
+    if crate_roots.is_empty() {
+        return None;
+    }
+    let mut reached: HashSet<PathBuf> = HashSet::new();
+    let mut queue = crate_roots;
+    while let Some(file) = queue.pop() {
+        if !reached.insert(file.clone()) {
+            continue;
+        }
+        let owned;
+        let text = match texts.get(&file) {
+            Some(text) => *text,
+            None => {
+                owned = std::fs::read_to_string(&file).unwrap_or_default();
+                &owned
+            }
+        };
+        let stem_dir = match file.file_name().and_then(|n| n.to_str()) {
+            Some("mod.rs" | "lib.rs" | "main.rs") => file.parent().map(Path::to_path_buf),
+            _ => file
+                .parent()
+                .zip(file.file_stem())
+                .map(|(parent, stem)| parent.join(stem)),
+        };
+        let Some(stem_dir) = stem_dir else { continue };
+        for child in module_declarations(text) {
+            let base = child.inline_parents.iter().fold(stem_dir.clone(), |dir, m| dir.join(m));
+            let candidates = match &child.path_attr {
+                // `#[path]` is relative to the declaring file's directory (inline modules nest).
+                Some(path) => vec![file
+                    .parent()
+                    .map(|p| child.inline_parents.iter().fold(p.to_path_buf(), |d, m| d.join(m)))
+                    .unwrap_or_default()
+                    .join(path)],
+                None => vec![
+                    base.join(format!("{}.rs", child.name)),
+                    base.join(&child.name).join("mod.rs"),
+                ],
+            };
+            if let Some(found) = candidates.into_iter().find(|p| p.is_file()) {
+                queue.push(found);
+            }
+        }
+    }
+    Some(reached)
+}
+
+/// One `mod NAME;` found by [`module_declarations`].
+struct ModuleDeclaration {
+    name: String,
+    /// Inline `mod a { mod b { … } }` blocks enclosing the declaration, outermost first.
+    inline_parents: Vec<String>,
+    /// A `#[path = "…"]` attribute on the declaration.
+    path_attr: Option<String>,
+}
+
+/// Every out-of-line `mod NAME;` in `text`, ignoring comments and strings.
+fn module_declarations(text: &str) -> Vec<ModuleDeclaration> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    // (module name, brace depth its body opened at)
+    let mut inline: Vec<(String, usize)> = Vec::new();
+    let mut depth = 0usize;
+    let mut pending_path: Option<String> = None;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b'}' => {
+                if inline.last().is_some_and(|(_, at)| *at == depth) {
+                    inline.pop();
+                }
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            b'#' if text[i..].starts_with("#[path") => {
+                let end = text[i..].find(']').map_or(text.len(), |n| i + n);
+                pending_path = attr_string_value(&text[i..end], "path");
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        if keyword_at(text, i, "mod") {
+            let name_start = i + 3 + (text[i + 3..].len() - text[i + 3..].trim_start().len());
+            let name_end = ident_end(text, name_start);
+            if name_end > name_start {
+                let name = text[name_start..name_end].to_string();
+                let after = text[name_end..].trim_start();
+                if after.starts_with(';') {
+                    out.push(ModuleDeclaration {
+                        name,
+                        inline_parents: inline.iter().map(|(n, _)| n.clone()).collect(),
+                        path_attr: pending_path.take(),
+                    });
+                } else if after.starts_with('{') {
+                    pending_path = None;
+                    inline.push((name, depth + 1));
+                }
+                i = name_end;
+                continue;
+            }
+        }
+        if !bytes[i].is_ascii_whitespace() && bytes[i] != b'#' && text.is_char_boundary(i) {
+            // Any other token between an attribute and its item ends the attribute's reach.
+            if bytes[i] == b';' {
+                pending_path = None;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
@@ -1047,10 +2384,15 @@ fn attr_value_span(line: &str, key: &str) -> Option<(Range<usize>, bool)> {
 
 /// Fighter names a file declares, via `Agent::new("…")` or an `agent = "…"` attribute.
 fn scan_fighter_names(text: &str) -> Vec<String> {
+    // A commented-out `// Agent::new("fighter")` template line is not a declaration; reading it
+    // gave Master Chief a fighter named `fighter` and split his scripts across two scopes.
+    let text = &without_comments(text);
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
         let name = normalize_fighter(&name);
-        if !name.is_empty() && !names.contains(&name) {
+        // `Agent::new("common")` hooks every fighter at once (opff, status lines). It is no
+        // one's character, and counting it made a mod's own folder name two fighters.
+        if !name.is_empty() && name != "common" && !names.contains(&name) {
             names.push(name);
         }
     };
@@ -1079,14 +2421,40 @@ fn scan_fighter_names(text: &str) -> Vec<String> {
     names
 }
 
-/// `(script_name, function_name)` for every `agent.acmd("…", fn, …)`-style registration, and
-/// for `#[acmd_script(script = "…")]` attributes.
-fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
+/// One `agent.acmd("…", fn, …)`-style registration.
+#[derive(Debug, Clone, PartialEq)]
+struct Registration<'a> {
+    script: &'a str,
+    function: &'a str,
+    /// The agent the call is made on, when the call itself says: a chain headed by
+    /// `Agent::new("…")`, or a `let` binding of one. `None` for a parameter (`agent.acmd(…)`
+    /// inside `fn install(agent: &mut Agent)`), whose agent only the caller knows.
+    agent: Option<String>,
+}
+
+/// The function that wins each `(agent, script)` pair: smashline keeps one function per agent
+/// and script, so a later registration replaces an earlier one — but only for the same agent.
+fn last_registrations<'a>(
+    registrations: &[Registration<'a>],
+) -> HashMap<(Option<String>, &'a str), &'a str> {
+    registrations
+        .iter()
+        .map(|registration| ((registration.agent.clone(), registration.script), registration.function))
+        .collect()
+}
+
+/// Every `agent.acmd("…", fn, …)`-style registration in `text`, in document order, with the
+/// agent each is made on.
+fn scan_registrations(text: &str) -> Vec<Registration<'_>> {
+    let mut out: Vec<(usize, &str, &str, Option<String>)> = Vec::new();
+    let boundaries = statement_boundaries(text);
+    let bindings = agent_bindings(text, &boundaries);
     for marker in [
         ".acmd(",
         ".game_acmd(",
         ".effect_acmd(",
+        ".sound_acmd(",
+        ".expression_acmd(",
         "install_acmd_script!(",
     ] {
         let mut search = 0;
@@ -1109,25 +2477,1299 @@ fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
                 continue;
             };
             // (script, function) for `.acmd(…)`; the bang form leads with the agent.
-            let (script, function) = match (marker, args.len()) {
-                ("install_acmd_script!(", 3..) => (&args[1], &args[2]),
-                (_, 2..) => (&args[0], &args[1]),
+            let (script, function, receiver) = match (marker, args.len()) {
+                ("install_acmd_script!(", 3..) => (&args[1], &args[2], &text[args[0].clone()]),
+                (_, 2..) => {
+                    // The method chain this call hangs off, from its statement's start.
+                    let dot = open + 1 - marker.len();
+                    let start = statement_start(&boundaries, dot);
+                    (&args[0], &args[1], &text[start..dot])
+                }
                 _ => continue,
             };
             let script = text[script.clone()].trim().trim_matches('"');
             let function = text[function.clone()].trim();
             if !script.is_empty() && is_identifier(function) {
-                out.push((script, function));
+                out.push((open, script, function, receiver_agent(receiver, &bindings)));
             }
         }
     }
+    // Document order: when one agent registers a script twice, the later call replaces the
+    // earlier one, and callers rely on reading them in the order the game does.
+    out.sort_by_key(|(at, _, _, _)| *at);
+    out.into_iter()
+        .map(|(_, script, function, agent)| Registration { script, function, agent })
+        .collect()
+}
+
+/// One `.status(Phase, KIND, f)` or `.on_start(f)` call, or one phase of a `noop_status!`.
+struct StatusRegistration {
+    /// Offset of the call, for its line number.
+    at: usize,
+    agent: Option<String>,
+    phase: String,
+    kind_expr: String,
+    /// The function's own name: a path (`jackbox::jackbox_main`) keeps its last segment. Anything
+    /// that is not a name (a closure) is kept as written.
+    function: String,
+    /// The module a path names the function in (`fly` for `fly::bullet_seed_end`), when it has one.
+    module: Option<String>,
+    /// A phase registered with `noop_status!`: there is no function to follow.
+    noop: bool,
+}
+
+/// The module segment before a function's name in a path (`fly` in `fly::bullet_seed_end`), when
+/// it is a plain module name rather than `self`, `super` or `crate`.
+fn function_module(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (module, _) = text.rsplit_once("::")?;
+    let last = module.rsplit("::").next()?.trim();
+    (!last.is_empty()
+        && !matches!(last, "self" | "super" | "crate")
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then(|| last.to_string())
+}
+
+/// A path's last segment, unless the text is not a plain path (a closure), which stays as written.
+fn function_name(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        text.rsplit("::").next().unwrap_or(text).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Every `.status(..)` / `.on_start(..)` / `noop_status!(..)` registration in `text`, in document
+/// order, with the agent each is made on when the call itself says (as [`scan_registrations`]).
+fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
+    let mut out: Vec<StatusRegistration> = Vec::new();
+    let boundaries = statement_boundaries(text);
+    let bindings = agent_bindings(text, &boundaries);
+    for marker in [".status(", ".on_start(", "noop_status!("] {
+        let mut search = 0;
+        while search < text.len() {
+            if !text.is_char_boundary(search) {
+                search += 1;
+                continue;
+            }
+            if let Some(next) = skip_trivia(text, search) {
+                search = next;
+                continue;
+            }
+            if !text[search..].starts_with(marker) {
+                search += 1;
+                continue;
+            }
+            let at = search;
+            let open = search + marker.len() - 1;
+            search = open + 1;
+            let Some((args, _)) = split_call_args(text, open + 1, text.len()) else {
+                continue;
+            };
+            let receiver = &text[statement_start(&boundaries, at)..at];
+            // `$agent.status($phase, $kind, …)` is the body of a `macro_rules!`: its invocations
+            // are the registrations (`noop_status!` ones are read below), not the template.
+            if args.iter().take(2).any(|arg| text[arg.clone()].trim_start().starts_with('$')) {
+                continue;
+            }
+            match (marker, args.len()) {
+                (".status(", 3..) => out.push(StatusRegistration {
+                    at,
+                    agent: receiver_agent(receiver, &bindings),
+                    phase: function_name(&text[args[0].clone()]),
+                    kind_expr: text[args[1].clone()].trim().to_string(),
+                    function: function_name(&text[args[2].clone()]),
+                    module: function_module(&text[args[2].clone()]),
+                    noop: false,
+                }),
+                (".on_start(", 1) => out.push(StatusRegistration {
+                    at,
+                    agent: receiver_agent(receiver, &bindings),
+                    phase: "Start".to_string(),
+                    kind_expr: String::new(),
+                    function: function_name(&text[args[0].clone()]),
+                    module: function_module(&text[args[0].clone()]),
+                    noop: false,
+                }),
+                ("noop_status!(", 3..) => {
+                    let agent = receiver_agent(&text[args[0].clone()], &bindings);
+                    let kind_expr = text[args[1].clone()].trim().to_string();
+                    let phases = text[args[2].clone()].trim().trim_start_matches('[').trim_end_matches(']');
+                    for phase in phases.split(',').map(str::trim).filter(|phase| !phase.is_empty()) {
+                        out.push(StatusRegistration {
+                            at,
+                            agent: agent.clone(),
+                            phase: function_name(phase),
+                            kind_expr: kind_expr.clone(),
+                            function: String::new(),
+                            module: None,
+                            noop: true,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort_by_key(|registration| registration.at);
     out
+}
+
+/// Offsets of every `;`, `{` and `}` outside strings and comments, ascending.
+fn statement_boundaries(text: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if matches!(text.as_bytes()[i], b';' | b'{' | b'}') {
+            found.push(i);
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Where the statement containing `at` starts: just past the last boundary before it.
+fn statement_start(boundaries: &[usize], at: usize) -> usize {
+    let before = boundaries.partition_point(|&b| b < at);
+    before.checked_sub(1).map_or(0, |i| boundaries[i] + 1)
+}
+
+/// The fighter named by the first `Agent::new("…")` in `text`, normalized.
+fn agent_literal(text: &str) -> Option<String> {
+    let rest = text.split("Agent::new(").nth(1)?.trim_start().strip_prefix('"')?;
+    Some(normalize_fighter(&rest[..rest.find('"')?]))
+}
+
+/// `let [mut] NAME = [&mut] [path::]Agent::new("…")` bindings in `text`: name → fighter.
+fn agent_bindings(text: &str, boundaries: &[usize]) -> HashMap<String, String> {
+    let mut bound = HashMap::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let head = text[statement_start(boundaries, at)..at].trim();
+        let Some(binding) = head.strip_prefix("let ") else {
+            continue;
+        };
+        let binding = binding.trim_start();
+        let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim_start();
+        let end = ident_end(binding, 0);
+        if end > 0 && binding[end..].trim_start().starts_with('=') {
+            if let Some(fighter) = agent_literal(&text[at..]) {
+                bound.insert(binding[..end].to_string(), fighter);
+            }
+        }
+    }
+    bound
+}
+
+/// The agent a registration's receiver names: an `Agent::new("…")` at the head of the chain, or
+/// a variable bound to one. A parameter or anything else is `None`.
+fn receiver_agent(receiver: &str, bindings: &HashMap<String, String>) -> Option<String> {
+    let receiver = receiver.trim_start();
+    if receiver.contains("Agent::new(") {
+        return agent_literal(receiver);
+    }
+    let receiver = receiver.strip_prefix("&mut").unwrap_or(receiver).trim_start();
+    let receiver = receiver.strip_prefix('&').unwrap_or(receiver).trim_start();
+    let receiver = receiver.strip_prefix('*').unwrap_or(receiver).trim_start();
+    let end = ident_end(receiver, 0);
+    bindings.get(&receiver[..end]).cloned()
 }
 
 fn is_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !value.starts_with(|c: char| c.is_ascii_digit())
+}
+
+// ── Scripts that forward to a shared implementation ───────────────────────────
+
+/// Any free function or method with a body, found by [`scan_plain_functions`].
+#[derive(Debug, Clone)]
+struct PlainFunction {
+    name: String,
+    /// `(name, type)` per parameter, `self` included as `("self", "Self")`. `None` when the
+    /// list holds something this reader cannot split, such as a pattern or a generic type
+    /// with a comma, because a misnumbered parameter would substitute the wrong argument.
+    params: Option<Vec<(String, String)>>,
+    /// From the declaration's line start through its closing brace.
+    span: Range<usize>,
+    /// The body, `{` through `}` inclusive.
+    body: Range<usize>,
+}
+
+/// `Type::method` → that method's `match self` arms, or `None` when the method is not a
+/// trivial match (or is defined twice).
+type MethodTable = HashMap<(String, String), Option<Vec<MatchArm>>>;
+
+/// One `A | B => value` arm: the last path segment of each pattern, and the value text.
+type MatchArm = (Vec<String>, String);
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The end of the identifier starting at `at`.
+fn ident_end(text: &str, at: usize) -> usize {
+    at + text[at..]
+        .bytes()
+        .position(|b| !is_ident_byte(b))
+        .unwrap_or(text.len() - at)
+}
+
+/// Whether `text[at..]` begins the keyword `word` as a whole token.
+fn keyword_at(text: &str, at: usize, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.is_char_boundary(at)
+        && text[at..].starts_with(word)
+        && (at == 0 || !is_ident_byte(bytes[at - 1]))
+        && bytes.get(at + word.len()).is_some_and(|b| !is_ident_byte(*b))
+}
+
+/// The span (declaration line start through closing brace) of the one function named `name` in
+/// `text`. `None` when there is none, or more than one, since which one a call reaches would then
+/// depend on module scoping this does not model.
+pub(crate) fn function_item(text: &str, name: &str) -> Option<Range<usize>> {
+    let mut found = scan_plain_functions(text).into_iter().filter(|f| f.name == name);
+    let first = found.next()?;
+    found.next().is_none().then_some(first.span)
+}
+
+/// Every `fn NAME(…) … { … }` in `text` with a body, nested ones included.
+fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(text, i, "fn") {
+            i += 1;
+            continue;
+        }
+        let fn_kw = i;
+        let name_start = i + 2 + text[i + 2..].len() - text[i + 2..].trim_start().len();
+        let name_end = ident_end(text, name_start);
+        i = name_end.max(fn_kw + 2);
+        if name_end == name_start {
+            continue;
+        }
+        let Some(paren) = text[name_end..].find('(').map(|n| name_end + n) else {
+            continue;
+        };
+        // Only generics may sit between the name and its parameter list.
+        let between = text[name_end..paren].trim();
+        if !(between.is_empty() || between.starts_with('<')) {
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, paren + 1, text.len()) else {
+            continue;
+        };
+        // The body, unless this is a bodiless declaration (`fn x();` in a trait).
+        let mut j = close + 1;
+        let mut open = None;
+        while j < text.len() {
+            if let Some(next) = skip_trivia(text, j) {
+                j = next;
+                continue;
+            }
+            match bytes[j] {
+                b'{' => {
+                    open = Some(j);
+                    break;
+                }
+                b';' => break,
+                _ => j += 1,
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let Some(close_brace) = match_brace(text, open) else {
+            continue;
+        };
+        let params = args
+            .iter()
+            .map(|span| {
+                let param = text[span.clone()].trim();
+                if param.trim_start_matches('&').trim_start_matches("mut ").trim() == "self"
+                    || param.ends_with("self") && !param.contains(':')
+                {
+                    return Some(("self".to_string(), "Self".to_string()));
+                }
+                let (name, ty) = param.split_once(':')?;
+                let name = name.trim().trim_start_matches("mut ").trim();
+                is_identifier(name).then(|| (name.to_string(), ty.trim().to_string()))
+            })
+            .collect::<Option<Vec<_>>>();
+        let line_start = text[..fn_kw].rfind('\n').map_or(0, |n| n + 1);
+        found.push(PlainFunction {
+            name: text[name_start..name_end].to_string(),
+            params,
+            span: line_start..close_brace + 1,
+            body: open..close_brace + 1,
+        });
+    }
+    found
+}
+
+/// Expand same-file agent-only helper calls inside an `effect_` script (for example Shy Guy's
+/// `stilt_trails_on(agent);` in `effect_special_air_lw` / `effect_special_air_lw_ledge`) so the
+/// effect parser, timeline, and 3D trail preview see the macros the helper emits.
+fn expand_same_file_effect_helpers(source: &str, file_text: &str) -> String {
+    const EFFECT_MACROS: &[&str] = &[
+        "AFTER_IMAGE",
+        "EFFECT",
+        "FOOT_EFFECT",
+        "LANDING_EFFECT",
+        "BURN_COLOR",
+        "FLASH",
+        "COL_NORMAL",
+        "LAST_EFFECT",
+    ];
+    let mut helpers: HashMap<String, Option<(String, String)>> = HashMap::new();
+    for func in scan_plain_functions(file_text) {
+        let Some(params) = func.params.as_ref() else {
+            continue;
+        };
+        if params.len() != 1 || !params[0].1.contains("L2CAgentBase") {
+            continue;
+        }
+        let inner = file_text[func.body.start + 1..func.body.end - 1].trim();
+        if inner.is_empty() || !EFFECT_MACROS.iter().any(|m| inner.contains(m)) {
+            continue;
+        }
+        let entry = (params[0].0.clone(), inner.to_string());
+        helpers
+            .entry(func.name)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(entry));
+    }
+    let helpers: HashMap<String, (String, String)> = helpers
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?)))
+        .collect();
+    if helpers.is_empty() {
+        return source.to_string();
+    }
+    fn expand_rec(
+        text: &str,
+        helpers: &HashMap<String, (String, String)>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> String {
+        if depth >= 3 {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            let expanded = trimmed
+                .strip_suffix(';')
+                .and_then(|stmt| {
+                    let open = stmt.find('(')?;
+                    let close = stmt.rfind(')')?;
+                    if close + 1 != stmt.len() {
+                        return None;
+                    }
+                    let callee = stmt[..open].trim();
+                    let arg = stmt[open + 1..close].trim();
+                    if !is_identifier(callee) || !is_identifier(arg) || visited.contains(callee) {
+                        return None;
+                    }
+                    let (param, body) = helpers.get(callee)?;
+                    let substituted = if param != arg {
+                        replace_identifier(body, param, arg)
+                    } else {
+                        body.clone()
+                    };
+                    visited.insert(callee.to_string());
+                    let nested = expand_rec(&substituted, helpers, visited, depth + 1);
+                    visited.remove(callee);
+                    let mut block = String::new();
+                    for body_line in nested.lines() {
+                        let t = body_line.trim();
+                        if !t.is_empty() {
+                            block.push_str(indent);
+                            block.push_str(t);
+                            block.push('\n');
+                        }
+                    }
+                    Some(block)
+                });
+            if let Some(block) = expanded {
+                out.push_str(&block);
+                changed = true;
+            } else {
+                out.push_str(line);
+            }
+        }
+        if changed {
+            out
+        } else {
+            text.to_string()
+        }
+    }
+    expand_rec(source, &helpers, &mut HashSet::new(), 0)
+}
+
+/// Replace every standalone identifier occurrence of `from` with `to`, skipping strings and
+/// comments.
+fn replace_identifier(text: &str, from: &str, to: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let end = ident_end(text, i);
+            if &text[i..end] == from {
+                out.push_str(&text[last..i]);
+                out.push_str(to);
+                last = end;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if last == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Unroll `for <ident> in ["a", "b", ...] { <body> }` loops in effect scripts by substituting
+/// each string literal for `<ident>` inside `<body>` (for example Shy Guy's
+/// `for shoe in ["stiltshoel", "stiltshoer"] { AFTER_IMAGE4_ON_arg29(..., Hash40::new(shoe), ...); }`).
+fn unroll_string_array_loops(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(next) = skip_trivia(source, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(source, i, "for") {
+            i += 1;
+            continue;
+        }
+        let for_start = i;
+        let mut cur = i + 3;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        let var_end = ident_end(source, cur);
+        if var_end == cur {
+            i += 3;
+            continue;
+        }
+        let var = &source[cur..var_end];
+        cur = var_end;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        if !keyword_at(source, cur, "in") {
+            i = var_end;
+            continue;
+        }
+        cur += 2;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        if bytes.get(cur) != Some(&b'[') {
+            i = cur;
+            continue;
+        }
+        let Some(arr_close) = match_bracket(source, cur) else {
+            i = cur + 1;
+            continue;
+        };
+        let items = parse_string_literal_list(&source[cur + 1..arr_close]);
+        if items.is_empty() || items.len() > 16 {
+            i = arr_close + 1;
+            continue;
+        }
+        let mut brace = arr_close + 1;
+        while brace < source.len() && bytes[brace].is_ascii_whitespace() {
+            brace += 1;
+        }
+        if bytes.get(brace) != Some(&b'{') {
+            i = brace;
+            continue;
+        }
+        let Some(body_close) = match_brace(source, brace) else {
+            i = brace + 1;
+            continue;
+        };
+        let line_start = source[..for_start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = &source[line_start..for_start];
+        let inner = &source[brace + 1..body_close];
+        out.push_str(&source[last..line_start]);
+        for (idx, item) in items.iter().enumerate() {
+            let expanded = replace_identifier(inner, var, item);
+            for body_line in expanded.lines() {
+                let t = body_line.trim();
+                if !t.is_empty() {
+                    out.push_str(indent);
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+            if idx + 1 == items.len() && out.ends_with('\n') {
+                out.pop();
+            }
+        }
+        last = body_close + 1;
+        i = body_close + 1;
+    }
+    if last == 0 {
+        return source.to_string();
+    }
+    out.push_str(&source[last..]);
+    out
+}
+
+fn match_bracket(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_string_literal_list(inner: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    for raw in inner.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && !t[1..t.len() - 1].contains('"')
+        {
+            items.push(t.to_string());
+        } else {
+            return Vec::new();
+        }
+    }
+    items
+}
+
+/// Every `impl … { … }` block's braces, with the type's last path segment for an inherent
+/// impl. A trait impl carries `None`: its methods are neither free functions nor what this
+/// reader resolves a `param.method()` through.
+fn scan_impl_blocks(text: &str) -> Vec<(Option<String>, Range<usize>)> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(text, i, "impl") {
+            i += 1;
+            continue;
+        }
+        i += 4;
+        let Some(open) = text[i..].find(['{', ';']).map(|n| i + n) else {
+            break;
+        };
+        if text.as_bytes()[open] != b'{' {
+            continue;
+        }
+        let header = text[i..open].trim();
+        // `impl<T> Type<T>` leads with its own generics.
+        let header = if header.starts_with('<') {
+            header.find('>').map_or("", |n| header[n + 1..].trim())
+        } else {
+            header
+        };
+        let inherent = !(header.contains(" for ") || header.contains(" where "));
+        let ty = type_name(header.split('<').next().unwrap_or(""));
+        if let Some(close) = match_brace(text, open) {
+            found.push(((inherent && !ty.is_empty()).then_some(ty), open..close + 1));
+        }
+    }
+    found
+}
+
+/// The bare type name out of a parameter's type: `&mut crate::Facing` → `Facing`.
+fn type_name(ty: &str) -> String {
+    let ty = ty.trim().trim_start_matches('&').trim();
+    let ty = ty.strip_prefix("mut ").unwrap_or(ty).trim();
+    let ty = ty.split('<').next().unwrap_or("");
+    ty.rsplit("::").next().unwrap_or("").trim().to_string()
+}
+
+/// `text` with every comment blanked out, strings and everything else kept.
+pub(crate) fn without_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with("//") || text[i..].starts_with("/*") {
+            i = skip_trivia(text, i).unwrap_or(text.len());
+            out.push(' ');
+            continue;
+        }
+        if let Some(next) = skip_trivia(text, i) {
+            out.push_str(&text[i..next]);
+            i = next;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Split `text` at every top-level `separator`, ignoring nested brackets, strings and
+/// comments. Pieces are trimmed; empty ones (a trailing comma) are dropped.
+fn split_top_level(text: &str, separator: u8) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut pieces = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b if b == separator && depth == 0 => {
+                pieces.push(text[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    pieces.push(text[start..].trim());
+    pieces.retain(|piece| !piece.is_empty());
+    pieces
+}
+
+/// A numeric literal as ACMD source spells one: `3`, `-28.4`, `1.`. No suffixes.
+fn is_number(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A value safe to paste in place of a name: a number, a bool, or a (dereferenced) constant
+/// path such as `*ATTACK_LR_CHECK_F`. Anything with an operator or a call is left alone.
+fn is_simple_value(text: &str) -> bool {
+    let text = text.trim();
+    if is_number(text) || text == "true" || text == "false" {
+        return true;
+    }
+    let path = text.strip_prefix('*').unwrap_or(text);
+    !path.is_empty() && path.split("::").all(is_identifier)
+}
+
+/// The arms of a `match` block's interior.
+fn parse_arms(text: &str) -> Option<Vec<MatchArm>> {
+    split_top_level(text, b',')
+        .into_iter()
+        .map(|arm| {
+            let (pattern, value) = arm.split_once("=>")?;
+            if pattern.contains(" if ") {
+                return None; // a guard decides at run time
+            }
+            let patterns = pattern
+                .split('|')
+                .map(|alternative| {
+                    let alternative = alternative.trim();
+                    alternative.rsplit("::").next().unwrap_or(alternative).trim().to_string()
+                })
+                .collect();
+            Some((patterns, value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The arms of a method whose whole body is `match self { … }`, optionally inside
+/// `unsafe { … }`. Every arm's value must be a [simple value](is_simple_value).
+fn parse_self_match(body: &str) -> Option<Vec<MatchArm>> {
+    let body = without_comments(body);
+    let mut inner = body.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    while let Some(rest) = inner.strip_prefix("unsafe") {
+        inner = rest.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    }
+    let rest = inner.strip_prefix("match")?.trim_start();
+    let rest = rest.strip_prefix("self")?.trim_start();
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let close = match_brace(rest, 0)?;
+    if !rest[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let arms = parse_arms(&rest[1..close])?;
+    arms.iter()
+        .all(|(_, value)| is_simple_value(value))
+        .then_some(arms)
+}
+
+/// The value of the arm matching `key`, falling back to a `_` arm.
+fn arm_for<'a>(arms: &'a [MatchArm], key: &str) -> Option<&'a str> {
+    arms.iter()
+        .find(|(patterns, _)| patterns.iter().any(|p| p == key))
+        .or_else(|| arms.iter().find(|(patterns, _)| patterns.iter().any(|p| p == "_")))
+        .map(|(_, value)| value.as_str())
+}
+
+/// A registered function whose body is one call to another function.
+#[derive(Debug, Clone)]
+struct Forward {
+    /// The called function's name, its last path segment.
+    callee: String,
+    /// Offset of the wrapper's body `{` within its item.
+    open: usize,
+    /// The call's arguments, verbatim.
+    args: Vec<String>,
+    /// The wrapper's own parameter names, to recognise pass-through arguments.
+    params: Vec<String>,
+}
+
+/// `fn game_x(agent) { shared_impl(agent, Facing::Reverse) }` → the call it forwards to.
+fn forwarding_call(item: &str) -> Option<Forward> {
+    let function = scan_plain_functions(item).into_iter().next()?;
+    let inner = without_comments(&item[function.body.start + 1..function.body.end - 1]);
+    let inner = inner.trim();
+    let inner = inner.strip_suffix(';').unwrap_or(inner).trim_end();
+    let path_end = inner
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(inner.len());
+    let callee = inner[..path_end].rsplit("::").next()?;
+    if !is_identifier(callee) || !inner[path_end..].starts_with('(') {
+        return None;
+    }
+    let (args, close) = split_call_args(inner, path_end + 1, inner.len())?;
+    if close + 1 != inner.len() {
+        return None;
+    }
+    Some(Forward {
+        callee: callee.to_string(),
+        open: function.body.start,
+        args: args.iter().map(|span| inner[span.clone()].to_string()).collect(),
+        params: function
+            .params
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+    })
+}
+
+/// A shared body as one caller sees it.
+struct Resolution {
+    body: String,
+    substituted: bool,
+    unresolved: Vec<String>,
+}
+
+/// What one callee parameter is for this caller.
+enum ParamValue {
+    /// An enum variant (`Facing::Reverse` → `Reverse`) of the parameter's type.
+    Variant { variant: String, ty: String },
+    /// A literal, pasted wherever the parameter is read.
+    Literal(String),
+    /// Anything else: an expression the index cannot evaluate.
+    Dynamic,
+}
+
+/// Substitute a caller's arguments into a shared body, `{` through `}`.
+///
+/// Three shapes resolve, all of them statically certain:
+/// - `let (a, b) = match param { Variant => (x, y), … };`, which binds `a`/`b` for the rest of
+///   the body and is itself removed;
+/// - `param.method()`, where `method` is a [trivial `match self`](parse_self_match);
+/// - a literal argument, read directly.
+///
+/// Constant products the substitution exposes (`28.4 * -1.0`) are then folded, since the
+/// readers downstream expect a number in those slots. Every other read of a parameter is left
+/// as written and reported, never guessed.
+fn resolve_shared_body(
+    body: &str,
+    params: &[(String, String)],
+    args: &[String],
+    wrapper_params: &[String],
+    methods: &MethodTable,
+) -> Resolution {
+    let mut unresolved = Vec::new();
+    let callee_params: Vec<&(String, String)> =
+        params.iter().filter(|(name, _)| name != "self").collect();
+    if callee_params.len() != args.len() {
+        unresolved.push(format!(
+            "passes {} argument(s) to a function taking {}",
+            args.len(),
+            callee_params.len()
+        ));
+        return Resolution {
+            body: body.to_string(),
+            substituted: false,
+            unresolved,
+        };
+    }
+    let mut values: HashMap<&str, ParamValue> = HashMap::new();
+    for ((name, ty), arg) in callee_params.into_iter().zip(args) {
+        let arg = arg.trim();
+        if is_identifier(arg) && wrapper_params.iter().any(|param| param == arg) {
+            continue; // the agent, passed straight through
+        }
+        let value = if is_number(arg) || arg == "true" || arg == "false" {
+            ParamValue::Literal(arg.to_string())
+        } else if arg.contains("::") && arg.split("::").all(is_identifier) {
+            ParamValue::Variant {
+                variant: arg.rsplit("::").next().unwrap_or(arg).to_string(),
+                ty: type_name(ty),
+            }
+        } else {
+            ParamValue::Dynamic
+        };
+        values.insert(name.as_str(), value);
+    }
+
+    let mut edits: Vec<Replacement> = Vec::new();
+    let mut removed: Vec<Range<usize>> = Vec::new();
+    let mut bindings: HashMap<String, String> = HashMap::new();
+    let mut unbound: Vec<String> = Vec::new();
+
+    // `let PATTERN = match PARAM { … };`
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < body.len() {
+        if let Some(next) = skip_trivia(body, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(body, i, "let") {
+            i += 1;
+            continue;
+        }
+        let let_at = i;
+        i += 3;
+        let Some(semi) = statement_end(body, let_at) else {
+            continue;
+        };
+        let Some(binding) = parse_let_match(&body[let_at..semi]) else {
+            continue;
+        };
+        let Some(value) = values.get(binding.scrutinee.as_str()) else {
+            continue;
+        };
+        let key = match value {
+            ParamValue::Variant { variant, .. } => variant.clone(),
+            ParamValue::Literal(literal) => literal.clone(),
+            ParamValue::Dynamic => {
+                unbound.extend(binding.names);
+                continue;
+            }
+        };
+        let chosen = binding
+            .arms
+            .as_deref()
+            .and_then(|arms| arm_for(arms, &key))
+            .map(|value| {
+                if binding.names.len() == 1 {
+                    Some(vec![value.to_string()])
+                } else {
+                    let inner = value.trim().strip_prefix('(')?.strip_suffix(')')?;
+                    let parts = split_top_level(inner, b',');
+                    (parts.len() == binding.names.len())
+                        .then(|| parts.into_iter().map(str::to_string).collect())
+                }
+            });
+        let Some(Some(parts)) = chosen else {
+            unresolved.push(format!(
+                "`let {} = match {} {{ … }}` has no arm this reader can pick for {key}",
+                binding.pattern, binding.scrutinee
+            ));
+            unbound.extend(binding.names);
+            continue;
+        };
+        for (name, part) in binding.names.iter().zip(parts) {
+            if is_simple_value(&part) {
+                bindings.insert(name.clone(), part);
+            } else {
+                unresolved.push(format!("{name} = `{part}` is not a literal"));
+                unbound.push(name.clone());
+            }
+        }
+        // Drop the whole line when the statement owns it, so no blank husk is left behind.
+        let line_start = body[..let_at].rfind('\n').map_or(0, |n| n + 1);
+        let start = if body[line_start..let_at].trim().is_empty() {
+            line_start
+        } else {
+            let_at
+        };
+        let mut end = semi + 1;
+        let rest = &body[end..];
+        let trailing = rest.len() - rest.trim_start_matches([' ', '\t', '\r']).len();
+        if rest[trailing..].starts_with('\n') {
+            end += trailing + 1;
+        }
+        removed.push(start..end);
+        edits.push(Replacement {
+            span: start..end,
+            value: String::new(),
+        });
+        i = end;
+    }
+
+    // Reads of a parameter or of a binding made above.
+    let mut i = 0;
+    while i < body.len() {
+        if let Some(next) = skip_trivia(body, i) {
+            i = next;
+            continue;
+        }
+        if !body.is_char_boundary(i)
+            || !is_ident_byte(bytes[i])
+            || bytes[i].is_ascii_digit()
+            || (i > 0 && is_ident_byte(bytes[i - 1]))
+        {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let end = ident_end(body, start);
+        i = end;
+        if removed.iter().any(|range| range.contains(&start)) {
+            continue;
+        }
+        let word = &body[start..end];
+        let before = body[..start].trim_end();
+        if before.ends_with('.') || before.ends_with("::") {
+            continue; // a field, a method or a path segment of the same name
+        }
+        let after = body[end..].trim_start();
+        let is_read = !(after.starts_with('(')
+            || after.starts_with('!')
+            || after.starts_with("::")
+            || (after.starts_with(':') && before.ends_with(['{', ','])));
+        if let Some(ParamValue::Variant { variant, ty }) = values.get(word) {
+            // `param.method()`
+            let Some(call) = method_call(body, end) else {
+                continue; // any other read is reported below
+            };
+            let found = methods
+                .get(&(ty.clone(), call.method.clone()))
+                .map(|arms| arms.as_deref().and_then(|arms| arm_for(arms, variant)));
+            match found {
+                Some(Some(value)) => {
+                    edits.push(Replacement {
+                        span: start..call.end,
+                        value: value.to_string(),
+                    });
+                    i = call.end;
+                }
+                Some(None) => unresolved.push(format!(
+                    "{word}.{}() is not a plain `match self` of literals",
+                    call.method
+                )),
+                None => unresolved.push(format!(
+                    "{word}.{}() is not a method of {ty} in the project",
+                    call.method
+                )),
+            }
+            continue;
+        }
+        if !is_read {
+            continue;
+        }
+        let value = match values.get(word) {
+            Some(ParamValue::Literal(literal)) => Some(literal.clone()),
+            _ => bindings.get(word).cloned(),
+        };
+        if let Some(value) = value {
+            edits.push(Replacement {
+                span: start..end,
+                value,
+            });
+        }
+    }
+
+    let substituted = !edits.is_empty();
+    let mut resolved = apply(body, edits);
+    if substituted {
+        resolved = fold_constant_products(&resolved);
+    }
+
+    // Whatever still reads a parameter, or a binding that could not be made, is reported.
+    let mut leftover: Vec<&str> = values
+        .iter()
+        .filter(|(_, value)| !matches!(value, ParamValue::Literal(_)))
+        .map(|(name, _)| *name)
+        .collect();
+    leftover.extend(unbound.iter().map(String::as_str));
+    let mut reported_lines: Vec<String> = Vec::new();
+    let out = resolved.as_bytes();
+    let mut i = 0;
+    while i < resolved.len() {
+        if let Some(next) = skip_trivia(&resolved, i) {
+            i = next;
+            continue;
+        }
+        if !is_ident_byte(out[i]) || (i > 0 && is_ident_byte(out[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let end = ident_end(&resolved, i);
+        let word = &resolved[i..end];
+        let field = resolved[..i].trim_end().ends_with('.');
+        if !field && leftover.contains(&word) {
+            let line_start = resolved[..i].rfind('\n').map_or(0, |n| n + 1);
+            let line_end = resolved[i..].find('\n').map_or(resolved.len(), |n| i + n);
+            let line = resolved[line_start..line_end].trim().to_string();
+            if !reported_lines.contains(&line) {
+                unresolved.push(format!("`{line}` depends on {word}, which is not resolved"));
+                reported_lines.push(line);
+            }
+        }
+        i = end;
+    }
+
+    Resolution {
+        body: resolved,
+        substituted,
+        unresolved,
+    }
+}
+
+/// The offset of the `;` ending the statement that starts at `start`, at bracket depth 0.
+pub(crate) fn statement_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' => {
+                if depth == 0 {
+                    return None; // the block ended first
+                }
+                depth -= 1;
+            }
+            b';' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `let (a, b) = match scrutinee { … }`, without its `;`.
+struct LetMatch {
+    pattern: String,
+    names: Vec<String>,
+    scrutinee: String,
+    /// `None` when the arms could not be read.
+    arms: Option<Vec<MatchArm>>,
+}
+
+fn parse_let_match(statement: &str) -> Option<LetMatch> {
+    let statement = without_comments(statement);
+    let rest = statement.trim().strip_prefix("let")?;
+    let (pattern, rhs) = rest.split_once('=')?;
+    if rhs.starts_with(['=', '>']) {
+        return None;
+    }
+    let pattern = pattern.trim();
+    // A type ascription (`let x: f32 = …`) is fine; only the names matter.
+    let names_part = match pattern.strip_prefix('(') {
+        Some(tuple) => tuple.strip_suffix(')')?,
+        None => pattern.split(':').next()?,
+    };
+    let names = split_top_level(names_part, b',')
+        .into_iter()
+        .map(|name| {
+            let name = name.strip_prefix("mut ").unwrap_or(name).trim();
+            is_identifier(name).then(|| name.to_string())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let rhs = rhs.trim().strip_prefix("match")?;
+    if !rhs.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rhs = rhs.trim_start();
+    let scrutinee_end = ident_end(rhs, 0);
+    let scrutinee = &rhs[..scrutinee_end];
+    let block = rhs[scrutinee_end..].trim_start();
+    if scrutinee.is_empty() || !block.starts_with('{') {
+        return None;
+    }
+    let close = match_brace(block, 0)?;
+    if !block[close + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(LetMatch {
+        pattern: pattern.to_string(),
+        names,
+        scrutinee: scrutinee.to_string(),
+        arms: parse_arms(&block[1..close]),
+    })
+}
+
+/// `.method()` right after a receiver ending at `at`.
+struct MethodCall {
+    method: String,
+    /// Just past the call's `)`.
+    end: usize,
+}
+
+fn method_call(text: &str, at: usize) -> Option<MethodCall> {
+    let rest = text[at..].strip_prefix('.')?;
+    let name_end = ident_end(rest, 0);
+    let method = &rest[..name_end];
+    let call = rest[name_end..].strip_prefix('(')?;
+    let close = call.len() - call.trim_start().len();
+    if !call[close..].starts_with(')') || method.is_empty() {
+        return None;
+    }
+    Some(MethodCall {
+        method: method.to_string(),
+        end: at + 1 + name_end + 1 + close + 1,
+    })
+}
+
+/// Fold every `NUMBER * NUMBER` into its product: `28.4 * -1.0` → `-28.4`.
+///
+/// Only products whose surroundings cannot bind tighter are folded: an operand after `/`,
+/// `*`, `%` or `.` belongs to that operation first, and a number followed by `.` is a method
+/// receiver. A leading `-` counts as the operand's sign only where it cannot be subtraction.
+fn fold_constant_products(text: &str) -> String {
+    let mut text = text.to_string();
+    let mut search = 0;
+    'scan: while search < text.len() {
+        let mut i = search;
+        while i < text.len() {
+            if let Some(next) = skip_trivia(&text, i) {
+                i = next;
+                continue;
+            }
+            if text.as_bytes()[i] == b'*' {
+                if let Some((range, product)) = constant_product(&text, i) {
+                    text.replace_range(range.clone(), &product);
+                    search = range.start;
+                    continue 'scan;
+                }
+            }
+            i += 1;
+        }
+        break;
+    }
+    text
+}
+
+/// The span and folded value of a `NUMBER * NUMBER` whose `*` is at `star`.
+fn constant_product(text: &str, star: usize) -> Option<(Range<usize>, String)> {
+    let bytes = text.as_bytes();
+    // Left operand, read backwards.
+    let left_end = text[..star].trim_end().len();
+    let mut left_start = left_end;
+    while left_start > 0 && (bytes[left_start - 1].is_ascii_digit() || bytes[left_start - 1] == b'.')
+    {
+        left_start -= 1;
+    }
+    if left_start == left_end || !bytes[left_start].is_ascii_digit() {
+        return None;
+    }
+    if left_start > 0 && is_ident_byte(bytes[left_start - 1]) {
+        return None;
+    }
+    let before_sign = text[..left_start].trim_end();
+    if before_sign.ends_with('-') {
+        let ahead = text[..before_sign.len() - 1].trim_end();
+        if ahead.is_empty() || ahead.ends_with(['(', ',', '=', '[', '{']) {
+            left_start = before_sign.len() - 1;
+        }
+    }
+    let ahead = text[..left_start].trim_end();
+    if ahead.ends_with(['/', '*', '%', '.']) {
+        return None;
+    }
+    // Right operand.
+    let right_start = star + 1 + (text[star + 1..].len() - text[star + 1..].trim_start().len());
+    let mut right_end = right_start;
+    if bytes.get(right_end) == Some(&b'-') {
+        right_end += 1;
+    }
+    while right_end < text.len() && (bytes[right_end].is_ascii_digit() || bytes[right_end] == b'.')
+    {
+        right_end += 1;
+    }
+    let left = &text[left_start..left_end];
+    let right = &text[right_start..right_end];
+    if !is_number(left) || !is_number(right) {
+        return None;
+    }
+    let after = text[right_end..].trim_start();
+    if right.ends_with('.')
+        || after.starts_with('.')
+        || bytes.get(right_end).is_some_and(|b| is_ident_byte(*b))
+    {
+        return None;
+    }
+    let product = if left.contains('.') || right.contains('.') {
+        let value = left.parse::<f32>().ok()? * right.parse::<f32>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        let mut formatted = format!("{value}");
+        if !formatted.contains('.') {
+            formatted.push_str(".0");
+        }
+        formatted
+    } else {
+        left.parse::<i64>().ok()?.checked_mul(right.parse::<i64>().ok()?)?.to_string()
+    };
+    Some((left_start..right_end, product))
 }
 
 // ── Creating a script the project does not have ───────────────────────────────
@@ -1218,7 +3860,12 @@ pub fn create_script(
 
     // Highest offset first, so an earlier insertion cannot move a later one's index.
     let mut inserts: Vec<(usize, String)> = Vec::new();
-    let body = source.trim_end();
+    // The new function is copied from the reference script, which spells everything the
+    // canonical way; written into this file it takes the file's own spelling instead — a bare
+    // `ATTACK(` in a project that glob-imports the macros, its agent name, its indentation.
+    let style = crate::source_style::SourceStyle::detect(&text);
+    let styled = style.apply(source.trim_end(), "");
+    let body = styled.trim_end();
     let note = match &anchor.binding {
         Binding::Attribute(line) => {
             let attribute = rebuild_attribute(line, &anchor.script, script_name)?;
@@ -1261,6 +3908,13 @@ pub fn create_script(
         }
     };
 
+    // The surrounding text and the registration line come from this file already; only the
+    // line endings of what joins them need to match it.
+    if style.newline == "\r\n" {
+        for (_, insert) in &mut inserts {
+            *insert = insert.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+    }
     inserts.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let mut updated = text;
     for (at, insert) in inserts {
@@ -1459,7 +4113,8 @@ pub struct SyncReport {
     pub changed: usize,
     /// Files whose contents actually differ afterwards.
     pub files: Vec<PathBuf>,
-    /// Edits that could not be expressed as a value change, each with the reason.
+    /// Edits that could not be expressed as a value change, each with the reason — and notes on
+    /// edits carried out somewhere other than the call, such as a const's definition.
     pub skipped: Vec<String>,
 }
 
@@ -1471,10 +4126,27 @@ struct Replacement {
 }
 
 /// Rewrite `text` with every replacement applied. Spans must not overlap.
-fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
+fn apply(text: &str, edits: Vec<Replacement>) -> String {
+    apply_mapped(text, edits).0
+}
+
+/// [`apply`], with where each offset of `text` that no edit covers lands in the result.
+fn apply_mapped(text: &str, mut edits: Vec<Replacement>) -> (String, impl Fn(usize) -> usize) {
+    // An empty span is an argument a project helper fixes (see `scan_macro_sites`): the value
+    // lives in the helper's body, not at this call, so writing here would add an argument.
+    edits.retain(|edit| {
+        let phantom = edit.span.is_empty() && !edit.value.is_empty();
+        if phantom {
+            crate::project_helpers::refuse_fixed();
+        }
+        !phantom
+    });
     edits.sort_by_key(|e| e.span.start);
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
+    // (end of an applied span in `text`, total growth up to and including it)
+    let mut shifts: Vec<(usize, isize)> = Vec::new();
+    let mut growth = 0isize;
     for edit in edits {
         if edit.span.start < cursor {
             continue; // overlapping — the earlier edit wins
@@ -1482,9 +4154,16 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
         out.push_str(&text[cursor..edit.span.start]);
         out.push_str(&edit.value);
         cursor = edit.span.end;
+        growth += edit.value.len() as isize - edit.span.len() as isize;
+        shifts.push((edit.span.end, growth));
     }
     out.push_str(&text[cursor..]);
-    out
+    let map = move |at: usize| {
+        let before = shifts.partition_point(|(end, _)| *end <= at);
+        let growth = before.checked_sub(1).map_or(0, |i| shifts[i].1);
+        (at as isize + growth) as usize
+    };
+    (out, map)
 }
 
 /// Format a float the way ACMD source spells one, and only if it actually differs.
@@ -1494,8 +4173,12 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
 fn float_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement> {
     let current = text[span.clone()].trim();
     // A const or expression, not a literal — replacing it would discard the author's intent,
-    // which is exactly what this path promises not to do.
-    let old = current.parse::<f32>().ok()?;
+    // which is exactly what this path promises not to do. A project const is instead changed at
+    // its definition (see `crate::project_consts`).
+    let Ok(old) = current.parse::<f32>() else {
+        crate::project_consts::record_edit(current, f64::from(new));
+        return None;
+    };
     let replacement = format_float(new);
     // Two ways there is nothing to write, and both matter. The value being unchanged is the
     // obvious one. The second is that a written value only carries four decimals, so a float
@@ -1520,7 +4203,10 @@ fn float_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement> 
 /// author already chose.
 fn to_f32_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement> {
     let current = text[span.clone()].trim();
-    let old = current.parse::<f32>().ok()?;
+    let Ok(old) = current.parse::<f32>() else {
+        crate::project_consts::record_edit(current, f64::from(new));
+        return None;
+    };
     let replacement = new.to_string();
     if old == new || replacement == current {
         return None;
@@ -1533,7 +4219,10 @@ fn to_f32_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement>
 
 fn int_edit(text: &str, span: &Range<usize>, new: i64) -> Option<Replacement> {
     let current = text[span.clone()].trim();
-    let old = current.parse::<i64>().ok()?;
+    let Ok(old) = current.parse::<i64>() else {
+        crate::project_consts::record_edit(current, new as f64);
+        return None;
+    };
     (old != new).then(|| Replacement {
         span: span.clone(),
         value: new.to_string(),
@@ -1558,7 +4247,7 @@ fn bool_edit(text: &str, span: &Range<usize>, new: bool) -> Option<Replacement> 
 }
 
 /// `2.0`, `0.75`, `-1.5` — always with a decimal point, since these slots are floats.
-fn format_float(value: f32) -> String {
+pub(crate) fn format_float(value: f32) -> String {
     let mut text = format!("{value:.4}");
     while text.ends_with('0') && !text.ends_with(".0") {
         text.pop();
@@ -1686,7 +4375,10 @@ fn enclosing_effect_execute(text: &str, site_start: usize) -> Option<(usize, usi
         let Some(line) = line_range_at(text, header.span.start) else {
             continue;
         };
-        if text.get(line.clone())?.trim() != "if macros::is_excute(agent) {" {
+        // An `if` on this function's own agent, under whatever name it gives it, written over
+        // several lines or as one (`if macros::is_excute(agent) { EFFECT(…); }`).
+        // The same headers the effect parser reads as an Execute block.
+        if !crate::acmd::is_plain_excute_header(text.get(line.clone())?) {
             continue;
         }
         let open = header.span.end + text[header.span.end..line.end].find('{')?;
@@ -1842,8 +4534,11 @@ fn source_frame_blocks(text: &str) -> Vec<EffectSourceBlock> {
                 .map(|next| next.span.start)
                 .unwrap_or(text.len());
             let execute = text[site.span.end..limit]
-                .find("if macros::is_excute")
-                .map(|offset| site.span.end + offset)?;
+                .match_indices("is_excute(")
+                .map(|(offset, _)| site.span.end + offset)
+                .find(|at| {
+                    line_range_at(text, *at).is_some_and(|line| opens_is_excute(&text[line]))
+                })?;
             let execute_line = line_range_at(text, execute)?;
             if execute_line.start < line.end {
                 return None;
@@ -2372,11 +5067,19 @@ fn hitbox_source_identity(a: &crate::data::Hitbox, b: &crate::data::Hitbox) -> b
 /// This is the guard against a coincidental count match. If an unsupported or malformed macro
 /// disappears from the parser while a different collision family takes its place, zipping the
 /// two lists must fall back to the older unique-match path instead of retuning the neighbour.
+/// A numeric id/part argument of `site`: a literal, or a project const the parser resolved
+/// (`THROWB_STAB_HITBOX_ID as u64`).
+fn site_u32(text: &str, site: &MacroSite, slot: usize) -> Option<u32> {
+    let value = site.arg(text, slot)?.trim();
+    value.parse::<u32>().ok().or_else(|| {
+        crate::project_consts::resolve_in_scope(value)
+            .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u32::MAX))
+            .map(|v| v as u32)
+    })
+}
+
 fn hitbox_site_matches(text: &str, site: &MacroSite, hitbox: &crate::data::Hitbox) -> bool {
-    let number = |slot: usize| {
-        site.arg(text, slot)
-            .and_then(|value| value.trim().parse().ok())
-    };
+    let number = |slot: usize| site_u32(text, site, slot);
     let hash = |slot: usize| {
         site.arg(text, slot)
             .map(|value| value.trim().trim_start_matches('*'))
@@ -2486,6 +5189,22 @@ fn canonicalize_effect_call_for_source(
             }
         }
     }
+    // A stop the editor never set is written with the defaults (see `acmd::emit_spawn_stop`),
+    // which the parser then reads back as set. Compare both as the line the source holds; a
+    // call with no stop has neither.
+    let trail = call.trail_command.is_some() || call.spawn_func == "AFTER_IMAGE_ON" || call.raw_line.is_some();
+    let stopped = call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME;
+    if stopped && trail {
+        call.trail_off = Some(call.trail_off.unwrap_or(crate::data::TRAIL_OFF_DEFAULT));
+    } else if stopped && call.follows_bone {
+        let (fade, detach) = crate::data::EFFECT_OFF_KIND_DEFAULT;
+        call.off_fade = Some(call.off_fade.unwrap_or(fade));
+        call.off_detach = Some(call.off_detach.unwrap_or(detach));
+    }
+    if !stopped {
+        call.off_fade = None;
+        call.off_detach = None;
+    }
     call.offset = call.offset.map(source_compare_float);
     call.rotation = call.rotation.map(source_compare_float);
     call.scale = source_compare_float(call.scale);
@@ -2556,9 +5275,30 @@ pub fn rewrite_effect_calls(
         return Ok((text.to_string(), report));
     }
 
-    let (mut timing_moves, timing_skipped) =
+    let (mut timing_moves, mut timing_skipped) =
         plan_effect_timing_moves(text, label, &script, &pristine, &edited, &ordinals, &sites);
-    report.skipped.extend(timing_skipped);
+    // The block mover above needs a flat `frame` script with each spawn alone in its block.
+    // When it refuses, every retime goes through the line mover instead, which follows `wait`s
+    // and moves just the spawn's own lines; its refusal keeps the block mover's reasons.
+    let line_retimes: Vec<usize> = if timing_skipped.is_empty() || edited.len() != pristine.len() {
+        Vec::new()
+    } else {
+        pristine
+            .iter()
+            .zip(&edited)
+            .enumerate()
+            .filter(|(_, (before, after))| {
+                before.active_start != after.active_start || before.active_end != after.active_end
+            })
+            .filter(|(_, (before, after))| structural_identity_matches(before, after))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    if line_retimes.is_empty() {
+        report.skipped.append(&mut timing_skipped);
+    } else {
+        timing_moves.clear();
+    }
     // Timing moves are only valid for a one-to-one list whose call identity stays the same.
     // Otherwise a rename/disable/add/remove could still carry a previously approved block move
     // through the value-writing pass and leave a partial structural edit in the source.
@@ -2804,9 +5544,67 @@ pub fn rewrite_effect_calls(
     }
 
     let value_count = edits.len();
-    let valued = apply(text, edits.clone());
-    let moved =
-        apply_effect_timing_moves(text, &timing_moves, &pristine, &ordinals, &sites, &edits);
+    let (valued, map) = apply_mapped(text, edits.clone());
+    let moved = if line_retimes.is_empty() {
+        apply_effect_timing_moves(text, &timing_moves, &pristine, &ordinals, &sites, &edits)
+    } else {
+        let retimed: Option<Vec<crate::source_timing::EffectRetimed>> = line_retimes
+            .iter()
+            .map(|&index| {
+                let ordinal = *ordinals.get(index)?;
+                let spawn = sites.get(ordinal)?;
+                let mut calls = vec![map(spawn.span.start)..map(spawn.span.end)];
+                if let Some(modifiers) = modifier_sites.get(ordinal) {
+                    let mut extra: Vec<&MacroSite> = [
+                        &modifiers.rate,
+                        &modifiers.work_int,
+                        &modifiers.camera_offset,
+                        &modifiers.tint,
+                        &modifiers.particle_tint,
+                        &modifiers.alpha,
+                        &modifiers.scale_w,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    extra.sort_by_key(|site| site.span.start);
+                    calls.extend(extra.iter().map(|site| map(site.span.start)..map(site.span.end)));
+                }
+                Some(crate::source_timing::EffectRetimed {
+                    calls,
+                    before: &pristine[index],
+                    after: &edited[index],
+                })
+            })
+            .collect();
+        let result = retimed
+            .ok_or_else(|| "a retimed effect has no source call".to_string())
+            .and_then(|retimed| {
+                let spawns: Vec<Range<usize>> =
+                    sites.iter().map(|site| map(site.span.start)..map(site.span.end)).collect();
+                crate::source_timing::retime_effects(&valued, &spawns, &edited, &retimed)
+            });
+        match result {
+            Ok(updated) => {
+                timing_moves = line_retimes
+                    .iter()
+                    .map(|&index| EffectTimingMove {
+                        call_index: index,
+                        new_start: edited[index].active_start,
+                        new_end: edited[index].active_end,
+                        move_start: pristine[index].active_start != edited[index].active_start,
+                        move_end: pristine[index].active_end != edited[index].active_end,
+                    })
+                    .collect();
+                Some(updated)
+            }
+            Err(reason) => {
+                report.skipped.append(&mut timing_skipped);
+                report.skipped.push(format!("{label}: the effect retime was not written — {reason}"));
+                Some(valued.clone())
+            }
+        }
+    };
     let (updated, moved_count) = match moved {
         Some(updated) => {
             let count = timing_moves
@@ -2829,13 +5627,66 @@ pub fn rewrite_effect_calls(
     // conditional, loop, or opaque statement makes the insertion context ambiguous;
     // leave it alone and explain why rather than placing a new spawn in the wrong arm.
     let mut updated = updated;
-    let additions_allowed = effect_source_is_flat(&script.stmts);
-    if edited.len() > pristine.len() && !additions_allowed {
-        report.skipped.push(format!(
-            "{label}: added effect spawns are inside a source with a branch, loop, wait, or opaque statement — source syncing cannot choose their execution context"
-        ));
+    let flat = effect_source_is_flat(&script.stmts);
+    // The frame-block inserter below reads only `frame(…)`. A script stepped by `wait` — most of
+    // them — goes through the timeline-following inserter instead, which is also what a retime
+    // uses, so an added effect lands on the same frame either way.
+    let mut additions_allowed = flat;
+    if edited.len() > pristine.len() && !flat {
+        let mut timed: Vec<crate::source_timing::EffectAddition> = Vec::new();
+        let mut written = 0usize;
+        let mut with_helpers = updated.clone();
+        for call in edited.iter().skip(pristine.len()) {
+            if call.disabled {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn is disabled — source syncing does not invent a disabled source call"
+                ));
+                continue;
+            }
+            // A copy of a spawn that sat in a condition carries that condition only as verbatim
+            // context lines, not as a guard; which arm the copy belongs in is unknown.
+            if call.leading.iter().chain(&call.trailing).any(|line| line.contains('{')) {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn copies one inside a condition in the source — source syncing cannot choose its execution context"
+                ));
+                continue;
+            }
+            let lines = crate::acmd::effect_call_insert_lines(call);
+            if lines.is_empty() {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn has no source representation — source syncing left it unchanged"
+                ));
+                continue;
+            }
+            ensure_effect_helpers(&mut with_helpers, call);
+            written += lines.len();
+            timed.push(crate::source_timing::EffectAddition {
+                frame: call.active_start,
+                lines,
+                guard: call.guard.clone(),
+            });
+            if let Some(stop) = crate::acmd::effect_call_stop_insert_line(call) {
+                written += 1;
+                timed.push(crate::source_timing::EffectAddition {
+                    frame: call.active_end.max(call.active_start),
+                    lines: vec![stop],
+                    guard: None,
+                });
+            }
+        }
+        match crate::source_timing::add_effects(&with_helpers, &timed) {
+            Ok(text) => {
+                updated = text;
+                report.changed += written;
+                // The read-back below checks these exactly as it checks the flat path's.
+                additions_allowed = true;
+            }
+            Err(reason) => report.skipped.push(format!(
+                "{label}: the added effect spawns were not written — {reason}"
+            )),
+        }
     }
-    if edited.len() > pristine.len() && additions_allowed {
+    if edited.len() > pristine.len() && flat {
         let mut additions: Vec<&crate::data::EffectCall> =
             edited.iter().skip(pristine.len()).collect();
         additions.sort_by_key(|call| call.active_start);
@@ -2899,7 +5750,26 @@ pub fn rewrite_effect_calls(
     }
     if report.skipped.is_empty() {
         let reparsed = crate::acmd::parse_effect_script(&updated).to_effect_calls();
-        if effect_call_set_signature(&reparsed) != effect_call_set_signature(&edited) {
+        // A line move re-wraps a spawn that sat in a condition, so the lines around it — kept on
+        // each call as provenance, not as anything an export reads back — are its own now.
+        let signature = |calls: &[crate::data::EffectCall]| {
+            if line_retimes.is_empty() {
+                return effect_call_set_signature(calls);
+            }
+            let bare: Vec<crate::data::EffectCall> = calls
+                .iter()
+                .cloned()
+                .map(|mut call| {
+                    // Structure moves with the spawn; what still acts on it must not.
+                    call.leading.clear();
+                    call.trailing
+                        .retain(|line| crate::source_timing::touches_last_effect(line));
+                    call
+                })
+                .collect();
+            effect_call_set_signature(&bare)
+        };
+        if signature(&reparsed) != signature(&edited) {
             // Do not return a source move that failed its own semantic read-back. Value edits are
             // still safe to keep, but the timing operation is refused as one batch so a future
             // parser/source-shape change cannot leave only half of a retime on disk.
@@ -2954,7 +5824,6 @@ point_syncs! {
     sync_set_air: "game", rewrite_set_air, SetAirEvent;
     sync_reverse_lr: "game", rewrite_reverse_lr, ReverseLrEvent;
     sync_expressions: "expression", rewrite_expressions, ExpressionEvent;
-    sync_sounds: "sound", rewrite_sounds, SoundEvent;
 }
 
 /// Read one indexed script, hand its text to `rewrite`, and splice the result back in.
@@ -2980,25 +5849,61 @@ fn sync_script(
     let Some(site) = current.script(fighter, script_name) else {
         bail!("{fighter}: the project has no {script_name} to sync into");
     };
-    let text = std::fs::read_to_string(&site.file)
-        .with_context(|| format!("reading {}", site.file.display()))?;
-    let Some(body) = text.get(site.span.clone()) else {
+    // A forwarding wrapper's own span holds only the call. Its edits belong in the callee, and
+    // only when that callee is this script's alone and was shown verbatim.
+    let (file, span) = match &site.delegate {
+        None => (&site.file, site.span.clone()),
+        Some(delegate) => {
+            if let Some(reason) = delegate.write_refusal(script_name, &site.function) {
+                bail!("{reason}");
+            }
+            (&delegate.file, delegate.span.clone())
+        }
+    };
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let Some(body) = text.get(span.clone()) else {
         bail!(
             "{} changed on disk since it was indexed — rescan and try again",
-            site.file.display()
+            file.display()
         );
     };
+    // A function whose agent is `fighter` has its `FT_MOTION_RATE(fighter, …)` read as the
+    // agent's own; the rewriters must count the same calls the parser typed.
+    let _agent = crate::acmd::agent_scope(body);
+    let _consts = crate::project_consts::scope(std::sync::Arc::clone(&current.consts));
+    let _macros = crate::hash_macros::scope(std::sync::Arc::new(current.hash_macros.clone()));
+    let _helpers = crate::project_helpers::scope(std::sync::Arc::clone(&current.helpers));
     let (updated_body, mut report) = rewrite(body)?;
+    let refused = crate::project_helpers::take_refused();
+    if refused > 0 {
+        report.skipped.push(format!(
+            "{script_name}: {refused} edit(s) changed a value that one of the project's helper \
+             functions fixes (such as the hidden argument of a RUMBLE_HIT helper) — change it in \
+             the helper itself"
+        ));
+    }
+    // Values written as project consts change at the const's definition, wherever that is.
+    let pending = crate::project_consts::take_pending();
+    if !pending.is_empty() {
+        let (files, notes, changed) = crate::project_consts::apply_edits(&current.consts, &pending);
+        report.changed += changed;
+        report.skipped.extend(notes);
+        for written in files {
+            if !report.files.contains(&written) {
+                report.files.push(written);
+            }
+        }
+    }
     if updated_body == body {
         return Ok(report);
     }
     let mut updated = String::with_capacity(text.len());
-    updated.push_str(&text[..site.span.start]);
+    updated.push_str(&text[..span.start]);
     updated.push_str(&updated_body);
-    updated.push_str(&text[site.span.end..]);
-    std::fs::write(&site.file, &updated)
-        .with_context(|| format!("writing {}", site.file.display()))?;
-    report.files.push(site.file.clone());
+    updated.push_str(&text[span.end..]);
+    std::fs::write(file, &updated).with_context(|| format!("writing {}", file.display()))?;
+    report.files.push(file.clone());
     Ok(report)
 }
 
@@ -3671,6 +6576,8 @@ pub fn rewrite_hitboxes(
 
     let mut report = SyncReport::default();
     let mut edits = Vec::new();
+    // Ordinary hitboxes whose frames changed, moved once their values are written.
+    let mut retimed: Vec<(usize, Range<usize>)> = Vec::new();
     // Hitboxes are keyed by id + part, which is what the game uses to tell them apart and
     // what stays stable across a retime. Two calls sharing a key in one script would be
     // ambiguous, so those are reported rather than guessed at.
@@ -3726,6 +6633,10 @@ pub fn rewrite_hitboxes(
                 ));
                 continue;
             };
+            if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end
+            {
+                retimed.push((position, macro_site.span.clone()));
+            }
             let (call_edits, missing) = attack_abs_edits(text, macro_site, before, hitbox);
             if !missing.is_empty() {
                 report.skipped.push(format!(
@@ -3768,9 +6679,9 @@ pub fn rewrite_hitboxes(
                         .iter()
                         .filter(|site| {
                             site.name == "ATTACK_FP"
-                                && site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok())
+                                && site_u32(text, site, 1)
                                     == Some(before.id)
-                                && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                                && site_u32(text, site, 2)
                                     == Some(before.part)
                         })
                         .collect()
@@ -3786,11 +6697,7 @@ pub fn rewrite_hitboxes(
             };
             if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end
             {
-                report.skipped.push(format!(
-                    "{label}: ATTACK_FP hitbox {} was retimed — its frames are the block it sits \
-                     in, not arguments, so source syncing cannot move it",
-                    before.id
-                ));
+                retimed.push((position, macro_site.span.clone()));
             }
             let (call_edits, missing) = attack_fp_edits(text, macro_site, before, hitbox);
             if !missing.is_empty() {
@@ -3839,7 +6746,7 @@ pub fn rewrite_hitboxes(
                 .iter()
                 .copied()
                 .filter(|site| {
-                    site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok()) == Some(before.id)
+                    site_u32(text, site, 1) == Some(before.id)
                 })
                 .collect()
         } else if is_search {
@@ -3847,8 +6754,8 @@ pub fn rewrite_hitboxes(
                 .iter()
                 .copied()
                 .filter(|site| {
-                    site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok()) == Some(before.id)
-                        && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                    site_u32(text, site, 1) == Some(before.id)
+                        && site_u32(text, site, 2)
                             == Some(before.part)
                 })
                 .collect()
@@ -3860,9 +6767,9 @@ pub fn rewrite_hitboxes(
                     // Family members share the id space but are not the same call, so an
                     // `ATTACK` hitbox never retunes an `ATTACK_IGNORE_THROW` beside it.
                     site.name == before.func
-                        && site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok())
+                        && site_u32(text, site, 1)
                             == Some(before.id)
-                        && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                        && site_u32(text, site, 2)
                             == Some(before.part)
                 })
                 .collect()
@@ -3876,15 +6783,11 @@ pub fn rewrite_hitboxes(
             ));
             continue;
         };
-        // A hitbox's frames are the `frame(...)` block it sits in and the `ATTACK_CLEAR` that
-        // ends it, not arguments of the call — so a retime is reported. The values it also
-        // changed are still worth writing, so this does not skip the call.
+        // A hitbox's frames are the `frame(...)` block it sits in and the clear that ends it,
+        // not arguments of the call. It moves through [`crate::source_timing`] once its values
+        // are written, which are written either way.
         if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end {
-            report.skipped.push(format!(
-                "{label}: hitbox {} was retimed — its frames are the block it sits in, not \
-                 arguments, so source syncing cannot move it",
-                before.id
-            ));
+            retimed.push((position, macro_site.span.clone()));
         }
         let (call_edits, missing) = if is_grab {
             catch_edits(text, macro_site, before, hitbox)
@@ -3906,7 +6809,33 @@ pub fn rewrite_hitboxes(
     }
 
     report.changed = edits.len();
-    Ok((apply(text, edits), report))
+    let (written, map) = apply_mapped(text, edits);
+    if retimed.is_empty() {
+        return Ok((written, report));
+    }
+    let moved: Vec<crate::source_timing::Retimed> = retimed
+        .iter()
+        .map(|(position, call)| crate::source_timing::Retimed {
+            position: *position,
+            call: map(call.start)..map(call.end),
+            before: &pristine[*position],
+            after: &edited[*position],
+        })
+        .collect();
+    match crate::source_timing::retime_hitboxes(&written, pristine, &moved) {
+        Ok(timed) => {
+            report.changed += moved.len();
+            Ok((timed, report))
+        }
+        Err(reason) => {
+            let ids: Vec<String> = moved.iter().map(|m| m.before.id.to_string()).collect();
+            report.skipped.push(format!(
+                "{label}: hitbox {} was retimed, but its frames were left as they are — {reason}",
+                ids.join(", ")
+            ));
+            Ok((written, report))
+        }
+    }
 }
 
 /// The new text for one changed `ATTACK` argument, by the kind of slot it is.
@@ -4810,9 +7739,25 @@ fn wind_box_edits(
 /// Replace a non-numeric argument — a const, a bool, a hash, a capsule endpoint — when the
 /// text the editor would write differs from what is already there.
 fn text_edit(text: &str, span: &Range<usize>, new: &str) -> Option<Replacement> {
-    (text[span.clone()].trim() != new).then(|| Replacement {
+    let current = text[span.clone()].trim();
+    // A hash the author wrote through one of the project's own macros (`rb!("attackm")`) keeps
+    // that spelling when the editor hands back a plain `Hash40::new("…")` for it.
+    let macros = crate::hash_macros::current();
+    let new = match new
+        .strip_prefix("Hash40::new(\"")
+        .and_then(|rest| rest.strip_suffix("\")"))
+    {
+        Some(name) if macros.expand_call(current).is_some() => {
+            if macros.expand_call(current).as_deref() == Some(name) {
+                return None;
+            }
+            macros.spell(current, name, text)
+        }
+        _ => new.to_string(),
+    };
+    (current != new).then(|| Replacement {
         span: span.clone(),
-        value: new.to_string(),
+        value: new,
     })
 }
 
@@ -5411,6 +8356,802 @@ pub fn sync_motion_rates(
     })
 }
 
+// ── Article call write-back ─────────────────────────────────────────────────
+
+/// The module paths an article call is written with, as [`crate::data::ArticleCall::parse`]
+/// reads them.
+const ARTICLE_MODULE: &str = "ArticleModule::";
+const ARTICLE_LUA_BIND: &str = "smash::app::lua_bind::";
+
+/// Every `ArticleModule::f(..)` call in `text` written as a whole statement, in document order:
+/// `[let x = ][smash::app::lua_bind::]ArticleModule::f(args);`.
+///
+/// Located in the file's own text, never rebuilt from the editor's model of a call (a timeline
+/// call carries the timeline's spelling, not the file's). A call inside an expression
+/// (`if ArticleModule::is_exist(..)`, an argument of another call) is not a statement and is not
+/// counted: the parser keeps those as raw lines, so the walk never reports them either.
+pub(crate) fn article_call_sites(text: &str) -> Vec<MacroSite> {
+    let bytes = text.as_bytes();
+    let mut sites = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        if !text.is_char_boundary(i) || !text[i..].starts_with(ARTICLE_MODULE) {
+            i += 1;
+            continue;
+        }
+        let start = if text[..i].ends_with(ARTICLE_LUA_BIND) {
+            i - ARTICLE_LUA_BIND.len()
+        } else {
+            i
+        };
+        let name_start = i + ARTICLE_MODULE.len();
+        // Not a longer or differently qualified name that merely ends in `ArticleModule::`.
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.')
+        {
+            i = name_start;
+            continue;
+        }
+        let mut name_end = name_start;
+        while name_end < text.len()
+            && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || bytes.get(name_end) != Some(&b'(') {
+            i = name_end;
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, name_end + 1, text.len()) else {
+            i = name_end + 1;
+            continue;
+        };
+        i = close + 1;
+        if article_statement_semicolon(text, start, close).is_some() {
+            sites.push(MacroSite {
+                name: text[name_start..name_end].to_string(),
+                span: start..close + 1,
+                args,
+            });
+        }
+    }
+    sites
+}
+
+/// The `;` ending the statement a call from `start` to its `)` at `close` makes, if the call is
+/// a whole statement: preceded by the start of a block or statement (`{`, `;`, `}`), optionally
+/// through a `let` binding on the same line, and followed by `;`.
+fn article_statement_semicolon(text: &str, start: usize, close: usize) -> Option<usize> {
+    let after = &text[close + 1..];
+    let semicolon = close + 1 + (after.len() - after.trim_start().len());
+    if text.as_bytes().get(semicolon) != Some(&b';') {
+        return None;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+    let prefix = text[line_start..start].trim();
+    let before = if prefix.is_empty() {
+        &text[..line_start]
+    } else if let Some(binding) = prefix.strip_prefix("let ") {
+        // `let id = ` and nothing else: no operator before the `=`.
+        let pattern = binding.strip_suffix('=')?.trim_end();
+        if pattern.is_empty()
+            || pattern.ends_with(['=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'])
+            || pattern.contains(['(', ';', '"', '{', '}'])
+        {
+            return None;
+        }
+        let at = text[line_start..start].find("let ")? + line_start;
+        &text[..at]
+    } else {
+        &text[..start]
+    };
+    matches!(last_code_char(before), None | Some('{' | ';' | '}')).then_some(semicolon)
+}
+
+/// The last character of `text` that is code: not whitespace and not inside a comment.
+fn last_code_char(text: &str) -> Option<char> {
+    let mut last = None;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            if !(text[i..].starts_with("//") || text[i..].starts_with("/*")) {
+                last = text[..next.min(text.len())].chars().next_back();
+            }
+            i = next;
+            continue;
+        }
+        let Some(c) = text[i..].chars().next() else {
+            break;
+        };
+        if !c.is_whitespace() {
+            last = Some(c);
+        }
+        i += c.len_utf8();
+    }
+    last
+}
+
+/// The frame block `site` sits in, as [`source_frame_block`] finds it, when its `frame(..)` line
+/// comes before the `is_excute` block holding the site and on a line of its own. (A `frame` inside
+/// the block, or on the block's own line, is not a frame block this can retime.)
+fn article_frame_block(text: &str, site: &MacroSite) -> Option<EffectSourceBlock> {
+    let (open, _) = enclosing_effect_execute(text, site.span.start)?;
+    let frame = scan_named_sites(text, "frame", 0..text.len())
+        .into_iter()
+        .rev()
+        .find(|frame| frame.span.end <= site.span.start)?;
+    let frame_line = line_range_at(text, frame.span.start)?;
+    let execute_line = line_range_at(text, open)?;
+    if execute_line.start < frame_line.end {
+        return None;
+    }
+    source_frame_block(text, site)
+}
+
+/// Why the call at `site` is not `call` at `frame`, if it is not. The writer pairs by position
+/// with a list read from this same text, so every field must agree: function, argument count,
+/// article, every argument (the target by what it names, since a timeline call carries the
+/// timeline's spelling of it) and, where the source states one, the frame.
+fn article_pairing_mismatch(
+    text: &str,
+    site: &MacroSite,
+    frame: u32,
+    call: &crate::data::ArticleCall,
+) -> Option<String> {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    if site.name != call.op.name() {
+        return Some(format!("the source calls `{}` where the list has `{}`", site.name, call.op.name()));
+    }
+    if site.args.len() != call.args.len() + 2 {
+        return Some(format!(
+            "the source's `{}` has {} argument(s) where the list has {}",
+            site.name,
+            site.args.len(),
+            call.args.len() + 2
+        ));
+    }
+    if squash(&text[site.args[1].clone()]) != squash(&call.article) {
+        return Some(format!(
+            "the source's `{}` acts on `{}` where the list has `{}`",
+            site.name,
+            text[site.args[1].clone()].trim(),
+            call.article
+        ));
+    }
+    let target_slot = call.op.target_index();
+    for (slot, expected) in call.args.iter().enumerate() {
+        let written = &text[site.args[slot + 2].clone()];
+        let agrees = if Some(slot) == target_slot {
+            crate::data::ArticleTarget::read(written) == call.target
+        } else {
+            squash(written) == squash(expected)
+        };
+        if !agrees {
+            return Some(format!(
+                "the source's `{}` passes `{}` where the list has `{expected}`",
+                site.name,
+                written.trim()
+            ));
+        }
+    }
+    if let Some(block) = article_frame_block(text, site) {
+        if block.frame != frame {
+            return Some(format!(
+                "the source's `{}` is under frame {} where the list has it at frame {frame}",
+                site.name, block.frame
+            ));
+        }
+    }
+    None
+}
+
+/// Rewrite edited article calls into the user's own source.
+///
+/// `pristine` is the calls `text` holds, as [`AcmdScript::to_article_calls`]
+/// (crate::data::AcmdScript::to_article_calls) reads them from it, and `edited` is the same list
+/// with the user's edits, as (script frame, call). They are paired with the file's own call
+/// statements **by position**, the way [`rewrite_motion_rates`] pairs rates, and every pair must
+/// agree exactly ([`article_pairing_mismatch`]); otherwise nothing is written and the reason is
+/// reported. The editor's own lists go through [`rewrite_editor_article_calls`], which puts them
+/// in this form.
+///
+/// - An argument edit replaces only that argument's bytes, so the receiver, any `let` binding,
+///   the module path and the spacing stay as written. A changed target keeps the file's own
+///   spelling of it (`ArticleOperationTarget(..)` or bare, symbolic or numeric).
+/// - A frame change moves the statement to the new frame's block, creating the block when the
+///   function has none, as effect blocks move. See [`move_call_to_frame`].
+/// - Changing which `ArticleModule` function is called, or adding or removing arguments or calls,
+///   is structural and reported.
+pub fn rewrite_article_calls(
+    text: &str,
+    label: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<(String, SyncReport)> {
+    let mut report = SyncReport::default();
+    let same = article_call_unchanged;
+    if pristine.len() == edited.len() && pristine.iter().zip(edited).all(|(a, b)| same(a, b)) {
+        return Ok((text.to_string(), report));
+    }
+    if pristine.len() != edited.len() {
+        report.skipped.push(format!(
+            "{label}: article calls were added or removed — source syncing only retunes existing \
+             calls, so use an export to land that"
+        ));
+        return Ok((text.to_string(), report));
+    }
+    let sites = article_call_sites(text);
+    if sites.len() != pristine.len() {
+        report.skipped.push(format!(
+            "{label}: the source has {} `ArticleModule` call(s) and the editor models {} — one of \
+             them is inside a branch, a loop or an expression, which this cannot address by \
+             position",
+            sites.len(),
+            pristine.len()
+        ));
+        return Ok((text.to_string(), report));
+    }
+    for (index, (site, (frame, call))) in sites.iter().zip(pristine).enumerate() {
+        if let Some(reason) = article_pairing_mismatch(text, site, *frame, call) {
+            report.skipped.push(format!(
+                "{label}: article call #{} is not what the source holds there ({reason}), so no \
+                 article call was changed; reload the move",
+                index + 1
+            ));
+            return Ok((text.to_string(), report));
+        }
+    }
+    let assigned: Vec<usize> = (0..sites.len()).collect();
+
+    let mut edits = Vec::new();
+    let mut moves = Vec::new();
+    for (site, &index) in sites.iter().zip(&assigned) {
+        let (was, now) = (&pristine[index], &edited[index]);
+        if same(was, now) {
+            continue;
+        }
+        let ((from, before), (to, after)) = (was, now);
+        let number = index + 1;
+        if before.op != after.op {
+            report.skipped.push(format!(
+                "{label}: article call #{number} changes which function it calls (`{}` to `{}`) — \
+                 source syncing only retunes existing calls, so use an export to land that",
+                before.op.name(),
+                after.op.name()
+            ));
+            continue;
+        }
+        if before.args.len() != after.args.len() {
+            report.skipped.push(format!(
+                "{label}: article call #{number} (`{}`) had arguments added or removed — source \
+                 syncing only retunes existing arguments",
+                site.name
+            ));
+            continue;
+        }
+        let mut replace = |span: &Range<usize>, value: String| {
+            if text[span.clone()].trim() != value.trim() {
+                edits.push(Replacement { span: span.clone(), value });
+            }
+        };
+        if before.article != after.article {
+            replace(&site.args[1], after.article.clone());
+        }
+        let target_slot = before.op.target_index();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for (slot, (was, now)) in before.args.iter().zip(&after.args).enumerate() {
+            let span = &site.args[slot + 2];
+            if Some(slot) == target_slot && after.target != crate::data::ArticleTarget::Unspecified {
+                // By what it names only: the text in `args` may still be the spelling from before
+                // an edit that set `target`. Written in the file's own spelling, not the editor's.
+                if before.target != after.target {
+                    replace(span, after.target.respell(&text[span.clone()]));
+                }
+            } else if squash(was) != squash(now) {
+                replace(span, now.clone());
+            }
+        }
+        if from != to {
+            moves.push((index, *from, *to));
+        }
+    }
+
+    report.changed = edits.len();
+    let mut out = apply(text, edits);
+    // Which editor call each statement in `out` is, in document order: a move can carry a call
+    // past others, and every later move must still find its own call.
+    let mut order: Vec<usize> = assigned;
+    for (index, from, to) in moves {
+        let number = index + 1;
+        let current = article_call_sites(&out);
+        let Some(site) = order
+            .iter()
+            .position(|&call| call == index)
+            .and_then(|position| current.get(position))
+        else {
+            report.skipped.push(format!(
+                "{label}: article call #{number} could not be found again after an earlier move"
+            ));
+            break;
+        };
+        if article_frame_block(&out, site).is_some_and(|block| block.frame == to) {
+            continue; // Already there: a sync ran before with this edit.
+        }
+        match move_call_to_frame(&out, site, from, to) {
+            Ok((moved, at)) => {
+                let after = article_call_sites(&moved);
+                let Some(position) = after.iter().position(|site| site.span.start == at) else {
+                    report.skipped.push(format!(
+                        "{label}: article call #{number} moved, but could not be found again, so no \
+                         later article call was moved"
+                    ));
+                    out = moved;
+                    report.changed += 1;
+                    break;
+                };
+                order.retain(|&call| call != index);
+                order.insert(position, index);
+                out = moved;
+                report.changed += 1;
+            }
+            Err(reason) => report.skipped.push(format!(
+                "{label}: `{}` (article call #{number}) could not move from frame {from} to frame \
+                 {to}: {reason}",
+                site.name
+            )),
+        }
+    }
+    Ok((out, report))
+}
+
+/// The editor's edited article calls in the order, and against the values, of `source`: the
+/// calls `text` holds now, read with the same parser (`to_article_calls`). This is the per-write
+/// baseline hitboxes and effects use. An earlier sync may have moved a call past another,
+/// renamed its article, or retimed it, so the file's list and the editor's original list
+/// (`pristine`, edited into `edited`) no longer line up by position.
+///
+/// A source call can be editor call `i` only when they have the same function and argument count
+/// and every field (frame, article, each argument, the target by what it names) is either as call
+/// `i` was, as it is edited, or — only for a field the user changed on that call — some value in
+/// between that an earlier sync wrote. Among those, a call that agrees on every field is paired
+/// first; then each remaining source call takes its one best match. Several equal matches are
+/// accepted only when they are the same call, edited the same way. Anything else is refused with
+/// the reason, and nothing is guessed by position.
+pub fn article_calls_in_source_order(
+    source: &[(u32, crate::data::ArticleCall)],
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> std::result::Result<Vec<(u32, crate::data::ArticleCall)>, String> {
+    if pristine.len() != edited.len() {
+        return Err(
+            "article calls were added or removed — source syncing only retunes existing calls, so \
+             use an export to land that"
+                .into(),
+        );
+    }
+    if source.len() != pristine.len() {
+        return Err(format!(
+            "the source has {} article call(s) where the editor has {}, so they cannot be matched \
+             up; reload the move",
+            source.len(),
+            pristine.len()
+        ));
+    }
+    // The file holds exactly the calls the editor loaded, in their order: call `i` is the `i`th,
+    // even where several are the same call (Cuphead's four identical bullets in one frame).
+    if source.iter().zip(pristine).all(|(held, loaded)| article_call_unchanged(held, loaded)) {
+        return Ok(edited.to_vec());
+    }
+    let was: Vec<Vec<String>> = pristine.iter().map(article_call_fields).collect();
+    let then: Vec<Vec<String>> = edited.iter().map(article_call_fields).collect();
+    // `None`: this source call cannot be editor call `index`. Otherwise how many fields agree,
+    // and whether all of them do.
+    let score = |(_, call): &(u32, crate::data::ArticleCall), fields: &[String], index: usize| {
+        let (before, after) = (&pristine[index].1, &edited[index].1);
+        if (call.op != before.op && call.op != after.op) || call.args.len() != before.args.len() {
+            return None;
+        }
+        let mut agree = 0;
+        for (field, now) in fields.iter().enumerate() {
+            let old = &was[index][field];
+            let new = then[index].get(field).unwrap_or(old);
+            if now == old || now == new {
+                agree += 1;
+            } else if old == new {
+                // A value neither side has, on a field the user did not change: not this call.
+                return None;
+            }
+        }
+        Some((agree, agree == fields.len()))
+    };
+    let interchangeable = |a: usize, b: usize| {
+        article_call_unchanged(&pristine[a], &pristine[b]) && article_call_unchanged(&edited[a], &edited[b])
+    };
+    let fields: Vec<Vec<String>> = source.iter().map(article_call_fields).collect();
+
+    let mut assigned: Vec<Option<usize>> = vec![None; source.len()];
+    let mut used = vec![false; pristine.len()];
+    while assigned.iter().any(Option::is_none) {
+        let mut progress = false;
+        // Calls that agree on everything settle first; only then the closest match.
+        for full_only in [true, false] {
+            for (position, call) in source.iter().enumerate() {
+                if assigned[position].is_some() {
+                    continue;
+                }
+                let scored: Vec<(usize, usize, bool)> = (0..pristine.len())
+                    .filter(|&index| !used[index])
+                    .filter_map(|index| score(call, &fields[position], index).map(|(agree, full)| (index, agree, full)))
+                    .filter(|(_, _, full)| *full || !full_only)
+                    .collect();
+                if scored.is_empty() {
+                    if full_only {
+                        continue;
+                    }
+                    return Err(format!(
+                        "the source's `{}` call on {} at frame {} matches none of the editor's article \
+                         calls as they were or as edited, so none was changed; reload the move",
+                        call.1.op.name(),
+                        call.1.article,
+                        call.0
+                    ));
+                }
+                let best = scored.iter().map(|(_, agree, _)| *agree).max().unwrap_or(0);
+                let top: Vec<usize> = scored
+                    .iter()
+                    .filter(|(_, agree, _)| *agree == best)
+                    .map(|(index, _, _)| *index)
+                    .collect();
+                if top.iter().all(|&index| interchangeable(top[0], index)) {
+                    assigned[position] = Some(top[0]);
+                    used[top[0]] = true;
+                    progress = true;
+                }
+            }
+            if progress {
+                break;
+            }
+        }
+        if !progress {
+            let position = assigned.iter().position(Option::is_none).unwrap_or(0);
+            let (frame, call) = &source[position];
+            return Err(format!(
+                "the source's `{}` call on {} at frame {frame} could be more than one of the \
+                 editor's article calls, so none was changed; reload the move, or edit one call at \
+                 a time and sync in between",
+                call.op.name(),
+                call.article
+            ));
+        }
+    }
+    Ok(assigned
+        .into_iter()
+        .map(|index| edited[index.expect("every source call was assigned")].clone())
+        .collect())
+}
+
+/// [`rewrite_article_calls`] for the editor's lists: the baseline is what `text` holds now (see
+/// [`article_calls_in_source_order`]), so a sync after an earlier sync of the same move still
+/// pairs each call with its own statement. When the lists cannot be matched, the reason is
+/// reported unless the file already holds exactly the edited calls.
+pub fn rewrite_editor_article_calls(
+    text: &str,
+    label: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<(String, SyncReport)> {
+    let source = crate::acmd::parse_acmd_script(text).to_article_calls();
+    match article_calls_in_source_order(&source, pristine, edited) {
+        Ok(ordered) => rewrite_article_calls(text, label, &source, &ordered),
+        Err(reason) => {
+            let mut report = SyncReport::default();
+            // Nothing to do only when the FILE already holds every edited call, in any order.
+            let mut left: Vec<&(u32, crate::data::ArticleCall)> = source.iter().collect();
+            let settled = source.len() == edited.len()
+                && edited.iter().all(|call| {
+                    left.iter()
+                        .position(|held| article_call_unchanged(held, call))
+                        .map(|at| left.remove(at))
+                        .is_some()
+                });
+            if !settled {
+                report.skipped.push(format!("{label}: {reason}"));
+            }
+            Ok((text.to_string(), report))
+        }
+    }
+}
+
+/// What an article call does, field by field, as comparable text: its frame, its article, then
+/// every argument with whitespace removed. A known target is compared by what it names, since a
+/// timeline call keeps the timeline's spelling of it and an edit may set only `target`.
+fn article_call_fields((frame, call): &(u32, crate::data::ArticleCall)) -> Vec<String> {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let target_slot = call.op.target_index();
+    let mut fields = vec![frame.to_string(), squash(&call.article)];
+    for (slot, arg) in call.args.iter().enumerate() {
+        fields.push(if Some(slot) == target_slot && call.target != crate::data::ArticleTarget::Unspecified {
+            format!("target {:?}", call.target)
+        } else {
+            squash(arg)
+        });
+    }
+    fields
+}
+
+/// Whether two calls do the same thing: `source`, `edited` and `origin` only say how one was read.
+fn article_call_unchanged(a: &(u32, crate::data::ArticleCall), b: &(u32, crate::data::ArticleCall)) -> bool {
+    a.1.op == b.1.op && article_call_fields(a) == article_call_fields(b)
+}
+
+/// Sync edited article calls for one move back into the project source on disk. `pristine` and
+/// `edited` are the editor's lists; the baseline is re-read from the file on every sync.
+pub fn sync_article_calls(
+    index: &SourceIndex,
+    fighter: &str,
+    move_name: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<SyncReport> {
+    let script_name = crate::acmd::acmd_script_name("game", move_name);
+    sync_script(index, fighter, &script_name, |body| {
+        rewrite_editor_article_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
+    })
+}
+
+/// Why frame blocks in `text` do not say when a line runs, if they do not: a `wait` makes the
+/// time a block runs at depend on what came before it, and a loop runs its blocks more than once.
+fn frame_order_unreliable(text: &str) -> Option<&'static str> {
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        let word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if word_start {
+            // `wait(..)`, `macros::wait(..)` and the `wait_loop_*` family all hold the script.
+            let rest = &text[i..];
+            let wait_call = rest.strip_prefix("wait").is_some_and(|after| {
+                after.trim_start().starts_with('(') || after.starts_with("_loop")
+            });
+            if wait_call {
+                return Some("the script uses `wait`, so a frame block's place does not say when it runs");
+            }
+            for keyword in ["for", "while", "loop"] {
+                let end = i + keyword.len();
+                if text[i..].starts_with(keyword)
+                    && bytes.get(end).is_some_and(|b| b.is_ascii_whitespace() || *b == b'{')
+                {
+                    return Some("the script has a loop, so its frame blocks can run more than once");
+                }
+            }
+        }
+        i += 1;
+        while i < text.len() && !text.is_char_boundary(i) {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The brace depth of `at` inside `body` (0 directly in it), ignoring literals and comments.
+fn brace_depth(text: &str, body: Range<usize>, at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = body.start;
+    while i < at {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        match text.as_bytes()[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// The frame argument `old` respelled as `frame`: `10.0` gives `14.0`, `10` gives `14`.
+fn frame_arg_like(old: &str, frame: u32) -> String {
+    crate::project_consts::format_literal_like(old, f64::from(frame))
+        .unwrap_or_else(|| format_float(frame as f32))
+}
+
+/// Move the statement calling `site` from its frame block (at frame `from`) to frame `to`.
+///
+/// This works for any call `site` locates, not only effects. The statement must be a whole line
+/// (or lines) directly inside a `frame(..); if is_excute(..) { .. }` block, the shape effect
+/// timing moves accept. Then:
+///
+/// - If it is the block's only statement (comments aside) and no block exists at `to`, the whole
+///   block, comments included, is retimed and placed in frame order, exactly as an effect block
+///   moves.
+/// - If a block already exists at `to`, the statement joins the end of it, and a block the
+///   statement leaves with nothing in it at all is removed; one left holding comments stays.
+/// - Otherwise a new block is made at `to` from the frame line, `is_excute` header and closing
+///   line of the block it left, so it is written the way the user writes blocks.
+///
+/// Every byte moved keeps its own line endings and indentation. Returns the new text and where
+/// the moved call now starts, or why it cannot be moved.
+fn move_call_to_frame(text: &str, site: &MacroSite, from: u32, to: u32) -> Result<(String, usize), String> {
+    if let Some(reason) = frame_order_unreliable(text) {
+        return Err(reason.into());
+    }
+    let block = article_frame_block(text, site).ok_or(
+        "it is not directly inside a `frame(..)` statement's `is_excute` block",
+    )?;
+    if block.frame != from {
+        return Err(format!("its block is at frame {}, not {from}", block.frame));
+    }
+    if brace_depth(text, block.execute_body.clone(), site.span.start) != 0 {
+        return Err("it is inside a condition or block within its frame block".into());
+    }
+    let line_of = |at: usize| line_range_at(text, at).ok_or("its line could not be found");
+    let start_line = line_of(site.span.start)?;
+    let prefix = text[start_line.start..site.span.start].trim();
+    if !(prefix.is_empty() || prefix.starts_with("let ")) {
+        return Err("another statement shares its line".into());
+    }
+    let semicolon = article_statement_semicolon(text, site.span.start, site.span.end - 1)
+        .or_else(|| {
+            let after = &text[site.span.end..];
+            let at = site.span.end + (after.len() - after.trim_start().len());
+            (text.as_bytes().get(at) == Some(&b';')).then_some(at)
+        })
+        .ok_or("it is not a whole statement")?;
+    let end_line = line_of(semicolon)?;
+    let tail = text[semicolon + 1..end_line.end].trim();
+    if !(tail.is_empty() || tail.starts_with("//")) {
+        return Err("another statement shares its line".into());
+    }
+    let statement = start_line.start..end_line.end;
+    if statement.start < block.execute_body.start || statement.end > block.execute_body.end {
+        return Err("its block opens or closes on the same line as it".into());
+    }
+    let statement_text = &text[statement.clone()];
+    let call_offset = site.span.start - statement.start;
+    // What else the block holds: nothing at all, or only comments (which move with a block that
+    // moves whole, as an effect block's do, and stay put otherwise).
+    let rest = format!(
+        "{}{}",
+        &text[block.execute_body.start..statement.start],
+        &text[statement.end..block.execute_body.end]
+    );
+    let empty = rest.trim().is_empty();
+    let alone = rest.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.ends_with("*/")
+    });
+
+    // Where a block closes: the start of the line holding its `}`, which must hold nothing else.
+    let closing_line = |close: usize| -> Result<Range<usize>, String> {
+        let line = line_of(close)?;
+        if !text[line.start..close].trim().is_empty() {
+            return Err(format!(
+                "a block at frame {to} closes on the same line as its last statement"
+            ));
+        }
+        Ok(line)
+    };
+    let target = source_frame_blocks(text)
+        .into_iter()
+        .find(|candidate| candidate.frame == to && candidate.range != block.range);
+
+    // (removed range, insertion point, inserted text, call's offset in the inserted text)
+    let (removed, anchor, inserted, offset) = match &target {
+        Some(target) => {
+            let anchor = closing_line(target.execute_body.end)?.start;
+            let removed = if empty { block.range.clone() } else { statement.clone() };
+            (removed, anchor, statement_text.to_string(), call_offset)
+        }
+        None => {
+            let frame_arg = block.frame_arg.clone();
+            let new_arg = frame_arg_like(&text[frame_arg.clone()], to);
+            let (removed, chunk, offset) = if alone {
+                let relative = frame_arg.start - block.range.start..frame_arg.end - block.range.start;
+                let mut chunk = text[block.range.clone()].to_string();
+                let growth = new_arg.len() as isize - relative.len() as isize;
+                chunk.replace_range(relative, &new_arg);
+                let offset = (site.span.start - block.range.start) as isize + growth;
+                (block.range.clone(), chunk, offset as usize)
+            } else {
+                // `{` ends its header line and `}` starts its closing line, or the block cannot
+                // be copied without the statements it holds.
+                let header_end = line_of(block.execute_body.start - 1)?.end;
+                if !text[block.execute_body.start..header_end].trim().is_empty() {
+                    return Err("its block's `is_excute` line also holds a statement".into());
+                }
+                let closer = closing_line(block.execute_body.end)
+                    .map_err(|_| "its block closes on the same line as a statement".to_string())?;
+                let mut header = text[block.range.start..header_end].to_string();
+                header.replace_range(
+                    frame_arg.start - block.range.start..frame_arg.end - block.range.start,
+                    &new_arg,
+                );
+                let offset = header.len() + call_offset;
+                let chunk = format!("{header}{statement_text}{}", &text[closer.start..block.range.end]);
+                (statement.clone(), chunk, offset)
+            };
+            // A block the call leaves behind keeps its frame line, which still orders the rest.
+            let moving = if alone { block.range.clone() } else { statement.clone() };
+            (removed, frame_insertion_point(text, to, &moving)?, chunk, offset)
+        }
+    };
+    if removed.start < anchor && anchor < removed.end {
+        return Err("its new place is inside the lines it leaves".into());
+    }
+    let mut out = String::with_capacity(text.len() + inserted.len());
+    let at = if anchor <= removed.start {
+        out.push_str(&text[..anchor]);
+        let at = out.len() + offset;
+        out.push_str(&inserted);
+        out.push_str(&text[anchor..removed.start]);
+        out.push_str(&text[removed.end..]);
+        at
+    } else {
+        out.push_str(&text[..removed.start]);
+        out.push_str(&text[removed.end..anchor]);
+        let at = out.len() + offset;
+        out.push_str(&inserted);
+        out.push_str(&text[anchor..]);
+        at
+    };
+    Ok((out, at))
+}
+
+/// Where a new block for `frame` goes: before the first `frame(..)` statement for a later frame
+/// (outside `moving`, the block being moved), else at the end of the function. Every frame line
+/// counts, not only those with an `is_excute` block: placing a block after a later frame would
+/// make it run at that later frame.
+fn frame_insertion_point(text: &str, frame: u32, moving: &Range<usize>) -> Result<usize, String> {
+    let mut later: Option<usize> = None;
+    for site in scan_named_sites(text, "frame", 0..text.len()) {
+        if moving.start <= site.span.start && site.span.start < moving.end {
+            continue;
+        }
+        let Some(line) = line_range_at(text, site.span.start) else {
+            continue;
+        };
+        if !text[line.clone()].trim_start().starts_with("frame(") {
+            continue;
+        }
+        let value = site.arg(text, 1).and_then(|value| value.trim().parse::<f32>().ok());
+        let Some(value) = value else {
+            return Err(format!(
+                "a `frame` statement is not a plain number (`{}`), so where frame {frame} goes is \
+                 unclear",
+                text[site.span.clone()].trim()
+            ));
+        };
+        if crate::data::script_frame(value) > frame && later.is_none_or(|at| line.start < at) {
+            later = Some(line.start);
+        }
+    }
+    if let Some(at) = later {
+        return Ok(at);
+    }
+    let close = text.rfind('}').ok_or("the function has no closing brace")?;
+    let line = line_range_at(text, close).ok_or("the function has no closing brace")?;
+    if !text[line.start..close].trim().is_empty() {
+        return Err("the function's closing brace shares its line with a statement".into());
+    }
+    Ok(line.start)
+}
+
 // ── Kinetic speed write-back ────────────────────────────────────────────────
 
 /// The buildable `SET_SPEED_EX` calls in source order.
@@ -5774,7 +9515,7 @@ pub(crate) fn motion_module_set_rate_sites(text: &str) -> Vec<MacroSite> {
         site.args.len() == 2
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .and_then(|value| value.trim().parse::<f32>().ok())
@@ -5807,7 +9548,7 @@ pub fn rewrite_motion_module_set_rate(
                 || site.args.len() != 2
                 || site
                     .arg(text, 0)
-                    .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
             {
                 report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate` site {} no longer has its verified receiver/arity shape",
@@ -5843,7 +9584,7 @@ pub(crate) fn motion_module_set_helper_calculation_sites(text: &str) -> Vec<Macr
         site.args.len() == 2
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(|value| matches!(value.trim(), "false" | "true"))
@@ -5875,7 +9616,7 @@ pub fn rewrite_motion_module_set_helper_calculation(
                 || site.args.len() != 2
                 || site
                     .arg(text, 0)
-                    .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
                 || site
                     .arg(text, 1)
                     .is_none_or(|value| !matches!(value.trim(), "false" | "true"))
@@ -5937,7 +9678,7 @@ pub(crate) fn motion_module_set_rate_partial_sites(text: &str) -> Vec<MacroSite>
         site.args.len() == 3
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(valid_motion_module_part_kind_token)
@@ -5980,7 +9721,7 @@ pub fn rewrite_motion_module_set_rate_partial(
                 || site.args.len() != 3
                 || site
                     .arg(text, 0)
-                    .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
                 || site
                     .arg(text, 1)
                     .is_none_or(|value| value.trim() != before.call.part_kind.trim())
@@ -6062,7 +9803,7 @@ pub(crate) fn motion_module_set_frame_partial_sites(text: &str) -> Vec<MacroSite
         (site.args.len() == 3 || site.args.len() == 4)
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(valid_motion_module_part_kind_token)
@@ -6120,7 +9861,7 @@ pub fn rewrite_motion_module_set_frame_partial(
                 || site.args.len() != usize::from(before.call.sync.is_some()) + 3
                 || site
                     .arg(text, 0)
-                    .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
                 || site
                     .arg(text, 1)
                     .is_none_or(|value| value.trim() != before.call.part_kind.trim())
@@ -6259,7 +10000,7 @@ pub fn rewrite_clr_speed(
 /// The HDR dump binds `boma` to `agent.boma()` at the top of the function; generated source uses
 /// `agent.module_accessor`, so this receiver is normalized only for parsing and source syncing.
 fn is_change_kinetic_receiver(value: &str) -> bool {
-    matches!(value.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(value.trim())
 }
 
 /// The verified direct `KineticModule::change_kinetic` calls in source order.
@@ -6331,7 +10072,7 @@ pub fn rewrite_change_kinetic(
 
 /// Whether a direct kinetic-energy receiver is one of the measured source forms.
 fn is_kinetic_energy_receiver(value: &str) -> bool {
-    matches!(value.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(value.trim())
 }
 
 /// The verified direct kinetic-energy toggle calls in source order.
@@ -6470,7 +10211,7 @@ pub(crate) fn work_flag_sites(text: &str) -> Vec<MacroSite> {
             site.args.len() == 2
                 && site
                     .arg(text, 0)
-                    .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
                 && site.arg(text, 1).is_some_and(valid_work_flag_token)
         })
         .collect()
@@ -6507,7 +10248,7 @@ pub fn rewrite_work_flags(
                 || site.args.len() != 2
                 || site
                     .arg(text, 0)
-                    .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
                 || site
                     .arg(text, 1)
                     .is_none_or(|value| value.trim() != before.call.flag.trim())
@@ -6538,9 +10279,9 @@ pub fn rewrite_work_flags(
 fn valid_work_transition_term_receiver(function: &str, receiver: &str) -> bool {
     match function {
         "WorkModule::enable_transition_term_group"
-        | "WorkModule::unable_transition_term_group_ex" => receiver == "agent.module_accessor",
+        | "WorkModule::unable_transition_term_group_ex" => crate::acmd::is_agent_module_accessor(receiver),
         "WorkModule::enable_transition_term" | "WorkModule::unable_transition_term" => {
-            matches!(receiver, "agent.module_accessor" | "boma")
+            crate::acmd::is_module_accessor(receiver)
         }
         _ => false,
     }
@@ -6646,7 +10387,7 @@ pub(crate) fn work_module_inc_int_sites(text: &str) -> Vec<MacroSite> {
             site.args.len() == 2
                 && site
                     .arg(text, 0)
-                    .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
                 && site.arg(text, 1).is_some_and(valid_work_flag_token)
         })
         .collect()
@@ -6676,7 +10417,7 @@ pub fn rewrite_work_module_inc_int(
                 || site.args.len() != 2
                 || site
                     .arg(text, 0)
-                    .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
                 || site
                     .arg(text, 1)
                     .is_none_or(|value| value.trim() != before.call.slot.trim())
@@ -6728,7 +10469,7 @@ pub(crate) fn work_module_set_sites(text: &str) -> Vec<MacroSite> {
             site.args.len() == 3
                 && site
                     .arg(text, 0)
-                    .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
                 && site
                     .arg(text, 1)
                     .is_some_and(|value| valid_work_module_set_value(value, kind))
@@ -6829,7 +10570,7 @@ pub fn rewrite_work_module_sets(
             ));
             continue;
         }
-        if !matches!(now.call.receiver.trim(), "agent.module_accessor" | "boma")
+        if !crate::acmd::is_module_accessor(now.call.receiver.trim())
             || !valid_work_module_set_value(&now.call.value, now.call.kind)
             || if now.call.kind.is_int64() {
                 !valid_work_module_slot_token(&now.call.slot)
@@ -6860,7 +10601,7 @@ pub fn rewrite_work_module_sets(
 
 /// Whether a direct `KineticModule::add_speed` receiver is one of the measured source forms.
 fn is_kinetic_add_speed_receiver(value: &str) -> bool {
-    matches!(value.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(value.trim())
 }
 
 fn parse_source_zero_z_vector(value: &str) -> Option<(f32, f32)> {
@@ -6984,7 +10725,7 @@ pub(crate) fn kinetic_set_consider_ground_friction_sites(text: &str) -> Vec<Macr
         site.args.len() == 3
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(|value| matches!(value.trim(), "true" | "false"))
@@ -7056,7 +10797,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -7070,7 +10811,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
@@ -7080,7 +10821,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -7100,7 +10841,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -7187,7 +10928,7 @@ pub fn rewrite_kinetic_set_consider_ground_friction(
             || site.args.len() != 3
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
         {
             report.skipped.push(format!(
                 "{label}: set_consider_ground_friction site {} no longer has its verified receiver/arity shape",
@@ -7304,7 +11045,7 @@ pub(crate) fn kinetic_clear_speed_all_sites(text: &str) -> Vec<MacroSite> {
         site.args.len() == 1
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
     })
     .collect()
 }
@@ -7321,7 +11062,7 @@ fn remove_set_air_line(text: &str, site: &MacroSite) -> Replacement {
         };
     };
     let trimmed = text[line.clone()].trim();
-    if trimmed == "macros::SET_AIR(agent);" || trimmed == "visionary_set_air(agent);" {
+    if is_lone_agent_call(trimmed, "SET_AIR") || is_lone_agent_call(trimmed, "visionary_set_air") {
         Replacement {
             span: line.clone(),
             value: String::new(),
@@ -7353,7 +11094,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -7367,7 +11108,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(
+                    insert_styled(text,
                         close,
                         &format!("{body_indent}macros::SET_AIR(agent);{newline}"),
                     );
@@ -7380,7 +11121,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::SET_AIR(agent);{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -7400,7 +11141,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::SET_AIR(agent);{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -7457,7 +11198,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -7471,7 +11212,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
@@ -7481,7 +11222,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -7501,7 +11242,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -7697,6 +11438,44 @@ pub(crate) fn reverse_lr_sites(text: &str) -> Vec<MacroSite> {
         .collect()
 }
 
+/// Insert canonical generated `block` at `at`, re-spelled in the style of `text` (the function
+/// being edited): its agent name, macro path, `frame` spelling, indentation and line endings.
+/// See [`crate::source_style`].
+fn insert_styled(text: &mut String, at: usize, block: &str) {
+    let style = crate::source_style::SourceStyle::detect(text);
+    let first = block.lines().next().unwrap_or("");
+    let base = &first[..first.len() - first.trim_start().len()];
+    let styled = style.apply(block, base);
+    // Callers aim at a block's closing `}`. Inserting there put the new line after the brace's
+    // own indentation — doubling it — and left the brace at column 0. A whole-line block goes
+    // in at the start of the brace's line instead.
+    let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+    let at = if styled.ends_with('\n') && text[line_start..at].trim().is_empty() {
+        line_start
+    } else {
+        at
+    };
+    text.insert_str(at, &styled);
+}
+
+/// Whether `trimmed` is exactly one call of the macro `name` on the agent alone —
+/// `macros::SET_AIR(agent);`, `SET_AIR(fighter);` — however the file spells the path and agent.
+fn is_lone_agent_call(trimmed: &str, name: &str) -> bool {
+    let Some(at) = trimmed.find(&format!("{name}(")) else {
+        return false;
+    };
+    let path = &trimmed[..at];
+    if !(path.is_empty() || path.ends_with("::"))
+        || !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return false;
+    }
+    let Some(arg) = trimmed[at + name.len() + 1..].strip_suffix(");") else {
+        return false;
+    };
+    is_identifier(arg.trim())
+}
+
 fn source_line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -7722,11 +11501,13 @@ fn frame_literal(line: &str) -> Option<f32> {
     line[comma + 1..end].trim().parse().ok()
 }
 
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
+pub(crate) fn matching_brace(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
+    let mut depth = 0usize;
     let mut i = open;
     while i < bytes.len() {
+        // A brace inside a comment, a string or a raw string is not structure:
+        // `// if is_excute(agent) {` left in a body used to swallow the real block after it.
         if let Some(next) = skip_rust_literal_or_comment(text, i) {
             i = next;
             continue;
@@ -7815,7 +11596,7 @@ fn remove_reverse_line(text: &str, site: &MacroSite) -> Replacement {
         };
     };
     let trimmed = text[line.clone()].trim();
-    if trimmed == "macros::REVERSE_LR(agent);" {
+    if is_lone_agent_call(trimmed, "REVERSE_LR") {
         Replacement {
             span: line.clone(),
             value: String::new(),
@@ -7849,7 +11630,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -7863,7 +11644,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(
+                    insert_styled(text,
                         close,
                         &format!("{body_indent}macros::REVERSE_LR(agent);{newline}"),
                     );
@@ -7878,7 +11659,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::REVERSE_LR(agent);{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -7900,7 +11681,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::REVERSE_LR(agent);{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -7942,7 +11723,7 @@ fn insert_hurt_line(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -7956,7 +11737,7 @@ fn insert_hurt_line(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
@@ -7965,7 +11746,7 @@ fn insert_hurt_line(
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -7985,7 +11766,7 @@ fn insert_hurt_line(
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -8034,7 +11815,7 @@ fn insert_damage_no_reaction_line(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -8048,13 +11829,13 @@ fn insert_damage_no_reaction_line(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
         }
         let indent = line_indent(text, &frame_range);
-        text.insert_str(
+        insert_styled(text,
             frame_range.end,
             &format!(
                 "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
@@ -8075,7 +11856,7 @@ fn insert_damage_no_reaction_line(
         .find(|range| frame_literal(&text[range.start..range.end]).is_some())
         .map(|range| line_indent(text, range).to_string())
         .unwrap_or_else(|| "    ".into());
-    text.insert_str(
+    insert_styled(text,
         insert_at,
         &format!(
             "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
@@ -8164,7 +11945,7 @@ fn insert_effect_lines(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -8178,7 +11959,7 @@ fn insert_effect_lines(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &render_into(&body_indent));
+                    insert_styled(text, close, &render_into(&body_indent));
                     return true;
                 }
             }
@@ -8189,7 +11970,7 @@ fn insert_effect_lines(
             "{indent}if macros::is_excute(agent) {{{newline}{}{indent}}}{newline}",
             render_into(&body_indent)
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -8211,7 +11992,7 @@ fn insert_effect_lines(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{}{indent}}}{newline}",
         render_into(&body_indent)
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -8327,6 +12108,8 @@ pub(crate) fn expression_sites(text: &str) -> Vec<MacroSite> {
             CALLS
                 .iter()
                 .any(|(name, arity)| site.name == *name && site.args.len() == *arity)
+                // A project helper around `set_rumble` (see `crate::project_helpers`).
+                || (site.name == "ControlModule::set_rumble" && site.args.len() == 5)
         })
         .collect();
     sites.extend(
@@ -8453,12 +12236,30 @@ pub fn rewrite_expressions(
 ///
 /// `SOUND_FUNCS` carries `(name, hash args, has tail)`, and the total after `agent` is the sum
 /// of the last two.
+#[cfg(test)]
 pub(crate) fn sound_sites(text: &str) -> Vec<MacroSite> {
+    sound_sites_with(text, &crate::hash_macros::current())
+}
+
+/// [`sound_sites`] reading hash macros from `macros` — the linked project's own table.
+pub(crate) fn sound_sites_with(
+    text: &str,
+    macros: &crate::hash_macros::HashMacros,
+) -> Vec<MacroSite> {
     scan_macro_sites(text, 0..text.len())
         .into_iter()
         .filter(|site| {
             crate::acmd::SOUND_FUNCS.iter().any(|(name, hashes, tail)| {
-                site.name == *name && site.args.len() == hashes + usize::from(*tail) + 1
+                site.name == *name
+                    && site.args.len() == hashes + usize::from(*tail) + 1
+                    // The parser types a call only when every sound is a name it can read; a
+                    // `PLAY_SE(agent, sound)` with a variable stays raw. Counting it here anyway
+                    // numbered every later site one too high.
+                    && site.args[1..=*hashes].iter().all(|span| {
+                        let arg = text[span.clone()].trim();
+                        (arg.starts_with("Hash40::new(\"") && arg.ends_with("\")"))
+                            || macros.expand_call(arg).is_some()
+                    })
             })
         })
         .collect()
@@ -8477,7 +12278,19 @@ pub fn rewrite_sounds(
     pristine: &[crate::data::SoundEvent],
     edited: &[crate::data::SoundEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = sound_sites(text);
+    rewrite_sounds_with(text, label, pristine, edited, &crate::hash_macros::current())
+}
+
+/// [`rewrite_sounds`] with the project's hash macros given explicitly, so an edited name is
+/// written back in the author's own spelling (`se!("jump02")`, not `Hash40::new(…)`).
+pub fn rewrite_sounds_with(
+    text: &str,
+    label: &str,
+    pristine: &[crate::data::SoundEvent],
+    edited: &[crate::data::SoundEvent],
+    macros: &crate::hash_macros::HashMacros,
+) -> Result<(String, SyncReport)> {
+    let sites = sound_sites_with(text, macros);
     let mut report = SyncReport::default();
     let mut edits: Vec<Replacement> = Vec::new();
 
@@ -8548,7 +12361,9 @@ pub fn rewrite_sounds(
             let Some(span) = site.args.get(index + 1) else {
                 continue;
             };
-            let Some(edit) = text_edit(text, span, &format!("Hash40::new(\"{is}\")")) else {
+            // In the author's own spelling: `se!("jump02")` stays a `se!`.
+            let spelled = macros.spell(&text[span.clone()], is, text);
+            let Some(edit) = text_edit(text, span, &spelled) else {
                 continue;
             };
             // One looped `PLAY_SE` yields one event per iteration, all carrying the same site,
@@ -8569,6 +12384,26 @@ pub fn rewrite_sounds(
 
     report.changed = edits.len();
     Ok((apply(text, edits), report))
+}
+
+/// Write edited sound names back into the project's own `sound_` function.
+pub fn sync_sounds(
+    index: &SourceIndex,
+    fighter: &str,
+    move_name: &str,
+    pristine: &[crate::data::SoundEvent],
+    edited: &[crate::data::SoundEvent],
+) -> Result<SyncReport> {
+    let script_name = crate::acmd::acmd_script_name("sound", move_name);
+    sync_script(index, fighter, &script_name, |body| {
+        rewrite_sounds_with(
+            body,
+            &format!("{fighter}/{move_name}"),
+            pristine,
+            edited,
+            &index.hash_macros,
+        )
+    })
 }
 
 /// Sync edited hurtbox state for one move back into the project source on disk.
@@ -8915,6 +12750,261 @@ pub fn install(agent: &mut smashline::Agent) {
 }
 "#;
 
+    /// Shy Guy's forward smash: both directions forward to one `_impl` with a facing argument.
+    const SHARED_SMASH: &str = r#"
+use super::*;
+
+#[derive(Clone, Copy)]
+enum SmashFacing { Forward, Reverse }
+
+impl SmashFacing {
+    fn z(self) -> f32 { match self { Self::Forward => 1.0, Self::Reverse => -1.0 } }
+    #[inline]
+    fn lr_check(self) -> i32 {
+        unsafe { match self { Self::Forward => *ATTACK_LR_CHECK_F, Self::Reverse => *ATTACK_LR_CHECK_B } }
+    }
+}
+
+unsafe fn game_attacks4_impl(agent: &mut L2CAgentBase, facing: SmashFacing) {
+    // The reverse sweetspot doing 21.5 instead of 21.0 is on purpose
+    let (hit_frame, clear_frame, sweet_damage) = match facing {
+        SmashFacing::Forward => (21.0, 25.0, 21.0),
+        SmashFacing::Reverse => (24.0, 28.0, 21.5),
+    };
+    frame(agent.lua_state_agent, 3.0);
+    if macros::is_excute(agent) {
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD);
+    }
+    frame(agent.lua_state_agent, hit_frame);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), sweet_damage, 42, 80, 0, 35, 6.0, 0.0, 11.6, 28.4 * facing.z(), None, None, None, 1.2, 1.0, *ATTACK_SETOFF_KIND_ON, facing.lr_check(), false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_HEAVY, *ATTACK_REGION_OBJECT);
+        macros::ATTACK(agent, 1, 0, Hash40::new("top"), 14.5, 42, 90, 0, 35, 2.4, 0.0, 10.7, 21.6 * facing.z(), Some(0.0), Some(10.0), Some(12.0 * facing.z()), 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, facing.lr_check(), false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_HEAVY, *ATTACK_REGION_OBJECT);
+    }
+    frame(agent.lua_state_agent, clear_frame);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+    }
+}
+
+unsafe fn effect_attacks4_impl(agent: &mut L2CAgentBase, facing: SmashFacing) {
+    let (smoke_frame, impact_frame) = match facing {
+        SmashFacing::Forward => (20.0, 21.0),
+        SmashFacing::Reverse => (23.0, 24.0),
+    };
+    frame(agent.lua_state_agent, smoke_frame);
+    if macros::is_excute(agent) {
+        macros::LANDING_EFFECT(agent, Hash40::new("sys_h_smoke_b"), Hash40::new("top"), 0, 0, -7.0 * facing.z(), 0, 0, 0, 0.7, 0, 0, 0, 0, 0, 0, true);
+    }
+    frame(agent.lua_state_agent, impact_frame);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 11.6, 28.4 * facing.z(), 90, 0, 0, 1.95, 0, 0, 0, 0, 0, 0, true);
+    }
+}
+
+unsafe extern "C" fn game_attacks4(agent: &mut L2CAgentBase) { game_attacks4_impl(agent, SmashFacing::Forward) }
+unsafe extern "C" fn game_attacks4reverse(agent: &mut L2CAgentBase) { game_attacks4_impl(agent, SmashFacing::Reverse) }
+unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) { effect_attacks4_impl(agent, SmashFacing::Forward) }
+unsafe extern "C" fn effect_attacks4reverse(agent: &mut L2CAgentBase) { effect_attacks4_impl(agent, SmashFacing::Reverse) }
+
+pub(super) fn install(agent: &mut Agent) {
+    agent
+        .game_acmd("game_attacks4", game_attacks4, Priority::Default)
+        .effect_acmd("effect_attacks4", effect_attacks4, Priority::Default)
+        .game_acmd("game_attacks4reverse", game_attacks4reverse, Priority::Default)
+        .effect_acmd("effect_attacks4reverse", effect_attacks4reverse, Priority::Default)
+        ;
+}
+"#;
+
+    /// The Effects page reads which moves play a moveset's own effects from these bodies:
+    /// the fighter's scripts and its objects', and nobody else's.
+    #[test]
+    fn script_bodies_cover_the_fighter_and_its_objects_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/pacman/acmd.rs",
+            r#"unsafe extern "C" fn effect_attack_lw3(agent: &mut L2CAgentBase) {
+    EFFECT(agent, Hash40::new("carrot_pull"), Hash40::new("top"), 0, 0, 6.8, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, true);
+}
+unsafe extern "C" fn effect_hop(agent: &mut L2CAgentBase) {
+    macros::EFFECT_FOLLOW(agent, Hash40::new("fryguy_fire"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 4.4, true);
+}
+unsafe extern "C" fn effect_win(agent: &mut L2CAgentBase) {
+    macros::EFFECT(agent, Hash40::new("mario_only"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+}
+pub fn install() {
+    Agent::new("pacman").acmd("effect_attacklw3", effect_attack_lw3, Priority::Low).install();
+    Agent::new("pacman_bigpacman").acmd("effect_specialnhop", effect_hop, Priority::Low).install();
+    Agent::new("mario").acmd("effect_win1", effect_win, Priority::Low).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let bodies = index.fighter_script_bodies("pacman");
+        let found: Vec<(&str, &str)> = bodies
+            .iter()
+            .map(|(agent, script, _)| (agent.as_str(), script.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("pacman", "effect_attacklw3"),
+                ("pacman_bigpacman", "effect_specialnhop")
+            ]
+        );
+        assert!(bodies[0].2.contains("carrot_pull"), "{}", bodies[0].2);
+        assert!(bodies[1].2.contains("fryguy_fire"), "{}", bodies[1].2);
+    }
+
+    fn shared_smash_project(acmd: &str) -> (tempfile::TempDir, SourceIndex) {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "src/pacman/acmd/smashes.rs", acmd);
+        write(
+            tmp.path(),
+            "src/pacman/mod.rs",
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"pacman\"); }",
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        (tmp, index)
+    }
+
+    #[test]
+    fn forwarding_scripts_read_the_shared_body_resolved_for_each_caller() {
+        let (_tmp, index) = shared_smash_project(SHARED_SMASH);
+        let reverse = index.script_source("pacman", "attacks4reverse").unwrap();
+        assert!(reverse.notes.is_empty(), "{:?}", reverse.notes);
+        assert_eq!(reverse.covers, vec!["game_", "effect_"]);
+        let body = &reverse.body;
+        assert!(body.contains("fn game_attacks4reverse("), "{body}");
+        assert!(!body.contains("facing"), "every facing read resolves: {body}");
+        assert!(!body.contains("let ("), "the resolved binding is dropped: {body}");
+        assert!(body.contains("frame(agent.lua_state_agent, 24.0);"), "{body}");
+        assert!(body.contains("frame(agent.lua_state_agent, 28.0);"), "{body}");
+        assert!(body.contains("Some(-12.0)"), "{body}");
+        assert!(body.contains("*ATTACK_LR_CHECK_B"), "{body}");
+        // `-7.0 * -1.0`: the leading minus is the operand's sign.
+        assert!(body.contains("0, 0, 7.0, 0"), "{body}");
+
+        let hitboxes = crate::acmd::parse_acmd_script(body).to_hitboxes();
+        assert_eq!(hitboxes.len(), 2, "{body}");
+        assert_eq!(hitboxes[0].damage, 21.5);
+        assert_eq!(hitboxes[0].offset_z, -28.4);
+        assert_eq!(hitboxes[0].active_start, 24);
+        assert_eq!(hitboxes[1].offset_z, -21.6);
+        assert_eq!(hitboxes[1].capsule_end.map(|end| end[2]), Some(-12.0));
+
+        let forward = index.script_source("pacman", "attacks4").unwrap();
+        let hitboxes = crate::acmd::parse_acmd_script(&forward.body).to_hitboxes();
+        assert_eq!(hitboxes.len(), 2, "{}", forward.body);
+        assert_eq!(hitboxes[0].damage, 21.0);
+        assert_eq!(hitboxes[0].offset_z, 28.4);
+        assert_eq!(hitboxes[0].active_start, 21);
+        assert!(forward.body.contains("*ATTACK_LR_CHECK_F"), "{}", forward.body);
+    }
+
+    #[test]
+    fn a_shared_body_refuses_write_back_instead_of_changing_every_variant() {
+        let (tmp, index) = shared_smash_project(SHARED_SMASH);
+        let site = index.script("pacman", "game_attacks4reverse").unwrap();
+        let delegate = site.delegate.as_ref().expect("the wrapper forwards");
+        assert_eq!(delegate.function, "game_attacks4_impl");
+        assert_eq!(delegate.callers, 2);
+        assert_eq!(site.function, "game_attacks4reverse", "the wrapper keeps its own site");
+
+        let body = index.script_source("pacman", "attacks4reverse").unwrap().body;
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].damage = 30.0;
+        let error = sync_hitboxes(&index, "pacman", "attacks4reverse", &pristine, &edited)
+            .expect_err("one variant's edit must not reach the shared body");
+        assert!(error.to_string().contains("2 scripts share"), "{error}");
+        let on_disk =
+            std::fs::read_to_string(tmp.path().join("src/pacman/acmd/smashes.rs")).unwrap();
+        assert_eq!(on_disk, SHARED_SMASH);
+    }
+
+    #[test]
+    fn values_that_cannot_be_resolved_are_reported_not_guessed() {
+        let acmd = SHARED_SMASH
+            .replace(
+                "frame(agent.lua_state_agent, 3.0);",
+                "frame(agent.lua_state_agent, facing.charge_frame());",
+            )
+            .replace(
+                "game_attacks4_impl(agent, SmashFacing::Reverse)",
+                "game_attacks4_impl(agent, pick_facing(agent))",
+            );
+        let (_tmp, index) = shared_smash_project(&acmd);
+
+        let forward = index.script_source("pacman", "attacks4").unwrap();
+        assert!(
+            forward
+                .notes
+                .iter()
+                .any(|note| note.starts_with("game_attacks4:") && note.contains("charge_frame")),
+            "{:?}",
+            forward.notes
+        );
+        // What could be resolved still is.
+        assert!(
+            forward.body.contains("frame(agent.lua_state_agent, 21.0);"),
+            "{}",
+            forward.body
+        );
+
+        let reverse = index.script_source("pacman", "attacks4reverse").unwrap();
+        assert!(
+            reverse
+                .notes
+                .iter()
+                .any(|note| note.contains("frame(agent.lua_state_agent, hit_frame);")),
+            "{:?}",
+            reverse.notes
+        );
+        assert!(reverse.body.contains("hit_frame"), "nothing is guessed: {}", reverse.body);
+    }
+
+    #[test]
+    fn a_private_pass_through_body_is_written_where_it_lives() {
+        let acmd = MARIO.replace(
+            "unsafe extern \"C\" fn game_attackairn(agent: &mut L2CAgentBase) {",
+            "unsafe extern \"C\" fn game_attackairn(agent: &mut L2CAgentBase) {\n    \
+             nair_impl(agent);\n}\n\nunsafe fn nair_impl(agent: &mut L2CAgentBase) {",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write(tmp.path(), "src/mario/acmd.rs", &acmd);
+        write(
+            tmp.path(),
+            "src/mario/mod.rs",
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"mario\"); }",
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let body = index.script_source("mario", "attack_air_n").unwrap().body;
+        assert!(body.contains("fn game_attackairn("), "{body}");
+        assert!(body.contains("macros::ATTACK("), "{body}");
+
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].damage = 9.5;
+        let report = sync_hitboxes(&index, "mario", "attack_air_n", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1);
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(on_disk.contains("    nair_impl(agent);\n"), "the wrapper is untouched");
+        assert!(on_disk.contains("Hash40::new(\"top\"), 9.5, 361"), "{on_disk}");
+    }
+
+    #[test]
+    fn constant_products_fold_only_where_nothing_binds_tighter() {
+        assert_eq!(
+            fold_constant_products("f(0, 28.4 * -1.0, Some(12.0 * -1.0), -7.0 * -1.0, 2 * 3)"),
+            "f(0, -28.4, Some(-12.0), 7.0, 6)"
+        );
+        assert_eq!(fold_constant_products("x / 2.0 * 3.0"), "x / 2.0 * 3.0");
+        assert_eq!(fold_constant_products("x - 2.0 * 3.0"), "x - 6.0");
+        assert_eq!(fold_constant_products("a, *CONST, 1.0"), "a, *CONST, 1.0");
+    }
+
     fn mario_project() -> (tempfile::TempDir, SourceIndex) {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "src/mario/acmd.rs", MARIO);
@@ -9050,6 +13140,206 @@ pub fn install(agent: &mut smashline::Agent) {
         assert!(std::fs::read_to_string(script_file)
             .unwrap()
             .contains("6.0"));
+    }
+
+    /// Empoleon's layout: the module is named for the mod (`emperte/`), not the fighter it
+    /// plays on; the ACMD folder also declares Falco's articles; the mod's folder hooks the
+    /// `common` agent. None of that may take Falco's own scripts away from him.
+    #[test]
+    fn a_module_named_for_the_mod_still_belongs_to_its_base_fighter() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            r#"mod emperte;
+pub fn main() {
+    let agent = &mut Agent::new("falco");
+    emperte::install(agent);
+    agent.install();
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/mod.rs",
+            "mod acmd;\nmod vars;\npub fn install(agent: &mut Agent) { acmd::install(agent); }\n",
+        );
+        write(
+            tmp.path(),
+            "src/emperte/vars.rs",
+            "pub fn install() { Agent::new(\"common\").on_line(Main, hook).install(); }\n",
+        );
+        write(
+            tmp.path(),
+            "src/emperte/acmd/mod.rs",
+            "mod aerials;\nmod specials;\npub fn install(agent: &mut Agent) { aerials::install(agent); specials::install(agent); }\n",
+        );
+        let aerials = write(
+            tmp.path(),
+            "src/emperte/acmd/aerials.rs",
+            r#"unsafe extern "C" fn game_attackairb(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_attackairb", game_attackairb, Priority::Low);
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/acmd/specials.rs",
+            r#"unsafe extern "C" fn game_specialnstart(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 3.0);
+}
+unsafe extern "C" fn game_fly(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_specialnstart", game_specialnstart, Priority::Low);
+    Agent::new("falco_cannon").acmd("game_fly", game_fly, Priority::Low).install();
+    Agent::new("falco_arwing").install();
+}
+"#,
+        );
+
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]
+name = \"empoleon\"
+
+[lib]
+crate-type = [\"cdylib\"]
+",
+        );
+        // A backup crate kept beside the live one; cargo never builds it.
+        write(tmp.path(), "plugin(old)/Cargo.toml", "[package]
+name = \"empoleon\"
+");
+        write(tmp.path(), "plugin(old)/src/lib.rs", "mod aerials;
+");
+        write(
+            tmp.path(),
+            "plugin(old)/src/aerials.rs",
+            "unsafe extern \"C\" fn game_attackairb(agent: &mut L2CAgentBase) {}
+",
+        );
+
+        // Linked at the moveset, its crate's `src/`, or the mod's own folder: the folder
+        // linked inside the crate is told it is Falco's only by `src/lib.rs` above it.
+        for linked in ["", "src", "src/emperte"] {
+            let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
+            assert_eq!(
+                index.script("falco", "game_attackairb").unwrap().file,
+                aerials,
+                "linked at {linked:?}"
+            );
+            assert!(index.script("falco", "game_specialnstart").is_some(), "linked at {linked:?}");
+            assert!(index.script("falco_cannon", "game_fly").is_some(), "linked at {linked:?}");
+            assert!(index.script("falco_cannon", "game_attackairb").is_none(), "linked at {linked:?}");
+            assert!(!index.has_fighter("common"), "linked at {linked:?}");
+            assert!(index.conflicts.is_empty(), "linked at {linked:?}");
+        }
+    }
+
+    /// Empoleon installs Falco's agent narrowed to its own costumes, through a rebinding:
+    /// `let agent = agent.set_costume(…)`. Its scripts are Empoleon's slots', not Falco's own,
+    /// wherever the folder is linked — the gating is read from the crate root above it.
+    #[test]
+    fn a_costume_narrowed_agent_marks_its_fighter_costume_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]
+name = \"empoleon\"
+
+[lib]
+crate-type = [\"cdylib\"]
+",
+        );
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            r#"mod emperte;
+pub fn main() {
+    // let other = Agent::new("mario").set_costume(all.to_vec());
+    let agent_emperte = &mut Agent::new("falco");
+    let agent_emperte = agent_emperte.set_costume(costume.to_vec());
+    emperte::install(agent_emperte);
+    agent_emperte.install();
+    Agent::new("falco_cannon").install();
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/mod.rs",
+            r#"unsafe extern "C" fn game_attackairb(agent: &mut L2CAgentBase) {}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_attackairb", game_attackairb, Priority::Low);
+}
+"#,
+        );
+        for linked in ["", "src", "src/emperte"] {
+            let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
+            assert!(index.is_costume_gated("falco"), "linked at {linked:?}");
+            assert!(index.is_costume_gated("fighter_falco"), "attribute spelling");
+            assert!(!index.is_costume_gated("falco_cannon"), "linked at {linked:?}");
+            assert!(!index.is_costume_gated("mario"), "a commented-out line is not code");
+            assert!(index.script("falco", "game_attackairb").is_some(), "linked at {linked:?}");
+        }
+    }
+
+    #[test]
+    fn costume_gating_reads_chains_and_stays_inside_the_binding() {
+        let gating = scan_agent_gating(
+            r#"pub fn a() {
+    Agent::new("falco")
+        .set_costume(costume.to_vec())
+        .acmd("game_attack11", attack11, Priority::Low)
+        .install();
+}
+pub fn b() {
+    let agent = &mut Agent::new("mario");
+    agent.install();
+}
+pub fn c() {
+    let agent = &mut Agent::new("luigi");
+    agent.set_costume(slots);
+    agent.install();
+}
+pub fn d() -> Agent { Agent::new("pikachu").set_costume(slots) }
+pub fn e() { let x = Agent::new("common"); x.set_costume(slots); }
+"#,
+        );
+        assert_eq!(
+            gating,
+            vec![
+                ("falco".to_string(), true),
+                ("mario".to_string(), false),
+                ("luigi".to_string(), true),
+                ("pikachu".to_string(), true),
+            ]
+        );
+    }
+
+    /// One agent for every costume beside a narrowed one modifies the fighter's own slots too.
+    #[test]
+    fn an_ungated_agent_beside_a_gated_one_is_not_costume_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "acmd.rs",
+            r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco").set_costume(slots).acmd("game_attack11", game_attack11, Priority::Low).install();
+    Agent::new("falco").on_start(start).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert!(!index.is_costume_gated("falco"));
     }
 
     /// A project whose functions are named for the mod, not the script, has to read the same
@@ -9638,6 +13928,105 @@ unsafe extern "C" fn my_custom_name(agent: &mut L2CAgentBase) {
         assert_eq!(sites.len(), 1, "found {sites:?}");
         assert_eq!(sites[0].name, "EFFECT");
         assert_eq!(sites[0].arg(text, 1), Some("4"));
+    }
+
+    /// Shy Guy's forward smash, shape for shape: a retired `EFFECT_FOLLOW` and a whole trail
+    /// block left as `//` lines between live calls. The parser used to read both as calls, so
+    /// the editor drew seven effects and every edit after the comments matched the wrong site.
+    const COMMENTED_EFFECT_SOURCE: &str = r#"unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_smash_flash"), Hash40::new("top"), 12, 10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+    }
+    frame(agent.lua_state_agent, 17.0);
+    if macros::is_excute(agent) {
+        // Dedede's hammer arc.
+        macros::EFFECT(agent, Hash40::new("shyguy_mace_arc_wind"), Hash40::new("top"), 2, 4, 10, 0, -60, -115, 0.85, 0, 0, 0, 0, 0, 0, true);
+        // macros::EFFECT_FOLLOW(agent, Hash40::new("shyguy_mace_arc_wind"), Hash40::new("haver"), 2, 4, 10, 0, -60, -115, 0.85, true);
+    }
+    // frame(agent.lua_state_agent, 15.0);
+    // if macros::is_excute(agent) {
+    //     let (ball, z) = if is_facing_left(agent.module_accessor) {
+    //         (Hash40::new("center_boner"), 3.0)
+    //     } else {
+    //         (Hash40::new("center_bonel"), -3.0)
+    //     };
+    //     macros::AFTER_IMAGE4_ON_arg29(agent, Hash40::new("tex_shyguy_hammer"), Hash40::new("tex_shyguy_cutlass2"), 10, ball, 0, 3.0, -z, ball, 0, -3.0, z, true, Hash40::new("null"), ball, 0, 0, 0, 0, 0, 0, 1, 0, *EFFECT_AXIS_X, 0, *TRAIL_BLEND_ALPHA, 101, *TRAIL_CULL_NONE, 1.4, 0.2);
+    // }
+    frame(agent.lua_state_agent, 20.0);
+    if macros::is_excute(agent) {
+        macros::LANDING_EFFECT(agent, Hash40::new("sys_h_smoke_b"), Hash40::new("top"), 0, 0, -7.0, 0, 0, 0, 0.7, 0, 0, 0, 0, 0, 0, true);
+        // // Stop adding to it before the spin flips it
+        // macros::AFTER_IMAGE_OFF(agent, 10);
+        /* macros::EFFECT(agent, Hash40::new("sys_block_comment"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true); */
+        /*
+        macros::EFFECT(agent, Hash40::new("sys_spanning_comment"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+        if x {
+        */
+    }
+    frame(agent.lua_state_agent, 21.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 11.6, 28.4, 90, 0, 0, 1.95, 0, 0, 0, 0, 0, 0, true);
+    }
+    frame(agent.lua_state_agent, 24.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_DETACH_KIND(agent, Hash40::new("shyguy_mace_arc_wind"), -1);
+    }
+}
+"#;
+
+    #[test]
+    fn commented_out_effect_calls_are_not_read_as_calls() {
+        let calls = crate::acmd::parse_effect_script(COMMENTED_EFFECT_SOURCE).to_effect_calls();
+        let names: Vec<&str> = calls.iter().map(|call| call.effect_name.as_str()).collect();
+        assert_eq!(calls.len(), 5, "{names:?}");
+        assert!(!names.contains(&"tex_shyguy_hammer"), "{names:?}");
+        assert!(!names.contains(&"sys_block_comment"), "{names:?}");
+        assert!(!names.contains(&"sys_spanning_comment"), "{names:?}");
+        let arcs: Vec<_> = calls
+            .iter()
+            .filter(|call| call.effect_name == "shyguy_mace_arc_wind" && call.active_start == 17)
+            .collect();
+        assert_eq!(arcs.len(), 1, "{calls:#?}");
+        assert!(!arcs[0].follows_bone, "the live arc is the plain EFFECT, not the comment");
+        // The structure still closes: the impact lands at its own frame.
+        let impact = calls
+            .iter()
+            .find(|call| call.effect_name == "sys_attack_impact")
+            .expect("impact parsed");
+        assert_eq!(impact.active_start, 21);
+    }
+
+    #[test]
+    fn an_edit_after_commented_calls_lands_on_its_own_line() {
+        let source = COMMENTED_EFFECT_SOURCE;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        let mut edited = pristine.clone();
+        let impact = edited
+            .iter()
+            .position(|call| call.effect_name == "sys_attack_impact")
+            .expect("impact parsed");
+        edited[impact].offset[1] = 12.5;
+
+        let (after, report) =
+            rewrite_effect_calls(source, "pacman/attack_s4_s", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert!(
+            after.contains(r#"Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 12.5, 28.4,"#),
+            "{after}"
+        );
+        // Everything else, comments included, is untouched.
+        let changed: Vec<_> = source
+            .lines()
+            .zip(after.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:#?}");
+        let reparsed = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert_eq!(
+            effect_call_set_signature(&reparsed),
+            effect_call_set_signature(&edited)
+        );
     }
 
     #[test]
@@ -10465,8 +14854,10 @@ visionary_set_speed(agent, 9, 10);
         );
     }
 
+    /// A spawn added between two `wait` points lands on its own frame: the wait is split around
+    /// it, so the later spawn still runs on the frame it did.
     #[test]
-    fn adding_an_effect_between_wait_points_is_refused_before_it_can_rewind_timeline() {
+    fn adding_an_effect_between_wait_points_splits_the_wait() {
         let text = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if macros::is_excute(agent) {
@@ -10489,17 +14880,14 @@ visionary_set_speed(agent, 9, 10);
         edited.push(added);
 
         let (updated, report) = rewrite_effect_calls(text, "test", &pristine, &edited).unwrap();
-        assert_eq!(
-            updated, text,
-            "a wait cannot safely be split by a new frame block"
-        );
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|message| message.contains("wait")),
-            "the unsafe insertion must be explained: {report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}
+{updated}");
+        assert_eq!(updated.matches("wait(agent.lua_state_agent, 1.0);").count(), 2, "{updated}");
+        let calls = crate::acmd::parse_effect_script(&updated).to_effect_calls();
+        let frame_of = |name: &str| calls.iter().find(|c| c.effect_name == name).map(|c| c.active_start);
+        assert_eq!(frame_of("sys_first"), Some(5));
+        assert_eq!(frame_of("sys_between"), Some(6));
+        assert_eq!(frame_of("sys_second"), Some(7));
     }
 
     #[test]
@@ -12060,7 +16448,7 @@ pub fn install(agent: &mut smashline::Agent) {
     }
 
     #[test]
-    fn effect_timing_moves_refuse_nonflat_blocks_collisions_and_unrelated_lines() {
+    fn effect_timing_moves_refuse_branches_and_loops_but_move_a_spawn_on_its_own() {
         let branch = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 {
@@ -12118,16 +16506,14 @@ pub fn install(agent: &mut smashline::Agent) {
         let pristine = crate::acmd::parse_effect_script(collision).to_effect_calls();
         let mut edited = pristine.clone();
         edited[0].active_start = 10;
+        // A frame that already has a block is no longer a refusal: the line mover appends the
+        // spawn to it, after what that frame already spawns.
         let (after, report) =
             rewrite_effect_calls(collision, "collision", &pristine, &edited).unwrap();
-        assert_eq!(after, collision);
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|note| note.contains("occupied frame block")),
-            "{report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let moved = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert!(moved.iter().all(|call| call.active_start == 10), "{after}");
+        assert!(after.find("sys_late") < after.find("sys_attack"), "{after}");
 
         let unrelated = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
@@ -12141,15 +16527,13 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(pristine.len(), 1);
         let mut edited = pristine.clone();
         edited[0].active_start = 8;
+        // The spawn moves on its own; the unrelated line keeps the frame it runs on.
         let (after, report) =
             rewrite_effect_calls(unrelated, "unrelated", &pristine, &edited).unwrap();
-        assert_eq!(after, unrelated);
-        assert!(
-            report.skipped.iter().any(|note| {
-                note.contains("unrelated source lines") || note.contains("opaque source statement")
-            }),
-            "{report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let frame_eight = after.find("frame(agent.lua_state_agent, 8.0);").expect("a frame-8 block");
+        assert!(after.find("COL_PRI").unwrap() < frame_eight, "{after}");
+        assert!(after.find("sys_attack").unwrap() > frame_eight, "{after}");
     }
 
     #[test]
@@ -12312,9 +16696,10 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(after, text.replace("10.0, 361", "12.5, 361"));
     }
 
-    /// A hitbox's frames are the block it sits in, not arguments of its call.
+    /// A hitbox's frames are the block it sits in, not arguments of its call: a retime moves
+    /// the call to the block on its new frame, carrying the values edited with it.
     #[test]
-    fn retiming_a_hitbox_is_reported_rather_than_written() {
+    fn retiming_a_hitbox_moves_its_call_with_its_new_values() {
         let text = r#"unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if macros::is_excute(agent) {
@@ -12328,10 +16713,25 @@ pub fn install(agent: &mut smashline::Agent) {
         edited[0].damage = 12.0;
 
         let (after, report) = rewrite_hitboxes(text, "t", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let moved = crate::acmd::parse_acmd_script(&after).to_hitboxes();
+        assert_eq!((moved[0].active_start, moved[0].damage), (9, 12.0), "{after}");
+        assert!(after.contains("frame(agent.lua_state_agent, 9.0);"), "{after}");
+
+        // Timing that runs through a loop is not restructured: the retime is reported, and the
+        // damage it was bundled with still lands.
+        let looped = text
+            .replace("    frame(agent.lua_state_agent, 5.0);\n", "    for _ in 0..2 {\n    wait(agent.lua_state_agent, 5.0);\n")
+            .replace("    }\n}\n", "    }\n    }\n}\n");
+        let pristine = crate::acmd::parse_acmd_script(&looped).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].active_start += 1;
+        edited[0].damage = 12.0;
+        let (after, report) = rewrite_hitboxes(&looped, "t", &pristine, &edited).unwrap();
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].contains("retimed"), "{report:?}");
-        // The retime is refused, but the damage it was bundled with still lands.
+        assert!(report.skipped[0].contains("retimed") && report.skipped[0].contains("loop"), "{report:?}");
         assert!(after.contains("12.0, 361"), "{after}");
+        assert!(after.contains("wait(agent.lua_state_agent, 5.0);"), "{after}");
     }
 
     /// kirby/ThrowHi's `ATTACK_IGNORE_THROW`, which the archive writes without the capsule
@@ -14219,5 +18619,1294 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(after, text);
         assert!(report.skipped.iter().any(|note| note.contains("retimed")));
         assert_eq!(motion_module_set_helper_calculation_sites(text).len(), 1);
+    }
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A status registered on a chained `Agent::new`, whose body holds the article's motion. The
+    /// chain form is synthetic; the status body shape (`sv_kinetic_energy!` in a `Main` status) is
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/status.rs:49 (tier 1). The parameter-agent
+    /// layout King Boo really uses is `indexes_parameter_agent_status_through_install_module`.
+    #[test]
+    fn indexes_weapon_status_on_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "status.rs",
+            r#"unsafe extern "C" fn shoot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 1.5, 0.0);
+    0.into()
+}
+pub fn install() {
+    Agent::new("dedede_fireball").status(Main, *WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT, shoot_main).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let bodies = index.status_bodies("dedede_fireball");
+        assert_eq!(bodies.len(), 1, "{:?}", index.statuses);
+        let (site, body) = &bodies[0];
+        assert_eq!(site.phase, "Main");
+        assert_eq!(site.kind_expr, "*WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT");
+        assert_eq!(site.function, "shoot_main");
+        assert!(body.contains("sv_kinetic_energy!"), "{body}");
+    }
+
+    /// A bound agent, a function in another file reached by path, the long phase spelling and
+    /// `on_start`.
+    /// Shy-Guy-Moveset · plugin/src/shyguy/articles/trampoline/status/mod.rs:16 and mod.rs:46 (tier 1)
+    #[test]
+    fn indexes_bound_agent_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "jackbox.rs",
+            "pub unsafe extern \"C\" fn jackbox_main(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+",
+        );
+        put(
+            root,
+            "install.rs",
+            r#"unsafe extern "C" fn trampoline_start(weapon: &mut L2CWeaponCommon) {}
+unsafe extern "C" fn trampoline_init(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+pub fn install() {
+    let agent = &mut Agent::new("pacman_trampoline");
+    agent.status(Init, 0, trampoline_init);
+    agent.status(smashline::Main, *WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_JACKBOX, jackbox::jackbox_main);
+    agent.on_start(trampoline_start);
+    agent.install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let sites = &index.statuses["pacman_trampoline"];
+        assert_eq!(sites.len(), 3, "{sites:?}");
+        assert!(sites.iter().any(|s| s.phase == "Init" && s.kind_expr == "0" && s.function == "trampoline_init"));
+        assert!(sites.iter().any(|s| s.phase == "Main" && s.function == "jackbox_main"));
+        assert!(sites.iter().any(|s| s.phase == "Start" && s.kind_expr.is_empty()));
+        assert_eq!(index.status_bodies("pacman_trampoline").len(), 3);
+    }
+
+    /// King Boo's real layout: `mod.rs` builds the agent and hands it to `status::install(agent)`;
+    /// `status.rs` registers on the parameter. `start.rs` does the same with `on_start`.
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/mod.rs:5-11, status.rs:103-111;
+    /// weapon/portrait/start.rs:26 (tier 1)
+    #[test]
+    fn indexes_parameter_agent_status_through_install_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "weapon/fireball/mod.rs",
+            r#"mod status;
+mod start;
+pub fn install() {
+    let agent = &mut smashline::Agent::new("dedede_fireball");
+    status::install(agent);
+    start::install(agent);
+    agent.install();
+}
+"#,
+        );
+        put(
+            root,
+            "weapon/fireball/status.rs",
+            r#"unsafe extern "C" fn shoot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 1.5, 0.0);
+    0.into()
+}
+pub fn install(agent: &mut smashline::Agent) {
+    agent.status(Main, FIREBALL_STATUS_KIND_SHOOT, shoot_main);
+}
+"#,
+        );
+        put(
+            root,
+            "weapon/fireball/start.rs",
+            r#"unsafe extern "C" fn fireball_start(weapon: &mut L2CWeaponCommon) {}
+pub fn install(agent: &mut smashline::Agent) {
+    agent.on_start(fireball_start);
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let bodies = index.status_bodies("dedede_fireball");
+        assert_eq!(bodies.len(), 2, "{:?} / {:?}", index.statuses, index.unresolved_statuses);
+        assert!(bodies.iter().any(|(site, body)| site.phase == "Main" && body.contains("sv_kinetic_energy!")));
+        assert!(bodies.iter().any(|(site, _)| site.phase == "Start" && site.function == "fireball_start"));
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+    }
+
+    /// King-Boo-Moveset · src/kingteresa/mod.rs:47-52 hands `Agent::new("dedede")` to
+    /// `status::install(agent)`, and src/kingteresa/status/status_catched_portrait.rs:75 in that
+    /// module builds `Agent::new("fighter")` for a status every fighter gets (tier 1, smashline2).
+    /// The module's parameter registrations are still dedede's; the generic agent keeps its own.
+    #[test]
+    fn a_generic_fighter_agent_does_not_claim_the_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "kingteresa/mod.rs",
+            "mod status;\npub fn do_install() {\n    let agent = &mut smashline::Agent::new(\"dedede\");\n    status::install(agent);\n    agent.install();\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/mod.rs",
+            "mod status_attack_air;\nmod status_catched_portrait;\npub fn install(agent: &mut smashline::Agent) {\n    status_attack_air::install(agent);\n    status_catched_portrait::install(agent);\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/status_attack_air.rs",
+            "unsafe extern \"C\" fn kingteresa_attack_air_status_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(agent: &mut smashline::Agent) {\n    agent.status(Pre, *FIGHTER_STATUS_KIND_ATTACK_AIR, kingteresa_attack_air_status_pre);\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/status_catched_portrait.rs",
+            "unsafe extern \"C\" fn catched_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(_agent: &mut smashline::Agent) {\n    Agent::new(\"fighter\")\n        .status(Pre, FIGHTER_STATUS_KIND_CATCHED_KINGTERESA_PORTRAIT, catched_pre)\n        .install();\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        let dedede = index.status_bodies("dedede");
+        assert_eq!(dedede.len(), 1, "{:?}", index.statuses);
+        assert_eq!(dedede[0].0.function, "kingteresa_attack_air_status_pre");
+        assert_eq!(index.status_bodies("fighter")[0].0.function, "catched_pre");
+    }
+
+    /// Sceptile-Moveset · plugin/src/sceptile/articles/bullet_seed/status/mod.rs:19 registers
+    /// `.status(End, *WEAPON_SIMON_AXE_STATUS_KIND_FLY, fly::bullet_seed_end)`, and
+    /// `bullet_seed_end` is defined both in `status/fly.rs:248` and in `bullet_seed/mod.rs:24`
+    /// (tier 1, smashline2). The path names the one in `fly`.
+    #[test]
+    fn a_module_path_picks_the_function_in_that_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "bullet_seed/mod.rs",
+            "mod status;\nunsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) {}\n",
+        );
+        put(
+            root,
+            "bullet_seed/status/mod.rs",
+            "mod fly;\npub fn install() {\n    Agent::new(\"mario_bulletseed\")\n        .status(End,  *WEAPON_SIMON_AXE_STATUS_KIND_FLY, fly::bullet_seed_end)\n        .install();\n}\n",
+        );
+        put(
+            root,
+            "bullet_seed/status/fly.rs",
+            "pub(super) unsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        let bodies = index.status_bodies("mario_bulletseed");
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].0.file.ends_with("fly.rs"), "{:?}", bodies[0].0.file);
+        assert!(bodies[0].1.contains("-> L2CValue"));
+    }
+
+    /// I-3: a path that names no module beside the registering file still finds a function
+    /// defined once: `super::status::f`, and a `pub use` re-export.
+    #[test]
+    fn a_path_naming_no_module_beside_the_file_keeps_the_unique_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "orb/mod.rs", "mod status;\nmod install;\n");
+        put(
+            root,
+            "orb/status.rs",
+            "pub unsafe extern \"C\" fn orb_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
+        );
+        put(
+            root,
+            "orb/install.rs",
+            "pub fn install() {\n    Agent::new(\"mario_orb\")\n        .status(Main, *WEAPON_KIND_X, super::status::orb_main)\n        .install();\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert_eq!(index.status_bodies("mario_orb").len(), 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "shot/mod.rs", "mod imp;\nmod fly { pub use super::imp::shot_main; }\npub fn install() {\n    Agent::new(\"mario_shot\").status(Main, 0, fly::shot_main).install();\n}\n");
+        put(root, "shot/imp.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n");
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(index.status_bodies("mario_shot")[0].1.contains("shot_main"));
+
+        // Defined twice and the path names neither: refused, with a reason that says so.
+        put(root, "shot/other.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    1.into()\n}\n");
+        let index = SourceIndex::build(root).unwrap();
+        let reason = &index.unresolved_statuses[0].reason;
+        assert!(reason.contains("defined in 2 places") && reason.contains("path doesn't say which"), "{reason}");
+    }
+
+    /// Sceptile-Moveset · plugin/src/common/util.rs:1187-1191 defines `noop_status!` as
+    /// `$( $agent.status($phase, $kind, $crate::empty_status_weapon); )+` (tier 1, smashline2).
+    /// The template is not a registration; each invocation is listed as a no-op.
+    #[test]
+    fn a_macro_rules_body_is_not_a_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "util.rs",
+            "#[macro_export]\nmacro_rules! noop_status {\n    ($agent:expr, $kind:expr, [$($phase:expr),+ $(,)?]) => {\n        $( $agent.status($phase, $kind, $crate::empty_status_weapon); )+\n    };\n}\npub fn install() {\n    let agent = &mut Agent::new(\"mario_bulletseed\");\n    noop_status!(agent, *WEAPON_SIMON_AXE_STATUS_KIND_HAVED, [Pre, Main]);\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let unresolved = &index.unresolved_statuses;
+        assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+        assert!(unresolved.iter().all(|u| u.reason.contains("noop_status!") && u.kind_expr.starts_with('*')));
+    }
+
+    /// Closures, `noop_status!` (Shy Guy has eight) and a parameter nobody installs are not
+    /// sites, but they are listed with a reason rather than dropped.
+    /// Shy-Guy-Moveset · plugin/src/shyguy/articles/trampoline/status/mod.rs:13-14 (tier 1)
+    #[test]
+    fn indexes_unresolved_statuses_are_listed_with_reasons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "tramp/install.rs",
+            r#"pub fn install() {
+    let agent = &mut Agent::new("pacman_trampoline");
+    noop_status!(agent, *WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_START, [Pre, Main, End]);
+    agent.status(Main, 0, |weapon| 0.into());
+    agent.status(End, 0, missing_function);
+}
+"#,
+        );
+        put(
+            root,
+            "orphan.rs",
+            "pub fn install(agent: &mut Agent) {\n    agent.status(Main, 1, orphan_main);\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let unresolved = &index.unresolved_statuses;
+        let noops = unresolved.iter().filter(|u| u.reason.contains("noop_status!")).collect::<Vec<_>>();
+        assert_eq!(noops.len(), 3, "{unresolved:?}");
+        assert!(noops.iter().all(|u| u.agent_hint.as_deref() == Some("pacman_trampoline")));
+        assert!(unresolved.iter().any(|u| u.reason.contains("closure") && u.phase == "Main" && u.line == 4));
+        assert!(unresolved.iter().any(|u| u.reason.contains("not defined") && u.phase == "End"));
+        assert!(unresolved.iter().any(|u| u.kind_expr == "1" && u.reason.contains("parameter")), "{unresolved:?}");
+        assert!(index.statuses.is_empty(), "{:?}", index.statuses);
+    }
+
+    /// The fighter's own status registrations never leak onto its article, or the reverse.
+    #[test]
+    fn indexes_fighter_status_not_on_article() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "status.rs",
+            r#"unsafe extern "C" fn fighter_main(fighter: &mut L2CFighterCommon) -> L2CValue { 0.into() }
+unsafe extern "C" fn article_main(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+pub fn install() {
+    Agent::new("pacman").status(Main, *FIGHTER_STATUS_KIND_ATTACK, fighter_main).install();
+    Agent::new("pacman_trampoline").status(Main, 0, article_main).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let article = &index.statuses["pacman_trampoline"];
+        assert_eq!(article.len(), 1);
+        assert_eq!(article[0].function, "article_main");
+        let fighter = &index.statuses["pacman"];
+        assert_eq!(fighter.len(), 1);
+        assert_eq!(fighter[0].function, "fighter_main");
+    }
+}
+
+/// Layouts and spellings taken from real movesets (see `moveset_survey`), each of which the
+/// indexer or the write-back used to get wrong.
+#[cfg(test)]
+mod moveset_layout_tests {
+    use super::*;
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Empoleon (over Falco): one folder registers the fighter and two of its articles, each on
+    /// its own `Agent::new` chain. The folder naming several agents used to drop every script
+    /// in it, so the whole moveset read as vanilla Falco from the mirror.
+    #[test]
+    fn chained_registrations_attribute_each_script_to_its_own_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n");
+        put(root, "src/lib.rs", "mod emperte;\n");
+        put(root, "src/emperte/mod.rs", "mod acmd;\npub fn install() { acmd::install(); }\n");
+        put(root, "src/emperte/acmd/mod.rs", "mod normals;\nmod specials;\npub fn install() { normals::install(); specials::install(); }\n");
+        put(
+            root,
+            "src/emperte/acmd/normals.rs",
+            r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco")
+    .set_costume(costume.to_vec())
+    .acmd("game_attack11", game_attack11, Priority::Default)
+    .install();
+}
+"#,
+        );
+        put(
+            root,
+            "src/emperte/acmd/specials.rs",
+            r#"unsafe extern "C" fn game_specialsstart(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn game_fly(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn ava_game_regular(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco")
+    .acmd("game_specialsstart", game_specialsstart, Priority::Default)
+    .acmd("game_specialairsstart", game_specialsstart, Priority::Default)
+    .install();
+
+    Agent::new("falco_cannon")
+    .acmd("game_fly", game_fly, Priority::Default)
+    .install();
+
+    let ava = &mut Agent::new("FALCO_ava");
+    ava.game_acmd("game_regular", ava_game_regular, Priority::Default);
+    ava.install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        for script in ["game_attack11", "game_specialsstart", "game_specialairsstart"] {
+            assert!(index.script("falco", script).is_some(), "falco/{script}: {:?}", index.fighters.keys());
+        }
+        assert!(index.script("falco_cannon", "game_fly").is_some());
+        assert!(index.script("falco", "game_fly").is_none(), "an article script is not the fighter's");
+        assert!(index.script("falco_ava", "game_regular").is_some());
+        assert_eq!(index.conflict_count(), 0, "{:?}", index.conflicts);
+
+        // A move it leaves vanilla, and a fighter it is not for, say which.
+        let other = index.why_no_script("mario", "attack_11");
+        assert!(other.contains("no `mario` scripts") && other.contains("falco"), "{other}");
+        let unmodded = index.why_no_script("falco", "attack_lw4");
+        assert!(unmodded.contains("does not define falco/attack_lw4"), "{unmodded}");
+    }
+
+    /// Two agents registering the same script name in one file are two scripts, not a
+    /// replacement: smashline keys registrations by agent.
+    #[test]
+    fn same_script_on_two_agents_in_one_file_is_not_a_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "acmd.rs",
+            r#"unsafe extern "C" fn fly_a(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn fly_b(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco_blaster_bullet").acmd("game_fly", fly_a, Priority::Low).install();
+    Agent::new("falco_cannon").acmd("game_fly", fly_b, Priority::Low).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert_eq!(index.script("falco_blaster_bullet", "game_fly").map(|s| s.function.as_str()), Some("fly_a"));
+        assert_eq!(index.script("falco_cannon", "game_fly").map(|s| s.function.as_str()), Some("fly_b"));
+    }
+
+    /// Point `VISIONARY_PROBE_SOURCE` at a real project to see how it indexes:
+    /// `cargo test probe_linked_source -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn probe_linked_source() {
+        let Some(root) = std::env::var_os("VISIONARY_PROBE_SOURCE") else {
+            return;
+        };
+        //NOCARGO
+        let index = SourceIndex::build(Path::new(&root)).unwrap();
+        let mut fighters: Vec<_> = index.fighters.iter().map(|(name, f)| (name.clone(), f.scripts.len())).collect();
+        fighters.sort();
+        println!("{} scripts, {} conflicts", index.script_count(), index.conflict_count());
+        for (name, count) in fighters {
+            println!("  {name:?}: {count}");
+        }
+        for conflict in &index.conflicts {
+            println!("  conflict {}/{}", conflict.fighter, conflict.script);
+        }
+    }
+
+    const TILTS: &str = r#"use super::*;
+
+unsafe extern "C" fn game_attack_s3_kick(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("footl"), 8.0, 361, 100, 0, 40, 3.1, 1.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_KICK, *ATTACK_REGION_KICK);
+    }
+}
+
+unsafe extern "C" fn sound_attack_s3_kick(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, cmn!("punch_kick_swing_m"));
+        macros::PLAY_SE(agent, se!("special_n01"));
+    }
+}
+
+pub(super) fn install(agent: &mut Agent) {
+    agent
+        .game_acmd("game_attacks3hop", game_attack_s3_kick, Priority::Default)
+        .sound_acmd("sound_attacks3hop", sound_attack_s3_kick, Priority::Default);
+}
+"#;
+
+    /// Shy Guy's layout: one installer creates the fighter AND an article agent, hands each to a
+    /// submodule, keeps its sound macros in `common/`, and has an old copy of the source beside
+    /// the crate.
+    fn shy_guy_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "plugin/Cargo.toml", "[package]\nname = \"shyguy\"\n");
+        put(root, "plugin/src/lib.rs", "mod common;\nmod shyguy;\n");
+        put(
+            root,
+            "plugin/src/common/mod.rs",
+            "pub mod util;\n// Agent::new(\"fighter\") is how a common agent would look\n",
+        );
+        put(
+            root,
+            "plugin/src/common/util.rs",
+            r#"#[macro_export]
+macro_rules! fighter_se {
+    ($fighter:literal, $tone:literal) => {
+        smash::phx::Hash40::new(concat!("se_", $fighter, "_", $tone))
+    };
+}
+#[macro_export]
+macro_rules! cmn {
+    ($tone:literal) => { smash::phx::Hash40::new(concat!("se_common_", $tone)) };
+}
+"#,
+        );
+        put(
+            root,
+            "plugin/src/shyguy/mod.rs",
+            r#"macro_rules! se {
+    ($tone:literal) => { $crate::fighter_se!("pacman", $tone) };
+}
+mod articles;
+mod pacman;
+
+pub(crate) fn install() {
+    let pacman = &mut Agent::new("pacman");
+    pacman::install(pacman);
+    pacman.install();
+
+    let trampoline = &mut Agent::new("pacman_trampoline");
+    articles::trampoline::install(trampoline);
+    trampoline.install();
+}
+"#,
+        );
+        put(
+            root,
+            "plugin/src/shyguy/pacman/mod.rs",
+            "mod acmd;\npub(super) fn install(agent: &mut Agent) { acmd::install(agent); }\n",
+        );
+        put(
+            root,
+            "plugin/src/shyguy/pacman/acmd/mod.rs",
+            "mod tilts;\npub(super) fn install(agent: &mut Agent) { tilts::install(agent); }\n",
+        );
+        put(root, "plugin/src/shyguy/pacman/acmd/tilts.rs", TILTS);
+        put(root, "plugin/src/shyguy/articles/mod.rs", "pub mod trampoline;\n");
+        put(
+            root,
+            "plugin/src/shyguy/articles/trampoline/mod.rs",
+            r#"unsafe extern "C" fn game_shoot(agent: &mut L2CAgentBase) {}
+pub fn install(agent: &mut Agent) { agent.game_acmd("game_shoot", game_shoot, Priority::Low); }
+"#,
+        );
+        // Never compiled: no `mod` reaches it.
+        put(root, "plugin/srcOLD/shyguy/pacman/acmd/tilts.rs", TILTS);
+        tmp
+    }
+
+    #[test]
+    fn a_multi_agent_installer_attributes_each_submodule_to_the_agent_it_is_handed() {
+        let tmp = shy_guy_project();
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert!(index.conflicts.is_empty(), "{:?}", index.conflicts);
+        let mut fighters: Vec<_> = index.fighters.keys().cloned().collect();
+        fighters.sort();
+        assert_eq!(fighters, ["pacman", "pacman_trampoline"], "no `fighter` from a comment");
+        let game = index.script("pacman", "game_attacks3hop").expect("registered game script");
+        assert!(game.file.ends_with("plugin/src/shyguy/pacman/acmd/tilts.rs"), "{game:?}");
+        // `.sound_acmd(` registrations count, under the registered name.
+        assert!(index.script("pacman", "sound_attacks3hop").is_some());
+        assert!(index.script("pacman", "sound_attack_s3_kick").is_none());
+        assert!(index.script("pacman_trampoline", "game_shoot").is_some());
+        assert!(
+            !index.files.iter().any(|f| f.to_string_lossy().contains("srcOLD")),
+            "a backup copy outside the crate is not indexed"
+        );
+    }
+
+    #[test]
+    fn project_sound_macros_read_as_names_and_edits_keep_the_macro() {
+        let tmp = shy_guy_project();
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let project = index.script_source("pacman", "attacks3hop").unwrap();
+        assert!(
+            project.body.contains(r#"Hash40::new("se_common_punch_kick_swing_m")"#),
+            "{}",
+            project.body
+        );
+        let events = crate::acmd::parse_sound_script(&project.body).to_sound_events();
+        assert_eq!(events.len(), 2, "both macro-written sounds are typed");
+        assert_eq!(events[1].call.sounds, ["se_pacman_special_n01"]);
+
+        let mut edited = events.clone();
+        edited[1].call.sounds[0] = "se_pacman_special_n02".into();
+        edited[0].call.sounds[0] = "se_common_swing_01".into();
+        let file = tmp.path().join("plugin/src/shyguy/pacman/acmd/tilts.rs");
+        let site = index.script("pacman", "sound_attacks3hop").unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let body = &text[site.span.clone()];
+        let (after, report) =
+            rewrite_sounds_with(body, "t", &events, &edited, &index.hash_macros).unwrap();
+        assert_eq!(report.changed, 2, "{:?}", report.skipped);
+        assert!(after.contains(r#"macros::PLAY_SE(agent, se!("special_n02"));"#), "{after}");
+        assert!(after.contains(r#"macros::PLAY_SE(agent, cmn!("swing_01"));"#), "{after}");
+        assert!(!after.contains("Hash40::new(\"se_"), "no line was restyled: {after}");
+    }
+
+    /// A project that glob-imports smash_script's macros calls them bare. Reads see the calls,
+    /// and a value edit changes the value — the call stays bare.
+    #[test]
+    fn bare_macro_calls_are_read_and_edited_without_gaining_a_path() {
+        let source = r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 3.0);
+    if is_excute(agent) {
+        ATTACK(agent, 0, 0, Hash40::new("top"), 3.0, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+    wait(agent.lua_state_agent, 2.0);
+    if is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_acmd_script(source).to_hitboxes();
+        assert_eq!(pristine.len(), 1, "the bare ATTACK is read");
+        assert_eq!(pristine[0].active_start, 3);
+        let mut edited = pristine.clone();
+        edited[0].damage = 4.5;
+        let (after, report) = rewrite_hitboxes(source, "t", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{:?}", report.skipped);
+        assert!(
+            after.contains("        ATTACK(agent, 0, 0, Hash40::new(\"top\"), 4.5, 361"),
+            "{after}"
+        );
+        assert!(!after.contains("macros::"), "{after}");
+        assert_eq!(after.lines().count(), source.lines().count());
+    }
+
+    /// Bluster Kong registers `game_landingairhi` to `game_attackairhi` and leaves an unused
+    /// `fn game_landingairhi` behind; Sackboy registers `effect_fall` twice. Iron Man has an
+    /// ACMD `stub` and a status `stub` in different files.
+    #[test]
+    fn the_registered_function_is_the_script_not_a_namesake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "src/acmd.rs",
+            r#"unsafe extern "C" fn game_attackairhi(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn game_landingairhi(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn effect_fall(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn effect_burst(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn stub(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    let agent = &mut Agent::new("donkey");
+    agent.game_acmd("game_attackairhi", game_attackairhi, Priority::Default);
+    agent.game_acmd("game_landingairhi", game_attackairhi, Priority::Default);
+    agent.acmd("effect_fall", effect_fall, Priority::Default);
+    agent.acmd("effect_fall", effect_burst, Priority::Default);
+    agent.acmd("effect_appeallwr", stub, Priority::Default);
+}
+"#,
+        );
+        put(
+            root,
+            "src/status.rs",
+            "unsafe extern \"C\" fn stub(fighter: &mut L2CFighterCommon) -> L2CValue { 0.into() }\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.conflicts.is_empty(), "{:?}", index.conflicts);
+        assert_eq!(
+            index.script("donkey", "game_landingairhi").unwrap().function,
+            "game_attackairhi"
+        );
+        assert_eq!(index.script("donkey", "effect_fall").unwrap().function, "effect_burst");
+        assert!(index.script("donkey", "effect_appeallwr").unwrap().file.ends_with("acmd.rs"));
+    }
+
+    /// An inserted line takes the file's own spelling. In a project that glob-imports the
+    /// macros, names its agent `fighter`, indents with tabs and checks out with CRLF, a
+    /// canonical `macros::REVERSE_LR(agent);` would not compile and would mix line endings.
+    #[test]
+    fn inserted_lines_match_the_file_they_land_in() {
+        let mut text = "unsafe extern \"C\" fn game_x(fighter: &mut L2CAgentBase) {\r\n\tframe(fighter.lua_state_agent, 3);\r\n\tif is_excute(fighter) {\r\n\t\tATTACK(fighter, 0);\r\n\t}\r\n}\r\n".to_string();
+        assert!(insert_reverse_line(&mut text, 3));
+        assert!(insert_reverse_line(&mut text, 7));
+        assert!(text.contains("\t\tATTACK(fighter, 0);\r\n\t\tREVERSE_LR(fighter);\r\n\t}"), "{text:?}");
+        assert!(
+            text.contains("\tframe(fighter.lua_state_agent, 7);\r\n\tif is_excute(fighter) {\r\n\t\tREVERSE_LR(fighter);\r\n\t}\r\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("macros::") && !text.contains("agent)"), "{text:?}");
+        assert_eq!(text.matches('\n').count(), text.matches("\r\n").count(), "no bare LF");
+        // And the line it wrote is recognised as the one to take back out.
+        let line = text.lines().find(|l| l.contains("REVERSE_LR")).unwrap().trim();
+        assert!(is_lone_agent_call(line, "REVERSE_LR"));
+    }
+
+    /// Amy, Captain America and others name the agent `fighter`. Its calls are the agent's own
+    /// and are typed; a call on some other object stays raw, as it always did.
+    #[test]
+    fn a_fighter_named_agent_is_still_the_agent() {
+        let source = "unsafe extern \"C\" fn game_x(fighter: &mut L2CAgentBase) {\n    frame(fighter.lua_state_agent, 2.0);\n    macros::FT_MOTION_RATE(fighter, 0.5);\n    frame(fighter.lua_state_agent, 6.0);\n    if macros::is_excute(fighter) {\n        macros::SET_AIR(fighter);\n        macros::SET_AIR(other);\n    }\n}\n";
+        let script = crate::acmd::parse_acmd_script(source);
+        assert!(
+            script.stmts.iter().any(|s| matches!(s, crate::data::AcmdStmt::MotionRate(r) if *r == 0.5)),
+            "{:?}",
+            script.stmts
+        );
+        assert_eq!(script.to_set_air_events().len(), 1, "only the fighter's own SET_AIR");
+        // Outside any scope, the name means nothing special again.
+        assert!(!crate::acmd::is_agent_arg("fighter"));
+    }
+
+    /// A hitbox tuned through named constants — Shy Guy's walk kick keeps its numbers in
+    /// `const`s — reads as a hitbox, and an edit changes the constant where it is defined.
+    #[test]
+    fn a_value_written_as_a_const_is_edited_at_its_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod mario;\n");
+        put(
+            root,
+            "src/mario/mod.rs",
+            "mod acmd;\nmod params;\npub fn install() { let agent = &mut Agent::new(\"mario\"); acmd::install(agent); }\n",
+        );
+        put(root, "src/mario/params.rs", "pub const JAB_DAMAGE:   f32 = 3.0;\npub const JAB_ID: i32 = 0;\n");
+        let acmd = "use super::params::*;\nunsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK(agent, JAB_ID as u64, 0, Hash40::new(\"top\"), JAB_DAMAGE, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);\n    }\n}\npub fn install(agent: &mut Agent) { agent.game_acmd(\"game_attack11\", game_attack11, Priority::Default); }\n";
+        put(root, "src/mario/acmd.rs", acmd);
+        let index = SourceIndex::build(root).unwrap();
+        let body = index.script_source("mario", "attack11").unwrap().body;
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        assert_eq!(pristine.len(), 1, "{body}");
+        assert_eq!(pristine[0].damage, 3.0);
+        let mut edited = pristine.clone();
+        edited[0].damage = 4.5;
+        let report = sync_hitboxes(&index, "mario", "attack11", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{:?}", report.skipped);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/mario/params.rs")).unwrap(),
+            "pub const JAB_DAMAGE:   f32 = 4.5;\npub const JAB_ID: i32 = 0;\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap(), acmd, "the call keeps its name");
+        assert!(report.skipped.iter().any(|note| note.contains("JAB_DAMAGE is a constant")), "{:?}", report.skipped);
+    }
+
+    /// Shy Guy's `RUMBLE_HIT(agent, kind)` helper stands for `RUMBLE_HIT(agent, kind, 0)`. The
+    /// helper call reads as that rumble, a vanilla-shaped call beside it keeps its own number,
+    /// an edited kind keeps the author's `rb!`, and the helper's fixed `0` is not writable here.
+    #[test]
+    fn a_project_helper_call_is_read_and_edited_through_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod common;\nmod mario;\n");
+        put(
+            root,
+            "src/common.rs",
+            "pub unsafe fn RUMBLE_HIT(agent: &mut L2CAgentBase, kind: Hash40) {\n    smash_script::macros::RUMBLE_HIT(agent, kind, 0);\n}\nmacro_rules! rb {\n    ($kind:literal) => { smash::phx::Hash40::new(concat!(\"rbkind_\", $kind)) };\n}\n",
+        );
+        put(root, "src/mario/mod.rs", "mod acmd;\npub fn install() { let agent = &mut Agent::new(\"mario\"); acmd::install(agent); }\n");
+        let acmd = "unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {\n        macros::RUMBLE_HIT(agent, rb!(\"attackm\"));\n        macros::RUMBLE_HIT(agent, Hash40::new(\"rbkind_attacks\"), 0);\n    }\n}\npub fn install(agent: &mut Agent) { agent.expression_acmd(\"expression_attack11\", expression_attack11, Priority::Default); }\n";
+        put(root, "src/mario/acmd.rs", acmd);
+        let index = SourceIndex::build(root).unwrap();
+        let body = index.script_source("mario", "attack11").unwrap().body;
+        let events = crate::acmd::parse_expression_script(&body).to_expression_events();
+        assert_eq!(events.len(), 2, "{body}");
+        assert_eq!(
+            events[0].call,
+            crate::data::ExpressionCall::RumbleHit {
+                kind: "Hash40::new(\"rbkind_attackm\")".into(),
+                unk: "0".into()
+            }
+        );
+
+        // Retune both kinds and the helper's hidden argument.
+        let mut edited = events.clone();
+        edited[0].call = crate::data::ExpressionCall::RumbleHit {
+            kind: "Hash40::new(\"rbkind_attackl\")".into(),
+            unk: "4".into(),
+        };
+        edited[1].call = crate::data::ExpressionCall::RumbleHit {
+            kind: "Hash40::new(\"rbkind_attackll\")".into(),
+            unk: "0".into(),
+        };
+        let report = sync_expressions(&index, "mario", "attack11", &events, &edited).unwrap();
+        let written = std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap();
+        assert!(written.contains("        macros::RUMBLE_HIT(agent, rb!(\"attackl\"));\n"), "{written}");
+        assert!(
+            written.contains("        macros::RUMBLE_HIT(agent, Hash40::new(\"rbkind_attackll\"), 0);\n"),
+            "the vanilla-shaped call is the second site, not the first: {written}"
+        );
+        assert!(
+            report.skipped.iter().any(|note| note.contains("helper")),
+            "the fixed argument is refused with a reason: {:?}",
+            report.skipped
+        );
+    }
+
+    #[test]
+    fn a_block_written_on_one_line_parses_instead_of_panicking() {
+        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) { macros::ATTACK(agent, 0, 0, Hash40::new("top"), 3.0, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH); }
+    if foo(&Vector2f{x: 1.0, y: 0.0}) {
+        bar();
+    }
+    frame(agent.lua_state_agent, 9.0);
+}
+"#;
+        let script = crate::acmd::parse_acmd_script(source);
+        assert_eq!(script.to_hitboxes().len(), 1);
+        assert_eq!(script.to_hitboxes()[0].active_start, 4);
+        let effect = source.replace("game_x", "effect_x");
+        let _ = crate::acmd::parse_effect_script(&effect);
+    }
+}
+
+#[cfg(test)]
+mod rewrite_article_tests {
+    use super::*;
+    use crate::data::{ArticleCall, ArticleTarget};
+
+    /// A charge-shot spawn and its shoot, each in its own frame block, in the shape the vanilla
+    /// dump and the corpus write them (`samus/game_specialn`).
+    const SPECIAL_N: &str = "unsafe extern \"C\" fn game_specialn(agent: &mut L2CAgentBase) {\n\
+        \x20   frame(agent.lua_state_agent, 10.0);\n\
+        \x20   if macros::is_excute(agent) {\n\
+        \x20       ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n\
+        \x20   }\n\
+        \x20   frame(agent.lua_state_agent, 20.0);\n\
+        \x20   if macros::is_excute(agent) {\n\
+        \x20       ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);\n\
+        \x20   }\n\
+        }\n";
+
+    fn calls(text: &str) -> Vec<(u32, ArticleCall)> {
+        crate::acmd::parse_acmd_script(text).to_article_calls()
+    }
+
+    fn rewrite(text: &str, edit: impl FnOnce(&mut Vec<(u32, ArticleCall)>)) -> (String, SyncReport) {
+        let pristine = calls(text);
+        let mut edited = pristine.clone();
+        edit(&mut edited);
+        rewrite_article_calls(text, "samus/specialn", &pristine, &edited).unwrap()
+    }
+
+    #[test]
+    fn edits_target_only() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| {
+            assert_eq!(calls.len(), 2, "{calls:#?}");
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        assert_eq!(report.changed, 1);
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(calls(&out)[1].1.target, ArticleTarget::All);
+    }
+
+    /// A bare `*ARTICLE_OPE_TARGET_X` is the timeline's canonical form wrapped; the file keeps
+    /// its own bare spelling, and compact commas stay compact, because only the target's bytes
+    /// are replaced.
+    #[test]
+    fn edits_keep_the_file_spelling() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::shoot(agent.module_accessor,*FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT,*ARTICLE_OPE_TARGET_LAST,false);",
+        );
+        let (out, report) = rewrite(&text, |calls| {
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, text.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        // The receiver path, the binding and an argument edit.
+        let text = SPECIAL_N.replace(
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+            "let id = smash::app::lua_bind::ArticleModule::generate_article(boma,  *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+        );
+        let (out, report) = rewrite(&text, |calls| {
+            calls[0].1.args[0] = "true".into();
+            calls[0].1.edited = true;
+        });
+        assert_eq!(out, text.replace("CSHOT, false, -1", "CSHOT, true, -1"), "{report:?}");
+    }
+
+    /// The only call in its frame block: the block is retimed and placed in frame order, the way
+    /// effect blocks move.
+    #[test]
+    fn moves_spawn_to_new_frame() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| calls[0].0 = 14);
+        assert_eq!(out, SPECIAL_N.replace("10.0", "14.0"), "{report:?}");
+        assert!(out.contains("frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article("));
+        assert_eq!(calls(&out)[0].0, 14);
+        assert_eq!(report.changed, 1);
+
+        // Past the shoot: the block lands after frame 20, so the calls swap order.
+        let (out, report) = rewrite(SPECIAL_N, |calls| calls[0].0 = 25);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out}\n{report:?}");
+        assert_eq!(moved[1].1.op, crate::data::ArticleOp::Generate);
+        assert_eq!(out.len(), SPECIAL_N.len());
+    }
+
+    /// A call sharing its block moves alone: into the target frame's block when there is one,
+    /// else into a new block built like the one it left.
+    #[test]
+    fn moves_one_line_between_blocks() {
+        let shared = SPECIAL_N.replace(
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n",
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n        macros::ATTACK(agent, 0, 0, Hash40::new(\"top\"), 1.0, 361, 100, 0, 0, 3.0, 0.0, 8.0, 8.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_NONE);\n",
+        );
+        // Into frame 20's existing block, after its own call.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 20);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 20), "{out}\n{report:?}");
+        assert_eq!(moved[1].1.op, crate::data::ArticleOp::Generate);
+        assert!(out.contains("frame(agent.lua_state_agent, 10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        // Into a new frame 14 block.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 14);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (14, 20), "{out}\n{report:?}");
+        assert!(out.contains("    }\n    frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n    }\n    frame(agent.lua_state_agent, 20.0);"), "{out}");
+        assert!(out.contains("10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        assert_eq!(crate::acmd::parse_acmd_script(&out).to_hitboxes().len(), 1);
+        // Earlier than the block it leaves: the new block goes before that block's frame line.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 5);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (5, 20), "{out}\n{report:?}");
+        let (five, ten) = (out.find("5.0);").unwrap(), out.find("10.0);").unwrap());
+        assert!(five < ten, "{out}");
+    }
+
+    /// Comments, a `let` binding and an `if` condition around the calls: the statements are
+    /// counted as the parser types them.
+    #[test]
+    fn statement_sites_skip_comments_and_conditions() {
+        let text = SPECIAL_N
+            .replace(
+                "        ArticleModule::generate_article(",
+                "        // spawn the shot\n        /* charged */ \n        ArticleModule::generate_article(",
+            )
+            .replace(
+                "    frame(agent.lua_state_agent, 20.0);\n",
+                "    frame(agent.lua_state_agent, 20.0); // fire\n",
+            );
+        let sites = article_call_sites(&text);
+        assert_eq!(sites.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["generate_article", "shoot"]);
+        let condition = "    if ArticleModule::is_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT) {\n    }\n";
+        let with_condition = format!("{}{condition}}}\n", &SPECIAL_N[..SPECIAL_N.len() - 2]);
+        assert_eq!(article_call_sites(&with_condition).len(), 2, "{with_condition}");
+        assert_eq!(calls(&with_condition).len(), 2);
+        let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
+        assert_eq!(out, text.replace("10.0", "14.0"), "{report:?}");
+    }
+
+    #[test]
+    fn count_mismatch_skips_with_reason() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[1].1.target = ArticleTarget::All;
+        // A third call the editor does not model by position (inside a condition).
+        let text = SPECIAL_N.replace(
+            "    frame(agent.lua_state_agent, 20.0);\n",
+            "    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_SAMUS_STATUS_SPECIAL_N_FLAG_CHARGE) {\n        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));\n    }\n    frame(agent.lua_state_agent, 20.0);\n",
+        );
+        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!(out, text);
+        assert_eq!(report.changed, 0);
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].contains("3 `ArticleModule` call(s)"), "{report:?}");
+        assert!(report.skipped[0].contains("models 2"), "{report:?}");
+
+        // Added or removed calls are structural too.
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited[..1]).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("added or removed"), "{report:?}");
+
+        // Nothing edited: nothing reported, even where the counts disagree.
+        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &pristine).unwrap();
+        assert_eq!((out.as_str(), report), (text.as_str(), SyncReport::default()));
+    }
+
+    /// Paired by position, but the call at that position is a different one: refused.
+    #[test]
+    fn mispaired_calls_are_refused() {
+        let pristine = calls(SPECIAL_N);
+        let mut other = pristine.clone();
+        other[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let mut edited = other.clone();
+        edited[1].1.target = ArticleTarget::All;
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("is not what the source holds there"), "{report:?}");
+        assert!(report.skipped[0].contains("SUPERMISSILE"), "{report:?}");
+        // An argument that differs is a different call too, not only the function or article.
+        let mut other = pristine.clone();
+        other[0].1.args[0] = "true".into();
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &other).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped.is_empty(), "nothing edited: {report:?}");
+        let mut edited = other.clone();
+        edited[0].1.args[1] = "0".into();
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("passes `false` where the list has `true`"), "{report:?}");
+        // The editor's list in another order than the file's pairs each call with its own.
+        let swapped = vec![pristine[1].clone(), pristine[0].clone()];
+        let mut edited = swapped.clone();
+        edited[0].1.target = ArticleTarget::All;
+        let (out, report) = rewrite_editor_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+    }
+
+    /// One editor session, synced after every edit: `pristine` stays the list loaded at the start,
+    /// as the editor keeps it; the baseline is the file each time.
+    fn sync_each(text: &str, pristine: &[(u32, ArticleCall)], edited: &[(u32, ArticleCall)]) -> String {
+        let (out, report) = rewrite_editor_article_calls(text, "samus/specialn", pristine, edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{out}");
+        out
+    }
+
+    /// I1: a written move carries a call past another; the next sync still pairs and writes.
+    #[test]
+    fn second_sync_after_a_carry_past_move() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(sync_each(&first, &pristine, &edited), first, "re-running writes nothing");
+        edited[1].1.target = ArticleTarget::All;
+        edited[0].1.args[0] = "true".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(
+            second,
+            first.replace("TARGET_LAST", "TARGET_ALL").replace("CSHOT, false, -1", "CSHOT, true, -1")
+        );
+    }
+
+    /// Important B: the same call retimed twice, 10→25 then 25→30, without a reload.
+    #[test]
+    fn a_call_retimed_twice() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        edited[0].0 = 30;
+        let second = sync_each(&first, &pristine, &edited);
+        let now = calls(&second);
+        assert_eq!((now[0].0, now[1].0), (20, 30), "{second}");
+        assert_eq!(second.len(), SPECIAL_N.len(), "only the block moved and its frame changed: {second}");
+        assert!(second.ends_with("    frame(agent.lua_state_agent, 30.0);
+    if macros::is_excute(agent) {
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);
+    }
+}
+"), "{second}");
+    }
+
+    /// Important B: the same call's article changed twice, A→B then B→C, without a reload.
+    #[test]
+    fn an_article_changed_twice() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(first, SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1));
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_MISSILE".into();
+        edited[0].1.args[1] = "0".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, SPECIAL_N.replacen("ARTICLE_CSHOT, false, -1", "ARTICLE_MISSILE, false, 0", 1));
+    }
+
+    /// Important A: two `generate_article` calls of the same article with different arguments.
+    /// The first moves onto the second's frame and lands after it, so the file lists them the other
+    /// way round; a later edit to the first changes only the first's bytes.
+    #[test]
+    fn same_article_calls_keep_their_own_edits() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, true, 7);",
+        );
+        let pristine = calls(&text);
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        edited[0].0 = 20;
+        let first = sync_each(&text, &pristine, &edited);
+        let lines: Vec<&str> = first.lines().filter(|line| line.contains("generate_article")).collect();
+        assert!(lines[0].contains("true, 7") && lines[1].contains("false, -1"), "{first}");
+        edited[0].1.args[1] = "3".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, first.replace("CSHOT, false, -1", "CSHOT, false, 3"), "{second}");
+        assert!(second.contains("CSHOT, true, 7"), "the other call is untouched: {second}");
+    }
+
+    /// Cuphead-Moveset · src/buddy/acmd/specials.rs:78-96 (`game_specialn2`, tier 1, smashline2)
+    /// spawns `*FIGHTER_BUDDY_GENERATE_ARTICLE_BULLET` four times at frame 14 with the same
+    /// arguments. While the file still holds the calls as loaded, an edit to one of them writes
+    /// that one, and putting it back restores every byte.
+    #[test]
+    fn identical_calls_as_loaded_pair_by_position() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_BUDDY_GENERATE_ARTICLE_BULLET, false, -1);";
+        let text = format!(
+            "unsafe extern \"C\" fn game_specialn2(agent: &mut L2CAgentBase) {{\r\n    frame(agent.lua_state_agent, 14.0);\r\n    if macros::is_excute(agent) {{\r\n            {line}\r\n            {line}\r\n    }}\r\n}}\r\n"
+        );
+        let pristine = calls(&text);
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        edited[1].1.args[1] = "0".into();
+        let (out, report) = rewrite_editor_article_calls(&text, "buddy/specialn2", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let second = text.rfind("false, -1").unwrap();
+        assert_eq!(out, format!("{}false, 0{}", &text[..second], &text[second + "false, -1".len()..]));
+        let (back, report) = rewrite_editor_article_calls(&out, "buddy/specialn2", &edited, &pristine).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(back, text);
+    }
+
+    /// Calls the mapping cannot tell apart are refused with the reason, and nothing is written.
+    #[test]
+    fn ambiguous_mapping_is_refused() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);";
+        let call = ArticleCall::parse(line).unwrap();
+        // The editor retimed both identical calls; the file holds them at frames neither had.
+        let pristine = vec![(10, call.clone()), (20, call.clone())];
+        let edited = vec![(30, call.clone()), (40, call.clone())];
+        let source = vec![(25, call.clone()), (35, call.clone())];
+        let error = article_calls_in_source_order(&source, &pristine, &edited).unwrap_err();
+        assert!(error.contains("could be more than one of the editor's article calls"), "{error}");
+        assert!(!error.contains("  "), "one sentence, no stray spacing: {error}");
+        // Told apart by frame, the same lists pair.
+        let source = vec![(20, call.clone()), (30, call.clone())];
+        let ordered = article_calls_in_source_order(&source, &pristine, &edited).unwrap();
+        assert_eq!((ordered[0].0, ordered[1].0), (40, 30));
+        // Identical calls edited identically are interchangeable.
+        let same = vec![(10, call.clone()), (10, call.clone())];
+        assert!(article_calls_in_source_order(&same, &same, &same).is_ok());
+        // Through the writer: the reason is reported and the text is unchanged.
+        let text = format!(
+            "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 25.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n    frame(agent.lua_state_agent, 35.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+        );
+        let (out, report) = rewrite_editor_article_calls(&text, "samus/x", &pristine, &edited).unwrap();
+        assert_eq!(out, text);
+        assert!(report.skipped[0].contains("could be more than one"), "{report:?}");
+        // A different number of calls is refused too.
+        let error = article_calls_in_source_order(&source[..1], &pristine, &edited).unwrap_err();
+        assert!(error.contains("1 article call(s) where the editor has 2"), "{error}");
+    }
+
+    /// N1: an argument edited twice without a reload. The file holds a value from the first edit
+    /// that neither the call's original nor its new edit has; it must not be taken for the other
+    /// call that happens to hold that value. Refused, with nothing written.
+    #[test]
+    fn an_in_between_value_is_not_taken_for_another_call() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, true, 5);",
+        );
+        let pristine = calls(&text);
+        let mut edited = pristine.clone();
+        edited[0].1.args = vec!["true".into(), "5".into()];
+        let first = sync_each(&text, &pristine, &edited);
+        assert_eq!(first, text.replacen("CSHOT, false, -1", "CSHOT, true, 5", 1));
+        edited[0].1.args = vec!["false".into(), "3".into()];
+        let (second, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!(second, first, "nothing is written");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].contains("matches none of the editor's article calls"), "{report:?}");
+    }
+
+    /// N2: an edit that sets only `target` (its argument text still the old spelling) is kept
+    /// through later syncs instead of being written back.
+    #[test]
+    fn a_target_edit_survives_later_syncs() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[1].1.target = ArticleTarget::All;
+        assert!(edited[1].1.args[0].contains("LAST"), "the argument text is stale on purpose");
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(first, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"));
+        for _ in 0..2 {
+            let (again, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+            assert_eq!((again.as_str(), report.changed), (first.as_str(), 0), "{report:?}");
+            assert!(report.skipped.is_empty(), "{report:?}");
+        }
+    }
+
+    /// N3: a synced edit put back to its original in the editor is never dropped silently: the
+    /// file returns to the original, or the refusal is reported.
+    #[test]
+    fn restoring_a_synced_value_is_written_or_reported() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.args[0] = "true".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_ne!(first, SPECIAL_N);
+        let (second, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &pristine).unwrap();
+        assert!(second == SPECIAL_N || !report.skipped.is_empty(), "silent: {report:?}\n{second}");
+        assert!(second == SPECIAL_N || second == first, "{second}");
+        // A file that already holds the edited calls, in any order, has nothing to report.
+        let (_, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+    }
+
+    /// I1: a written article change renames the call; a later edit to it still lands.
+    #[test]
+    fn second_edit_after_an_article_change() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        edited[0].1.args[1] = "0".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, first.replace("SUPERMISSILE, false, -1", "SUPERMISSILE, false, 0"));
+    }
+
+    /// The same two syncs through the project on disk, as the editor runs them.
+    #[test]
+    fn two_syncs_on_disk_after_a_carry_past_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("src/samus/acmd.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, SPECIAL_N).unwrap();
+        std::fs::write(
+            tmp.path().join("src/samus/mod.rs"),
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"samus\"); }",
+        )
+        .unwrap();
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let report = sync_article_calls(&index, "samus", "special_n", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{report:?}");
+        edited[1].1.target = ArticleTarget::All;
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let report = sync_article_calls(&index, "samus", "special_n", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.changed, 1, "{report:?}");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let moved = calls(&on_disk);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{on_disk}");
+        assert_eq!(moved[0].1.target, ArticleTarget::All, "{on_disk}");
+    }
+
+    #[test]
+    fn changing_the_function_is_reported() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| {
+            calls[1].1.op = crate::data::ArticleOp::ShootExist;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("`shoot` to `shoot_exist`"), "{report:?}");
+    }
+
+    #[test]
+    fn crlf_preserved() {
+        let text = SPECIAL_N.replace('\n', "\r\n");
+        let (out, report) = rewrite(&text, |calls| {
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+            calls[0].0 = 25;
+        });
+        assert_eq!(report.changed, 2, "{report:?}");
+        assert!(out.contains("TARGET_ALL"));
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(out.len(), text.len() - "LAST".len() + "ALL".len());
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out:?}");
+
+        let shared = text.replace(
+            "-1);\r\n",
+            "-1);\r\n        macros::FT_MOTION_RATE(agent, 0.5);\r\n",
+        );
+        let (out, _) = rewrite(&shared, |calls| calls[0].0 = 14);
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(calls(&out)[0].0, 14, "{out:?}");
+    }
+
+    /// A move is refused, with the reason, where frame blocks do not say when a line runs.
+    #[test]
+    fn move_refused_after_a_wait() {
+        let text = SPECIAL_N.replace(
+            "    frame(agent.lua_state_agent, 20.0);\n",
+            "    wait(agent.lua_state_agent, 2.0);\n    frame(agent.lua_state_agent, 20.0);\n",
+        );
+        let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
+        assert_eq!(out, text);
+        assert_eq!(report.changed, 0);
+        assert!(report.skipped[0].contains("wait"), "{report:?}");
+    }
+
+    #[test]
+    fn effect_helper_with_string_array_loop_expands_both_trails() {
+        let file = r#"
+unsafe fn stilt_trails_on(agent: &mut L2CAgentBase) {
+    for shoe in ["stiltshoel", "stiltshoer"] {
+        macros::AFTER_IMAGE4_ON_arg29(agent, Hash40::new("tex_shyguy_stilt1"), Hash40::new("tex_shyguy_stilt2"), 4, Hash40::new(shoe), -3.0, 0.0, 0.0, Hash40::new(shoe), 4.0, -0.0, -0.0, true, Hash40::new("marth_sword_blue"), Hash40::new(shoe), 0, 0, 0, 0, 0, 0, 0.65, 0, *EFFECT_AXIS_X, 0, *TRAIL_BLEND_ALPHA, 101, *TRAIL_CULL_NONE, 1.4, 0.2);
+    }
+}
+
+unsafe extern "C" fn effect_special_air_lw(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 14.0);
+    if macros::is_excute(agent) {
+        stilt_trails_on(agent);
+    }
+    frame(agent.lua_state_agent, 23.0);
+    if macros::is_excute(agent) {
+        macros::AFTER_IMAGE_OFF(agent, 3);
+    }
+}
+"#;
+        let start = file.find("unsafe extern \"C\" fn effect_special_air_lw").unwrap();
+        let source = &file[start..];
+        let expanded =
+            super::unroll_string_array_loops(&super::expand_same_file_effect_helpers(source, file));
+        let calls = crate::acmd::parse_effect_script(&expanded).to_effect_calls();
+        assert_eq!(calls.len(), 2, "expected 2 trail calls, got {calls:?}\n{expanded}");
+        assert_eq!(calls[0].bone_name, "stiltshoel");
+        assert_eq!(calls[1].bone_name, "stiltshoer");
+        assert_eq!((calls[0].active_start, calls[0].active_end), (14, 23));
+        assert_eq!((calls[1].active_start, calls[1].active_end), (14, 23));
+        assert!(crate::trail_preview::trail_geometry(&calls[0]).is_some());
+        assert!(
+            calls[0]
+                .raw_line
+                .as_deref()
+                .and_then(crate::preview_trail::parse)
+                .is_some()
+        );
     }
 }

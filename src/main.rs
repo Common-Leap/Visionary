@@ -1,16 +1,22 @@
 // Visionary: character/circle preview, authored effect editing, and live in-game rendering.
+// A window application: the console is opened on request, see `console`.
+#![windows_subsystem = "windows"]
 mod acmd;
 mod acmd_macro_names;
 mod acmd_src;
 mod acmd_verify;
 mod app;
 mod app_icon;
+mod articles;
 mod article_preview;
 mod asset_snapshots;
 mod capture_hitbox;
+mod cargo_project;
 mod carrier_motion;
 mod carrier_support;
 mod character;
+mod console;
+mod costume_files;
 mod credits;
 mod data;
 mod eff_attrs;
@@ -22,35 +28,58 @@ mod effect_colour;
 mod effect_pool;
 mod effect_uses;
 mod effects;
+mod fighter_hurtboxes;
+mod fighter_scale;
+mod frame_data;
 mod game_link;
 mod gimmicks;
+mod hash_macros;
 mod mod_export;
 mod mod_import;
 mod mod_project;
+mod model_checks;
+mod motion_list;
+mod motion_list_editor;
+mod motion_scripts;
 mod move_kinds;
 mod move_nodes;
+mod orientation_widget;
+mod moveset_build;
+mod moveset_survey;
 mod param_labels;
 mod plugin_deploy;
 mod post_grading;
+mod preferences;
+mod preview_axes;
 mod preview_floor;
 mod preview_item;
 mod preview_opponent;
 mod preview_stage;
 mod preview_trail;
 mod preview_visibility;
+mod project_consts;
+mod project_helpers;
 mod project_hub;
 mod project_parts;
+mod project_scope;
 mod renderer;
 mod roster;
 mod scratch_dirs;
+mod source_style;
+mod source_timing;
+mod sources;
 mod texture_import;
+mod trail_preview;
 mod ui;
 mod vfx_preview;
+mod viewport_navigation;
 mod viewport_target;
 #[cfg(target_os = "linux")]
 mod wayland_icon;
 
 fn main() -> anyhow::Result<()> {
+    // First, so everything below logs to the launching terminal or the console the user asked for.
+    console::init(preferences::Preferences::load().show_console);
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
     if matches!(first.as_deref(), Some(arg) if arg == "--help" || arg == "-h") {
@@ -112,7 +141,7 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(app_icon::APP_ID)
             .with_icon(app_icon::viewport_icon())
-            .with_title("Visionary")
+            .with_title(concat!("Visionary ", env!("CARGO_PKG_VERSION")))
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 600.0]),
         renderer: eframe::Renderer::Wgpu,

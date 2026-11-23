@@ -1475,10 +1475,106 @@ macro_rules! effect_hook {
                 set_pending_scale_w(None);
                 // Eff-editor spawn rules: suppression + PER-SPAWN transform, both scoped to
                 // (motion, frame window) so editing one spawn doesn't affect the others.
+                // Weapons owned by the selected fighter read ONLY from the separate article rule
+                // table; fighters read ONLY from fighter spawn_rules.
                 let mut scoped_transform = false;
-                if crate::slight::effect_viewer::spawn_rules::any_for(args.eff_hash) {
-                    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
-                        as *mut smash::app::BattleObjectModuleAccessor;
+                let rule_boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+                    as *mut smash::app::BattleObjectModuleAccessor;
+                let is_weapon = !rule_boma.is_null()
+                    && smash::app::utility::get_category(&mut *rule_boma)
+                        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON;
+                if is_weapon && crate::slight::effect_viewer::spawn_rules::any_article_rules() {
+                    if let Some(article_key) =
+                        crate::slight::systems::article_notifier::selected_owner_article(
+                            (*rule_boma).battle_object_id,
+                        )
+                    {
+                        let frame = smash::app::lua_bind::MotionModule::frame(rule_boma);
+                        let motion = smash::app::lua_bind::MotionModule::motion_kind(rule_boma);
+                        if !crate::slight::hitbox_viewer::is_injecting()
+                            && crate::slight::effect_viewer::spawn_rules::suppressed_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            )
+                        {
+                            return;
+                        }
+                        if let Some((pos, rot, scale)) =
+                            crate::slight::effect_viewer::spawn_rules::transform_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            )
+                        {
+                            let pins = crate::slight::effect_viewer::kinds::Pinned {
+                                pos: pos.map(|p| super::effect_data::Point3D {
+                                    x: p[0],
+                                    y: p[1],
+                                    z: p[2],
+                                }),
+                                rot: rot.map(|r| super::effect_data::Point3D {
+                                    x: r[0],
+                                    y: r[1],
+                                    z: r[2],
+                                }),
+                                scale,
+                                ..Default::default()
+                            };
+                            rewrite_args(lua_state, &pins, $flip);
+                            if let Some(scoped_args) = parse_args(lua_state, $flip) {
+                                carrier_base_args = scoped_args;
+                            }
+                            scoped_transform = true;
+                        }
+                        set_pending_rate(
+                            crate::slight::effect_viewer::spawn_rules::rate_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                        set_pending_camera_offset(
+                            crate::slight::effect_viewer::spawn_rules::camera_offset_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                        let (tint, alpha) =
+                            crate::slight::effect_viewer::spawn_rules::tint_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            )
+                            .unwrap_or((None, None));
+                        set_pending_tint(tint, alpha);
+                        set_pending_particle_tint(
+                            crate::slight::effect_viewer::spawn_rules::particle_tint_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                        set_pending_scale_w(
+                            crate::slight::effect_viewer::spawn_rules::scale_w_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                    }
+                } else if !is_weapon
+                    && crate::slight::effect_viewer::spawn_rules::any_for(args.eff_hash)
+                {
+                    let boma = rule_boma;
                     let (motion, frame) = if boma.is_null() {
                         (0u64, -1.0f32)
                     } else {
@@ -2292,6 +2388,8 @@ enum CoroutineBoundary {
     Frame,
     Wait,
     Resume,
+    /// The fighter's once-per-frame status line, for targets no ACMD boundary lands on.
+    Tick,
 }
 
 impl CoroutineBoundary {
@@ -2305,6 +2403,7 @@ impl CoroutineBoundary {
             Self::Frame => "frame",
             Self::Wait => "wait",
             Self::Resume => "resume",
+            Self::Tick => "tick",
         }
     }
 }
@@ -2899,6 +2998,9 @@ pub fn reset_effect_injection_latches() {
     if let Some(mut noted) = LATE_FALLBACK_NOTED.try_lock() {
         noted.clear();
     }
+    if let Some(mut latches) = ARTICLE_EFF_FIRED.try_lock() {
+        latches.clear();
+    }
 }
 
 pub fn reset_control_injection_latches() {
@@ -3488,6 +3590,192 @@ unsafe fn inject_after_acmd_frame(lua_state: u64, target: f32) {
     );
 }
 
+/// Last motion frame each fighter's tick saw, by battle object: `(motion, frame)`.
+static TICK_LAST_FRAME: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u32, (u64, f32)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Fire retimed and added effects, their stops, and point controls whose frame no ACMD
+/// boundary reaches.
+///
+/// Injection is otherwise driven from the `frame`/`wait` boundaries of the fighter's ACMD
+/// coroutines, which only exist where some script wrote one. A dash attack whose scripts step
+/// from frame 15 straight to 34 has no boundary on frames 16–33, so an effect moved, added, or
+/// stopped there was logged as a missed frame and never shown — only frames a hitbox happened
+/// to spawn on worked. This runs once per frame from the fighter's status line and replays each
+/// target on the first frame at or past it since the last tick, as if exactly on it: under a
+/// motion rate the per-frame step is fractional and can step over the ±0.5 window entirely. The
+/// shared latch makes it a no-op for a target a boundary already fired.
+pub unsafe fn inject_tick(lua_state: u64) {
+    use crate::slight::effect_viewer::{control_rules, spawn_rules};
+    if lua_state == 0 || crate::slight::hitbox_viewer::is_injecting() {
+        return;
+    }
+    if !spawn_rules::any_inject() && !control_rules::any_inject() {
+        return;
+    }
+    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+        as *mut smash::app::BattleObjectModuleAccessor;
+    if boma.is_null() {
+        return;
+    }
+    // Rules name the selected fighter's motion; an article's motion hash is not that namespace.
+    // Articles keep their ACMD-boundary path.
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        return;
+    }
+    service_pending_latch_resets();
+    spawn_rules::service_pending();
+    control_rules::service_pending();
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    if !frame.is_finite() {
+        return;
+    }
+    let (motion, _) = resolve_injection_motion(boma, CoroutineBoundary::Tick, frame);
+    let boid = (*boma).battle_object_id;
+    let previous = TICK_LAST_FRAME.lock().insert(boid, (motion, frame));
+    // A new motion, or the same one restarted or looped, starts the window from before zero.
+    let since = match previous {
+        Some((last_motion, last_frame)) if last_motion == motion && last_frame <= frame => last_frame,
+        _ => -1.0,
+    };
+    let mut targets: Vec<f32> = spawn_rules::injections_for(motion)
+        .into_iter()
+        .map(|(_, inject, _)| inject.frame)
+        .chain(
+            control_rules::injections_for(motion)
+                .into_iter()
+                .map(|(_, inject, _, _)| inject.frame),
+        )
+        .filter(|&target| target.is_finite() && since < target && target <= frame)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    targets.sort_by(f32::total_cmp);
+    targets.dedup_by(|a, b| (*a - *b).abs() < MOTION_FRAME_WIDTH);
+    let mut agent = smash::lua2cpp::L2CAgentBase {
+        agent: smash::lib::L2CAgent::new(lua_state),
+        unk48: [0; 0x10],
+    };
+    // In frame order, so an earlier target is confirmed before a later one is considered.
+    for target in targets {
+        inject_control(&mut agent, boma, motion, CoroutineBoundary::Tick, target, frame);
+        inject_effect(&mut agent, boma, motion, CoroutineBoundary::Tick, target, frame);
+    }
+}
+
+/// Separate per-frame effect/control injection latch for articles so article injections never
+/// share latch state with fighters.
+static ARTICLE_EFF_FIRED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(u32, usize), InjectionLatch>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static ARTICLE_TICK_LAST_FRAME: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u32, (u64, f32)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Per-weapon effect/control injection tick for the selected fighter's own articles only.
+/// Reads strictly from the separate article rule tables keyed by `(agent, motion)`.
+pub unsafe fn inject_tick_article(lua_state: u64) {
+    use crate::slight::effect_viewer::{control_rules, spawn_rules};
+    if lua_state == 0 || crate::slight::hitbox_viewer::is_injecting() {
+        return;
+    }
+    if !spawn_rules::any_inject_article() && !control_rules::any_inject_article() {
+        return;
+    }
+    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+        as *mut smash::app::BattleObjectModuleAccessor;
+    if boma.is_null() {
+        return;
+    }
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
+    {
+        return;
+    }
+    let boid = (*boma).battle_object_id;
+    let Some(article_key) =
+        crate::slight::systems::article_notifier::selected_owner_article(boid)
+    else {
+        return;
+    };
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    if !frame.is_finite() {
+        return;
+    }
+    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let previous = ARTICLE_TICK_LAST_FRAME.lock().insert(boid, (motion, frame));
+    let since = match previous {
+        Some((last_motion, last_frame)) if last_motion == motion && last_frame <= frame => last_frame,
+        _ => -1.0,
+    };
+
+    let eff_injections = spawn_rules::injections_for_article(&article_key.agent, motion);
+    if eff_injections.is_empty() {
+        return;
+    }
+    let mut agent = smash::lua2cpp::L2CAgentBase {
+        agent: smash::lib::L2CAgent::new(lua_state),
+        unk48: [0; 0x10],
+    };
+    for (idx, inj, rule_fingerprint) in eff_injections {
+        if !(inj.frame.is_finite() && since < inj.frame && inj.frame <= frame) {
+            continue;
+        }
+        let key = (boid, idx);
+        let latch = {
+            let mut fired = ARTICLE_EFF_FIRED.lock();
+            observed_latch(&mut fired, key, motion, inj.frame, rule_fingerprint, frame)
+        };
+        if !latch_can_attempt(
+            latch.as_ref(),
+            motion,
+            inj.frame,
+            idx,
+            rule_fingerprint,
+            frame,
+        ) {
+            continue;
+        }
+        if inj
+            .guard
+            .as_ref()
+            .is_some_and(|guard| !crate::slight::hitbox_viewer::guard_passes(boma, guard))
+        {
+            if let Some(mut latch) = latch {
+                latch.confirmed = true;
+                ARTICLE_EFF_FIRED.lock().insert(key, latch);
+            }
+            continue;
+        }
+        load_args(&mut agent, &inj.args);
+        let confirmed = {
+            let _attempt = InjectionAttemptGuard::new(key, motion, inj.frame, rule_fingerprint);
+            let _guard = crate::slight::hitbox_viewer::InjectGuard::new();
+            let confirmation = dispatch_effect(&inj.func, agent.agent.lua_state_agent);
+            if confirmation == DispatchConfirmation::NativeReturn {
+                note_injected_success();
+            }
+            InjectionAttemptGuard::confirmed()
+        };
+        agent.agent.clear_lua_stack();
+        store_latch(
+            &mut ARTICLE_EFF_FIRED.lock(),
+            key,
+            motion,
+            inj.frame,
+            idx,
+            rule_fingerprint,
+            frame,
+            confirmed,
+            false,
+        );
+    }
+}
+
 /// Record the requested motion before the native transition runs.  On the first ACMD boundary
 /// the module's published `motion_kind` can still be the previous move, so observing it after
 /// `original!()` is too late for a frame-zero replacement.
@@ -3586,10 +3874,115 @@ unsafe fn hook_acmd_wait(lua_state: u64, target: f32) {
     inject_before_acmd_wait(lua_state, CoroutineBoundary::Wait);
 }
 
+// These four live in `lua2cpp_common`, not the main executable. At plugin load that module is
+// not mapped yet, so their imports are unresolved: Skyline silently skipped the hook and ozone
+// aborts on it. Each one is installed once its symbol resolves, at boot or when a lua2cpp module
+// loads.
+const CALL_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase14call_coroutineEiN3phx6Hash40E\0";
+const START_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase15start_coroutineEiN3phx6Hash40ERi\0";
+const RESUME_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase16resume_coroutineEiRi\0";
+const EFFECT_COMMON_CTOR: &[u8] = b"_ZN7lua2cpp29L2CFighterAnimcmdEffectCommonC1EPN3app12BattleObjectEPNS1_26BattleObjectModuleAccessorEP9lua_State\0";
+
+fn module_target(import: *const (), mangled: &[u8]) -> *const u8 {
+    crate::slight::loader::target(import, mangled)
+}
+
+// Address each hook below installs on; written just before its install call. skyline's hook
+// macro only accepts a path for `replace`, and casts it inside its own `unsafe` block.
+static mut CALL_COROUTINE_TARGET: usize = 0;
+static mut START_COROUTINE_TARGET: usize = 0;
+static mut RESUME_COROUTINE_TARGET: usize = 0;
+static mut EFFECT_COMMON_CTOR_TARGET: usize = 0;
+
+struct ModuleHook {
+    name: &'static str,
+    symbol: fn() -> *const u8,
+    install: unsafe fn(usize),
+    installed: std::sync::atomic::AtomicBool,
+}
+
+static MODULE_HOOKS: [ModuleHook; 4] = [
+    ModuleHook {
+        name: "call_coroutine",
+        symbol: || module_target(smash::lua2cpp::L2CAgentBase_call_coroutine as *const (), CALL_COROUTINE),
+        install: |target| unsafe {
+            CALL_COROUTINE_TARGET = target;
+            skyline::install_hook!(hook_call_coroutine);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+    ModuleHook {
+        name: "start_coroutine",
+        symbol: || module_target(smash::lua2cpp::L2CAgentBase_start_coroutine as *const (), START_COROUTINE),
+        install: |target| unsafe {
+            START_COROUTINE_TARGET = target;
+            skyline::install_hook!(hook_start_coroutine);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+    ModuleHook {
+        name: "resume_coroutine",
+        symbol: || module_target(smash::lua2cpp::L2CAgentBase_resume_coroutine as *const (), RESUME_COROUTINE),
+        install: |target| unsafe {
+            RESUME_COROUTINE_TARGET = target;
+            skyline::install_hook!(hook_resume_coroutine);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+    ModuleHook {
+        name: "L2CFighterAnimcmdEffectCommon ctor",
+        symbol: || {
+            module_target(
+                smash::lua2cpp::L2CFighterAnimcmdEffectCommon_L2CFighterAnimcmdEffectCommon as *const (),
+                EFFECT_COMMON_CTOR,
+            )
+        },
+        install: |target| unsafe {
+            EFFECT_COMMON_CTOR_TARGET = target;
+            skyline::install_hook!(hook_common_effect_agent_ctor);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+];
+
+fn install_module_hooks() {
+    use std::sync::atomic::Ordering;
+    let loader = crate::slight::loader::current().name();
+    for hook in &MODULE_HOOKS {
+        if hook.installed.load(Ordering::Acquire) {
+            continue;
+        }
+        let target = (hook.symbol)();
+        if target.is_null() {
+            crate::slight::diag::note(format!("{} hook deferred (unresolved, {loader})", hook.name));
+            continue;
+        }
+        if hook.installed.swap(true, Ordering::AcqRel) {
+            continue;
+        }
+        unsafe { (hook.install)(target as usize) };
+        skyline::println!("[SLight] {} hook installed @ {:p} ({loader})", hook.name, target);
+        crate::slight::diag::note(format!("{} hook installed ({loader})", hook.name));
+    }
+}
+
+extern "Rust" fn retry_module_hooks(info: &skyline::nro::NroInfo) {
+    if info.name.contains("lua2cpp_") {
+        install_module_hooks();
+    }
+}
+
+fn install_module_hook_retry() {
+    if skyline::nro::add_hook(retry_module_hooks).is_err() {
+        skyline::println!("[SLight] nro hook unavailable; lua2cpp_common hooks stay inactive");
+        crate::slight::diag::note("lua2cpp module hooks=unavailable (no nro hook)");
+    }
+}
+
 /// `call_coroutine` is retained as a lifecycle hook for the pinned runtime, but it is not a live
 /// dispatch point: its callback runs before the ACMD has necessarily reached a valid command
 /// context, and `inject_for_lua_state` intentionally returns for this boundary.
-#[skyline::hook(replace = smash::lua2cpp::L2CAgentBase_call_coroutine)]
+#[skyline::hook(replace = CALL_COROUTINE_TARGET)]
 unsafe fn hook_call_coroutine(
     agent: *mut smash::lua2cpp::L2CAgentBase,
     coroutine_index: i32,
@@ -3609,7 +4002,7 @@ unsafe fn hook_call_coroutine(
     result
 }
 
-#[skyline::hook(replace = smash::lua2cpp::L2CAgentBase_start_coroutine)]
+#[skyline::hook(replace = START_COROUTINE_TARGET)]
 unsafe fn hook_start_coroutine(
     agent: *mut smash::lua2cpp::L2CAgentBase,
     coroutine_index: i32,
@@ -3629,7 +4022,7 @@ unsafe fn hook_start_coroutine(
     result
 }
 
-#[skyline::hook(replace = smash::lua2cpp::L2CAgentBase_resume_coroutine)]
+#[skyline::hook(replace = RESUME_COROUTINE_TARGET)]
 unsafe fn hook_resume_coroutine(
     agent: *mut smash::lua2cpp::L2CAgentBase,
     coroutine_index: i32,
@@ -3644,7 +4037,7 @@ unsafe fn hook_resume_coroutine(
 
 /// Mark the persistent Lua state used by the game's common effect script bank. Fighter-specific
 /// effect agents are distinct objects and intentionally do not enter this set.
-#[skyline::hook(replace = smash::lua2cpp::L2CFighterAnimcmdEffectCommon_L2CFighterAnimcmdEffectCommon)]
+#[skyline::hook(replace = EFFECT_COMMON_CTOR_TARGET)]
 unsafe fn hook_common_effect_agent_ctor(
     this: *mut smash::lua2cpp::L2CFighterAnimcmdEffectCommon,
     battle_object: *mut smash::app::BattleObject,
@@ -3659,6 +4052,8 @@ unsafe fn hook_common_effect_agent_ctor(
 
 pub fn install() {
     install_effect_detach_kind_import_hook();
+    install_module_hooks();
+    install_module_hook_retry();
     skyline::install_hooks!(
         hook_motion_change,
         hook_motion_change_inherit_frame,
@@ -3668,10 +4063,6 @@ pub fn install() {
         hook_acmd_is_excute,
         hook_acmd_frame,
         hook_acmd_wait,
-        hook_call_coroutine,
-        hook_start_coroutine,
-        hook_resume_coroutine,
-        hook_common_effect_agent_ctor,
         hook_eff,
         hook_eff_alpha,
         hook_eff_attr,

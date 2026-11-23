@@ -31,6 +31,20 @@ pub fn move_name_to_pascal(name: &str) -> String {
 /// are `attacks32` / `attacks33` (`AttackS32.txt`), while Link's `attack_s4_s2`
 /// keeps its `s` (`AttackS4S2.txt`) and is listed for completeness.
 pub fn move_script_aliases(move_name: &str) -> Vec<String> {
+    let mut out = move_script_aliases_guess(move_name);
+    // What the motion list says this motion runs comes FIRST: it is the game's own answer, and
+    // the name-based spellings below are only guesses at it. Registered only for motions the
+    // guess cannot reach (see `motion_scripts`), so vanilla lookups are unchanged.
+    if let Some(suffix) = crate::motion_scripts::registered_suffix(move_name) {
+        out.retain(|alias| *alias != suffix);
+        out.insert(0, suffix);
+    }
+    out
+}
+
+/// The name-based spellings alone, without the motion list's answer. `motion_scripts` uses
+/// this to decide whether a motion's real script is reachable by guessing at all.
+pub fn move_script_aliases_guess(move_name: &str) -> Vec<String> {
     let mut out = vec![move_name.to_string()];
     let lower = move_name.to_ascii_lowercase();
     let alias: Option<&str> = match lower.as_str() {
@@ -144,6 +158,10 @@ pub fn script_name_aliases(script_name: &str) -> Vec<String> {
 /// `attack_s3_s2`/`s3` map to `attack_s3_2`/`_3` (`AttackS32/33.txt`); Link's
 /// `attack_s4_s2` keeps its `s` and needs no resolution.
 pub fn resolve_script_move_name(fighter: &str, move_name: &str) -> String {
+    // The motion list named this motion's script outright; nothing to guess.
+    if let Some(suffix) = crate::motion_scripts::registered_suffix(move_name) {
+        return suffix;
+    }
     // The game runs the script its motion list names, whatever the motion is called.
     if let Some(script) = registered_motion_script(fighter, move_name) {
         return script;
@@ -359,6 +377,72 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
     Ok(String::new())
 }
 
+/// Whether `value` is an ACMD call's agent argument.
+///
+/// Every ACMD macro takes the agent first, and projects name it whatever they like: `agent`,
+/// `fighter` (2,200 calls across the moveset corpus), `weapon`, `_agent`. Matching only the
+/// literal `agent` left every call in those projects untyped — a `FT_MOTION_RATE(fighter, 0.7)`
+/// was ignored, so every frame after it was drawn at the wrong time. Shared by the parsers and
+/// the write-back scanners so both always accept the same calls.
+///
+/// Only the function's OWN agent counts: `SET_AIR(other)` acts on some other object, and typing
+/// it as this fighter's would let an edit change the wrong thing. The name is `agent` unless an
+/// [`AgentScope`] says the function being read or written calls it something else.
+pub(crate) fn is_agent_arg(value: impl AsRef<str>) -> bool {
+    let value = value.as_ref().trim();
+    value == "agent" || AGENT_NAME.with(|name| name.borrow().as_deref() == Some(value))
+}
+
+thread_local! {
+    static AGENT_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, [`is_agent_arg`] also accepts the agent parameter named in a function header.
+/// Restores the previous name on drop, so nested scopes are safe.
+pub(crate) struct AgentScope(Option<String>);
+
+impl Drop for AgentScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        AGENT_NAME.with(|name| *name.borrow_mut() = previous);
+    }
+}
+
+/// Scope [`is_agent_arg`] to the agent parameter of the first ACMD function in `text`.
+pub(crate) fn agent_scope(text: &str) -> AgentScope {
+    let detected = agent_param_name(text);
+    let previous = AGENT_NAME.with(|name| std::mem::replace(&mut *name.borrow_mut(), detected));
+    AgentScope(previous)
+}
+
+/// The name of the first `NAME: &mut L2CAgentBase` parameter in `text`.
+pub(crate) fn agent_param_name(text: &str) -> Option<String> {
+    let at = text.find("L2CAgentBase")?;
+    let before = text[..at].trim_end();
+    let before = before.strip_suffix("&mut").unwrap_or(before).trim_end();
+    let before = before.strip_suffix(':')?.trim_end();
+    let start = before
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |n| n + 1);
+    let name = &before[start..];
+    (!name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit())).then(|| name.to_string())
+}
+
+/// `agent.module_accessor`, with any agent name (see [`is_agent_arg`]).
+pub(crate) fn is_agent_module_accessor(value: impl AsRef<str>) -> bool {
+    value
+        .as_ref()
+        .trim()
+        .strip_suffix(".module_accessor")
+        .is_some_and(is_agent_arg)
+}
+
+/// A module-accessor receiver: `agent.module_accessor` under any agent name, or `boma`.
+pub(crate) fn is_module_accessor(value: impl AsRef<str>) -> bool {
+    let value = value.as_ref().trim();
+    value == "boma" || is_agent_module_accessor(value)
+}
+
 /// One script of a fighter's object (`agent` is like "mario_fireball", `script` like
 /// "Regular"), cached beside the fighter's own. `None` when the dump has no such script.
 pub fn fetch_object_script(fighter: &str, agent: &str, script: &str) -> Option<String> {
@@ -386,6 +470,7 @@ pub fn fetch_object_script(fighter: &str, agent: &str, script: &str) -> Option<S
 }
 
 pub fn parse_acmd_script(source: &str) -> AcmdScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let game_fn = extract_function(source, "game_");
     // A body with no function header at all is a live capture or a paste, and is read whole —
     // that is the only reason this falls back. A source that *does* hold ACMD functions but no
@@ -397,7 +482,9 @@ pub fn parse_acmd_script(source: &str) -> AcmdScript {
         None if holds_acmd_function(source) => return AcmdScript::default(),
         None => source,
     };
-    let lines: Vec<&str> = source.lines().collect();
+    let _agent = agent_scope(source);
+    let lines = source_lines(source);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     // Skip the function signature line and closing brace
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
@@ -706,9 +793,34 @@ fn parse_stmts_with_fear_face_guard(
             continue;
         }
 
+        // A commented-out call is text, not a command: kept verbatim, never read as one.
+        if is_comment_only(line) {
+            stmts.push(AcmdStmt::Raw(line.to_string()));
+            pos += lines_consumed;
+            continue;
+        }
+
         // for _ in 0..N { ... }
         if clean_loop_heads.contains(&pos) {
             if let Some(count) = parse_for_loop_header(line) {
+                if let Some(inner) = one_line_block_body(lines, pos, lines_consumed) {
+                    let (body, _) = parse_stmts_with_fear_face_guard(
+                        &[inner.as_str()],
+                        0,
+                        domain,
+                        false,
+                        false,
+                        false,
+                        RootStatementPermissions::default(),
+                    );
+                    stmts.push(AcmdStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count,
+                        body,
+                    });
+                    pos += lines_consumed;
+                    continue;
+                }
                 // Find the matching closing brace
                 let body_start = pos + lines_consumed;
                 let Some((body_start, body_lines_end)) =
@@ -758,6 +870,19 @@ fn parse_stmts_with_fear_face_guard(
 
         // if macros::is_excute(agent) { ... }
         if is_plain_excute_header(line) {
+            if let Some(inner) = one_line_block_body(lines, pos, lines_consumed) {
+                stmts.push(AcmdStmt::Excute(parse_excute_block_with_fear_face_guard(
+                    &[inner.as_str()],
+                    domain,
+                    native_attack_all_allowed,
+                    fear_face_read_only_guard,
+                    visibility_execute_heads.contains(&pos),
+                    closed_root_execute_heads.contains(&pos),
+                    named_event_execute_heads.contains(&pos),
+                )));
+                pos += lines_consumed;
+                continue;
+            }
             let body_start = pos + lines_consumed;
             let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
                 stmts.push(AcmdStmt::Raw(raw_block_tail(lines, pos)));
@@ -779,10 +904,11 @@ fn parse_stmts_with_fear_face_guard(
                 && plain_command_body(&lines[body_start..body_end])
                 && !excute_stmts
                     .iter()
-                    .any(|command| matches!(command, ExcuteStmt::Raw(_)))
+                    .any(|command| matches!(command, ExcuteStmt::Raw(_) | ExcuteStmt::Article(_)))
             {
                 stmts.push(AcmdStmt::RawBlock {
-                    header: "if macros::is_excute(agent) {".into(),
+                    // As written: the function may call its agent something else.
+                    header: line.to_string(),
                     body: excute_stmts
                         .into_iter()
                         .map(|command| AcmdStmt::Bare(Box::new(command)))
@@ -970,6 +1096,13 @@ fn parse_stmts_with_fear_face_guard(
         // exact count could not be proven. Detect the brace outside trailing comments/literals
         // so an unsupported loop header plus comment still owns its complete body.
         if opens_block(line) {
+            // A runtime branch opened and closed on one line stays as its own source line,
+            // rather than taking every statement after it along as raw text.
+            if one_line_block_body(lines, pos, lines_consumed).is_some() {
+                stmts.push(AcmdStmt::Raw(line.to_string()));
+                pos += lines_consumed;
+                continue;
+            }
             let body_start = pos + lines_consumed;
             let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
                 stmts.push(AcmdStmt::Raw(raw_block_tail(lines, pos)));
@@ -1011,7 +1144,7 @@ fn parse_stmts_with_fear_face_guard(
                 body,
             });
             // Dumped scripts often put the closing brace and the following branch opener on
-            // one physical line (`} else {`). `find_block_end` stops at the first closing brace,
+            // one physical line (`} else {`). `find_block_end_after` stops at the first closing brace,
             // so parse that sibling block here rather than feeding the combined line back into
             // the recursive walker (which would otherwise produce an inverted slice).
             if let Some((else_header, else_body_start, else_body_end)) = else_body_range {
@@ -1063,6 +1196,14 @@ fn parse_stmts_with_fear_face_guard(
             continue;
         }
 
+        // An `ArticleModule` statement written outside `is_excute`: typed, and still written
+        // back exactly as it was unless edited.
+        if let Some(call) = crate::data::ArticleCall::parse(line) {
+            stmts.push(AcmdStmt::Bare(Box::new(ExcuteStmt::Article(call))));
+            pos += lines_consumed;
+            continue;
+        }
+
         // Everything else — preserve verbatim
         if !line.is_empty() {
             stmts.push(AcmdStmt::Raw(line.to_string()));
@@ -1073,11 +1214,32 @@ fn parse_stmts_with_fear_face_guard(
     (stmts, pos)
 }
 
-fn is_plain_excute_header(line: &str) -> bool {
-    matches!(
-        line,
-        "if macros::is_excute(agent) {" | "if is_excute(agent) {"
-    )
+/// Exactly `if macros::is_excute(<agent>) {`, the one header native effect controls are typed
+/// under (any agent name, see `is_agent_arg`; nothing else on the line).
+fn is_canonical_macros_excute_header(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("if macros::is_excute(")
+        .and_then(|rest| rest.strip_suffix(") {"))
+        .is_some_and(is_agent_arg)
+}
+
+pub(crate) fn is_plain_excute_header(line: &str) -> bool {
+    // Any name the function gives its agent (`fighter` in many movesets, see `is_agent_arg`),
+    // and the one-line form `if macros::is_excute(agent) { ATTACK(…); }`.
+    let line = line.trim();
+    let Some(rest) = line
+        .strip_prefix("if macros::is_excute(")
+        .or_else(|| line.strip_prefix("if is_excute("))
+    else {
+        return false;
+    };
+    let Some((agent, after)) = rest.split_once(')') else {
+        return false;
+    };
+    // Exactly ` {`, or ` { …; }` on one line: `(agent){` and `(agent) && more {` are other
+    // guards, kept as their own blocks.
+    is_agent_arg(agent)
+        && (after == " {" || (after.starts_with(" { ") && after.trim_end().ends_with('}')))
 }
 
 /// Only direct, unattributed command statements may be lifted out of the command-list
@@ -1460,6 +1622,10 @@ fn parse_excute_block_with_fear_face_guard(
         let line = logical_line.as_str();
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if is_comment_only(line) {
+            stmts.push(ExcuteStmt::Raw(line.to_string()));
             continue;
         }
         let direct_native_allowed = native_heads.contains(&start_line);
@@ -1983,6 +2149,8 @@ fn parse_excute_block_with_fear_face_guard(
         }
         // GrabModule and AttackModule clear different things, so they are different
         // statements. Matching `clear_all` alone re-emitted a grab clear as an attack clear.
+        // `grab!(agent, *MA_MSC_CMD_GRAB_CLEAR_ALL)` stays the native call it is written as
+        // (see `move_nodes::native_calls`); timing reads both as a grab clear.
         if line.contains("GrabModule::clear_all") {
             stmts.push(ExcuteStmt::GrabClearAll);
             continue;
@@ -1998,6 +2166,11 @@ fn parse_excute_block_with_fear_face_guard(
                 stmts.push(ExcuteStmt::NativeCall(call));
                 continue;
             }
+        }
+        // Any other `ArticleModule` statement: typed, saved as written unless edited.
+        if let Some(call) = crate::data::ArticleCall::parse(line) {
+            stmts.push(ExcuteStmt::Article(call));
+            continue;
         }
         stmts.push(ExcuteStmt::Raw(line.to_string()));
     }
@@ -2022,6 +2195,22 @@ fn complete_block_body(lines: &[&str], opener: usize, body_start: usize) -> Opti
         .then_some((body_start, body_end))
 }
 
+/// The interior of a block that opens AND closes within its opening statement's own lines:
+/// `if is_excute(agent) { ATTACK(…); }` written on one line, as movesets often are.
+/// [`complete_block_body`] sees such a block end before its body would start, and the readers
+/// would then keep the rest of the script as raw text. `None` when the block spans further
+/// lines.
+fn one_line_block_body(lines: &[&str], pos: usize, consumed: usize) -> Option<String> {
+    let (end, depth) = find_block_end(lines, pos);
+    if depth != 0 || end >= pos + consumed {
+        return None;
+    }
+    let (logical, _) = logical_line_at(lines, pos);
+    let open = logical.find('{')?;
+    let close = logical.rfind('}')?;
+    (close > open).then(|| logical[open + 1..close].trim().to_string())
+}
+
 fn raw_block_tail(lines: &[&str], start: usize) -> String {
     lines.get(start..).unwrap_or_default().join("\n")
 }
@@ -2040,15 +2229,20 @@ fn complete_combined_else_body(
 
 fn find_lexical_block_end(lines: &[&str], start: usize, mut depth: i32) -> (usize, i32) {
     let source = lines[start..].join("\n");
+    // Where each entry of `lines` starts in `source`. An entry may itself hold newlines (a
+    // `/* … */` comment spanning lines is kept as one entry, see `source_lines`), so counting
+    // `\n` would drift past the real entry.
+    let mut starts = Vec::with_capacity(lines.len().saturating_sub(start));
+    let mut offset = 0usize;
+    for line in &lines[start..] {
+        starts.push(offset);
+        offset += line.len() + 1;
+    }
+    let line_at = |at: usize| start + starts.partition_point(|&s| s <= at).saturating_sub(1);
     let bytes = source.as_bytes();
-    let mut line_index = start;
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         if let Some(next) = crate::acmd_src::skip_rust_literal_or_comment(&source, cursor) {
-            line_index += bytes[cursor..next]
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count();
             cursor = next;
             continue;
         }
@@ -2057,10 +2251,9 @@ fn find_lexical_block_end(lines: &[&str], start: usize, mut depth: i32) -> (usiz
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return (line_index, 0);
+                    return (line_at(cursor), 0);
                 }
             }
-            b'\n' => line_index += 1,
             _ => {}
         }
         cursor += 1;
@@ -2172,6 +2365,38 @@ fn combined_else_header(line: &str) -> Option<String> {
 /// Find the closing brace for an `else` whose opening `{` shares a line with the prior `}`.
 fn find_else_block_end(lines: &[&str], combined_line: usize) -> (usize, i32) {
     find_lexical_block_end(lines, combined_line + 1, 1)
+}
+
+/// Whether `line` holds comments and nothing else: `// macros::EFFECT(…);`, or a whole
+/// `/* … */` that [`source_lines`] kept on one line.
+///
+/// Every parser checks this before it looks for a call, because each of them dispatches on
+/// `line.contains("macros::NAME(")`, which a commented-out call satisfies just as well. The
+/// write-back scanners in `acmd_src` already skip comments, so a commented call the parser
+/// counted also shifted the numbering every later edit was matched by.
+fn is_comment_only(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && crate::acmd_src::without_comments(line).trim().is_empty()
+}
+
+/// `source`'s lines, with a `/* … */` comment that spans several lines kept as one.
+///
+/// The parsers walk one line at a time and could not otherwise tell a line in the middle of a
+/// block comment from code. The joined line goes back out verbatim like any other `Raw` line.
+fn source_lines(source: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in source.lines() {
+        match lines.last_mut() {
+            Some(last) if open => {
+                last.push('\n');
+                last.push_str(line);
+            }
+            _ => lines.push(line.to_string()),
+        }
+        open = crate::acmd_src::ends_in_block_comment(lines.last().expect("just pushed"));
+    }
+    lines
 }
 
 /// Return the source line at `start`, joined with following lines while its parentheses are
@@ -2479,6 +2704,10 @@ fn parse_excute_block_effects(lines: &[&str], allow_native_controls: bool) -> Ve
         let line = logical_line.as_str();
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if is_comment_only(line) {
+            macros.push(EffectMacro::Raw(line.to_string()));
             continue;
         }
 
@@ -2895,7 +3124,7 @@ fn parse_excute_block_effects(lines: &[&str], allow_native_controls: bool) -> Ve
                 "visionary_last_effect_set_work_int("
             };
             if let Some(t) = try_extract(prefix) {
-                if t.len() == 2 && t[0].trim() == "agent" && !t[1].trim().is_empty() {
+                if t.len() == 2 && crate::acmd::is_agent_arg(&t[0]) && !t[1].trim().is_empty() {
                     macros.push(EffectMacro::LastEffectSetWorkInt {
                         work: strip_deref(&t[1]),
                     });
@@ -2979,7 +3208,7 @@ fn parse_excute_block_effects(lines: &[&str], allow_native_controls: bool) -> Ve
         };
         if let Some(prefix) = scale_w_prefix {
             if let Some(t) = try_extract(prefix) {
-                if (2..=4).contains(&t.len()) && t[0].trim() == "agent" {
+                if (2..=4).contains(&t.len()) && crate::acmd::is_agent_arg(&t[0]) {
                     let values = t[1..]
                         .iter()
                         .enumerate()
@@ -3172,6 +3401,14 @@ fn parse_effect_stmts(
             continue;
         }
 
+        // Shy Guy's forward smash keeps a retired `EFFECT_FOLLOW` and a whole trail block as
+        // `//` lines; reading them as calls drew both on top of the live effects.
+        if is_comment_only(line) {
+            stmts.push(EffectStmt::Raw(line.to_string()));
+            pos += lines_consumed;
+            continue;
+        }
+
         // `loop { ...; wait_loop_sync_mot }`, the effect side of the motion loops read in
         // `parse_stmts_with_fear_face_guard`. Root only; the body is read as the root it replaces.
         if line == "loop {" && at_function_root {
@@ -3197,6 +3434,16 @@ fn parse_effect_stmts(
 
         if clean_loop_heads.contains(&pos) {
             if let Some(count) = parse_for_loop_header(line) {
+                if let Some(inner) = one_line_block_body(lines, pos, lines_consumed) {
+                    let (body, _) = parse_effect_stmts(&[inner.as_str()], 0, false);
+                    stmts.push(EffectStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count,
+                        body,
+                    });
+                    pos += lines_consumed;
+                    continue;
+                }
                 let body_start = pos + lines_consumed;
                 let Some((body_start, body_lines_end)) =
                     complete_block_body(lines, pos, body_start)
@@ -3218,6 +3465,14 @@ fn parse_effect_stmts(
         }
 
         if is_plain_excute_header(line) {
+            if let Some(inner) = one_line_block_body(lines, pos, lines_consumed) {
+                stmts.push(EffectStmt::Excute(parse_excute_block_effects(
+                    &[inner.as_str()],
+                    is_canonical_macros_excute_header(line),
+                )));
+                pos += lines_consumed;
+                continue;
+            }
             let body_start = pos + lines_consumed;
             let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
                 stmts.push(EffectStmt::Raw(raw_block_tail(lines, pos)));
@@ -3226,7 +3481,7 @@ fn parse_effect_stmts(
             };
             let effect_macros = parse_excute_block_effects(
                 &lines[body_start..body_end],
-                line.trim() == "if macros::is_excute(agent) {",
+                is_canonical_macros_excute_header(line),
             );
             if is_plain_excute_header(line)
                 && separate_else_follows(lines, body_end)
@@ -3235,7 +3490,8 @@ fn parse_effect_stmts(
                 && !effect_macros.iter().any(|command| matches!(command, EffectMacro::EffectFollowWork { .. } | EffectMacro::Raw(_)))
             {
                 stmts.push(EffectStmt::Cond {
-                    header: "if macros::is_excute(agent) {".into(),
+                    // As written: the function may call its agent something else.
+                    header: line.to_string(),
                     body: effect_macros
                         .into_iter()
                         .map(|command| EffectStmt::BareEffect(Box::new(command)))
@@ -3256,6 +3512,11 @@ fn parse_effect_stmts(
         // dropped line and — worse — parsed the body as siblings of the conditional. Both arms
         // of an `if`/`else` then resolved as unconditional spawns at the same frame.
         if opens_block(line) {
+            if one_line_block_body(lines, pos, lines_consumed).is_some() {
+                stmts.push(EffectStmt::Raw(line.to_string()));
+                pos += lines_consumed;
+                continue;
+            }
             let body_start = pos + lines_consumed;
             let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
                 stmts.push(EffectStmt::Raw(raw_block_tail(lines, pos)));
@@ -3857,12 +4118,15 @@ fn effect_source_compatibility_macros(source: &str) -> String {
 
 /// Parse an effect_ script source into an `EffectScript` IR.
 pub fn parse_effect_script(source: &str) -> crate::data::EffectScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let effect_fn = extract_function(source, "effect_");
     let effect_fn = match effect_fn {
         Some(ref s) => s.as_str(),
         None => return EffectScript::default(),
     };
-    let lines: Vec<&str> = effect_fn.lines().collect();
+    let _agent = agent_scope(effect_fn);
+    let lines = source_lines(effect_fn);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
     } else {
@@ -3916,10 +4180,13 @@ fn sync_motion_loop_body<'a, 'b>(body: &'a [&'b str]) -> Option<&'a [&'b str]> {
 /// export does not write sound scripts yet. This remains an intentionally narrow staging parser
 /// until sound editing has its own complete surface contract.
 pub fn parse_sound_script(source: &str) -> AcmdScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let Some(sound_fn) = extract_function(source, "sound_") else {
         return AcmdScript::default();
     };
-    let lines: Vec<&str> = sound_fn.lines().collect();
+    let _agent = agent_scope(&sound_fn);
+    let lines = source_lines(&sound_fn);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
     } else {
@@ -3936,10 +4203,13 @@ pub fn parse_sound_script(source: &str) -> AcmdScript {
 
 /// Parse the `expression_` function's measured camera/rumble calls.
 pub fn parse_expression_script(source: &str) -> AcmdScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let Some(expression_fn) = extract_function(source, "expression_") else {
         return AcmdScript::default();
     };
-    let lines: Vec<&str> = expression_fn.lines().collect();
+    let _agent = agent_scope(&expression_fn);
+    let lines = source_lines(&expression_fn);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
     } else {
@@ -4244,7 +4514,7 @@ fn parse_motion_rate_call(line: &str) -> Option<f32> {
     let (agent, rate) = inner.split_once(',')?;
     // The first argument is the agent in every corpus call. Anything else is a shape this has
     // not seen, and guessing at it is how a wrong value reaches the export.
-    (agent.trim() == "agent").then(|| rate.trim().parse::<f32>().ok())?
+    (crate::acmd::is_agent_arg(agent)).then(|| rate.trim().parse::<f32>().ok())?
 }
 
 fn parse_wait_call(line: &str) -> Option<f32> {
@@ -4658,7 +4928,7 @@ fn parse_damage_no_reaction_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, command, mode, value] = args.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent"
+    if !crate::acmd::is_agent_arg(agent)
         || command.trim().trim_start_matches('*') != "MA_MSC_DAMAGE_DAMAGE_NO_REACTION"
     {
         return None;
@@ -6026,7 +6296,7 @@ fn parse_direct_expression_call(line: &str) -> Option<ExcuteStmt> {
     let [receiver, kind, duration, looped, target] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(receiver.trim(), "agent.module_accessor" | "boma")
+    if !crate::acmd::is_module_accessor(receiver.trim())
         || kind.trim().is_empty()
         || duration.trim().parse::<i32>().is_err()
         || !matches!(looped.trim(), "true" | "false")
@@ -6104,7 +6374,7 @@ fn parse_reverse_lr_call(line: &str) -> Option<ExcuteStmt> {
     let start = line.find(needle)? + needle.len();
     let end = line[start..].rfind(')')? + start;
     let tokens = tokenize_args(&line[start..end]);
-    (tokens.as_slice() == ["agent"]).then_some(ExcuteStmt::ReverseLr)
+    (tokens.len() == 1 && crate::acmd::is_agent_arg(&tokens[0])).then_some(ExcuteStmt::ReverseLr)
 }
 
 /// Parse the buildable `SET_SPEED_EX(agent, x, y, kinetic_kind)` shape.
@@ -6120,7 +6390,7 @@ fn parse_set_speed_ex_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, speed_x, speed_y, kinetic_kind] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::SetSpeedEx(crate::data::SetSpeedExCall {
@@ -6146,7 +6416,7 @@ fn parse_set_speed_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, speed_x, speed_y] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::SetSpeed(crate::data::SetSpeedCall {
@@ -6164,7 +6434,7 @@ fn parse_add_speed_no_limit_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, speed_x, speed_y] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::AddSpeedNoLimit(
@@ -6184,7 +6454,7 @@ fn parse_correct_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, kind] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" || kind.trim().is_empty() {
+    if !crate::acmd::is_agent_arg(agent) || kind.trim().is_empty() {
         return None;
     }
     Some(ExcuteStmt::Correct(crate::data::CorrectCall {
@@ -6204,7 +6474,7 @@ fn parse_ft_catch_stop_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, arg1, arg2] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::FtCatchStop(crate::data::FtCatchStopCall {
@@ -6225,7 +6495,7 @@ fn parse_ft_start_adjust_motion_frame_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, value] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::FtStartAdjustMotionFrame(
@@ -6248,7 +6518,7 @@ fn parse_motion_module_set_rate_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, rate] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let rate = rate.trim().parse::<f32>().ok()?;
@@ -6269,7 +6539,7 @@ fn parse_motion_module_set_helper_calculation_call(line: &str) -> Option<ExcuteS
     let [module_accessor, enabled] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let enabled = match enabled.trim() {
@@ -6309,7 +6579,7 @@ fn parse_motion_module_set_rate_partial_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, part_kind, rate] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let part_kind = parse_motion_module_part_kind(part_kind)?;
@@ -6341,7 +6611,7 @@ fn parse_motion_module_set_frame_partial_call(line: &str) -> Option<ExcuteStmt> 
         },
         _ => return None,
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let part_kind = parse_motion_module_part_kind(part_kind)?;
@@ -6372,7 +6642,7 @@ fn parse_clr_speed_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, kinetic_kind] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" || kinetic_kind.trim().is_empty() {
+    if !crate::acmd::is_agent_arg(agent) || kinetic_kind.trim().is_empty() {
         return None;
     }
     Some(ExcuteStmt::ClrSpeed(crate::data::ClrSpeedCall {
@@ -6392,7 +6662,7 @@ fn parse_set_air_call(line: &str) -> Option<ExcuteStmt> {
     let start = line.find(needle)? + needle.len();
     let end = line[start..].rfind(')')? + start;
     let tokens = tokenize_args(&line[start..end]);
-    (tokens.as_slice() == ["agent"]).then_some(ExcuteStmt::SetAir)
+    (tokens.len() == 1 && crate::acmd::is_agent_arg(&tokens[0])).then_some(ExcuteStmt::SetAir)
 }
 
 /// Parse the measured direct `KineticModule::clear_speed_all` shapes:
@@ -6407,7 +6677,7 @@ fn parse_kinetic_clear_speed_all_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor] = tokens.as_slice() else {
         return None;
     };
-    matches!(module_accessor.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(module_accessor.trim())
         .then_some(ExcuteStmt::KineticClearSpeedAll)
 }
 
@@ -6424,7 +6694,7 @@ fn parse_kinetic_set_consider_ground_friction_call(line: &str) -> Option<ExcuteS
     else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let consider_ground_friction = match consider_ground_friction.trim() {
@@ -6457,7 +6727,7 @@ fn parse_change_kinetic_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, kinetic_type] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma")
+    if !crate::acmd::is_module_accessor(module_accessor.trim())
         || kinetic_type.trim().is_empty()
     {
         return None;
@@ -6499,7 +6769,7 @@ fn parse_kinetic_energy_call(line: &str) -> Option<ExcuteStmt> {
         let [module_accessor, kinetic_energy_id] = tokens.as_slice() else {
             continue;
         };
-        if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma")
+        if !crate::acmd::is_module_accessor(module_accessor.trim())
             || kinetic_energy_id.trim().is_empty()
         {
             continue;
@@ -6524,7 +6794,7 @@ fn parse_kinetic_add_speed_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, vector] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let (speed_x, speed_y) = parse_zero_z_vector(vector)?;
@@ -6551,7 +6821,7 @@ fn parse_work_flag_call(line: &str) -> Option<ExcuteStmt> {
         let [module_accessor, flag] = tokens.as_slice() else {
             continue;
         };
-        if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+        if !crate::acmd::is_module_accessor(module_accessor.trim()) {
             continue;
         }
         let flag = flag.trim();
@@ -6621,7 +6891,10 @@ fn parse_work_transition_term_call(line: &str) -> Option<ExcuteStmt> {
             continue;
         };
         let receiver = match module_accessor.trim() {
-            "agent.module_accessor" => crate::data::WorkTransitionTermReceiver::AgentAccessor,
+            // Under whatever name the function gives its agent (see `is_agent_arg`).
+            accessor if crate::acmd::is_agent_module_accessor(accessor) => {
+                crate::data::WorkTransitionTermReceiver::AgentAccessor
+            }
             "boma"
                 if matches!(
                     action,
@@ -6664,7 +6937,7 @@ fn parse_work_module_inc_int_call(line: &str) -> Option<ExcuteStmt> {
     let [receiver, slot] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(receiver.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(receiver.trim()) {
         return None;
     }
     let slot = slot.trim();
@@ -6744,7 +7017,7 @@ fn parse_work_module_set_call(line: &str) -> Option<ExcuteStmt> {
             continue;
         };
         let receiver = module_accessor.trim();
-        if !matches!(receiver, "agent.module_accessor" | "boma") {
+        if !crate::acmd::is_module_accessor(receiver) {
             continue;
         }
         let value = value.trim();
@@ -7152,7 +7425,14 @@ pub(crate) fn attack_mod_num(value: f32) -> String {
     num(value)
 }
 
-fn parse_attack_clear(line: &str) -> Option<u32> {
+/// Whether `line` ends every grab box: `GrabModule::clear_all`, or the msc command vanilla
+/// scripts and most movesets write instead, `grab!(agent, *MA_MSC_CMD_GRAB_CLEAR_ALL)`.
+pub(crate) fn is_grab_clear_all(line: &str) -> bool {
+    line.contains("GrabModule::clear_all")
+        || line.contains("grab!(") && line.contains("MA_MSC_CMD_GRAB_CLEAR_ALL")
+}
+
+pub(crate) fn parse_attack_clear(line: &str) -> Option<u32> {
     let start = line.find("AttackModule::clear(")? + "AttackModule::clear(".len();
     let end = line[start..].find(')')? + start;
     tokenize_args(&line[start..end])
@@ -7594,7 +7874,7 @@ fn emit_attack_abs(call: &crate::data::AttackAbsCall, indent: &str) -> String {
     )
 }
 
-fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<String> {
+pub(crate) fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<String> {
     stmts
         .iter()
         .map(|s| match s {
@@ -8064,6 +8344,8 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
                 num(call.slow_mul),
                 num(call.slow_time)
             ),
+            // As written unless edited, exactly like the raw line it used to be.
+            crate::data::ExcuteStmt::Article(call) => format!("{indent}{}", call.emit()),
             crate::data::ExcuteStmt::Raw(line) => format!("{indent}{line}"),
         })
         .collect()
@@ -10297,6 +10579,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::move_nodes::test_support::assert_json_eq;
 
+    /// The text of a statement kept exactly as written: a raw line, or an `ArticleModule`
+    /// call read into [`crate::data::ArticleCall`] and not edited. Both save verbatim.
+    pub(crate) fn verbatim(command: &crate::data::ExcuteStmt) -> Option<&str> {
+        match command {
+            crate::data::ExcuteStmt::Raw(line) => Some(line),
+            crate::data::ExcuteStmt::Article(call) if !call.edited => Some(&call.source),
+            _ => None,
+        }
+    }
+
     #[test]
     fn body_visibility_new_pairs_require_unattributed_root_execute_context() {
         fn typed(stmts: &[AcmdStmt]) -> usize {
@@ -11778,12 +12070,22 @@ pub(crate) mod tests {
             Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ShootExist { symbol, target: crate::data::ArticleTarget::Last }))
                 if symbol == "FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1"
         ));
+        // Every unmeasured spelling stays exactly as written: as a typed `Article` when the line
+        // is one whole `ArticleModule` statement, or raw when it is not (a trailing statement,
+        // a wrapping call).
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| verbatim(command).is_some())
+                .count(),
+            15
+        );
         assert_eq!(
             commands
                 .iter()
                 .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
                 .count(),
-            15
+            2
         );
         for (index, enabled, article_index, receiver) in [
             (8, "true", "-1", None),
@@ -12029,10 +12331,12 @@ pub(crate) mod tests {
         };
         let assert_preserved = |source: &str| {
             let parsed = parse_expression_script(source);
+            // Not the closed timeline form; an unmeasured spelling may still be read as a
+            // verbatim `ExcuteStmt::Article`.
             assert!(
                 !serde_json::to_string(&parsed)
                     .unwrap()
-                    .contains("ChangeMotion"),
+                    .contains("ArticleLifecycle"),
                 "{source}"
             );
             assert_json_eq!(
@@ -12752,7 +13056,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     parsed.stmts.as_slice(),
-                    [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == mutation)
+                    [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [command] if verbatim(command).is_some_and(|raw| raw.trim() == mutation))
                 ),
                 "mutated native position became editable: {mutation}"
             );
@@ -12808,8 +13112,10 @@ pub(crate) mod tests {
                                 ExcuteStmt::ArticleLifecycle(
                                     ArticleLifecycleCall::AddMotionPartial { .. },
                                 ) => *typed += 1,
-                                ExcuteStmt::Raw(source)
-                                    if source.contains("ArticleModule::add_motion_partial(") =>
+                                command
+                                    if verbatim(command).is_some_and(|source| {
+                                        source.contains("ArticleModule::add_motion_partial(")
+                                    }) =>
                                 {
                                     *raw += 1
                                 }
@@ -12819,6 +13125,13 @@ pub(crate) mod tests {
                     }
                     AcmdStmt::Raw(source)
                         if source.contains("ArticleModule::add_motion_partial(") =>
+                    {
+                        *raw += 1
+                    }
+                    AcmdStmt::Bare(command)
+                        if verbatim(command).is_some_and(|source| {
+                            source.contains("ArticleModule::add_motion_partial(")
+                        }) =>
                     {
                         *raw += 1
                     }
@@ -12897,12 +13210,12 @@ pub(crate) mod tests {
                             symbol: shot_symbol,
                             target: ArticleTarget::All,
                         }),
-                        ExcuteStmt::Raw(raw),
+                        raw,
                     ] if symbol == "FIGHTER_ROBOT_GENERATE_ARTICLE_GYRO"
                         && shot_symbol == "FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1"
-                        && raw.contains("ArticleModule::shoot("))
+                        && verbatim(raw).is_some_and(|raw| raw.contains("ArticleModule::shoot(")))
             ),
-            "Expression ArticleModule::shoot is not an eligible operation and must remain Raw"
+            "Expression ArticleModule::shoot is not an eligible operation and must stay verbatim source"
         );
         let emitted = preview_expression_fn(&parsed, "article");
         assert!(emitted.contains(
@@ -13532,6 +13845,84 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn commented_out_game_lines_stay_comments() {
+        let source = r#"unsafe extern "C" fn game_attacks4(agent: &mut L2CAgentBase) {
+    // frame(agent.lua_state_agent, 5.0);
+    frame(agent.lua_state_agent, 10.0);
+    // if macros::is_excute(agent) {
+    //     macros::ATTACK(agent, 0, 0, Hash40::new("top"), 9.0, 361, 100, 0, 30, 4.0, 0.0, 8.0, 8.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    // }
+    if macros::is_excute(agent) {
+        // macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_m"));
+        /* macros::QUAKE(agent, *CAMERA_QUAKE_KIND_S); */
+        macros::PLAY_SE(agent, Hash40::new("se_common_swing_05"));
+    }
+}
+"#;
+        let script = parse_acmd_script(source);
+        let frames: Vec<f32> = script
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Frame(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![10.0]);
+        assert!(script.to_hitboxes().is_empty());
+        let excutes: Vec<&Vec<ExcuteStmt>> = script
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Excute(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(excutes.len(), 1, "{:#?}", script.stmts);
+        let raw: Vec<&str> = excutes[0]
+            .iter()
+            .filter_map(|stmt| match stmt {
+                ExcuteStmt::Raw(line) => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raw.len(), 2, "{:#?}", excutes[0]);
+        assert_eq!(excutes[0].len(), 3, "{:#?}", excutes[0]);
+        // Commented lines go back out verbatim.
+        let emitted = emit_stmts(&script.stmts, "    ").join("\n");
+        assert!(emitted.contains("// frame(agent.lua_state_agent, 5.0);"), "{emitted}");
+        assert!(emitted.contains("// if macros::is_excute(agent) {"), "{emitted}");
+
+        // The sound and expression parsers share the block walker: only the live call is typed.
+        let typed = |stmts: &[AcmdStmt]| {
+            let mut counts = (0, 0);
+            for stmt in stmts {
+                if let AcmdStmt::Excute(body) = stmt {
+                    for inner in body {
+                        match inner {
+                            ExcuteStmt::Sound(_) => counts.0 += 1,
+                            ExcuteStmt::Expression(_) => counts.1 += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            counts
+        };
+        assert_eq!(typed(&parse_sound_script(&source.replace("game_", "sound_")).stmts), (1, 0));
+        assert_eq!(
+            typed(&parse_expression_script(&source.replace("game_", "expression_")).stmts),
+            (1, 0)
+        );
+    }
+
+    /// The test with teeth for a newly modelled macro: **the typed thing comes out at all.**
+    ///
+    /// A round-trip oracle cannot show this. An unmodelled line is kept as `Raw` and emitted
+    /// verbatim, so it round-trips *perfectly* — every export test was green on
+    /// `FT_MOTION_RATE` both before and after it was given a parse arm. Green means "nothing
+    /// broke", never "the new family works".
     #[test]
     fn a_motion_rate_call_parses_to_a_typed_statement_and_not_to_raw() {
         let script = parse_acmd_script(
@@ -21451,5 +21842,361 @@ mod motion_script_alias_tests {
         for line in missed.iter().take(60) {
             eprintln!("missed {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod article_call_tests {
+    use super::{emit_stmts, parse_acmd_script};
+    use crate::data::{AcmdScript, AcmdStmt, ArticleCall, ArticleOp, ArticleTarget, ExcuteStmt};
+
+    fn game(body: &[&str]) -> String {
+        let mut lines = vec![
+            "unsafe extern \"C\" fn game_article(agent: &mut L2CAgentBase) {",
+            "    if macros::is_excute(agent) {",
+        ];
+        lines.extend(body.iter().copied());
+        lines.extend(["    }", "}", ""]);
+        lines.join("\n")
+    }
+
+    /// One line per `ArticleOp`, each as a real moveset writes it:
+    /// - Generate: -Moveset-Wii-Sports · src/mario/acmd/tilts.rs:30
+    /// - GenerateEnable: HDR-Standalone-Movesets · vendor/hdr/fighters/koopa/src/status/special_n.rs:58
+    /// - Remove: Potemkin-SL2 · src/moveset/kamui/acmd/normals/normals.rs:110
+    /// - RemoveExist: AnuGamer-Akaza-Moveset · code/src/captain/mod.rs:2154
+    /// - Shoot: -Moveset-Wii-Sports · src/mario/acmd/tilts.rs:31
+    /// - ShootExist: Chaos-Moveset · Chaos-rs/src/gekkouga/acmd/specials.rs:10
+    /// - ChangeMotion: Cuphead-Moveset · src/buddy/acmd/wins.rs:33
+    /// - ChangeStatus: AnuGamer-Akaza-Moveset · code/src/captain/mod.rs:3738
+    /// - ChangeStatusExist: Dark-Bowser-Moveset · src/koopad/koopa/acmd/special/special_n_spit.rs:38
+    /// - SetRate: HDR-Standalone-Movesets · ports/fighters/krool/src/acmd/specials/special_n.rs:14
+    /// - SetFrame: Potemkin-SL2 · src/moveset/kamui/acmd/normals/win.rs:100
+    /// - AddMotionPartial: HDR-Standalone-Movesets · vendor/hdr/fighters/eflame/src/acmd/tilts.rs:13
+    /// - SetVisibilityWhole: -Moveset-Wii-Sports · src/mario/acmd/misc.rs:34
+    /// - SetVisibility: HDR-Standalone-Movesets · ports/fighters/pickel/src/acmd/throws.rs:18
+    /// - SetPos: Iron-Man · src/stark/status/final_proton.rs:65
+    /// - SetFlag: HDR-Standalone-Movesets · ports/fighters/pickel/src/acmd/throws.rs:48
+    /// - SetInt: Sackboy-Moveset · src/shizue/status/catch.rs:29
+    /// - SetFloat: Sackboy-Moveset · src/shizue/status/catch.rs:32
+    const CORPUS: &[(&str, ArticleOp, &str, ArticleTarget)] = &[
+        ("ArticleModule::generate_article(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, false, -1);", ArticleOp::Generate, "*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", ArticleTarget::Unspecified),
+        ("ArticleModule::generate_article_enable(fighter.module_accessor, *FIGHTER_KOOPA_GENERATE_ARTICLE_BREATH, false, -1);", ArticleOp::GenerateEnable, "*FIGHTER_KOOPA_GENERATE_ARTICLE_BREATH", ArticleTarget::Unspecified),
+        ("ArticleModule::remove(agent.module_accessor, FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::Remove, "FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON", ArticleTarget::All),
+        ("ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_CAPTAIN_GENERATE_ARTICLE_BLUEFALCON, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::RemoveExist, "*FIGHTER_CAPTAIN_GENERATE_ARTICLE_BLUEFALCON", ArticleTarget::All),
+        ("ArticleModule::shoot(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);", ArticleOp::Shoot, "*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", ArticleTarget::All),
+        ("ArticleModule::shoot_exist(agent.module_accessor, FIGHTER_CHAOS_GENERATE_ARTICLE_WATERBALL, smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);", ArticleOp::ShootExist, "FIGHTER_CHAOS_GENERATE_ARTICLE_WATERBALL", ArticleTarget::All),
+        ("ArticleModule::change_motion(agent.module_accessor, *FIGHTER_BUDDY_GENERATE_ARTICLE_STRINGS, Hash40::new(\"win_3_wait\"), false, -1.0);", ArticleOp::ChangeMotion, "*FIGHTER_BUDDY_GENERATE_ARTICLE_STRINGS", ArticleTarget::Unspecified),
+        ("ArticleModule::change_status(agent.module_accessor, FIGHTER_CAPTAIN_GENERATE_ARTICLE_NEEDLE, WEAPON_CAPTAIN_NEEDLE_STATUS_KIND_SPAWN, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::ChangeStatus, "FIGHTER_CAPTAIN_GENERATE_ARTICLE_NEEDLE", ArticleTarget::All),
+        ("ArticleModule::change_status_exist(agent.module_accessor, FIGHTER_KOOPA_GENERATE_ARTICLE_CANNONBALLCLONED, 0x2);", ArticleOp::ChangeStatusExist, "FIGHTER_KOOPA_GENERATE_ARTICLE_CANNONBALLCLONED", ArticleTarget::Unspecified),
+        ("ArticleModule::set_rate(boma, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, 1.0);", ArticleOp::SetRate, "*FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS", ArticleTarget::Unspecified),
+        ("ArticleModule::set_frame(agent.module_accessor, FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON, 143.0);", ArticleOp::SetFrame, "FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON", ArticleTarget::Unspecified),
+        ("ArticleModule::add_motion_partial(boma, *FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD, *WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE, Hash40::new(\"to_open\"), 5.0, 5.0, false, false, 0.0, false, true, false);", ArticleOp::AddMotionPartial, "*FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD", ArticleTarget::Unspecified),
+        ("ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_DOKAN, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::SetVisibilityWhole, "*FIGHTER_MARIO_GENERATE_ARTICLE_DOKAN", ArticleTarget::All),
+        ("ArticleModule::set_visibility(boma, *FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD, Hash40::new(\"rod\"), Hash40::new(\"rod_cast\"), smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::SetVisibility, "*FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::All),
+        ("ArticleModule::set_pos(fighter.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME, Vector3f {x: 0.0, y: 50.0, z: 0.0});", ArticleOp::SetPos, "*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME", ArticleTarget::Unspecified),
+        ("ArticleModule::set_flag(boma, *FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD, true, *WEAPON_PICKEL_FISHINGROD_INSTANCE_WORK_ID_FLAG_ENABLE_REWIND);", ArticleOp::SetFlag, "*FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::Unspecified),
+        ("ArticleModule::set_int(fighter.module_accessor,*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD, capture_id, *WEAPON_SHIZUE_FISHINGROD_INSTANCE_WORK_ID_INT_TARGET_OBJECT_ID);", ArticleOp::SetInt, "*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::Unspecified),
+        ("ArticleModule::set_float(fighter.module_accessor,*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD, 1.0, *WEAPON_SHIZUE_FISHINGROD_INSTANCE_WORK_ID_FLOAT_FLOAT_SPEED_Y);", ArticleOp::SetFloat, "*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::Unspecified),
+    ];
+
+    #[test]
+    fn parses_every_corpus_article_fn() {
+        for (line, op, article, target) in CORPUS {
+            let call = ArticleCall::parse(line).unwrap_or_else(|| panic!("not read: {line}"));
+            assert_eq!(&call.op, op, "{line}");
+            assert_eq!(call.article, *article, "{line}");
+            assert_eq!(call.target, *target, "{line}");
+            assert_eq!(call.emit(), *line);
+        }
+        // Inside a script every one reaches the walk's article calls, whichever statement
+        // form the parser keeps it as, and none is lost or doubled.
+        let body: Vec<String> = CORPUS.iter().map(|(line, ..)| format!("        {line}")).collect();
+        let source = game(&body.iter().map(String::as_str).collect::<Vec<_>>());
+        let walked = parse_acmd_script(&source).to_article_calls();
+        let ops: Vec<_> = walked.iter().map(|(_, call)| call.op.clone()).collect();
+        let expected: Vec<_> = CORPUS.iter().map(|(_, op, ..)| op.clone()).collect();
+        assert_eq!(ops, expected);
+        for ((_, call), (line, _, article, target)) in walked.iter().zip(CORPUS) {
+            assert_eq!(call.symbol(), article.trim_start_matches('*'), "{line}");
+            assert_eq!(call.target, *target, "{line}");
+        }
+    }
+
+    #[test]
+    fn article_lua_bind_path_is_read_inside_and_outside_execute() {
+        let line = "smash::app::lua_bind::ArticleModule::set_rate(agent.module_accessor, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, 0.5);";
+        let call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.op, ArticleOp::SetRate);
+        let source = format!(
+            "unsafe extern \"C\" fn game_article(agent: &mut L2CAgentBase) {{\n    {line}\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+        );
+        let parsed = parse_acmd_script(&source);
+        assert!(
+            matches!(parsed.stmts.first(), Some(AcmdStmt::Bare(inner))
+                if matches!(inner.as_ref(), ExcuteStmt::Article(c) if c.op == ArticleOp::SetRate)),
+            "{:#?}",
+            parsed.stmts
+        );
+        assert!(
+            matches!(parsed.stmts.get(1), Some(AcmdStmt::Excute(inner))
+                if matches!(inner.as_slice(), [ExcuteStmt::Article(_)])),
+            "{:#?}",
+            parsed.stmts
+        );
+        assert_eq!(parsed.to_article_calls().len(), 2);
+    }
+
+    #[test]
+    fn numeric_target_reads_as_all() {
+        // Springtrap-Moveset · src/springtrap/acmd/other/win_3.rs:28
+        let line = "ArticleModule::remove_exist(boma, *FIGHTER_GANON_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(0));";
+        let call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.target, ArticleTarget::All);
+        assert_eq!(call.emit(), line);
+        for (written, target) in [
+            ("ArticleOperationTarget(1)", ArticleTarget::First),
+            ("ArticleOperationTarget(2)", ArticleTarget::Last),
+            ("3", ArticleTarget::Term),
+            ("ArticleOperationTarget(-1)", ArticleTarget::None),
+            ("0xFFFFFFFF", ArticleTarget::None),
+            ("*ARTICLE_OPE_TARGET_LAST", ArticleTarget::Last),
+            ("app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_FIRST)", ArticleTarget::First),
+            ("ArticleOperationTarget(*ARTICLE_OPE_TARGET_OTHER)", ArticleTarget::Unspecified),
+        ] {
+            assert_eq!(ArticleTarget::read(written), target, "{written}");
+        }
+    }
+
+    #[test]
+    fn article_edit_keeps_receiver_path_and_target_spelling() {
+        let line = "smash::app::lua_bind::ArticleModule::shoot(boma, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(0), false);";
+        let mut call = ArticleCall::parse(line).unwrap();
+        call.target = ArticleTarget::Last;
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "smash::app::lua_bind::ArticleModule::shoot(boma, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(2), false);"
+        );
+        let mut call = ArticleCall::parse(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false);",
+        )
+        .unwrap();
+        call.target = ArticleTarget::First;
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_FIRST, false);"
+        );
+    }
+
+    #[test]
+    fn unknown_fn_is_other_verbatim() {
+        let line = "ArticleModule::set_weight(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, 1.5, false);";
+        let call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.op, ArticleOp::Other("set_weight".into()));
+        assert_eq!(call.emit(), line);
+        let parsed = parse_acmd_script(&game(&[&format!("        {line}")]));
+        let AcmdStmt::Excute(inner) = &parsed.stmts[0] else {
+            panic!("{:#?}", parsed.stmts);
+        };
+        assert!(
+            matches!(inner.as_slice(), [ExcuteStmt::Article(c)] if c.op == ArticleOp::Other("set_weight".into())),
+            "{inner:#?}"
+        );
+        let emitted = emit_stmts(&parsed.stmts, "    ").join("\n");
+        assert!(emitted.contains(&format!("        {line}\n")), "{emitted}");
+    }
+
+    #[test]
+    fn round_trip_byte_exact() {
+        let body = [
+            "    if macros::is_excute(agent) {",
+            "        ArticleModule::set_rate(boma, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, (25.0 - 1.0)/13.0);",
+            "        ArticleModule::remove_exist(boma, *FIGHTER_GANON_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(0));",
+            "        smash::app::lua_bind::ArticleModule::set_frame(agent.module_accessor, FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON, 143.0);",
+            "        ArticleModule::set_int(fighter.module_accessor,*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD, capture_id, *WEAPON_SHIZUE_FISHINGROD_INSTANCE_WORK_ID_INT_TARGET_OBJECT_ID);",
+            "        ArticleModule::set_weight(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, 1.5, false);",
+            "    }",
+            "    ArticleModule::shoot(agent.module_accessor, FIGHTER_CHAOS_GENERATE_ARTICLE_WATERBALL, smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);",
+        ];
+        let source = format!(
+            "unsafe extern \"C\" fn game_article(agent: &mut L2CAgentBase) {{\r\n{}\r\n}}\r\n",
+            body.join("\r\n")
+        );
+        let parsed = parse_acmd_script(&source);
+        assert_eq!(parsed.to_article_calls().len(), 6, "{:#?}", parsed.stmts);
+        let typed = parsed
+            .stmts
+            .iter()
+            .flat_map(|stmt| match stmt {
+                AcmdStmt::Excute(inner) => inner.iter().collect::<Vec<_>>(),
+                AcmdStmt::Bare(inner) => vec![inner.as_ref()],
+                _ => Vec::new(),
+            })
+            .filter(|stmt| matches!(stmt, ExcuteStmt::Article(_)))
+            .count();
+        assert_eq!(typed, 6, "{:#?}", parsed.stmts);
+        assert_eq!(emit_stmts(&parsed.stmts, "    ").join("\r\n"), body.join("\r\n"));
+    }
+
+    #[test]
+    fn plain_static_symbol_spawns() {
+        let parsed = parse_acmd_script(&game(&[
+            "        ArticleModule::generate_article(agent.module_accessor, FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT, false, -1);",
+        ]));
+        assert_eq!(
+            parsed.to_article_spawns(),
+            vec![(1, "FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT".to_owned(), true)]
+        );
+    }
+
+    /// The call a written line gives, with where it came from left out.
+    fn written(call: &ArticleCall) -> (ArticleOp, String, Vec<String>, ArticleTarget, String) {
+        (
+            call.op.clone(),
+            call.article.clone(),
+            call.args.clone(),
+            call.target,
+            call.source.clone(),
+        )
+    }
+
+    /// The article calls a script of these statements gives, through the walk.
+    fn walked(stmts: Vec<ExcuteStmt>) -> Vec<(ArticleOp, String, Vec<String>, ArticleTarget, String)> {
+        AcmdScript {
+            stmts: vec![AcmdStmt::Excute(stmts)],
+        }
+        .to_article_calls()
+        .iter()
+        .map(|(_, call)| written(call))
+        .collect()
+    }
+
+    /// One written line, read through each statement form that accepts it: the parser's own
+    /// choice (a closed timeline form, a typed native call), a typed native call, and a typed
+    /// `Article`. All give the same call, with the original line as `source`.
+    #[test]
+    fn native_and_typed_agree() {
+        use crate::move_nodes::native_calls;
+        // (written line, the form the parser keeps it as)
+        let cases = [
+            (
+                "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, false, -1);",
+                "lifecycle",
+            ),
+            (
+                "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+                "native",
+            ),
+            (
+                "let id = ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+                "article",
+            ),
+            (
+                "ArticleModule::change_motion(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, Hash40::new(\"catch\"), false, -1.0);",
+                "native",
+            ),
+            (
+                "ArticleModule::set_rate(boma, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, (25.0 - 1.0)/13.0);",
+                "article",
+            ),
+        ];
+        for (line, form) in cases {
+            let parsed = parse_acmd_script(&game(&[&format!("        {line}")]));
+            let AcmdStmt::Excute(inner) = &parsed.stmts[0] else {
+                panic!("{:#?}", parsed.stmts);
+            };
+            let kept = match inner.as_slice() {
+                [ExcuteStmt::ArticleLifecycle(_)] => "lifecycle",
+                [ExcuteStmt::NativeCall(_)] => "native",
+                [ExcuteStmt::Article(_)] => "article",
+                other => panic!("{line}: {other:#?}"),
+            };
+            assert_eq!(kept, form, "{line}");
+
+            let expected = vec![written(&ArticleCall::parse(line).unwrap())];
+            assert_eq!(expected[0].4, line, "source is the line as written");
+            assert_eq!(walked(inner.clone()), expected, "parser's form: {line}");
+            assert_eq!(
+                walked(vec![ExcuteStmt::Article(ArticleCall::parse(line).unwrap())]),
+                expected,
+                "typed: {line}"
+            );
+            if let Some(call) = native_calls::parse(line) {
+                assert_eq!(
+                    walked(vec![ExcuteStmt::NativeCall(call)]),
+                    expected,
+                    "native: {line}"
+                );
+            } else {
+                assert_ne!(form, "native", "{line}");
+            }
+            assert_eq!(parsed.to_article_spawns(), {
+                let typed = AcmdScript {
+                    stmts: vec![AcmdStmt::Excute(vec![ExcuteStmt::Article(
+                        ArticleCall::parse(line).unwrap(),
+                    )])],
+                };
+                typed.to_article_spawns()
+            });
+        }
+    }
+
+    /// A native call edited after it was read no longer spells its original line, so the walk
+    /// reads the call's own spelling instead of the stale text.
+    #[test]
+    fn article_native_edit_is_read_from_the_call_not_the_stale_line() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);";
+        let mut call = crate::move_nodes::native_calls::parse(line).unwrap();
+        assert_eq!(ArticleCall::from_native(&call).unwrap().source, line);
+        call.arguments[2] = "0".into();
+        let read = ArticleCall::from_native(&call).unwrap();
+        assert_eq!(read.args, ["true", "0"]);
+        assert_eq!(read.source, call.source());
+    }
+
+    /// A closed timeline form keeps no text, so it is read from the line the timeline writes for
+    /// it and says so. A bare shoot target comes back wrapped.
+    #[test]
+    fn article_timeline_form_is_marked_and_read_from_its_written_form() {
+        let line = "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_LAST, false);";
+        let parsed = parse_acmd_script(&game(&[&format!("        {line}")]));
+        let calls = parsed.to_article_calls();
+        let [(_, call)] = calls.as_slice() else {
+            panic!("{calls:#?}");
+        };
+        assert_eq!(call.origin, crate::data::ArticleOrigin::Timeline);
+        assert_eq!(call.target, ArticleTarget::Last);
+        assert_eq!(
+            call.source,
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);"
+        );
+    }
+
+    #[test]
+    fn article_edit_keeps_binding_receiver_and_path() {
+        let line = "let id = smash::app::lua_bind::ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);";
+        let mut call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.op, ArticleOp::Generate);
+        assert_eq!(call.emit(), line);
+        call.args[0] = "false".into();
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "let id = smash::app::lua_bind::ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, false, -1);"
+        );
+        // Through the native path the call keeps the receiver it was written with.
+        let native = crate::move_nodes::native_calls::parse(
+            "ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+        )
+        .unwrap();
+        let mut call = ArticleCall::from_native(&native).unwrap();
+        call.args[0] = "false".into();
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, false, -1);"
+        );
     }
 }

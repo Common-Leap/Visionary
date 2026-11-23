@@ -9,20 +9,23 @@
 //     (c00, c07, c12, c50 …; NOT limited to 0–7). That's a modifier, expressed as
 //     `TransplantOp::one_slot_slots`, and it can ride on top of a transplant.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::data::{EditRecord, EffectCallEdit};
 
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
-pub const PROJECT_VERSION: u32 = 8;
+/// v9 reconciles the fork's v8 (`project_fighters`, `moveset_source`) and Common-Leap's v8
+/// (`characters` per-character stores for made characters) so both v8 lines migrate cleanly.
+pub const PROJECT_VERSION: u32 = 9;
 
 /// The first project version in which characters made in Visionary keep their own edits in
-/// [`ModProjectFile::characters`]. Before it, a made character played its donor's edits on its
-/// own costumes; [`ModProjectFile::migrate`] gives such a project's made characters a copy of
-/// them, once.
-pub const OWN_CHARACTER_STORES_VERSION: u32 = 8;
+/// [`ModProjectFile::characters`]. Before v9 (including fork v8 files written before this
+/// merge), a made character with no `characters` entry played its donor's edits on its own
+/// costumes; [`ModProjectFile::migrate`] gives such a project's made characters a copy of them,
+/// once.
+pub const OWN_CHARACTER_STORES_VERSION: u32 = 9;
 
 /// Oldest project version supported by the load-time field defaults and migrations.
 pub const OLDEST_SUPPORTED_VERSION: u32 = 1;
@@ -58,6 +61,42 @@ pub struct ModProjectFile {
     /// project created. Added in v3.
     #[serde(default, skip_serializing_if = "RosterMod::is_empty")]
     pub roster: RosterMod,
+    /// The fighters this project works on: the left fighter list shows exactly these. Added in
+    /// v4. Older projects load with it empty and get it seeded from what they already edit.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub project_fighters: BTreeSet<ProjectFighter>,
+    /// The moveset folder this project is linked to, as an absolute path in memory. Added in v4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moveset_source: Option<String>,
+}
+
+/// One row of the project's fighter list: a vanilla fighter, or a character this project
+/// added on a fighter's costume slot.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProjectFighter {
+    pub name: String,
+    /// The slot character's display name (`FighterEntry::custom_name`). `None` is the
+    /// fighter's own row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
+}
+
+impl ProjectFighter {
+    /// The fighter's own row.
+    pub fn fighter(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            character: None,
+        }
+    }
+
+    /// A character this project added on `name`'s costume slot.
+    pub fn character(name: &str, character: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            character: Some(character.to_string()),
+        }
+    }
 }
 
 /// Which ACMD portion of a saved project should be sent through the source exporter.
@@ -96,6 +135,9 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         // source export cannot carry a character select screen. They ship through the mod
         // folder path instead.
         roster: RosterMod::default(),
+        // Neither is ACMD, so neither belongs in a Smashline source export.
+        project_fighters: BTreeSet::new(),
+        moveset_source: None,
     };
 
     // A whole-project export may have a tweak stored under one fighter while the corresponding
@@ -314,17 +356,34 @@ impl Default for ModProjectFile {
             fighters: HashMap::new(),
             characters: BTreeMap::new(),
             roster: RosterMod::default(),
+            project_fighters: BTreeSet::new(),
+            moveset_source: None,
         }
     }
 }
 
 impl ModProjectFile {
-    /// Deliberately does not consult `effect_dropped_lines`. It is a note about what an export
-    /// would lose, not an edit, so a project holding only that has nothing to build and must
-    /// still count as empty — otherwise "No edits to export yet" turns into an export that
-    /// produces no files.
+    /// Deliberately ignores `project_fighters` and `moveset_source`: a project that only names
+    /// fighters has nothing to export. Likewise does not consult `effect_dropped_lines` (see
+    /// [`FighterMod::has_edits`]).
     pub fn is_empty(&self) -> bool {
         self.all_move_edits().all(|f| !f.has_edits()) && self.roster.is_empty()
+    }
+
+    /// Add the fighters this project already edits to `project_fighters`: every fighter with
+    /// edits, and every character it authored. Additive and idempotent. [`Self::migrate`] runs
+    /// it for files saved before the list existed (see there): a v4, v8, or v9 file's list is
+    /// what the user left it as.
+    pub fn seed_project_fighters(&mut self) {
+        for (name, fighter) in &self.fighters {
+            if fighter.has_edits() {
+                self.project_fighters.insert(ProjectFighter::fighter(name));
+            }
+        }
+        for entry in &self.roster.authored {
+            self.project_fighters
+                .insert(ProjectFighter::character(&entry.donor, &entry.display_name));
+        }
     }
 
     /// Every fighter's and every made character's edits. Anything that asks a question of all
@@ -470,6 +529,27 @@ impl ModProjectFile {
         }
         if self.version < OLDEST_SUPPORTED_VERSION {
             anyhow::bail!("unsupported project version {}", self.version);
+        }
+        // `project_fighters` was added in the fork's v4. Files from before it (v1–v3) and from
+        // Common-Leap's line (v7; it never wrote v4–v6) get it from what they already edit. A
+        // v4, v8, or v9 file's list is the user's own and is left alone, so a removal survives a
+        // reopen.
+        if self.version < 4 || (5..=7).contains(&self.version) {
+            self.seed_project_fighters();
+        }
+        // Older builds recorded an eff opened from outside the eff root by its absolute path.
+        // Rewrite it to the game path it stands for; one with no game path stays as it is and
+        // export refuses it.
+        for fighter in self
+            .fighters
+            .values_mut()
+            .chain(self.characters.values_mut())
+        {
+            if let Some(eff) = fighter.eff.as_mut() {
+                if !eff.source_rel.is_empty() && !is_mod_relative(&eff.source_rel) {
+                    eff.source_rel = eff_game_rel(std::path::Path::new(&eff.source_rel), None);
+                }
+            }
         }
         // Decided before the version is stamped. A project saved before made characters had
         // their own stores is one whose version predates them. Builds between the change and the
@@ -683,29 +763,6 @@ pub struct RosterMod {
     /// roster row — `color_num`, etc. — without touching the file copy.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub chara_overrides: std::collections::BTreeMap<crate::roster::RosterKey, CharaOverrides>,
-}
-
-impl FighterMod {
-    /// Whether this holds any edit. A browsed move's game source and the notes kept beside an
-    /// edit are not edits of their own.
-    pub fn has_edits(&self) -> bool {
-        !(self.acmd.is_empty()
-            && self.effect_calls.values().all(|v| v.is_empty())
-            && self.effect_calls_full.values().all(|v| v.is_empty())
-            // An empty category script is an explicit replacement: it means the user
-            // removed every call and wants the generated plugin to silence the stock
-            // category. The map's presence, not the statement count, carries that intent.
-            && self.sound_scripts.is_empty()
-            && self.expression_scripts.is_empty()
-            && self.effect_scripts.is_empty()
-            && self.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
-            && self.live_tweaks.is_empty()
-            && self.params.is_empty()
-            && self.behavior.is_unset()
-            && self.meters.is_empty()
-            && self.move_graphs.is_empty()
-            && self.controller_charts.is_empty())
-    }
 }
 
 impl RosterMod {
@@ -972,6 +1029,33 @@ pub struct FighterMod {
     /// remain the reserved `main` chart; IDs are validated by the controller project layer.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub controller_charts: BTreeMap<String, ControllerChart>,
+}
+
+impl FighterMod {
+    /// Whether this fighter holds anything an export would build.
+    ///
+    /// Deliberately does not consult `effect_dropped_lines`. It is a note about what an export
+    /// would lose, not an edit, so a fighter holding only that has nothing to build and must
+    /// still count as empty — otherwise "No edits to export yet" turns into an export that
+    /// produces no files.
+    pub fn has_edits(&self) -> bool {
+        !(self.acmd.is_empty()
+            && self.effect_calls.values().all(|v| v.is_empty())
+            && self.effect_calls_full.values().all(|v| v.is_empty())
+            // An empty category script is an explicit replacement: it means the user
+            // removed every call and wants the generated plugin to silence the stock
+            // category. The map's presence, not the statement count, carries that intent.
+            && self.sound_scripts.is_empty()
+            && self.expression_scripts.is_empty()
+            && self.effect_scripts.is_empty()
+            && self.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
+            && self.live_tweaks.is_empty()
+            && self.params.is_empty()
+            && self.behavior.is_unset()
+            && self.meters.is_empty()
+            && self.move_graphs.is_empty()
+            && self.controller_charts.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1364,6 +1448,77 @@ pub struct TransplantOp {
     /// entry. This is how a one-slot-scoped transplant is normally authored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_entry: Option<String>,
+}
+
+/// The game path (`effect/fighter/mario/ef_mario.eff`) an eff on disk stands for — what
+/// [`EffMod::source_rel`] records and what export writes under the mod folder.
+///
+/// Relative to `root` when the file sits under it at a game path. Otherwise the path from its
+/// last `effect` folder on, so an eff opened from a mod, a download or a project `romfs/` is
+/// recorded the same way as the dump's copy. A bare `ef_<fighter>.eff` maps to that fighter's
+/// path. Anything else keeps the full path, which export then refuses rather than writes:
+/// an absolute `source_rel` once made `mod_dir.join` overwrite the user's own file.
+pub fn eff_game_rel(path: &std::path::Path, root: Option<&std::path::Path>) -> String {
+    use std::path::Component;
+    let slashed = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    let under_root = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(slashed);
+    if let Some(rel) = &under_root {
+        if rel.to_ascii_lowercase().starts_with("effect/") {
+            return rel.clone();
+        }
+    }
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if let Some(i) = parts
+        .iter()
+        .rposition(|p| p.eq_ignore_ascii_case("effect"))
+        .filter(|i| i + 1 < parts.len())
+    {
+        return parts[i..].join("/");
+    }
+    if let Some(rel) = under_root {
+        return rel;
+    }
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if let Some(fighter) = file
+        .strip_prefix("ef_")
+        .and_then(|f| f.strip_suffix(".eff"))
+        .filter(|f| !f.is_empty())
+    {
+        // ef_mario_c03.eff is a one-slot file of mario's, not a fighter named mario_c03.
+        let fighter = match fighter.rsplit_once("_c") {
+            Some((name, slot))
+                if !name.is_empty()
+                    && slot.len() == 2
+                    && slot.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                name
+            }
+            _ => fighter,
+        };
+        return format!("effect/fighter/{fighter}/{file}");
+    }
+    slashed(path)
+}
+
+/// True when `source_rel` is a relative game path that stays inside whatever folder it is
+/// joined to: no drive, no root, no `..`. Export writes nothing for any other value.
+pub fn is_mod_relative(source_rel: &str) -> bool {
+    !source_rel.is_empty()
+        && !source_rel.contains(':')
+        && !source_rel.starts_with(['/', '\\'])
+        && !source_rel.split(['/', '\\']).any(|part| part == "..")
 }
 
 /// "effect/fighter/mario/ef_mario.eff" → "mario"; falls back to the file stem.
@@ -2173,6 +2328,8 @@ mod persistence_tests {
 
 #[cfg(test)]
 mod older_project_tests {
+    use super::*;
+
     /// Projects saved by older builds. Set `VISIONARY_OLD_PROJECTS` to a folder of them.
     #[test]
     fn older_projects_load_and_expand() {
@@ -2197,6 +2354,216 @@ mod older_project_tests {
         }
         println!("checked {checked} older projects");
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn v3_project_loads_with_empty_scope() {
+        let mut project: ModProjectFile =
+            serde_json::from_str(r#"{"version":3,"name":"x"}"#).expect("v3 must still load");
+        project.migrate().expect("v3 is supported");
+        assert_eq!(project.version, PROJECT_VERSION);
+        assert!(project.project_fighters.is_empty());
+        assert!(project.moveset_source.is_none());
+    }
+
+    #[test]
+    fn project_fighters_round_trip() {
+        let mut project = ModProjectFile::default();
+        project.project_fighters.insert(ProjectFighter::fighter("mario"));
+        project
+            .project_fighters
+            .insert(ProjectFighter::character("pacman", "Shy Guy"));
+
+        let json = serde_json::to_string(&ProjectFighter::fighter("mario")).unwrap();
+        assert!(!json.contains("character"), "a fighter's own row has no character key: {json}");
+
+        let reloaded: ModProjectFile =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(reloaded.project_fighters, project.project_fighters);
+    }
+
+    #[test]
+    fn seed_adds_edited_and_authored() {
+        let mut project = ModProjectFile::default();
+        project.fighters.entry("fox".into()).or_default().sound_scripts.insert(
+            "attack_s3_s".into(),
+            crate::data::AcmdScript::default(),
+        );
+        project.fighters.insert("falco".into(), FighterMod::default());
+        project.roster.authored.push(AuthoredEntry {
+            key: crate::roster::RosterKey::slot("pacman", 8),
+            donor: "pacman".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Shy Guy".into(),
+            name_id: "shy_guy".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+
+        project.seed_project_fighters();
+        let expected: std::collections::BTreeSet<ProjectFighter> = [
+            ProjectFighter::fighter("fox"),
+            ProjectFighter::character("pacman", "Shy Guy"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(project.project_fighters, expected);
+
+        project.seed_project_fighters();
+        assert_eq!(project.project_fighters, expected);
+    }
+
+    fn with_edited_fox(version: u32) -> ModProjectFile {
+        let mut project = ModProjectFile {
+            version,
+            ..Default::default()
+        };
+        project.fighters.entry("fox".into()).or_default().sound_scripts.insert(
+            "attack_s3_s".into(),
+            crate::data::AcmdScript::default(),
+        );
+        project
+    }
+
+    #[test]
+    fn v3_project_is_seeded_on_migrate() {
+        let mut project = with_edited_fox(3);
+        project.migrate().unwrap();
+        assert!(project.project_fighters.contains(&ProjectFighter::fighter("fox")));
+    }
+
+    #[test]
+    fn common_leap_v7_project_is_seeded_on_migrate() {
+        let mut project = with_edited_fox(7);
+        project.migrate().unwrap();
+        assert!(project.project_fighters.contains(&ProjectFighter::fighter("fox")));
+    }
+
+    #[test]
+    fn v8_project_is_not_reseeded() {
+        let mut project = with_edited_fox(8);
+        project.migrate().unwrap();
+        assert!(project.project_fighters.is_empty());
+    }
+
+    #[test]
+    fn v4_project_is_not_reseeded() {
+        // A v4 file's list is the user's own: fox was removed while it still had edits.
+        let mut project = with_edited_fox(4);
+        project.migrate().unwrap();
+        assert!(project.project_fighters.is_empty());
+    }
+
+    #[test]
+    fn scope_only_project_is_empty() {
+        let mut project = ModProjectFile::default();
+        project.project_fighters.insert(ProjectFighter::fighter("mario"));
+        project.moveset_source = Some("C:/mods/my_moveset".into());
+        assert!(project.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod eff_game_rel_tests {
+    use super::*;
+    use std::path::Path;
+
+    const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+
+    #[test]
+    fn an_eff_under_the_root_keeps_its_game_path() {
+        let root = Path::new("C:/dump");
+        assert_eq!(eff_game_rel(&root.join(MARIO), Some(root)), MARIO);
+    }
+
+    /// The bug: File → Open Effect File… on a mod's eff recorded `C:/mods/…/ef_mario.eff`.
+    #[test]
+    fn an_eff_outside_the_root_is_recorded_from_its_effect_folder() {
+        let root = Path::new("C:/dump");
+        for outside in [
+            "C:/Users/me/Downloads/coolmod/effect/fighter/mario/ef_mario.eff",
+            r"D:\mods\coolmod\romfs\effect\fighter\mario\ef_mario.eff",
+            "C:/dump/../elsewhere/Effect/fighter/mario/ef_mario.eff",
+        ] {
+            let rel = eff_game_rel(Path::new(outside), Some(root));
+            assert!(rel.eq_ignore_ascii_case(MARIO), "{outside} → {rel}");
+            assert!(is_mod_relative(&rel), "{outside} → {rel}");
+        }
+    }
+
+    /// A root that wraps the game folders (`<mod>/romfs`) still yields the game path.
+    #[test]
+    fn a_wrapper_under_the_root_is_dropped() {
+        let root = Path::new("C:/mod");
+        let path = root.join("romfs").join(MARIO);
+        assert_eq!(eff_game_rel(&path, Some(root)), MARIO);
+    }
+
+    #[test]
+    fn a_bare_fighter_eff_maps_to_that_fighters_path() {
+        assert_eq!(
+            eff_game_rel(Path::new("C:/Users/me/Downloads/ef_Mario.eff"), None),
+            MARIO
+        );
+        assert_eq!(
+            eff_game_rel(Path::new("C:/Users/me/Downloads/ef_mario_c03.eff"), None),
+            "effect/fighter/mario/ef_mario_c03.eff"
+        );
+    }
+
+    /// No game path to derive: kept as it is, and `is_mod_relative` says so — that is what
+    /// makes export refuse it instead of writing over it.
+    #[test]
+    fn an_eff_with_no_game_path_stays_absolute_and_unexportable() {
+        let path = Path::new("C:/Users/me/Downloads/custom.eff");
+        let rel = eff_game_rel(path, Some(Path::new("C:/dump")));
+        assert_eq!(rel, "C:/Users/me/Downloads/custom.eff");
+        assert!(!is_mod_relative(&rel));
+    }
+
+    #[test]
+    fn only_game_paths_are_mod_relative() {
+        assert!(is_mod_relative(MARIO));
+        for bad in [
+            "",
+            "C:/Users/me/ef_mario.eff",
+            r"C:\Users\me\ef_mario.eff",
+            "/home/me/ef_mario.eff",
+            r"\\server\share\ef_mario.eff",
+            "effect/../../outside.eff",
+            r"..\outside.eff",
+        ] {
+            assert!(!is_mod_relative(bad), "{bad:?} must not be exportable");
+        }
+    }
+
+    /// A project saved by an older build carries the absolute path; loading it rewrites the
+    /// path to the game path, and leaves one with no game path for export to refuse.
+    #[test]
+    fn migrate_rewrites_absolute_eff_sources() {
+        let mut project = ModProjectFile {
+            version: PROJECT_VERSION,
+            ..Default::default()
+        };
+        for (fighter, source) in [
+            (
+                "mario",
+                "C:/Users/me/mods/x/effect/fighter/mario/ef_mario.eff",
+            ),
+            ("custom", "C:/Users/me/custom.eff"),
+            ("link", "effect/fighter/link/ef_link.eff"),
+        ] {
+            project.fighters.entry(fighter.into()).or_default().eff = Some(EffMod {
+                source_rel: source.into(),
+                ..Default::default()
+            });
+        }
+        project.migrate().unwrap();
+        let source = |f: &str| project.fighters[f].eff.as_ref().unwrap().source_rel.clone();
+        assert_eq!(source("mario"), MARIO);
+        assert_eq!(source("custom"), "C:/Users/me/custom.eff");
+        assert_eq!(source("link"), "effect/fighter/link/ef_link.eff");
     }
 }
 

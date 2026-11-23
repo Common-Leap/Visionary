@@ -15,23 +15,24 @@ fn synthetic_top_matrix(bones: &std::collections::HashMap<String, glam::Mat4>) -
         .unwrap_or(glam::Mat4::IDENTITY)
 }
 
-pub struct Camera {
-    pub translation: Vec3,
-    pub rotation: Vec3,
-    /// The point the camera keeps centred: the fighter's position over the ground, so a move
-    /// that carries the fighter forward (a dash attack, a slide) stays in view.
-    pub follow: Vec3,
+/// A camera placement as Settings edits it and saves it as the default view. The view matrix
+/// is translation * rotation (XYZ Euler angles), as in SSBH Editor and SSBH Studio.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CameraView {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 3],
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
 }
 
-impl Default for Camera {
+impl Default for CameraView {
+    /// The side view of a fighter standing at the origin.
     fn default() -> Self {
         Self {
-            translation: Vec3::new(0.0, -8.0, -60.0),
-            follow: Vec3::ZERO,
-            rotation: Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0),
+            translation: [0.0, -8.0, -60.0],
+            rotation: [0.0, std::f32::consts::FRAC_PI_2, 0.0],
             fov_y: 30f32.to_radians(),
             near: 1.0,
             far: 400_000.0,
@@ -39,44 +40,142 @@ impl Default for Camera {
     }
 }
 
+pub struct Camera {
+    pub translation: Vec3,
+    pub rotation: Vec3,
+    /// The point the camera keeps centred: the fighter's position over the ground, so a move
+    /// that carries the fighter forward (a dash attack, a slide) stays in view.
+    pub follow: Vec3,
+    /// The point orbiting and view snaps turn about, relative to `follow`. Panning and
+    /// framing move it, so whatever is centred stays centred while turning (SSBH Studio).
+    pub target: Vec3,
+    pub fov_y: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self::from_view(&CameraView::default())
+    }
+}
+
+/// The camera's rotation matrix for XYZ Euler angles.
+pub fn camera_rotation(rotation: Vec3) -> Mat4 {
+    Mat4::from_euler(glam::EulerRot::XYZ, rotation.x, rotation.y, rotation.z)
+}
+
 impl Camera {
-    /// Pan in the camera plane (left/right and up/down) while keeping rotation fixed.
-    /// Moves in world X (left/right) and world Y (up/down) regardless of camera rotation.
-    pub fn pan(&mut self, delta_x: f32, delta_y: f32) {
-        let speed = self.translation.z.abs() * 0.001;
-        self.translation.x -= delta_x * speed;
-        self.translation.y += delta_y * speed;
+    pub fn from_view(view: &CameraView) -> Self {
+        let mut camera = Self {
+            translation: Vec3::from(view.translation),
+            rotation: Vec3::from(view.rotation),
+            follow: Vec3::ZERO,
+            target: Vec3::ZERO,
+            fov_y: view.fov_y,
+            near: view.near,
+            far: view.far,
+        };
+        camera.target = camera.centred_point();
+        camera
     }
 
-    /// Turn the camera around the fighter: sideways drags turn it around, vertical drags tilt
-    /// it up or down, short of looking straight down.
-    pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
-        self.rotation.y += delta_x * 0.01;
-        self.rotation.x = (self.rotation.x + delta_y * 0.01).clamp(-1.4, 1.4);
+    /// This placement, without the fighter it follows.
+    pub fn view(&self) -> CameraView {
+        CameraView {
+            translation: self.translation.to_array(),
+            rotation: self.rotation.to_array(),
+            fov_y: self.fov_y,
+            near: self.near,
+            far: self.far,
+        }
     }
 
-    /// Back to the side view, keeping the zoom.
-    pub fn reset_turn(&mut self) {
-        self.rotation = Camera::default().rotation;
+    /// The point straight ahead at the depth of the view origin, relative to `follow`.
+    fn centred_point(&self) -> Vec3 {
+        camera_rotation(self.rotation)
+            .inverse()
+            .transform_vector3(Vec3::new(-self.translation.x, -self.translation.y, 0.0))
     }
 
-    /// Zoom: move along Z axis.
-    pub fn zoom(&mut self, delta: f32) {
-        let speed = self.translation.z.abs() * 0.1;
-        self.translation.z += delta * speed;
-        self.translation.z = self.translation.z.min(-1.0);
+    /// Turns to `rotation` while keeping `target` where it appears on screen.
+    pub fn turn_to(&mut self, rotation: Vec3) {
+        let view = camera_rotation(self.rotation).transform_vector3(self.target) + self.translation;
+        self.rotation = rotation;
+        self.translation = view - camera_rotation(rotation).transform_vector3(self.target);
+    }
+
+    /// Orbit like dragging the scene: right turns right, up tilts up.
+    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
+        self.turn_to(self.rotation + Vec3::new(delta_y * 0.01, delta_x * 0.01, 0.0));
+    }
+
+    /// Moves the view by `shift` in view space, keeping `target` at the view centre.
+    pub fn pan_view(&mut self, shift: Vec3) {
+        self.translation += shift;
+        self.target -= camera_rotation(self.rotation)
+            .inverse()
+            .transform_vector3(shift);
+    }
+
+    /// Pan in the view plane so the model follows the pointer. The viewport height and
+    /// vertical field of view convert pixels to world units at the model's distance.
+    pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
+        let factor = self.fov_y.sin() * self.translation.z.abs() / viewport_height.max(1.0);
+        self.pan_view(Vec3::new(delta_x * factor, -delta_y * factor, 0.0));
+    }
+
+    /// Zooms in by `amount`, scaled by distance so far views zoom as quickly as near ones.
+    /// Never zooms through the point being looked at.
+    pub fn zoom(&mut self, amount: f32) {
+        let delta = amount * self.translation.z.abs();
+        self.translation.z = (self.translation.z + delta).min(-1.0);
+    }
+
+    /// Points the camera at a sphere (in world space) without changing its angle.
+    pub fn frame(&mut self, center: Vec3, radius: f32) {
+        let center = center - self.follow;
+        let half_fov = (self.fov_y * 0.5).max(0.05);
+        let distance = radius.max(1.0) / half_fov.sin() * 1.1;
+        self.translation = Vec3::new(0.0, 0.0, -distance)
+            - camera_rotation(self.rotation).transform_vector3(center);
+        self.target = center;
+    }
+
+    /// Whether the camera sits at `view`.
+    pub fn is_at(&self, view: &CameraView) -> bool {
+        self.translation
+            .abs_diff_eq(Vec3::from(view.translation), 1e-4)
+            && self.rotation.abs_diff_eq(Vec3::from(view.rotation), 1e-4)
+            && (self.fov_y - view.fov_y).abs() < 1e-4
+    }
+
+    /// Back to `view`'s angle, keeping the zoom and what is centred.
+    pub fn reset_turn(&mut self, view: &CameraView) {
+        self.turn_to(Vec3::from(view.rotation));
+    }
+
+    /// Takes one frame of a camera animation. Its view matrix is rotation * translation *
+    /// scale; it is decomposed into this camera's translation * rotation, as SSBH Studio does,
+    /// so the overlays and effects project through the same camera.
+    pub fn apply_animation(&mut self, values: &ssbh_wgpu::animation::camera::CameraAnimValues) {
+        let model_view = Mat4::from_quat(values.rotation)
+            * Mat4::from_translation(values.translation)
+            * Mat4::from_scale(values.scale);
+        let (_, rotation, translation) = model_view.to_scale_rotation_translation();
+        self.translation = translation;
+        self.rotation = rotation.to_euler(glam::EulerRot::XYZ).into();
+        self.fov_y = values.fov_y_radians;
+        self.near = values.near_clip;
+        self.far = values.far_clip;
+        self.follow = Vec3::ZERO;
+        self.target = self.centred_point();
     }
 
     pub fn transforms(&self, width: f32, height: f32) -> CameraTransforms {
         let aspect = if height > 0.0 { width / height } else { 1.0 };
-        let rotation = Mat4::from_euler(
-            glam::EulerRot::XYZ,
-            self.rotation.x,
-            self.rotation.y,
-            self.rotation.z,
-        );
         let model_view = Mat4::from_translation(self.translation)
-            * rotation
+            * camera_rotation(self.rotation)
             * Mat4::from_translation(-self.follow);
         let projection =
             glam::camera::rh::proj::directx::perspective(self.fov_y, aspect, self.near, self.far);
@@ -105,12 +204,27 @@ pub struct HitboxRenderState {
     pub current_height: u32,
     /// Cached selected-move animation data — reloaded only when the path changes.
     cached_anim: Option<(std::path::PathBuf, ssbh_data::anim_data::AnimData)>,
+    /// The mesh names both cached animations' visibility tracks were matched against (see
+    /// [`exact_visibility_tracks`]); a different set of loaded meshes re-reads them.
+    cached_vis_meshes: u64,
     /// Cached default eyelid animation data. This is kept separately from the selected move
     /// animation because the eyelid asset is a visibility baseline, not a second source of bone
     /// or material animation.
     cached_default_anim: Option<(std::path::PathBuf, Option<ssbh_data::anim_data::AnimData>)>,
     /// Cached skeleton data — reloaded only when the path changes
     cached_skel: Option<(std::path::PathBuf, ssbh_data::skel_data::SkelData)>,
+    /// The loaded model's `model.nuhlpb`. Applied to the mesh and to the overlay's bone
+    /// matrices while [`Self::helper_bones`] is on, as the game applies it every frame.
+    model_hlpb: Option<ssbh_data::hlpb_data::HlpbData>,
+    /// The loaded model's `model.numatb`, which material tracks in a move's `.nuanmb` animate.
+    model_matl: Option<ssbh_data::matl_data::MatlData>,
+    /// Viewport preference: evaluate helper bone constraints. Set through
+    /// [`Self::set_helper_bones`] so a change re-skins the model.
+    helper_bones: bool,
+    /// The fighter's model scale (`ModelModule::scale`): its `fighter_param` `scale`, or what
+    /// the moveset's frame callback sets. Applied at the skeleton's root, so the mesh and every
+    /// bone the overlay reads grow together. Set through [`Self::set_model_scale`].
+    model_scale: f32,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
     /// attach_bone_name is the character bone the weapon root attaches to (e.g. "haver")
     weapon_skels: Vec<(String, ssbh_data::skel_data::SkelData, String)>,
@@ -140,6 +254,9 @@ pub struct HitboxRenderState {
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
+    /// The X and Z lines through the origin on the ground, while Settings shows them.
+    axes: crate::preview_axes::PreviewAxes,
+    world_axes: bool,
     /// Body meshes hidden for a visibility set, to show again when the set switches back.
     set_hidden: std::collections::HashSet<usize>,
     /// Where the models and effects are drawn before going on screen.
@@ -203,8 +320,13 @@ impl HitboxRenderState {
             current_width: 0,
             current_height: 0,
             cached_anim: None,
+            cached_vis_meshes: 0,
             cached_default_anim: None,
             cached_skel: None,
+            model_hlpb: None,
+            model_matl: None,
+            helper_bones: true,
+            model_scale: 1.0,
             weapon_skels: Vec::new(),
             last_frame: -1.0,
             last_anim_path: None,
@@ -238,6 +360,13 @@ impl HitboxRenderState {
                 ssbh_wgpu::DEPTH_FORMAT,
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
             ),
+            axes: crate::preview_axes::PreviewAxes::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            world_axes: true,
             set_hidden: std::collections::HashSet::new(),
             floor_color: {
                 let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
@@ -246,6 +375,33 @@ impl HitboxRenderState {
             target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
+        }
+    }
+
+    /// Viewport preferences from the Settings window: background, floor grid, world axes and
+    /// bloom.
+    pub fn apply_preferences(
+        &mut self,
+        queue: &wgpu::Queue,
+        preferences: &crate::preferences::Preferences,
+    ) {
+        let [r, g, b, a] = preferences.viewport_clear_color();
+        self.renderer.set_clear_color([r, g, b, a]);
+        // The backdrop is part of the scene and goes through the post pass, so clear it at the
+        // value that comes out as the chosen colour (see `new`).
+        let scene = crate::post_grading::scene_value_for([r as f32, g as f32, b as f32]);
+        self.renderer.set_scene_clear_color(wgpu::Color {
+            r: scene[0] as f64,
+            g: scene[1] as f64,
+            b: scene[2] as f64,
+            a,
+        });
+        self.model_render_options.draw_floor_grid = preferences.floor_grid;
+        self.world_axes = preferences.world_axes;
+        if self.render_settings.render_bloom != preferences.bloom {
+            self.render_settings.render_bloom = preferences.bloom;
+            self.renderer
+                .update_render_settings(queue, &self.render_settings);
         }
     }
 
@@ -276,8 +432,9 @@ impl HitboxRenderState {
         self.set_hidden.clear();
         self.object_dirs.clear();
         self.weapon_skels.clear();
-        if !model_dir.exists() {
-            eprintln!("[MODEL] model directory does not exist: {:?}", model_dir);
+        // `folder` holds the files ARCropolis would load here (see `read_costume_model`).
+        if folder.meshes.is_empty() && folder.skels.is_empty() {
+            eprintln!("[MODEL] no model files for {:?}", model_dir);
             return;
         }
         let render_model = RenderModel::from_folder(
@@ -288,6 +445,8 @@ impl HitboxRenderState {
             &self.render_settings,
         );
         eprintln!("[MODEL] loaded from {:?}", model_dir);
+        self.model_hlpb = folder.find_hlpb().cloned();
+        self.model_matl = folder.find_matl().cloned();
         self.render_models.push(render_model);
 
         // Scan sibling directories for weapon skeletons.
@@ -301,23 +460,21 @@ impl HitboxRenderState {
             .and_then(crate::data::parse_costume_dir)
             .unwrap_or(0);
         if let Some(model_root) = model_dir.parent().and_then(|p| p.parent()) {
-            if let Ok(entries) = std::fs::read_dir(model_root) {
-                for entry in entries.flatten() {
-                    let dir_name = entry.file_name();
-                    let dir_name = dir_name.to_string_lossy();
-                    if dir_name == "body" {
-                        continue;
-                    }
-                    let Some(weapon_skel) = crate::data::find_part_skel(&entry.path(), body_slot)
-                    else {
-                        continue;
-                    };
-                    if let Ok(skel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel) {
-                        // Determine the attach bone: prefer "haver" (right hand), then "havel" (left hand)
-                        // This is the character body bone the weapon root is parented to at runtime.
-                        let attach = weapon_attach_bone(&dir_name);
-                        self.weapon_skels.push((dir_name.to_string(), skel, attach));
-                    }
+            for part_dir in crate::costume_files::sibling_dirs(model_root) {
+                let Some(dir_name) = part_dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if dir_name.eq_ignore_ascii_case("body") {
+                    continue;
+                }
+                let Some(weapon_skel) = crate::data::find_part_skel(&part_dir, body_slot) else {
+                    continue;
+                };
+                if let Ok(skel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel) {
+                    // Determine the attach bone: prefer "haver" (right hand), then "havel" (left hand)
+                    // This is the character body bone the weapon root is parented to at runtime.
+                    let attach = weapon_attach_bone(dir_name);
+                    self.weapon_skels.push((dir_name.to_string(), skel, attach));
                 }
             }
         }
@@ -343,7 +500,20 @@ impl HitboxRenderState {
         skel_path: Option<&Path>,
         frame: f32,
     ) {
-        self.update_default_animation(default_anim_path);
+        let meshes = self.mesh_names();
+        let meshes_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            meshes.hash(&mut hasher);
+            hasher.finish()
+        };
+        if meshes_key != self.cached_vis_meshes {
+            // Both animations' track names were fitted to the previous meshes.
+            self.cached_anim = None;
+            self.cached_default_anim = None;
+            self.cached_vis_meshes = meshes_key;
+        }
+        self.update_default_animation(default_anim_path, &meshes);
 
         // Reload anim only when path changes
         if let Some(path) = anim_path {
@@ -353,9 +523,13 @@ impl HitboxRenderState {
                 .map(|(p, _)| p != path)
                 .unwrap_or(true);
             if needs_load {
-                self.cached_anim = ssbh_data::anim_data::AnimData::from_file(path)
-                    .ok()
-                    .map(|a| (path.to_path_buf(), a));
+                self.cached_anim =
+                    ssbh_data::anim_data::AnimData::from_file(path)
+                        .ok()
+                        .map(|mut a| {
+                            exact_visibility_tracks(&mut a, &meshes);
+                            (path.to_path_buf(), a)
+                        });
             }
         } else {
             self.cached_anim = None;
@@ -379,6 +553,9 @@ impl HitboxRenderState {
 
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
         let skel = self.cached_skel.as_ref().map(|(_, s)| s);
+        // Field borrows rather than `active_hlpb()`: the loop below borrows `render_models`.
+        let hlpb = self.model_hlpb.as_ref().filter(|_| self.helper_bones);
+        let matl = self.model_matl.as_ref();
 
         // Only the body; object models after it are animated in `update_objects`.
         if let Some(render_model) = self.render_models.first_mut() {
@@ -390,17 +567,23 @@ impl HitboxRenderState {
                     .and_then(|(_, a)| a.as_ref()),
                 anim,
             );
-            render_model.apply_anims(
+            let model_scale = self.model_scale;
+            render_model.apply_anims_with_skel_edit(
                 queue,
                 animations.iter().copied(),
                 skel,
+                matl,
                 None,
                 None,
                 None,
-                None,
-                None,
+                hlpb,
                 &self.shared_data,
                 frame,
+                |bones| {
+                    if let Some(skel) = skel {
+                        scale_root_bones(bones, skel, model_scale);
+                    }
+                },
             );
         }
     }
@@ -581,7 +764,16 @@ impl HitboxRenderState {
         }
     }
 
-    fn update_default_animation(&mut self, path: Option<&Path>) {
+    /// Every mesh name of the fighter's own model.
+    fn mesh_names(&self) -> Vec<String> {
+        self.render_models
+            .iter()
+            .take(1)
+            .flat_map(|model| model.meshes.iter().map(|mesh| mesh.name.clone()))
+            .collect()
+    }
+
+    fn update_default_animation(&mut self, path: Option<&Path>, meshes: &[String]) {
         if let Some(path) = path {
             let needs_load = self
                 .cached_default_anim
@@ -593,7 +785,11 @@ impl HitboxRenderState {
                     path.to_path_buf(),
                     ssbh_data::anim_data::AnimData::from_file(path)
                         .ok()
-                        .map(|anim| visibility_only_animation(&anim)),
+                        .map(|anim| {
+                            let mut anim = visibility_only_animation(&anim);
+                            exact_visibility_tracks(&mut anim, meshes);
+                            anim
+                        }),
                 ));
             }
         } else {
@@ -681,6 +877,37 @@ impl HitboxRenderState {
         self.weapon_skels.len()
     }
 
+    /// Whether the loaded model has a `model.nuhlpb` for the helper-bones toggle to act on.
+    pub fn has_helper_bones(&self) -> bool {
+        self.model_hlpb.is_some()
+    }
+
+    /// Turn helper bone constraints on or off for both the mesh and the overlay.
+    pub fn set_helper_bones(&mut self, enabled: bool) {
+        if self.helper_bones != enabled {
+            self.helper_bones = enabled;
+            // Force the next prepare() to re-skin with the new constraint set.
+            self.last_frame = -1.0;
+        }
+    }
+
+    /// Resize the fighter, mesh and overlay alike. See [`Self::model_scale`].
+    pub fn set_model_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        if self.model_scale != scale {
+            self.model_scale = scale;
+            self.last_frame = -1.0;
+        }
+    }
+
+    fn active_hlpb(&self) -> Option<&ssbh_data::hlpb_data::HlpbData> {
+        self.model_hlpb.as_ref().filter(|_| self.helper_bones)
+    }
+
     /// Eagerly load skeleton data so bone_world_matrices_at() returns valid results
     /// immediately, without waiting for the first prepare() call.
     pub fn load_skeleton(&mut self, skel_path: &Path) {
@@ -706,7 +933,44 @@ impl HitboxRenderState {
             }
         };
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
-        compute_bone_world_matrices(skel, anim, &self.weapon_skels, frame)
+        let mut matrices =
+            compute_bone_world_matrices(skel, anim, self.active_hlpb(), &self.weapon_skels, frame);
+        if self.model_scale != 1.0 {
+            // The same as scaling the root bone, which is what the mesh gets.
+            let scale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale));
+            for matrix in matrices.values_mut() {
+                *matrix = scale * *matrix;
+            }
+        }
+        matrices
+    }
+
+    /// The model scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
+    pub fn model_scale(&self) -> f32 {
+        self.model_scale
+    }
+}
+
+/// Scale the skeleton's root bones by `scale`, which scales the whole fighter about its origin:
+/// what `ModelModule::set_scale` does to a fighter in game.
+fn scale_root_bones(
+    bones: &mut [(usize, ssbh_wgpu::animation::AnimatedBone)],
+    skel: &ssbh_data::skel_data::SkelData,
+    scale: f32,
+) {
+    use ssbh_wgpu::animation::{animate_skel_inner, AnimationTransforms};
+    if scale == 1.0 {
+        return;
+    }
+    // A root's world transform is its animated local one.
+    let mut sampled = Box::new(AnimationTransforms::from_skel(skel));
+    animate_skel_inner(&mut sampled, bones, &skel.bones, None);
+    for (index, bone) in bones.iter_mut() {
+        if bone.parent_index().is_none() {
+            let (bone_scale, rotation, translation) =
+                sampled.world_transforms[*index].to_scale_rotation_translation();
+            bone.set_current_trs(translation * scale, rotation, bone_scale * scale);
+        }
     }
 }
 
@@ -733,6 +997,38 @@ fn visibility_only_animation(
     }
 }
 
+/// Narrow each visibility track to the meshes the game gives it.
+///
+/// A visibility track names a mesh without its `_VIS_O_OBJShape` suffix, and ssbh_wgpu applies
+/// it to every mesh whose name merely *starts with* the track's name. That reaches too far
+/// whenever one mesh's name extends another's: Shy Guy's `mace_spike` track (on) also switched
+/// on `mace_spikeFLIP_VIS_O_OBJShape`, the left-hand mace its `mace_spikeFLIP` track keeps off.
+/// Which won depended on the order the tracks are stored in, so the forward smash showed one
+/// mace and its reverse showed both.
+///
+/// A track that has an exact match — a mesh named `<track>_VIS…` — is renamed to
+/// `<track>_VIS`, which the prefix rule can only match exactly. A track with no exact match is
+/// left alone, so any model that does rely on prefix matching renders as before.
+fn exact_visibility_tracks(anim: &mut ssbh_data::anim_data::AnimData, meshes: &[String]) {
+    use ssbh_data::anim_data::GroupType;
+    for group in &mut anim.groups {
+        if group.group_type != GroupType::Visibility {
+            continue;
+        }
+        for node in &mut group.nodes {
+            let exact = format!("{}_VIS", node.name);
+            let has_exact = meshes.iter().any(|mesh| mesh.starts_with(&exact));
+            let overreaches = meshes.iter().any(|mesh| {
+                mesh.starts_with(&node.name) && !mesh.starts_with(&exact) && *mesh != node.name
+            });
+            let named_bare = meshes.iter().any(|mesh| *mesh == node.name);
+            if has_exact && overreaches && !named_bare {
+                node.name = exact;
+            }
+        }
+    }
+}
+
 /// Build the animation stack in the same order used by [`RenderModel::apply_anims`]. Keeping this
 /// small piece pure makes the baseline-before-selected precedence easy to regression-test.
 fn animation_layers<'a>(
@@ -753,119 +1049,59 @@ fn animation_layers<'a>(
 ///
 /// Every bone is keyed under both its original and its lowercased name because ACMD bone
 /// names are inconsistently cased; callers look up either spelling.
+///
+/// The body skeleton is evaluated by ssbh_wgpu's own [`animate_skel`], the same evaluation
+/// that skins the mesh, so every collision sits where the rendered model puts its bone. That
+/// includes helper bones when `hlpb` is given, and bones a skeleton lists before their parent
+/// (Mario's `Jaw` and lip bones), which an in-order walk left at the origin.
+///
+/// [`animate_skel`]: ssbh_wgpu::animation::animate_skel
 pub fn compute_bone_world_matrices(
     skel: &ssbh_data::skel_data::SkelData,
     anim: Option<&ssbh_data::anim_data::AnimData>,
+    hlpb: Option<&ssbh_data::hlpb_data::HlpbData>,
     weapon_skels: &[(String, ssbh_data::skel_data::SkelData, String)],
     frame: f32,
 ) -> std::collections::HashMap<String, glam::Mat4> {
-    let bone_count = skel.bones.len();
-    let mut result = std::collections::HashMap::new();
-    if crate::debug_enabled() {
-        let names: Vec<&str> = skel
-            .bones
-            .iter()
-            .map(|b| b.name.as_str())
-            .take(15)
-            .collect();
-        eprintln!(
-            "[BONE] {} bones, names={:?}, anim={}, frame={}",
-            bone_count,
-            names,
-            anim.is_some(),
-            frame
+    let world = body_world(skel, anim, hlpb, frame);
+    bone_world_map(skel, &world, weapon_skels)
+}
+
+/// The body skeleton's world matrices through ssbh_wgpu, with any helper bone constraints.
+fn body_world(
+    skel: &ssbh_data::skel_data::SkelData,
+    anim: Option<&ssbh_data::anim_data::AnimData>,
+    hlpb: Option<&ssbh_data::hlpb_data::HlpbData>,
+    frame: f32,
+) -> Vec<glam::Mat4> {
+    use ssbh_wgpu::animation::{animate_skel, AnimationTransforms, MAX_BONE_COUNT};
+    // Three 512-matrix arrays; boxed to keep them off the UI thread's stack.
+    let mut transforms = Box::new(AnimationTransforms::identity());
+    animate_skel(&mut transforms, skel, anim.into_iter(), hlpb, frame);
+    let evaluated = skel.bones.len().min(MAX_BONE_COUNT);
+    let mut world = transforms.world_transforms[..evaluated].to_vec();
+    // The renderer stops at its uniform-buffer limit too; keep any further bones at rest so
+    // their names still resolve rather than vanishing from the map.
+    for bone in &skel.bones[evaluated..] {
+        world.push(
+            skel.calculate_world_transform(bone)
+                .unwrap_or(glam::Mat4::IDENTITY),
         );
-        // Log bone 0's bind-pose translation
-        if let Some(b0) = skel.bones.first() {
-            let m = b0.transform;
-            eprintln!(
-                "[BONE] bone[0] '{}' bind_trans={:?}",
-                b0.name,
-                m.col(3).truncate()
-            );
-        }
     }
+    world
+}
 
-    struct BoneState {
-        translation: glam::Vec3,
-        rotation: glam::Quat,
-        scale: glam::Vec3,
-        compensate_scale: bool,
-    }
-
-    let mut states: Vec<BoneState> = skel
-        .bones
-        .iter()
-        .map(|b| {
-            let m = b.transform;
-            let (scale, rotation, translation) = m.to_scale_rotation_translation();
-            BoneState {
-                translation,
-                rotation,
-                scale,
-                compensate_scale: false,
-            }
-        })
-        .collect();
-
-    if let Some(anim_data) = anim {
-        for group in &anim_data.groups {
-            use ssbh_data::anim_data::GroupType;
-            if group.group_type != GroupType::Transform {
-                continue;
-            }
-            for node in &group.nodes {
-                let Some(idx) = skel.bones.iter().position(|b| b.name == node.name) else {
-                    continue;
-                };
-                let Some(track) = node.tracks.first() else {
-                    continue;
-                };
-                use ssbh_data::anim_data::TrackValues;
-                if let TrackValues::Transform(values) = &track.values {
-                    if values.is_empty() {
-                        continue;
-                    }
-                    let cur = (frame.floor() as usize).clamp(0, values.len() - 1);
-                    let nxt = (frame.ceil() as usize).clamp(0, values.len() - 1);
-                    let f = frame.fract();
-                    let a = &values[cur];
-                    let b = &values[nxt];
-                    states[idx] = BoneState {
-                        translation: glam::Vec3::from(a.translation.to_array())
-                            .lerp(glam::Vec3::from(b.translation.to_array()), f),
-                        rotation: glam::Quat::from_array(a.rotation.to_array())
-                            .slerp(glam::Quat::from_array(b.rotation.to_array()), f),
-                        scale: glam::Vec3::from(a.scale.to_array())
-                            .lerp(glam::Vec3::from(b.scale.to_array()), f),
-                        compensate_scale: track.compensate_scale,
-                    };
-                }
-            }
-        }
-    }
-
-    let mut world: Vec<glam::Mat4> = vec![glam::Mat4::IDENTITY; bone_count];
-    for (i, bone) in skel.bones.iter().enumerate() {
-        let st = &states[i];
-        let comp = if st.compensate_scale {
-            bone.parent_index
-                .map(|p| glam::Vec3::ONE / states[p].scale)
-                .unwrap_or(glam::Vec3::ONE)
-        } else {
-            glam::Vec3::ONE
-        };
-        let local = glam::Mat4::from_translation(st.translation)
-            * glam::Mat4::from_scale(comp)
-            * glam::Mat4::from_quat(st.rotation)
-            * glam::Mat4::from_scale(st.scale);
-        let parent = bone
-            .parent_index
-            .map(|p| world[p])
-            .unwrap_or(glam::Mat4::IDENTITY);
-        world[i] = parent * local;
-        result.insert(bone.name.clone(), world[i]);
-        result.insert(bone.name.to_lowercase(), world[i]);
+/// Key the body's world matrices by bone name, then add the synthetic `top` joint and the
+/// weapon skeletons attached to their body bones.
+fn bone_world_map(
+    skel: &ssbh_data::skel_data::SkelData,
+    world: &[glam::Mat4],
+    weapon_skels: &[(String, ssbh_data::skel_data::SkelData, String)],
+) -> std::collections::HashMap<String, glam::Mat4> {
+    let mut result = std::collections::HashMap::new();
+    for (bone, matrix) in skel.bones.iter().zip(world) {
+        result.insert(bone.name.clone(), *matrix);
+        result.insert(bone.name.to_lowercase(), *matrix);
     }
 
     if crate::debug_enabled() {
@@ -964,6 +1200,173 @@ fn clip_to_screen(clip: glam::Vec4, viewport: egui::Rect) -> Option<egui::Pos2> 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)] // Rendering helpers remain grouped before callbacks.
 mod tests {
+    fn bone(
+        name: &str,
+        parent: Option<usize>,
+        translation: glam::Vec3,
+    ) -> ssbh_data::skel_data::BoneData {
+        ssbh_data::skel_data::BoneData {
+            name: name.to_string(),
+            transform: glam::Mat4::from_translation(translation),
+            parent_index: parent,
+            billboard_type: ssbh_data::skel_data::BillboardType::Disabled,
+        }
+    }
+
+    fn transform_track(
+        name: &str,
+        frames: Vec<(glam::Vec3, glam::Quat)>,
+    ) -> ssbh_data::anim_data::NodeData {
+        use ssbh_data::anim_data::*;
+        NodeData {
+            name: name.to_string(),
+            tracks: vec![TrackData {
+                name: "Transform".to_string(),
+                compensate_scale: false,
+                transform_flags: TransformFlags::default(),
+                values: TrackValues::Transform(
+                    frames
+                        .into_iter()
+                        .map(|(translation, rotation)| Transform {
+                            scale: glam::Vec3::ONE,
+                            rotation,
+                            translation,
+                        })
+                        .collect(),
+                ),
+            }],
+        }
+    }
+
+    /// Bone positions are evaluated through the hierarchy, whatever order the skeleton lists
+    /// bones in, and a helper bone file without constraints moves nothing.
+    #[test]
+    fn bone_world_matrices_follow_the_hierarchy() {
+        use glam::{Quat, Vec3};
+        let skel = ssbh_data::skel_data::SkelData {
+            major_version: 1,
+            minor_version: 0,
+            bones: vec![
+                bone("Trans", None, Vec3::ZERO),
+                bone("Hip", Some(0), Vec3::new(0.0, 8.0, 0.0)),
+                // Listed before its parent, like Mario's lip bones.
+                bone("H_ArmR", Some(3), Vec3::new(1.0, 0.0, 0.0)),
+                bone("ArmR", Some(1), Vec3::new(2.0, 3.0, 0.0)),
+            ],
+        };
+        let anim = ssbh_data::anim_data::AnimData {
+            major_version: 2,
+            minor_version: 0,
+            final_frame_index: 1.0,
+            groups: vec![ssbh_data::anim_data::GroupData {
+                group_type: ssbh_data::anim_data::GroupType::Transform,
+                nodes: vec![
+                    transform_track(
+                        "Trans",
+                        vec![
+                            (Vec3::ZERO, Quat::IDENTITY),
+                            (Vec3::new(4.0, 0.0, 0.0), Quat::IDENTITY),
+                        ],
+                    ),
+                    transform_track(
+                        "ArmR",
+                        vec![
+                            (Vec3::new(2.0, 3.0, 0.0), Quat::IDENTITY),
+                            (Vec3::new(2.0, 3.0, 0.0), Quat::from_rotation_z(1.2)),
+                        ],
+                    ),
+                ],
+            }],
+        };
+        let hlpb = ssbh_data::hlpb_data::HlpbData {
+            major_version: 1,
+            minor_version: 0,
+            aim_constraints: Vec::new(),
+            orient_constraints: Vec::new(),
+        };
+
+        let at = |name: &str, hlpb| {
+            super::compute_bone_world_matrices(&skel, Some(&anim), hlpb, &[], 1.0)[name]
+                .col(3)
+                .truncate()
+        };
+        let (sin, cos) = 1.2f32.sin_cos();
+        let expected = [
+            ("Trans", Vec3::new(4.0, 0.0, 0.0)),
+            ("Hip", Vec3::new(4.0, 8.0, 0.0)),
+            ("ArmR", Vec3::new(6.0, 11.0, 0.0)),
+            ("H_ArmR", Vec3::new(6.0 + cos, 11.0 + sin, 0.0)),
+            ("top", Vec3::new(4.0, 0.0, 0.0)),
+        ];
+        for (name, position) in expected {
+            for hlpb in [None, Some(&hlpb)] {
+                let got = at(name, hlpb);
+                assert!(
+                    got.abs_diff_eq(position, 1e-4),
+                    "{name}: {got:?}, expected {position:?}"
+                );
+            }
+        }
+    }
+
+    /// Against real data: a fighter's helper bones move once their constraints apply, and the
+    /// bones the constraints don't target stay where the plain evaluation put them.
+    #[test]
+    #[ignore = "needs a real extracted data root; see VISIONARY_BENCH_FIGHTER"]
+    fn helper_bones_move_only_constrained_bones() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("VISIONARY_BENCH_FIGHTER").expect("set VISIONARY_BENCH_FIGHTER"),
+        );
+        let body = root.join("model/body/c00");
+        let skel = ssbh_data::skel_data::SkelData::from_file(body.join("model.nusktb")).unwrap();
+        let hlpb = ssbh_data::hlpb_data::HlpbData::from_file(body.join("model.nuhlpb")).unwrap();
+        let anim =
+            ssbh_data::anim_data::AnimData::from_file(root.join("motion/body/c00/a00wait1.nuanmb"))
+                .unwrap();
+        let constrained: std::collections::HashSet<String> = hlpb
+            .orient_constraints
+            .iter()
+            .map(|c| c.target_bone_name.clone())
+            .chain(
+                hlpb.aim_constraints
+                    .iter()
+                    .map(|c| c.target_bone_name1.clone()),
+            )
+            .collect();
+        let plain = super::compute_bone_world_matrices(&skel, Some(&anim), None, &[], 20.0);
+        let helpers =
+            super::compute_bone_world_matrices(&skel, Some(&anim), Some(&hlpb), &[], 20.0);
+        // Mario lists `Jaw` and the lip bones after their `_offset` parents' children; an
+        // in-order walk used to leave them at the origin.
+        assert!(plain["Jaw"].col(3).truncate().length() > 1.0);
+        let mut moved = 0;
+        for bone in &skel.bones {
+            let same = plain[&bone.name].abs_diff_eq(helpers[&bone.name], 1e-3);
+            if constrained.contains(&bone.name) {
+                moved += usize::from(!same);
+            } else if !bone_has_constrained_ancestor(&skel, bone, &constrained) {
+                assert!(same, "{} moved without a constraint", bone.name);
+            }
+        }
+        eprintln!("{moved} of {} constrained bones moved", constrained.len());
+        assert!(moved > 0);
+    }
+
+    fn bone_has_constrained_ancestor(
+        skel: &ssbh_data::skel_data::SkelData,
+        bone: &ssbh_data::skel_data::BoneData,
+        constrained: &std::collections::HashSet<String>,
+    ) -> bool {
+        let mut parent = bone.parent_index;
+        while let Some(index) = parent {
+            if constrained.contains(&skel.bones[index].name) {
+                return true;
+            }
+            parent = skel.bones[index].parent_index;
+        }
+        false
+    }
+
     #[test]
     fn offscreen_endpoints_stay_projectable_for_partially_visible_shapes() {
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
@@ -1023,6 +1426,59 @@ mod tests {
     }
 
     #[test]
+    fn a_visibility_track_reaches_only_its_own_mesh() {
+        use ssbh_data::anim_data::{
+            AnimData, GroupData, GroupType, NodeData, TrackData, TrackValues,
+        };
+
+        let track = |name: &str, on: bool| NodeData {
+            name: name.into(),
+            tracks: vec![TrackData {
+                name: "Visibility".into(),
+                compensate_scale: false,
+                transform_flags: Default::default(),
+                values: TrackValues::Boolean(vec![on]),
+            }],
+        };
+        // The reverse forward smash stores the FLIP track first, so the plain one won last.
+        let mut anim = AnimData {
+            major_version: 2,
+            minor_version: 1,
+            final_frame_index: 0.0,
+            groups: vec![GroupData {
+                group_type: GroupType::Visibility,
+                nodes: vec![
+                    track("mace_spikeFLIP", false),
+                    track("mace_spike", true),
+                    track("Eye", true),
+                ],
+            }],
+        };
+        let meshes: Vec<String> = [
+            "mace_spike_VIS_O_OBJShape",
+            "mace_spikeFLIP_VIS_O_OBJShape",
+            "EyeL_VIS_O_OBJShape",
+            "EyeR_VIS_O_OBJShape",
+        ]
+        .map(String::from)
+        .to_vec();
+        super::exact_visibility_tracks(&mut anim, &meshes);
+
+        let mut visible: Vec<(String, bool)> = meshes.iter().map(|m| (m.clone(), true)).collect();
+        ssbh_wgpu::animation::animate_visibility(&anim, 0.0, &mut visible);
+        assert_eq!(
+            visible,
+            [
+                ("mace_spike_VIS_O_OBJShape".to_string(), true),
+                ("mace_spikeFLIP_VIS_O_OBJShape".to_string(), false),
+                // No exact `Eye_VIS` mesh: the prefix rule is left to work as it did.
+                ("EyeL_VIS_O_OBJShape".to_string(), true),
+                ("EyeR_VIS_O_OBJShape".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
     fn default_eyelid_layer_precedes_selected_animation() {
         use ssbh_data::anim_data::AnimData;
 
@@ -1038,6 +1494,120 @@ mod tests {
         assert_eq!(layers.len(), 2);
         assert!(std::ptr::eq(layers[0], &default));
         assert!(std::ptr::eq(layers[1], &selected));
+    }
+
+    /// Benchmark for the editor's dominant per-frame CPU cost. Ignored by default because it
+    /// needs real game files; run it against an extracted data root with:
+    ///
+    /// ```text
+    /// VISIONARY_BENCH_FIGHTER=/path/to/export/fighter/mario \
+    ///   cargo test --release -- --ignored --nocapture bone_matrix_cost
+    /// ```
+    #[test]
+    #[ignore = "needs a real extracted data root; see VISIONARY_BENCH_FIGHTER"]
+    fn bone_matrix_cost() {
+        use std::time::Instant;
+        let Some(root) = std::env::var_os("VISIONARY_BENCH_FIGHTER").map(std::path::PathBuf::from)
+        else {
+            panic!("set VISIONARY_BENCH_FIGHTER to a fighter dir, e.g. .../export/fighter/mario");
+        };
+        let model_root = root.join("model");
+        let skel_path = model_root.join("body").join("c00").join("model.nusktb");
+        let skel = ssbh_data::skel_data::SkelData::from_file(&skel_path)
+            .unwrap_or_else(|e| panic!("read {skel_path:?}: {e}"));
+
+        // Any body motion will do — pick the first one on disk for a stable, real workload.
+        let anim_dir = root.join("motion").join("body").join("c00");
+        let anim_path = std::fs::read_dir(&anim_dir)
+            .ok()
+            .and_then(|d| {
+                let mut v: Vec<_> = d
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "nuanmb"))
+                    .collect();
+                v.sort();
+                v.into_iter().next()
+            })
+            .expect("no .nuanmb under motion/body/c00");
+        let anim = ssbh_data::anim_data::AnimData::from_file(&anim_path).ok();
+
+        // Load weapon skeletons the way `load_model` does.
+        let mut weapons: Vec<(String, ssbh_data::skel_data::SkelData, String)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&model_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == "body" {
+                    continue;
+                }
+                let Some(p) = (0..8)
+                    .map(|s| entry.path().join(format!("c{s:02}")).join("model.nusktb"))
+                    .find(|p| p.exists())
+                else {
+                    continue;
+                };
+                if let Ok(s) = ssbh_data::skel_data::SkelData::from_file(&p) {
+                    let attach = super::weapon_attach_bone(&name);
+                    weapons.push((name, s, attach));
+                }
+            }
+        }
+
+        eprintln!(
+            "\n[bench] {} body bones, anim {:?}, {} weapon skeletons ({} bones)",
+            skel.bones.len(),
+            anim_path.file_name().unwrap(),
+            weapons.len(),
+            weapons.iter().map(|(_, s, _)| s.bones.len()).sum::<usize>(),
+        );
+
+        const N: usize = 200;
+        // Warm up so we time steady state rather than first-touch page faults.
+        for f in 0..10 {
+            std::hint::black_box(super::compute_bone_world_matrices(
+                &skel,
+                anim.as_ref(),
+                None,
+                &weapons,
+                f as f32,
+            ));
+        }
+
+        // Case A: a different frame each call (animation playing) — always real work.
+        let t = Instant::now();
+        let mut entries = 0;
+        for i in 0..N {
+            let m = super::compute_bone_world_matrices(
+                &skel,
+                anim.as_ref(),
+                None,
+                &weapons,
+                (i % 60) as f32,
+            );
+            entries += m.len();
+        }
+        let moving = t.elapsed();
+
+        // Case B: the same frame every call — the common editor case (idle repaints, mouse
+        // moves, slider drags all recompute an identical result).
+        let t = Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(super::compute_bone_world_matrices(
+                &skel,
+                anim.as_ref(),
+                None,
+                &weapons,
+                7.0,
+            ));
+        }
+        let still = t.elapsed();
+
+        eprintln!(
+            "[bench] moving frame: {:.3} ms/call\n[bench] same frame:   {:.3} ms/call\n[bench] {} map entries per call\n",
+            moving.as_secs_f64() * 1000.0 / N as f64,
+            still.as_secs_f64() * 1000.0 / N as f64,
+            entries / N,
+        );
     }
 }
 
@@ -1215,6 +1785,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
             }
+            let axes = state.world_axes.then_some(&state.axes);
+            if let Some(axes) = axes {
+                axes.update(queue, t.mvp_matrix, t.camera_pos);
+            }
             // The stage's models are drawn with the fighter's, in one list for the renderer;
             // they go back to their own list afterwards.
             let fighter_models = state.render_models.len();
@@ -1230,6 +1804,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     }
                     scene_copy.copy(device, encoder, scene.resolve, scene.depth);
                     let mut pass = scene_pass(encoder, &scene, "viewport effects");
+                    if let Some(axes) = axes {
+                        axes.draw(&mut pass);
+                    }
                     vfx.paint(&mut pass);
                     trails.draw(&mut pass);
                 },

@@ -2,13 +2,18 @@
 
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
+What changed is written up three ways: [CHANGELOG.md](CHANGELOG.md) (patch notes for every release), [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md) (features and fixes in more depth) and [CHANGELOG_fr.md](CHANGELOG_fr.md) (the full technical list for the latest release).
+
 ## Components
 
 - `src/` contains the desktop application.
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
 - [`ssbh_wgpu`](https://github.com/Common-Leap/ssbh_wgpu) (a fork of
   ScanMountGoat's, with two additions for effects) draws the fighters, their
-  objects and the stage.
+  objects and the stage. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu)
+  of it, which adds loading a model from files in different folders (costumes
+  that share files through `config.json`) and the skeleton edit that scales a
+  fighter at its root.
 - [`eff_wgpu`](https://github.com/Common-Leap/eff_wgpu) simulates and draws the
   effects in the preview the way the game does.
 - The [`effect_library`](https://crates.io/crates/effect_library) crate on
@@ -20,7 +25,9 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 ## Prerequisites
 
 - Rust, through rustup: `rust-toolchain.toml` picks the version (1.97.1)
-- The `cargo-skyline` toolchain for building the in-game plugin
+- The `cargo-skyline` toolchain for building the in-game plugin, and for
+  **Build & Deploy** of a linked moveset (see [Building and deploying your
+  plugin](#building-and-deploying-your-plugin))
 
 Cargo downloads `ssbh_wgpu`, `eff_wgpu`, `effect_library`, and the other Rust
 dependencies automatically during the build.
@@ -41,9 +48,45 @@ ArcExplorer export/
 └── item/      (optional — items fighters hold in their moves)
 ```
 
-Open this export root in Visionary when prompted. The `fighter` folder provides
-character models, motion data, and parameters; the `effect` folder provides the
-`.eff` files used by the effect editor.
+On first run Visionary asks for this folder (the **ArcExplorer dump**) before anything
+else, then shows the Project Hub (the hub waits until a dump is set). It checks the folder: one without `fighter/` and `effect/`
+is refused with the reason, one that looks like a mod (an `info.toml`, a `.nro`, a `romfs/`
+wrapper or only a handful of fighters) is warned about, and a folder that holds a valid dump
+one level down offers that folder instead. The `fighter` folder provides character models,
+motion data, and parameters; the `effect` folder provides the `.eff` files used by the
+effect editor.
+
+### Sources window
+
+**File → Sources…** is the one place that shows every input, top to bottom in load order,
+with what each is for and whether it is OK, missing or has a problem:
+
+1. **Base game — ArcExplorer dump.** Global: the same game for every project.
+2. **Reference mods.** Global: the enabled Mod Library entries, opened from this row.
+3. **This project's files.** The open project's `romfs/`.
+4. **Moveset code.** The Rust crate linked to the open project.
+
+The precedence rule: a file in the project's `romfs/` wins over everything else, in the
+fighter list and in previews (models, motions, params and icons), so a copied and edited
+model previews from `romfs/` and not from the dump. Effects are the exception: they still
+come from the dump and the reference mods, so exporting an edited effect can never write
+over a file in `romfs/`. Between the dump and the reference mods nothing changes: the dump stays
+authoritative for a fighter's model, motion and parameter paths, and mods add fighters and
+slots. The dump and the Mod Library belong to the machine; the project's files and moveset
+link belong to the project. The moveset link is saved per project in `modproject.json`
+(relative to the project folder when the crate is inside it), so opening a project re-links
+its crate. Without a project open, the link is the global one, as before.
+
+### Project fighters
+
+With a project open, the fighter list has two groups: **In this project** (expanded) and
+**Everything else** (collapsed, for effect donors and comparisons); search filters both.
+A fighter is in the project when it was added to it, has files in the project's
+`romfs/fighter/<name>/`, has scripts in the linked moveset crate, or has saved edits (an
+edited fighter is never hidden). Editing a fighter adds it to the project, and it stays
+after the edit is undone. Right-click a fighter to **Add to project** or **Remove from
+project**; the menu says why a fighter stays listed after removal (for example, it still has
+edits). Without a project the list is the flat list it always was.
 
 The `ui` folder is optional and only the Characters page needs it. Dump it if you
 want to edit the character select screen: it provides
@@ -195,9 +238,10 @@ the startup plugin rebuild/deployment check without disabling live editing.
 The main window keeps editing tasks in one focused inspector. Select a move in
 the Fighters list, then use the tabs beside the viewport:
 
-- **Collisions** contains attacks, grabs, wind, throw-damage, and active-hitbox
-  data. Common values are shown first; **Hit behavior**, **Valid targets**, **Hit
-  feedback**, and other less-used fields stay in clearly named collapsible sections.
+- **Collisions** opens with the move's frame data (below), then lists attacks,
+  grabs, wind, throw-damage, and active-hitbox data. Common values are shown
+  first; **Hit behavior**, **Valid targets**, **Hit feedback**, and other
+  less-used fields stay in clearly named collapsible sections.
 - **Hurtboxes** contains parameter-defined capsules, `HIT_NODE`/`HIT_NO`/
   `WHOLE_HIT` state changes, invincibility and intangibility ranges, and
   damage-reaction armor settings.
@@ -210,6 +254,25 @@ the Fighters list, then use the tabs beside the viewport:
   effect that ends at a finite frame also shows the two **End flags** its
   `EFFECT_OFF_KIND` was written with; the vanilla scripts do not agree on them,
   so they are carried per call rather than defaulted.
+
+The frame data line recalculates as you edit and shows:
+
+- **Startup** — the first game frame a damaging hitbox is out.
+- **Active** — every window in which one is out, inclusive (`5-7, 9-10`).
+- **FAF** — the first actionable frame: the motion list's `cancel_frame`, or the
+  frame after the animation ends when the motion list sets none.
+- **Landing lag** — for aerials, from `landing_attack_air_frame_*`. A value your
+  linked source sets (for example a `param_config` override in `params.rs`)
+  wins over the `.prc` files, and a mod's `fighter_param.prc` wins over the
+  vanilla one.
+- **Shieldstun** and advantage — `floor(damage × 0.8 × multiplier + 2)` for the
+  strongest hitbox out on the startup frame, using the smash-attack or aerial
+  multiplier from `common.prc`. Grounded advantage assumes the hit lands on the
+  first active frame; aerial advantage assumes the aerial lands right after
+  hitting (shieldstun − landing lag).
+
+Every figure is in game frames, so `FT_MOTION_RATE` windows are applied. Hover
+any figure to see where its number came from.
 
 Section names use plain language first and show the native macro name where it
 matters. Hover any section name to see what it controls, including engine terms
@@ -227,6 +290,99 @@ Edits preview immediately. **Undo** and **Redo** apply to the current move and
 remain available when you switch moves during the session. **Restore move**
 discards the current move's staged collision, motion, effect, sound, and
 expression edits and reloads the loaded source or capture baseline.
+
+### Viewport
+
+The camera works like SSBH Studio's. It turns about whatever is centred in the
+view, so something you pan to stays centred while you orbit. With the default
+**SSBH** navigation, left drag orbits, right or middle drag pans so the model
+follows the pointer, and scroll zooms. **Blender** navigation (in Settings) orbits
+with middle drag, pans with Shift + middle drag and zooms with Ctrl + middle drag;
+**Emulate 3 button mouse** lets Alt + left drag stand in for the middle button.
+Double-click turns back to the default angle.
+
+With the pointer over the viewport:
+
+- Numpad **1**, **3** and **7** look from the front, right and top; with **Ctrl**,
+  from the opposite side. Numpad **9** turns to the opposite of the current view.
+- **Home** frames the fighter, and **Period** the selected hitbox (or the fighter
+  when none is selected).
+- The arrow keys pan.
+
+The orientation widget in the top-right corner shows which way the camera looks:
+click an axis ball (or a cube face) to look along it, again to look from the other
+side, or drag it to orbit. The cube's arrows turn a quarter turn. Settings picks
+the axes, the cube, or neither.
+
+A red X line and a blue Z line on the ground mark the world axes through the
+origin, where the fighter starts.
+
+The toolbar in the viewport's top-left corner holds the display options:
+
+- **⚙** opens the **Settings** window, saved to `preferences.json` in the
+  user config directory (`%APPDATA%\visionary\` on Windows):
+  - **Show console window** (Windows). Visionary is a GUI program: started from
+    a terminal it logs there; otherwise a console opens only while this is on.
+    Its close button is removed, since closing it would end Visionary.
+  - **Interface scale**, kept in step with **Ctrl +/-**.
+  - **Background** colour (SSBH Editor's dark grey by default), **Floor grid**,
+    **World axes** and **Bloom**.
+  - **Enable helper bones**, which applies the model's `model.nuhlpb`, as the
+    game does. Helper bones (`H_` elbow, knee and similar helpers) then move
+    the mesh and any hitbox, hurtbox or effect placed on them. It is on by
+    default. A move's material animations (glows, colour changes, eye swaps)
+    always play.
+  - **Camera**: mouse navigation, the orientation widget, translation, rotation,
+    field of view, near and far clip, **⟲ Reset view**, **Save as default** (the
+    view the camera starts at and resets to) and **Reset default** (back to the
+    built-in side view).
+  - **Camera animation**: a `.nuanmb` with a camera in it (a Final Smash or stage
+    camera, from the fighter's `camera/` folder) that the viewport camera plays
+    along the timeline. **Play camera animation** turns it off without clearing
+    the file. It isn't saved between sessions.
+- **⟲** beside the gear returns the camera to the default view. It is disabled
+  while the camera is already there.
+- **Scale** appears when the fighter isn't drawn at 1.0. The fighter starts at
+  its `fighter_param` `scale` (or the moveset's `param_config` override of it).
+  A linked moveset's frame callback (`on_line`) wins over that:
+  `ModelModule::set_scale` resizes the model and skeleton,
+  `AttackModule::set_attack_scale` the hitboxes, and `GrabModule::set_size_mul`
+  the grab boxes. Each call is read on its own, through any helper the moveset
+  wraps them in, so a helper that leaves one out leaves that scale alone.
+  Branches that only run on the results screen or on entry are skipped. Hover
+  the label to see each value and the line it came from.
+- **Thrown fighter** picks the opponent the preview holds in grabs and throws
+  (on by default). Choose any indexed fighter or any fighter in the vanilla dump,
+  and its costume slot. On throws it plays that costume's own thrown animation:
+  **Auto** matches the throw's direction (`throw_f` → `thrown_f`), or the
+  thrower's own set when the victim has one (`shizue_special_s_thrown_f`). The
+  game also picks a `_dx`, `_big` or `_girl` variant depending on the thrower.
+  Visionary doesn't detect that yet, so choose it from the list. Turning it off
+  hides the opponent.
+- **Model** and **Motion** notes appear when the shown costume borrows files.
+  Visionary loads each costume the way ARCropolis does: the folder's own file
+  first, then a `config.json` share (`share-to-vanilla` or `share-to-added`),
+  then the game's file at that path from the vanilla dump. Hover a note to see
+  each borrowed file and its source. The move list's animations and motion list
+  are read the same way.
+
+### Motion List
+
+**Tools → Motion list** (ported from SSBH Editor) edits every field of the
+selected fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game
+and other scripts, up to three animations picked from the folder's `.nuanmb`
+files, flags, blend frames, cancel frames and intangibility frames. Motions can
+be added, duplicated, deleted and renamed, and the list saved in either format.
+A list with unsaved edits stays open until you save or discard it. When a
+folder has both files, the move list reads whichever was written last.
+
+### Fighter list
+
+A mod that plays its own character on a vanilla fighter's extra slots (Shy Guy
+on Pac-Man's c40–c47) is listed as its own fighter under its own name. Hover it
+to see the base fighter and the slots it takes; searching the base fighter's
+name still finds it. When the character takes every slot, the empty base
+fighter row is dropped.
 
 To hide a fighter from the sidebar, right-click its name and choose **Forget
 fighter**. Visionary removes that fighter's cached scripts, saved edits, and
@@ -293,18 +449,26 @@ The resulting `lib_effect_viewer.nro` is written beneath
 [plugin guide](plugins/slight_replica/README.md) for deployment, runtime
 dependencies, and live-edit setup.
 
-Visionary finds standard Eden, yuzu, and Ryujinx SD-card locations through the
-host operating system's application-data directories. For a portable or custom
+Visionary finds standard Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu
+SD-card locations through the host operating system's application-data
+directories. When more than one exists, it uses the one the game wrote to most
+recently. For a portable or custom
 emulator installation, set `VISIONARY_SD_DIR` to the emulator SD root before
 starting Visionary. `VISIONARY_CACHE_DIR` can similarly move Visionary's cache
 and temporary workspace to another location.
+
+Live effect previews load through a carrier built from vanilla effect files. If
+the root you opened is a mod rather than a full ArcExplorer export, set
+**Vanilla dump** in the Eff Editor to your vanilla export; the carrier base and
+each donor file are then found across both roots. When the carrier can't be
+built, the send indicator stops at once and says which file is missing.
 
 ## Your own ACMD source
 
 By default Visionary reads ACMD scripts from an online archive of the *vanilla*
 scripts. If you have already modded a move, that is not the code your game runs.
 
-Open **Windows → ACMD Source** and link the Rust project that builds your
+Open **File → Your source code** and link the Rust project that builds your
 plugin — the folder holding its `Cargo.toml`. Visionary recursively scans its
 Rust source files, so scripts can stay in their existing modules and filenames;
 you do not need to create a specially named aggregate file. It joins
@@ -319,6 +483,73 @@ resolved on its own: your `game_attackairn` is used for the hitboxes, and the
 move's stock effects and sounds still come from the vanilla scripts, so a mod
 that only retimes a hitbox does not make the move look silent and effectless.
 Anything your project does define always wins over the vanilla copy.
+
+### How your project is read
+
+Real movesets are written in many styles, and Visionary reads them as written.
+The link header shows how many scripts and fighters it found.
+
+- **Cargo decides the crates.** `cargo metadata` says which crates the linked
+  workspace builds, where each crate's root is and where its plugin is built
+  to. When cargo can't be asked, Visionary falls back to looking for crate
+  folders itself.
+- **Only compiled code counts.** Files are followed through the crate's `mod`
+  tree from `src/lib.rs` or `src/main.rs`, so a `srcOLD/` backup, an extracted
+  release copy, or a vanilla reference dump beside the crate is never mistaken
+  for the live script.
+- **Multi-agent installers.** `pacman::install(pacman)` after
+  `let pacman = &mut Agent::new("pacman")` gives that whole module to `pacman`,
+  even when the same installer also sets up article agents. A commented-out
+  `Agent::new("…")` is not a fighter.
+- **Every registration form.** `.acmd`, `.game_acmd`, `.effect_acmd`,
+  `.sound_acmd`, `.expression_acmd` and `install_acmd_script!` are read, under
+  the script name they register rather than the function's name. When one agent
+  registers a script twice, the later registration wins, as it does in game; a
+  `game_…` function that is never registered while another function is
+  registered under its name is treated as dead code. Status functions
+  (`L2CFighterCommon`) are never mistaken for ACMD, even when they share a name
+  with an ACMD helper elsewhere.
+- **Bare macros and any agent name.** `ATTACK(agent, …)` from a
+  `use smash_script::macros::*;` import reads the same as `macros::ATTACK`, and
+  a function whose agent is called `fighter`, `weapon`, or anything else is
+  understood. Calls on some *other* object (`SET_AIR(other)`) stay untyped.
+- **One-line blocks.** `if is_excute(agent) { ATTACK(…); }` written on one line
+  parses like the multi-line form.
+- **Shared implementations.** A script that only forwards to a shared function
+  shows that function's body, with the caller's arguments substituted where
+  they are certain (literals, match-bound lets). Values it can't settle are
+  named on the status line, and Save is refused, since the body belongs to
+  every caller.
+- **Custom motions.** Scripts named in `motion_list.bin` only by hash are named
+  from ParamLabels, your source, compiled plugins, `motion_list.yml` and the
+  animation file names, so a custom motion such as `attack_s4_s_reverse` reaches
+  its real scripts.
+
+The status line says where the open move's script came from — your source,
+vanilla, this project's saved copy or a live capture — and, when a linked
+project still shows vanilla, why, including a project that could not be
+re-linked at startup.
+
+The project's own shorthand is read too:
+
+- **Hash macros.** Single-arm `macro_rules!` that build a `Hash40` from string
+  literals — `cmn!("swing_06")`, `se!("jump01")`, `vc!("ottotto")`, including
+  ones defined through another macro such as `fighter_se!` — show the name they
+  hash, so those sounds and rumbles appear in the panels.
+- **Numeric consts.** `const WALK_LW_DAMAGE: f32 = 4.0;` shows its value where
+  it is used. Float consts always do; integer consts do when cast
+  (`LIFTOFF_FRAME as f32`) or named like a quantity. An integer named like an
+  identifier — a hitbox id, a work flag, a status — keeps its name.
+- **One-call helpers.** A function whose body is a single macro call built from
+  its own parameters, such as `RUMBLE_HIT(agent, kind)` wrapping
+  `RUMBLE_HIT(agent, kind, 0)`, or a `RUMBLE` helper around
+  `ControlModule::set_rumble`, reads as the call it makes. A helper with logic of
+  its own stays a raw line, which is always safe.
+
+A name defined twice with different values or bodies is left alone, since which
+one a call sees depends on module scoping.
+
+### Editing your source
 
 The same window edits a script in place: pick **Hitboxes** or **Effects** to
 open that function in a small text editor. Saving needs the function to exist in
@@ -335,10 +566,30 @@ The editor and the rest of the app stay in sync both ways while you work:
 
 Nothing touches the file on disk until you press **Save**, which rewrites only
 that one function in the source file that owns it and leaves the rest of the
-project alone. If the same fighter and script name appears in more than one
-function, Visionary reports the conflicting files and functions instead of
-guessing which one to edit; resolve the duplicate and press **Rescan**.
-**Revert** restores the script as loaded, panels included.
+project alone. If the same fighter and script name is still defined by more than
+one function after the rules above, Visionary reports the conflicting files and
+functions instead of guessing which one to edit; resolve the duplicate and press
+**Rescan**. When the duplicates come from separate crates — a folder holding
+several copies of one moveset — the report says so: link the folder of the crate
+you actually build instead. **Revert** restores the script as loaded, panels
+included.
+
+Edits keep your style:
+
+- A value changes in place, and nothing else on the line is rewritten.
+- A hash written through one of your macros stays in it: `se!("jump01")`
+  becomes `se!("jump02")`, or `cmn!("swing_01")` when the new name is a common
+  sound. A plain `Hash40::new("…")` stays plain.
+- A value written as a const changes the **definition**, in whichever file it
+  lives, and the report says how many other places use that const. The call keeps
+  the const's name. Dragging a const-backed value in the panels while the
+  source pane is open notes that the definition changes when you sync to the
+  project.
+- A value a helper fixes inside its own body (the hidden `0` of a `RUMBLE_HIT`
+  helper) is refused with a note rather than written at the call.
+- Lines Visionary has to add — a new `frame` block, an added effect, a new
+  script — use the file's own macro path (`macros::`, `smash_script::macros::`
+  or none), agent name, frame number style, indentation and line endings.
 
 **Show** switches between your source, the code Visionary *would* write into
 `acmd_source/` if you exported the move right now, and both side by side. The
@@ -349,6 +600,34 @@ cannot be exported under the macro your script used, it says which one and why.
 The generated pane does not need a linked project, and works for any move the
 editor has loaded — including one captured live from the game, which has no
 script file anywhere. That case is the reason it is worth having.
+
+### Building and deploying your plugin
+
+**Build & Deploy** in the link header runs `cargo skyline build --release` on
+the crate the linked source belongs to and copies the resulting
+`lib<name>.nro` over every deployed copy it finds on the emulator SD the game
+wrote to most recently:
+
+- copies with the same file name under `ultimate/mods/`, the Skyline plugins
+  folder, or the emulator's LayeredFS `load/` folder;
+- a mod that ships the plugin renamed to `plugin.nro`, recognised by the
+  crate's own source paths compiled into it. A plugin built from a shared
+  template only counts when it clearly matches this crate better than any
+  other;
+- any destination chosen with **Deploy to…**, remembered per linked project.
+
+If the plugin exports smashline's `smashline_install` entry point, it is also
+written as smashline's `development.nro`; press **L + R + D-pad Up** in the
+game's menus to reload it without restarting. Otherwise, restart the game to
+load the new build.
+
+The build runs in the background and reports on the status line, including the
+first compiler error and its location when it fails. The full cargo output is
+kept in `visionary-build.log` in the crate folder.
+
+This builds *your moveset's* plugin. Visionary's own in-game plugin is built
+separately (see [In-game plugin](#in-game-plugin)), and edits to Visionary do
+not require rebuilding it unless the plugin's sources changed.
 
 ### Checking the generated code
 
@@ -800,7 +1079,7 @@ installs looks exactly like one that does nothing.
 
 ## Projects and mod exports
 
-The **Project Hub** appears on launch — **Resume last / New / Open
+The **Project Hub** appears on launch once a game dump is set — **Resume last / New / Open
 (`modproject.json`) / Import mod / Recent / Browse without project** — and
 reopens from **File → Project Hub** mid-session. One current project holds
 every edit: its path is remembered, edits autosave to it about a second after
@@ -867,6 +1146,23 @@ after loading and remains usable during the preview. Do not
 spawn a normal Alucard assist while previewing, since it shares the carrier's
 resource graph.
 
+Visionary checks the model before every reload, after a model import, on export,
+and when you click **Check model** in Project Files. The checks are ported from
+SSBH Editor. Some problems stop **Reload asset preview** because they break the
+model in game:
+- a file that can't be read
+- a `model.numdlb` entry naming a mesh or material that doesn't exist, which
+  leaves that mesh invisible
+- a shader label the game doesn't have
+- a cube map in a 2D texture slot, or the reverse
+
+Everything else is a warning: missing vertex attributes (a yellow
+checkerboard), RENORMAL meshes without `model.adjb` entries, sRGB mismatches,
+clamped tiling, skin weights that don't sum to 1, duplicate names, missing
+textures. Issues the game's own model for that costume already has are left
+out, because SSBH Editor's rules also flag some vanilla models. Exports list
+the findings but are never blocked.
+
 The status distinguishes queued files, owner retirement, loading, and a ready
 preview. A successful file copy alone does not mean the game has reloaded its
 resources. This preview requires the matching Visionary plugin and the configured
@@ -875,3 +1171,18 @@ emulator SD directory. Save your work before testing it in-game.
 Preview snapshots are immutable and old generations are reclaimed after the
 plugin acknowledges retirement. Staging stops if its SD cache reaches the safety
 limit; stop the game before manually clearing that cache.
+
+## Additional tools
+
+`src/moveset_survey.rs` is an ignored test that runs the source indexer and
+parsers over a folder of moveset projects and reports, per project, the
+fighters and scripts found, conflicts, and the most common lines left untyped.
+Use it to check a change against real projects:
+
+```bash
+VISIONARY_MOVESETS="/path/to/Movesets" cargo test --bin visionary moveset_survey -- --ignored --nocapture
+```
+
+`VISIONARY_SURVEY_ONLY=<folder name>` limits it to one project, and
+`VISIONARY_SURVEY_PLAN=1` also prints the Build & Deploy plan each project would
+use (without building or copying anything).

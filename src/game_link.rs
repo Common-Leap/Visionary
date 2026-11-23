@@ -330,6 +330,52 @@ impl<T> ForFighter<T> {
     }
 }
 
+/// A live rule tagged with its article agent (`<owner>_<article>`, e.g. `samus_lativolt`).
+/// Sent on a separate wire family so fighter messages remain byte-identical.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ForArticle<T> {
+    pub agent: String,
+    #[serde(flatten)]
+    pub rule: T,
+}
+
+/// Whether the running plugin supports live edits for a given article agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArticleLiveSupport {
+    Supported,
+    Unsupported,
+}
+
+/// One captured ACMD call from an article owned by the selected fighter (`ArticleAcmdCapture`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArticleCaptureLine {
+    pub agent: String,
+    pub owner_kind: i32,
+    pub article_kind: i32,
+    pub motion: u64,
+    pub frame: f32,
+    pub func: String,
+    pub args: Vec<LuaArgWire>,
+    #[serde(default)]
+    pub run: u32,
+    #[serde(default)]
+    pub common: bool,
+}
+
+impl ArticleCaptureLine {
+    pub fn to_capture_line(&self) -> CaptureLine {
+        CaptureLine {
+            kind: self.article_kind,
+            motion: self.motion,
+            frame: self.frame,
+            func: self.func.clone(),
+            args: self.args.clone(),
+            run: self.run,
+            common: self.common,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SpawnRuleWire {
     pub eff_hash: u64,
@@ -875,6 +921,11 @@ pub const CAT_WORK_MODULE_INC_INT: u8 = 35;
 /// Wire category for direct `MotionModule::set_frame_partial` point overrides.
 pub const CAT_MOTION_MODULE_SET_FRAME_PARTIAL: u8 = 36;
 
+/// Wire category for suppressing a script's grab clear (`grab!` → `sv_module_access::grab` with
+/// `MA_MSC_CMD_GRAB_CLEAR_ALL`, or `GrabModule::clear_all`). **Must equal the plugin's value.**
+/// Not the grab category: those rules key on a box id, and the clear has none.
+pub const CAT_GRAB_CLEAR: u8 = 37;
+
 /// The wire category a modifier's rules go out under.
 pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
     match kind {
@@ -884,7 +935,8 @@ pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
 }
 
 /// Sparse ATTACK-arg overrides (plugin `HbOverrides`).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HbOverridesWire {
     /// Complete AREA_WIND argument vector when a wind payload changes. Wind calls do not share
     /// ATTACK's slot layout, so the plugin swaps this exact typed vector into the original hook.
@@ -1094,20 +1146,20 @@ pub struct HbOverridesWire {
     pub expression_args: Option<Vec<LuaArgWire>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InjectRuleWire {
     pub frame: f32,
     pub args: Vec<LuaArgWire>,
     /// Exact AREA_WIND family function for wind injection. Attack/grab injections omit it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Condition from an If block, checked in the match when this call is due.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<LiveGuard>,
 }
 
 /// An If block's condition as the plugin evaluates it. **Must match the plugin's `LiveGuard`.**
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveGuard {
     Grounded,
@@ -1176,23 +1228,24 @@ fn is_zero_u8(v: &u8) -> bool {
 
 /// `frame_start`/`frame_end` scope suppress/override to ONE hit so multi-hit moves (which
 /// reuse the same id across frames) stay independent.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HitboxRuleWire {
     pub motion: u64,
     /// Rule family: 0 attack, 1 grab, 2 wind, and 11 `REVERSE_LR`. Omitted when 0 so old
     /// plugins default to the attack family.
-    #[serde(skip_serializing_if = "is_zero_u8")]
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub category: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hitbox_id: Option<u64>,
+    #[serde(default)]
     pub suppress: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_start: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_end: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<HbOverridesWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<InjectRuleWire>,
     /// The exact ACMD call this rule is for, when the category alone does not identify it.
     ///
@@ -1205,7 +1258,7 @@ pub struct HitboxRuleWire {
     ///
     /// A plugin predating this field ignores it and matches on the category alone — too broad
     /// rather than silently dead, which is the right way round for a preview.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub func: Option<String>,
 }
 
@@ -2037,6 +2090,13 @@ struct Shared {
     /// Fighter kinds forgotten by the desktop roster. Their capture stream is ignored until the
     /// user restores the fighter, so a later playback cannot silently repopulate its memory.
     ignored_capture_kinds: BTreeSet<i32>,
+    /// Separate live-ACMD capture store for the selected fighter's articles, keyed by `(agent, motion)`.
+    article_captures: BTreeMap<(String, u64), Vec<ArticleCaptureLine>>,
+    article_capture_claimed_runs: BTreeMap<(String, u64), u32>,
+    article_capture_completed_runs: BTreeSet<(String, u64, u32)>,
+    /// Per-agent live support reported by the plugin (`Unsupported` for clones whose runtime kind
+    /// smashline does not expose).
+    article_live_status: BTreeMap<String, ArticleLiveSupport>,
     outbox: Vec<String>,
     /// Gimmick operations temporarily removed from `outbox` for the current socket
     /// flush. Counting them prevents a concurrent UI action burst from overfilling the
@@ -2075,6 +2135,10 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
     "\"effect_control_rules\":",
+    "\"selected_fighter\":",
+    "\"article_hitbox_rules\":",
+    "\"article_spawn_rules\":",
+    "\"article_effect_control_rules\":",
     "\"effect_aliases\":",
     "\"donor_effs\":",
     "\"donor_bytes\":",
@@ -2237,6 +2301,10 @@ impl Default for Shared {
             capture_ends: BTreeMap::new(),
             capture_completed_runs: BTreeSet::new(),
             ignored_capture_kinds: BTreeSet::new(),
+            article_captures: BTreeMap::new(),
+            article_capture_claimed_runs: BTreeMap::new(),
+            article_capture_completed_runs: BTreeSet::new(),
+            article_live_status: BTreeMap::new(),
             outbox: Vec::new(),
             gimmick_operations_in_flight: 0,
             last_error: None,
@@ -3297,6 +3365,119 @@ impl GameLink {
         }
     }
 
+    /// Tell the plugin which fighter (and optional costume slot scope for slot characters such
+    /// as Shy Guy) is currently selected, so article capture/injection scopes strictly to that
+    /// fighter's own articles.
+    pub fn send_selected_fighter(&self, fighter_kind: Option<i32>, costumes: &[u8]) {
+        let costumes: Vec<i32> = costumes.iter().map(|&c| c as i32).collect();
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "selected_fighter": {
+                "fighter_kind": fighter_kind,
+                "costumes": costumes,
+            }
+        })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Ask the plugin whether live edits for `agent` (e.g. `samus_lativolt`) are supported.
+    pub fn send_article_probe(&self, agent: &str) {
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "article_probe": { "agent": agent }
+        })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            push_outbox_capped(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Replace the plugin's separate article hitbox-rule list. Fighter `hitbox_rules` stays untouched.
+    pub fn send_article_hitbox_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) =
+            serde_json::to_string(&serde_json::json!({ "article_hitbox_rules": rules }))
+        else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Replace the plugin's separate article effect spawn-rule list.
+    pub fn send_article_spawn_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) =
+            serde_json::to_string(&serde_json::json!({ "article_spawn_rules": rules }))
+        else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Replace the plugin's separate article effect control-rule list.
+    pub fn send_article_effect_control_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(
+            &serde_json::json!({ "article_effect_control_rules": rules }),
+        ) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Captured ACMD lines for one article `(agent, motion)` from its latest run, separate
+    /// from the fighter capture store.
+    pub fn latest_article_run_for(&self, agent: &str, motion: u64) -> Vec<CaptureLine> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| {
+                let lines = s.article_captures.get(&(agent.to_string(), motion))?;
+                let latest = lines.iter().map(|l| l.run).max()?;
+                Some(
+                    lines
+                        .iter()
+                        .filter(|l| l.run == latest)
+                        .map(ArticleCaptureLine::to_capture_line)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Live support reported by the plugin for an article agent, if known.
+    pub fn article_live_status(&self, agent: &str) -> Option<ArticleLiveSupport> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| s.article_live_status.get(agent).copied())
+    }
+
     /// Queue a sparse kind-modifier edit. Color/speed controls must not upload the live
     /// form's position/rotation: those values are ACMD script offsets, while a carrier-owned
     /// transplant is physically world-space, so accidentally pinning them moves it to the
@@ -4137,7 +4318,69 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.capture_debug.clear();
             s.capture_ends.clear();
             s.capture_completed_runs.clear();
+            s.article_captures.clear();
+            s.article_capture_claimed_runs.clear();
+            s.article_capture_completed_runs.clear();
             s.captures_seq += 1;
+        }
+        "ArticleAcmdCapture" => {
+            let Some(c) = body.get("ArticleAcmdCapture") else {
+                return;
+            };
+            let Ok(line) = serde_json::from_value::<ArticleCaptureLine>(c.clone()) else {
+                return;
+            };
+            let key = (line.agent.clone(), line.motion);
+            let claim = s
+                .article_capture_claimed_runs
+                .entry(key.clone())
+                .or_insert(line.run);
+            if *claim != line.run {
+                return;
+            }
+            let bucket = s.article_captures.entry(key).or_default();
+            let candidate = line.to_capture_line();
+            if !bucket
+                .iter()
+                .any(|existing| same_capture(&existing.to_capture_line(), &candidate))
+            {
+                bucket.push(line);
+                s.captures_seq += 1;
+            }
+        }
+        "ArticleAcmdCaptureEnd" => {
+            let Some(e) = body.get("ArticleAcmdCaptureEnd") else {
+                return;
+            };
+            let (Some(agent), Some(motion)) = (
+                e.get("agent").and_then(|a| a.as_str()),
+                e.get("motion").and_then(|m| m.as_u64()),
+            ) else {
+                return;
+            };
+            let run = e.get("run").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+            let key = (agent.to_string(), motion);
+            if s.article_capture_claimed_runs.get(&key).copied() != Some(run) {
+                return;
+            }
+            s.article_capture_completed_runs
+                .insert((agent.to_string(), motion, run));
+        }
+        "ArticleLiveStatus" => {
+            let Some(st) = body.get("ArticleLiveStatus") else {
+                return;
+            };
+            let (Some(agent), Some(status)) = (
+                st.get("agent").and_then(|a| a.as_str()),
+                st.get("status").and_then(|s| s.as_str()),
+            ) else {
+                return;
+            };
+            let support = match status {
+                "supported" => ArticleLiveSupport::Supported,
+                _ => ArticleLiveSupport::Unsupported,
+            };
+            s.article_live_status.insert(agent.to_string(), support);
         }
         "CarrierStatus" => {
             // How far along the game is in taking the carrier we pushed. 0 = none staged,
@@ -4876,6 +5119,12 @@ mod costume_scope_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Reads a source file with CRLF folded to LF, so the needles below also match a
+    /// Windows checkout.
+    fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+        std::fs::read_to_string(path).map(|text| text.replace("\r\n", "\n"))
+    }
+
     #[test]
     fn a_rule_carries_the_fighter_from_its_store_key() {
         use super::ForFighter;
@@ -5692,7 +5941,7 @@ mod tests {
 
     #[test]
     fn capture_debug_window_uses_only_character_kinds_present_in_the_cache() {
-        let app = std::fs::read_to_string(
+        let app = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
         )
         .expect("read the desktop app");
@@ -6029,7 +6278,7 @@ mod tests {
     fn plugin_sound_hooks_source() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer/sound_hooks.rs");
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        read_source(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     /// The plugin's copy of the sound arity table still says what the editor's says.
@@ -6098,7 +6347,7 @@ mod tests {
         let source = plugin_sound_hooks_source();
         assert!(source.contains("pub(super) fn normalize_injection_args"));
         assert!(source.contains("*arg = LuaArg::Int(hash as i64)"));
-        let inject_tick = std::fs::read_to_string(
+        let inject_tick = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6115,7 +6364,7 @@ mod tests {
     /// the common check.
     #[test]
     fn the_plugin_tags_common_agent_captures_instead_of_dropping_them() {
-        let hooks = std::fs::read_to_string(
+        let hooks = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs"),
         )
@@ -6138,7 +6387,7 @@ mod tests {
             "record and the injection boundary must run before the common check, not inside it"
         );
 
-        let capture = std::fs::read_to_string(
+        let capture = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6197,7 +6446,7 @@ mod tests {
     /// game never made.
     #[test]
     fn the_plugin_resumes_a_capture_claim_held_by_the_same_object() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6228,7 +6477,7 @@ mod tests {
     /// The archive is durable and unbounded; only the live delivery queue remains in memory.
     #[test]
     fn the_plugin_archives_capture_history_and_skips_no_destination_serialization() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6241,7 +6490,7 @@ mod tests {
             "capture history must be archived instead of dropping complete old runs"
         );
 
-        let archive = std::fs::read_to_string(
+        let archive = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/capture_archive.rs"),
         )
@@ -6254,7 +6503,7 @@ mod tests {
         );
 
         let server =
-            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            read_source(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
                 "plugins/slight_replica/src/rust_extender/debugging/debuggable_server/mod.rs",
             ))
             .expect("read the plugin's debuggable server");
@@ -6273,7 +6522,7 @@ mod tests {
     /// one held motion frame while the per-agent completion callback touches the same state.
     #[test]
     fn the_plugin_capture_cache_never_parks_a_game_worker() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6337,7 +6586,7 @@ mod tests {
             "reporting a capture failure must remain fixed-size, atomic, and non-blocking"
         );
 
-        let facade = std::fs::read_to_string(
+        let facade = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/main_smash/facades/debuggable_server.rs"),
         )
@@ -6348,7 +6597,7 @@ mod tests {
             "capture outcomes must leave hook workers through the throttled facade"
         );
 
-        let archive = std::fs::read_to_string(
+        let archive = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/capture_archive.rs"),
         )
@@ -6361,7 +6610,7 @@ mod tests {
             "archive handoff from a capture hook must drop under contention instead of waiting"
         );
 
-        let server = std::fs::read_to_string(
+        let server = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/rust_extender/net/simple_server.rs"),
         )
@@ -6380,7 +6629,7 @@ mod tests {
     /// skip its native-query path entirely when no structural retime exists.
     #[test]
     fn the_plugin_acmd_scheduler_never_parks_without_live_retimes() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs"),
         )
@@ -6426,7 +6675,7 @@ mod tests {
     /// direct capture and rule, including `AttackModule::clear_all`.
     #[test]
     fn direct_acmd_calls_do_not_depend_on_an_expired_coroutine_guard() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6470,7 +6719,7 @@ mod tests {
     fn the_plugin_does_not_patch_collision_dispatch() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/systems/skyline_hook.rs");
-        let source = std::fs::read_to_string(&path)
+        let source = read_source(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         for needle in [
             "COLLISION_HOOK mode=disabled reason=unused-and-unsafe",
@@ -6497,7 +6746,7 @@ mod tests {
 
         let diag_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/diag.rs");
-        let diag_source = std::fs::read_to_string(&diag_path)
+        let diag_source = read_source(&diag_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", diag_path.display()));
         for needle in [
             "static COLLISION_HITS: AtomicU64",
@@ -6534,7 +6783,7 @@ mod tests {
     fn the_plugin_effect_kill_hook_preserves_the_native_return() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer/mod.rs");
-        let source = std::fs::read_to_string(&path)
+        let source = read_source(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let start = source
             .find("fn hook_kill(")
@@ -6568,7 +6817,7 @@ mod tests {
     fn the_motion_rate_category_and_override_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(
             module.contains(&format!(
                 "pub const CAT_MOTION_RATE: u8 = {CAT_MOTION_RATE};"
@@ -6594,7 +6843,7 @@ mod tests {
             "the plugin's HbOverrides has no motion_rate field to deserialise into"
         );
 
-        let hooks = std::fs::read_to_string(root.join("rate_hooks.rs")).expect("read rate_hooks");
+        let hooks = read_source(root.join("rate_hooks.rs")).expect("read rate_hooks");
         assert!(
             hooks.contains("replace = smash::app::sv_animcmd::FT_MOTION_RATE"),
             "the plugin no longer hooks sv_animcmd::FT_MOTION_RATE"
@@ -6705,7 +6954,7 @@ mod tests {
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer");
-        let rules = std::fs::read_to_string(root.join("spawn_rules.rs"))
+        let rules = read_source(root.join("spawn_rules.rs"))
             .expect("read the plugin's spawn rules");
         assert!(
             rules.contains("pub camera_offset: Option<f32>,")
@@ -6716,7 +6965,7 @@ mod tests {
                 && rules.contains("pub fn scale_w_for"),
             "the plugin no longer exposes the camera-flat rule field and lookup"
         );
-        let hooks = std::fs::read_to_string(root.join("acmd_hooks.rs"))
+        let hooks = read_source(root.join("acmd_hooks.rs"))
             .expect("read the plugin's ACMD hooks");
         assert!(
             hooks.contains(
@@ -6785,11 +7034,11 @@ mod tests {
         // optional field is absent.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer/spawn_rules.rs");
-        let plugin = std::fs::read_to_string(root).expect("read plugin spawn rules");
+        let plugin = read_source(root).expect("read plugin spawn rules");
         assert!(plugin.contains("#[serde(default)]\n    pub color_inject: Option<SpawnInject>"));
         assert!(plugin.contains("#[serde(default)]\n    pub stop_func: Option<String>"));
 
-        let hooks = std::fs::read_to_string(
+        let hooks = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs"),
         )
@@ -6904,7 +7153,7 @@ mod tests {
             "wait-boundary injection must run after the script reaches its target"
         );
 
-        let spawn_rules = std::fs::read_to_string(
+        let spawn_rules = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/spawn_rules.rs"),
         )
@@ -6913,7 +7162,7 @@ mod tests {
         assert!(spawn_rules.contains("PENDING_RULES"));
         assert!(spawn_rules.contains("pub fn service_pending"));
 
-        let control_rules = std::fs::read_to_string(
+        let control_rules = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/control_rules.rs"),
         )
@@ -6921,7 +7170,7 @@ mod tests {
         assert!(control_rules.contains("PENDING_RULES"));
         assert!(control_rules.contains("pub fn service_pending"));
 
-        let server = std::fs::read_to_string(
+        let server = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/rust_extender/net/simple_server.rs"),
         )
@@ -6929,13 +7178,13 @@ mod tests {
         assert!(server.contains("apply_timing_rules_from_network"));
 
         let debugger =
-            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            read_source(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
                 "plugins/slight_replica/src/rust_extender/debugging/debuggable_server/mod.rs",
             ))
             .expect("read plugin debug server");
         assert!(debugger.contains("pub fn apply_timing_rules_from_network"));
 
-        let agent_extender = std::fs::read_to_string(
+        let agent_extender = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/agent_extender/mod.rs"),
         )
@@ -6943,7 +7192,9 @@ mod tests {
         assert!(agent_extender.contains("StatusLine::Main"));
         assert!(agent_extender.contains("hitbox_viewer::inject_tick"));
         assert!(!agent_extender.contains("StatusLine::Post"));
-        assert!(!agent_extender.contains("acmd_hooks::inject_tick"));
+        // Effects whose frame no ACMD boundary reaches are fired from the same Main callback;
+        // the shared latch keeps a boundary and this tick from firing one target twice.
+        assert!(agent_extender.contains("acmd_hooks::inject_tick"));
     }
 
     #[test]
@@ -6952,12 +7203,12 @@ mod tests {
         // here for the CPU-match regression: every agent receives a Main callback, but only one
         // stable fighter is allowed to run the complete global fighter/weapon dispatch.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let extender = std::fs::read_to_string(
+        let extender = read_source(
             root.join("plugins/slight_replica/src/slight/agent_extender/mod.rs"),
         )
         .expect("read plugin agent extender");
         let agents =
-            std::fs::read_to_string(root.join("plugins/slight_replica/src/slight/agents.rs"))
+            read_source(root.join("plugins/slight_replica/src/slight/agents.rs"))
                 .expect("read plugin agent registry");
 
         assert!(agents.contains("pub fn is_frame_driver(boid: u32) -> bool"));
@@ -7067,9 +7318,9 @@ mod tests {
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer");
-        let rules = std::fs::read_to_string(root.join("control_rules.rs"))
+        let rules = read_source(root.join("control_rules.rs"))
             .expect("read the plugin's effect control rules");
-        let hooks = std::fs::read_to_string(root.join("acmd_hooks.rs"))
+        let hooks = read_source(root.join("acmd_hooks.rs"))
             .expect("read the plugin's ACMD hooks");
         assert!(
             rules.contains("pub struct ControlRule")
@@ -7088,7 +7339,7 @@ mod tests {
     fn the_sound_wire_category_matches_the_plugin() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs");
-        let source = std::fs::read_to_string(path).expect("read the plugin's hitbox_viewer");
+        let source = read_source(path).expect("read the plugin's hitbox_viewer");
         assert!(
             source.contains(&format!("pub const CAT_SOUND: u8 = {CAT_SOUND};")),
             "plugin's CAT_SOUND disagrees with the editor's {CAT_SOUND}"
@@ -7177,7 +7428,7 @@ mod tests {
     fn the_expression_category_and_hooks_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!("pub const CAT_EXPRESSION: u8 = {CAT_EXPRESSION};")));
         assert!(module.contains("pub expression_args: Option<Vec<LuaArg>>,"));
         assert!(module.contains("CAT_EXPRESSION => match inj.command.as_deref()"));
@@ -7211,7 +7462,7 @@ mod tests {
     fn the_reverse_lr_category_and_hook_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!("pub const CAT_REVERSE_LR: u8 = {CAT_REVERSE_LR};")));
         assert!(module.contains("replace = smash::app::sv_animcmd::REVERSE_LR"));
         assert!(module.contains("hook_reverse_lr"));
@@ -7239,7 +7490,7 @@ mod tests {
     fn the_set_speed_ex_category_and_hook_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!("pub const CAT_SPEED_EX: u8 = {CAT_SPEED_EX};")));
         assert!(module.contains("SET_SPEED_EX"));
         assert!(module.contains("hook_set_speed_ex"));
@@ -7261,7 +7512,7 @@ mod tests {
     fn the_speed_addition_and_correction_categories_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!(
             "pub const CAT_ADD_SPEED_NO_LIMIT: u8 = {CAT_ADD_SPEED_NO_LIMIT};"
         )));
@@ -7311,6 +7562,23 @@ mod tests {
     }
 
     #[test]
+    fn the_grab_clear_category_matches_the_plugin() {
+        let module = read_source(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+        )
+        .expect("read hitbox_viewer");
+        assert!(module.contains(&format!("pub const CAT_GRAB_CLEAR: u8 = {CAT_GRAB_CLEAR};")));
+        assert!(module.contains("replace = smash::app::sv_module_access::grab)"));
+        assert!(module.contains("replace = smash::app::lua_bind::GrabModule::clear_all)"));
+        // Installed, not just declared.
+        assert!(module.contains("hook_grab,") && module.contains("hook_grab_clear_all,"));
+        for other in [0, 1, 2, 3, 4, CAT_SEARCH, CAT_ATTACK_FP, CAT_MOTION_MODULE_SET_FRAME_PARTIAL] {
+            assert_ne!(CAT_GRAB_CLEAR, other, "CAT_GRAB_CLEAR collides with {other}");
+        }
+    }
+
+    #[test]
     fn outbound_ft_start_adjust_motion_frame_rules_match_plugin_wire_fields() {
         let link = GameLink::default();
         let key = numeric_point_key("FT_START_ADJUST_MOTION_FRAME_arg1", &[0.85]);
@@ -7351,9 +7619,9 @@ mod tests {
     fn kinetic_point_categories_and_overrides_match_plugin_wire_fields() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         let rate_hooks =
-            std::fs::read_to_string(root.join("rate_hooks.rs")).expect("read rate hooks");
+            read_source(root.join("rate_hooks.rs")).expect("read rate hooks");
         assert!(module.contains(&format!("pub const CAT_CLR_SPEED: u8 = {CAT_CLR_SPEED};")));
         assert!(module.contains(&format!("pub const CAT_SET_AIR: u8 = {CAT_SET_AIR};")));
         assert!(module.contains(&format!(
@@ -10473,6 +10741,90 @@ mod tests {
         deliver(&link, "GimmickLiveState", controller_state(1, too_many));
         assert!(link.gimmick_controller_snapshot().is_none());
     }
+
+    #[test]
+    fn wire_round_trip() {
+        // Article rule message encodes and decodes with its `agent` field intact.
+        let rule = HitboxRuleWire {
+            motion: 0x0765_4321,
+            category: 0,
+            hitbox_id: Some(0),
+            suppress: false,
+            frame_start: Some(1.0),
+            frame_end: Some(5.0),
+            overrides: None,
+            inject: None,
+            func: None,
+        };
+        let article_msg = ForArticle {
+            agent: "samus_lativolt".to_string(),
+            rule: rule.clone(),
+        };
+        let json = serde_json::to_string(&article_msg).expect("serialize ForArticle");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse ForArticle");
+        assert_eq!(parsed["agent"], "samus_lativolt");
+        assert_eq!(parsed["motion"], 0x0765_4321u64);
+        assert!(
+            parsed.get("fighter_kind").is_none(),
+            "article message must carry agent, not fighter_kind"
+        );
+        let decoded: ForArticle<HitboxRuleWire> =
+            serde_json::from_str(&json).expect("deserialize ForArticle");
+        assert_eq!(decoded.agent, "samus_lativolt");
+        assert_eq!(decoded.rule.motion, 0x0765_4321);
+
+        // Fighter message stays unchanged (no `agent` field).
+        let fighter_msg = ForFighter::from_key("mario/attack_air_n", rule);
+        let fighter_json: serde_json::Value =
+            serde_json::to_value(&fighter_msg).expect("serialize ForFighter");
+        assert!(fighter_json.get("agent").is_none());
+        assert_eq!(
+            fighter_json["fighter_kind"],
+            crate::gimmicks::registry::fighter_kind_value("mario").unwrap()
+        );
+
+        // Inbound ArticleAcmdCapture and ArticleLiveStatus route separately from fighter captures.
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "ArticleAcmdCapture",
+            serde_json::json!({
+                "ArticleAcmdCapture": {
+                    "agent": "mario_fireball",
+                    "owner_kind": 0,
+                    "article_kind": 0,
+                    "motion": 0x1111_u64,
+                    "frame": 1.0,
+                    "func": "ATTACK",
+                    "args": [],
+                    "run": 1,
+                    "common": false
+                }
+            }),
+        );
+        assert!(
+            link.latest_run_for(0x1111, Some(0)).is_empty(),
+            "article capture with article_kind == fighter_kind must never enter fighter captures"
+        );
+        let art = link.latest_article_run_for("mario_fireball", 0x1111);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0].func, "ATTACK");
+
+        deliver(
+            &link,
+            "ArticleLiveStatus",
+            serde_json::json!({
+                "ArticleLiveStatus": {
+                    "agent": "samus_lativolt",
+                    "status": "unsupported"
+                }
+            }),
+        );
+        assert_eq!(
+            link.article_live_status("samus_lativolt"),
+            Some(ArticleLiveSupport::Unsupported)
+        );
+    }
 }
 
 /// The connection policy, run on the real link thread against a stand-in game on loopback,
@@ -10683,9 +11035,28 @@ mod link_policy_tests {
             opened.elapsed() >= fast().open_window,
             "gave up before the window ended"
         );
+        #[cfg(not(windows))]
         assert_eq!(problem(&link), Some(LinkProblem::Refused));
+        // On Windows, `connect_timeout` against a closed loopback port hits the short test
+        // timeout before the TCP stack finishes its ~1s SYN retries and emits WSAECONNREFUSED.
+        #[cfg(windows)]
+        assert!(
+            matches!(
+                problem(&link),
+                Some(LinkProblem::Refused | LinkProblem::TimedOut)
+            ),
+            "unexpected problem: {:?}",
+            problem(&link)
+        );
         let tried = attempts(&link);
-        assert!(tried >= 3, "it must keep trying inside the window: {tried}");
+        #[cfg(not(windows))]
+        let min_attempts = 3;
+        #[cfg(windows)]
+        let min_attempts = 2;
+        assert!(
+            tried >= min_attempts,
+            "it must keep trying inside the window: {tried}"
+        );
 
         // A game that appears afterwards is not found on its own: no background retry.
         let game = FakeGame::start_on(TcpListener::bind(addr).unwrap(), true);

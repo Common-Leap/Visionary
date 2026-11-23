@@ -1607,6 +1607,32 @@ impl HurtTarget {
     }
 }
 
+/// End every grab box still open at `frame`, as a grab clear does.
+fn end_grab_boxes(frame: f32, hitboxes: &mut [Hitbox]) {
+    let end = script_frame(frame).saturating_sub(1);
+    for hb in hitboxes.iter_mut().filter(|hitbox| hitbox.category == 1) {
+        if hb.active_end == u32::MAX {
+            hb.active_end = end.max(hb.active_start);
+        }
+    }
+}
+
+/// Whether `stmt` ends every grab box: `GrabModule::clear_all`, or the msc command most
+/// scripts write instead, `grab!(agent, *MA_MSC_CMD_GRAB_CLEAR_ALL)`.
+pub(crate) fn is_grab_clear(stmt: &ExcuteStmt) -> bool {
+    match stmt {
+        ExcuteStmt::GrabClearAll => true,
+        ExcuteStmt::NativeCall(call) => {
+            call.callee == "grab!"
+                && call
+                    .arguments
+                    .first()
+                    .is_some_and(|command| command.trim() == "*MA_MSC_CMD_GRAB_CLEAR_ALL")
+        }
+        _ => false,
+    }
+}
+
 /// One resolved stretch of non-default hurtbox state, for the panel and the timeline.
 ///
 /// Produced by [`AcmdScript::to_hurtboxes`]. A row is one call plus the frame at which a later
@@ -1917,22 +1943,45 @@ pub enum ArticleLifecycleCall {
     /// Native `shoot` with an exact symbolic target; emitted through `ArticleOperationTarget`.
     Shoot {
         symbol: String,
+        #[serde(deserialize_with = "closed_shoot_target")]
         target: ArticleTarget,
     },
     /// Distinct native `shoot_exist` call with the same reviewed target and fixed false tail.
     ShootExist {
         symbol: String,
+        #[serde(deserialize_with = "closed_shoot_target")]
         target: ArticleTarget,
     },
     /// One exact source tuple from the closed Eflame/Elight E-Sword partial-motion presets.
     AddMotionPartial { preset: ArticlePartialMotionPreset },
 }
 
-/// Exact article-instance selection tokens measured for source-only shooting calls.
+/// The timeline's shoot forms are measured with `All` and `Last` only. [`ArticleTarget`] also
+/// names the targets [`ArticleCall`] reads, so a saved shoot node naming another is refused
+/// here rather than widened.
+fn closed_shoot_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ArticleTarget, D::Error> {
+    match <ArticleTarget as serde::Deserialize>::deserialize(deserializer)? {
+        target @ (ArticleTarget::All | ArticleTarget::Last) => Ok(target),
+        other => Err(serde::de::Error::custom(format!(
+            "shoot target {other:?} is not one of the measured All or Last"
+        ))),
+    }
+}
+
+/// Which of an article's live instances an `ArticleModule` call acts on
+/// (`ARTICLE_OPE_TARGET_*`). The timeline's shoot nodes offer only `All` and `Last`; the rest
+/// come from [`ArticleCall`] reading what a script wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ArticleTarget {
     All,
     Last,
+    First,
+    Term,
+    None,
+    /// The call takes no target, or the one written is not a known `ARTICLE_OPE_TARGET_*`.
+    Unspecified,
 }
 
 /// Exact owner/symbol rows observed with `generate_article_enable(..., false, -1)`.
@@ -1980,11 +2029,382 @@ pub(crate) fn is_measured_enabled_article(fighter: &str, symbol: &str) -> bool {
 }
 
 impl ArticleTarget {
+    /// The symbolic spelling. `Unspecified` has none and gives an empty string.
     pub const fn source_token(self) -> &'static str {
         match self {
             Self::All => "*ARTICLE_OPE_TARGET_ALL",
             Self::Last => "*ARTICLE_OPE_TARGET_LAST",
+            Self::First => "*ARTICLE_OPE_TARGET_FIRST",
+            Self::Term => "*ARTICLE_OPE_TARGET_TERM",
+            Self::None => "*ARTICLE_OPE_TARGET_NONE",
+            Self::Unspecified => "",
         }
+    }
+
+    /// The lua_const value: ALL 0, FIRST 1, LAST 2, TERM 3, NONE 0xFFFFFFFF.
+    pub const fn number(self) -> Option<i64> {
+        match self {
+            Self::All => Some(0),
+            Self::First => Some(1),
+            Self::Last => Some(2),
+            Self::Term => Some(3),
+            Self::None => Some(0xFFFF_FFFF),
+            Self::Unspecified => Option::None,
+        }
+    }
+
+    /// Read a target argument as written: `ArticleOperationTarget(*ARTICLE_OPE_TARGET_X)` (with
+    /// or without a `smash::app::`/`app::` path), a bare `*ARTICLE_OPE_TARGET_X`, or a number.
+    /// Anything else is `Unspecified`.
+    pub fn read(text: &str) -> Self {
+        let inner = article_target_parts(text).1;
+        if let Some(name) = inner.strip_prefix("*ARTICLE_OPE_TARGET_") {
+            return match name {
+                "ALL" => Self::All,
+                "FIRST" => Self::First,
+                "LAST" => Self::Last,
+                "TERM" => Self::Term,
+                "NONE" => Self::None,
+                _ => Self::Unspecified,
+            };
+        }
+        let digits = inner.replace('_', "");
+        let number = match digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            Some(hex) => i64::from_str_radix(hex, 16).ok(),
+            Option::None => digits.parse::<i64>().ok(),
+        };
+        match number {
+            Some(0) => Self::All,
+            Some(1) => Self::First,
+            Some(2) => Self::Last,
+            Some(3) => Self::Term,
+            Some(-1) | Some(0xFFFF_FFFF) => Self::None,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Write this target in the spelling of `written`: the same `ArticleOperationTarget(..)`
+    /// wrapper (and path) if it had one, numeric if it was numeric, symbolic otherwise. An
+    /// unchanged target keeps `written` exactly.
+    pub fn respell(self, written: &str) -> String {
+        if self == Self::Unspecified || Self::read(written) == self {
+            return written.to_owned();
+        }
+        let (wrapper, inner) = article_target_parts(written);
+        let numeric = !inner.is_empty() && !inner.starts_with('*');
+        let value = match (numeric, self.number()) {
+            (true, Some(0xFFFF_FFFF)) if inner.starts_with('-') => "-1".to_owned(),
+            (true, Some(0xFFFF_FFFF)) => "0xFFFFFFFF".to_owned(),
+            (true, Some(n)) => n.to_string(),
+            _ => self.source_token().to_owned(),
+        };
+        match wrapper {
+            Some(path) => format!("{path}ArticleOperationTarget({value})"),
+            Option::None => value,
+        }
+    }
+}
+
+/// Split a target argument into its `ArticleOperationTarget(` wrapper path, if any, and the
+/// value inside it, both trimmed.
+fn article_target_parts(text: &str) -> (Option<&str>, &str) {
+    let text = text.trim();
+    if let Some(at) = text.find("ArticleOperationTarget(") {
+        let path = &text[..at];
+        if path.is_empty() || path == "smash::app::" || path == "app::" {
+            if let Some(inner) = text[at + "ArticleOperationTarget(".len()..].strip_suffix(')') {
+                return (Some(path), inner.trim());
+            }
+        }
+    }
+    (Option::None, text)
+}
+
+/// The `ArticleModule` function an [`ArticleCall`] makes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArticleOp {
+    Generate,
+    GenerateEnable,
+    Remove,
+    RemoveExist,
+    Shoot,
+    ShootExist,
+    ChangeMotion,
+    ChangeStatus,
+    ChangeStatusExist,
+    SetRate,
+    SetFrame,
+    AddMotionPartial,
+    SetVisibilityWhole,
+    SetVisibility,
+    SetPos,
+    SetFlag,
+    SetInt,
+    SetFloat,
+    /// Any other `ArticleModule` function, by name. Kept and written back as it was.
+    Other(String),
+}
+
+impl ArticleOp {
+    const NAMED: &'static [(&'static str, ArticleOp)] = &[
+        ("generate_article", ArticleOp::Generate),
+        ("generate_article_enable", ArticleOp::GenerateEnable),
+        ("remove", ArticleOp::Remove),
+        ("remove_exist", ArticleOp::RemoveExist),
+        ("shoot", ArticleOp::Shoot),
+        ("shoot_exist", ArticleOp::ShootExist),
+        ("change_motion", ArticleOp::ChangeMotion),
+        ("change_status", ArticleOp::ChangeStatus),
+        ("change_status_exist", ArticleOp::ChangeStatusExist),
+        ("set_rate", ArticleOp::SetRate),
+        ("set_frame", ArticleOp::SetFrame),
+        ("add_motion_partial", ArticleOp::AddMotionPartial),
+        ("set_visibility_whole", ArticleOp::SetVisibilityWhole),
+        ("set_visibility", ArticleOp::SetVisibility),
+        ("set_pos", ArticleOp::SetPos),
+        ("set_flag", ArticleOp::SetFlag),
+        ("set_int", ArticleOp::SetInt),
+        ("set_float", ArticleOp::SetFloat),
+    ];
+
+    pub fn from_name(name: &str) -> Self {
+        Self::NAMED
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map_or_else(|| Self::Other(name.to_owned()), |(_, op)| op.clone())
+    }
+
+    /// The function name as written after `ArticleModule::`.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Other(name) => name,
+            op => Self::NAMED
+                .iter()
+                .find(|(_, known)| known == op)
+                .map_or("", |(name, _)| name),
+        }
+    }
+
+    /// How many arguments follow the article id, from the vanilla `lua_bind` signatures
+    /// (`generate_article(boma, id, bool, i32)` is 2). `None` for [`ArticleOp::Other`].
+    pub fn arity(&self) -> Option<usize> {
+        Some(match self {
+            Self::Remove | Self::RemoveExist | Self::ChangeStatusExist => 1,
+            Self::SetRate | Self::SetFrame | Self::SetPos => 1,
+            Self::Generate | Self::GenerateEnable | Self::Shoot | Self::ShootExist => 2,
+            Self::ChangeStatus | Self::SetVisibilityWhole => 2,
+            Self::SetFlag | Self::SetInt | Self::SetFloat => 2,
+            Self::ChangeMotion | Self::SetVisibility => 3,
+            Self::AddMotionPartial => 10,
+            Self::Other(_) => return Option::None,
+        })
+    }
+
+    /// Where the `ArticleOperationTarget` sits in [`ArticleCall::args`], from the vanilla
+    /// `lua_bind` signatures. `None` for functions that take no target.
+    pub fn target_index(&self) -> Option<usize> {
+        match self {
+            Self::Shoot | Self::ShootExist | Self::Remove | Self::RemoveExist => Some(0),
+            Self::ChangeStatus | Self::SetVisibilityWhole => Some(1),
+            Self::SetVisibility => Some(2),
+            _ => Option::None,
+        }
+    }
+}
+
+/// Which statement form an [`ArticleCall`] was read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArticleOrigin {
+    /// An [`ExcuteStmt::Article`] statement: `source` is the line as written.
+    #[default]
+    Script,
+    /// A typed native call (`move_nodes::native_calls`): `source` is the line as written while
+    /// the call still matches it, and the call's own spelling once it has been edited.
+    Native,
+    /// One of the timeline's closed [`ExcuteStmt::ArticleLifecycle`] forms. The statement keeps
+    /// no text of its own, so `source` is the line the timeline writes for it. That line differs
+    /// from the original only in spacing and in a shoot target written bare
+    /// (`*ARTICLE_OPE_TARGET_X`), which the timeline writes as `ArticleOperationTarget(..)`.
+    /// Write these back through their timeline statement, not as text.
+    Timeline,
+}
+
+/// One `ArticleModule::*` statement in a script, read from its source line.
+///
+/// `source` is the statement as written and is what gets saved back until `edited` is set, so
+/// an unedited script saves byte for byte. Once edited, the call is rebuilt from the fields with
+/// the binding (`let x = `), module path and receiver `source` was written with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArticleCall {
+    pub op: ArticleOp,
+    /// The first argument after the module accessor, as written (e.g. `*FIGHTER_X_GENERATE_ARTICLE_Y`).
+    pub article: String,
+    /// The arguments after `article`, as written.
+    pub args: Vec<String>,
+    pub target: ArticleTarget,
+    /// The original statement.
+    pub source: String,
+    pub edited: bool,
+    #[serde(default)]
+    pub origin: ArticleOrigin,
+}
+
+/// The two path spellings of the module a call may be written with.
+const ARTICLE_MODULE_PATHS: [&str; 2] = ["smash::app::lua_bind::ArticleModule::", "ArticleModule::"];
+
+/// One complete `[let x = ][path]ArticleModule::f(args);` statement, split into its parts.
+struct ArticleStatement<'a> {
+    /// `let x = ` exactly as written, or empty.
+    binding: &'a str,
+    path: &'static str,
+    name: &'a str,
+    /// Every argument, the receiver first, each trimmed.
+    args: Vec<String>,
+}
+
+/// Split one complete article statement. Anything else, such as a call inside an expression,
+/// a trailing statement or a trailing comment, is not a statement this model owns.
+fn split_article_statement(line: &str) -> Option<ArticleStatement<'_>> {
+    let line = line.trim();
+    let call_start = match line.strip_prefix("let ") {
+        Some(rest) => {
+            let (pattern, _) = rest.split_once(" = ")?;
+            if pattern.is_empty() || pattern.contains(['(', '"', ';']) {
+                return None;
+            }
+            "let ".len() + pattern.len() + " = ".len()
+        }
+        None => 0,
+    };
+    let (binding, call) = line.split_at(call_start);
+    let path = ARTICLE_MODULE_PATHS
+        .into_iter()
+        .find(|path| call.starts_with(path))?;
+    if line.contains("//") || line.contains("/*") {
+        return None;
+    }
+    let rest = &call[path.len()..];
+    let open = rest.find('(')?;
+    let name = &rest[..open];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let body = rest[open..].strip_suffix(';')?.trim_end();
+    // The opening parenthesis must close exactly at the end of the statement.
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && index + 1 != body.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || in_string || !body.ends_with(')') {
+        return None;
+    }
+    let args = crate::acmd::tokenize_args_balanced(&body[1..body.len() - 1]);
+    Some(ArticleStatement {
+        binding,
+        path,
+        name,
+        args,
+    })
+}
+
+impl ArticleCall {
+    /// Read one `ArticleModule::f(accessor, article, ...);` statement, either module path,
+    /// with or without a `let` binding.
+    pub fn parse(line: &str) -> Option<Self> {
+        let ArticleStatement { name, mut args, .. } = split_article_statement(line)?;
+        if args.len() < 2 {
+            return None;
+        }
+        let op = ArticleOp::from_name(name);
+        args.remove(0);
+        let article = args.remove(0);
+        let target = op
+            .target_index()
+            .and_then(|index| args.get(index))
+            .map_or(ArticleTarget::Unspecified, |text| ArticleTarget::read(text));
+        Some(Self {
+            op,
+            article,
+            args,
+            target,
+            source: line.trim().to_owned(),
+            edited: false,
+            origin: ArticleOrigin::Script,
+        })
+    }
+
+    /// The same call when it is kept as a typed native call (`move_nodes::native_calls`): read
+    /// from the line the script wrote while the call still spells it, else from the call.
+    pub fn from_native(call: &crate::move_nodes::native_calls::NativeCall) -> Option<Self> {
+        call.callee.strip_prefix("ArticleModule::")?;
+        let line = call
+            .written_source()
+            .map_or_else(|| call.source(), str::to_owned);
+        Some(Self {
+            origin: ArticleOrigin::Native,
+            ..Self::parse(&line)?
+        })
+    }
+
+    /// One of the timeline's closed forms, read from the line the timeline writes for it.
+    pub(crate) fn from_timeline(line: &str) -> Option<Self> {
+        Some(Self {
+            origin: ArticleOrigin::Timeline,
+            ..Self::parse(line)?
+        })
+    }
+
+    /// The article symbol without its `*`, as the preview looks objects up.
+    pub fn symbol(&self) -> &str {
+        self.article.trim_start_matches('*')
+    }
+
+    /// The statement to save: `source` unless edited, else rebuilt with the binding, module
+    /// path, receiver and target spelling `source` was written with.
+    pub fn emit(&self) -> String {
+        if !self.edited {
+            return self.source.clone();
+        }
+        let (binding, path, receiver) = match split_article_statement(&self.source) {
+            Some(written) => (
+                written.binding,
+                written.path,
+                written.args.into_iter().next(),
+            ),
+            None => ("", "ArticleModule::", None),
+        };
+        let receiver = receiver.unwrap_or_else(|| "agent.module_accessor".to_owned());
+        let mut args = self.args.clone();
+        if let Some(slot) = self.op.target_index().and_then(|index| args.get_mut(index)) {
+            *slot = self.target.respell(slot);
+        }
+        let mut all = vec![receiver, self.article.clone()];
+        all.extend(args);
+        format!("{binding}{path}{}({});", self.op.name(), all.join(", "))
     }
 }
 
@@ -4034,6 +4454,10 @@ pub enum ExcuteStmt {
     },
     /// One of the exact, registry-checked source-only ArticleModule lifecycle calls.
     ArticleLifecycle(ArticleLifecycleCall),
+    /// Any other `ArticleModule::*` statement, read into its parts and saved as written until
+    /// edited. Calls the timeline's closed forms ([`ArticleLifecycle`](Self::ArticleLifecycle))
+    /// or the typed native calls already own are not read into this.
+    Article(ArticleCall),
     /// Source-only handoff to a named live gimmick event receiver. Project expansion requires
     /// this name to be present in the fighter's compiled event bindings.
     GimmickEvent {
@@ -5054,43 +5478,97 @@ impl AcmdScript {
     /// in force: the engine advances the motion by `1/r` motion frames per game frame, so a span
     /// of `n` motion frames takes `n * r` game frames.
     ///
-    /// Rate calls sit at the function's top level in all 17 corpus calls, so only the top level
-    /// is walked. A rate set inside a runtime branch would apply for real, but whether the
-    /// branch is taken is not knowable here, and pretending otherwise would put a confident
-    /// wrong number on the timeline; those scripts keep a `Raw` block and are left alone.
+    /// Every way a moveset sets the rate counts, because frame data built from only one of them
+    /// is wrong for the rest: `FT_MOTION_RATE`, smash_script's `FT_MOTION_RATE_RANGE(start, end,
+    /// game_frames)` and `FT_DESIRED_RATE(motion_frames, game_frames)` (both of which call it
+    /// with `game_frames / motion_frames`), and `MotionModule::set_rate(r)`, the playback speed,
+    /// whose game-frames-per-motion-frame is `1/r`. `is_excute` blocks always run for the agent
+    /// whose script this is, so they are walked, and a loop's body is walked once per iteration.
+    ///
+    /// A rate set inside a runtime branch would apply for real, but whether the branch is taken
+    /// is not knowable here, and pretending otherwise would put a confident wrong number on the
+    /// timeline; those blocks are left alone.
     pub fn rate_spans(&self) -> Vec<RateSpan> {
-        let mut spans: Vec<RateSpan> = Vec::new();
-        let (mut motion, mut game, mut rate) = (0.0f32, 0.0f32, 1.0f32);
-        for stmt in &self.stmts {
-            match stmt {
-                // `frame()` waits *until* a frame and returns immediately if it has already
-                // passed, so a target behind the cursor advances nothing rather than rewinding.
-                AcmdStmt::Frame(f) => {
-                    let advance = (*f - motion).max(0.0);
-                    motion += advance;
-                    game += advance * rate;
+        /// Iterations walked per loop at most: a `loop {}` read as a huge count must not hang.
+        const MAX_LOOP: usize = 1000;
+        struct Walk {
+            spans: Vec<RateSpan>,
+            motion: f32,
+            game: f32,
+            rate: f32,
+        }
+        impl Walk {
+            fn advance(&mut self, by: f32) {
+                let by = by.max(0.0);
+                self.motion += by;
+                self.game += by * self.rate;
+            }
+            fn set_rate(&mut self, rate: f32) {
+                if !(rate > 0.0 && rate.is_finite()) {
+                    return;
                 }
-                AcmdStmt::Wait(w) => {
-                    let advance = w.max(0.0);
-                    motion += advance;
-                    game += advance * rate;
+                if let Some(last) = self.spans.last_mut() {
+                    last.to_motion = self.motion;
                 }
-                AcmdStmt::MotionRate(r) if *r > 0.0 => {
-                    if let Some(last) = spans.last_mut() {
-                        last.to_motion = motion;
+                self.spans.push(RateSpan {
+                    from_motion: self.motion,
+                    to_motion: f32::INFINITY,
+                    from_game: self.game,
+                    rate,
+                });
+                self.rate = rate;
+            }
+            fn stmts(&mut self, stmts: &[AcmdStmt]) {
+                for stmt in stmts {
+                    match stmt {
+                        // `frame()` waits *until* a frame and returns immediately if it has
+                        // already passed, so a target behind the cursor advances nothing rather
+                        // than rewinding.
+                        AcmdStmt::Frame(f) | AcmdStmt::NativeExecuteFrame(f) => {
+                            self.advance(*f - self.motion)
+                        }
+                        AcmdStmt::Wait(w) => self.advance(*w),
+                        AcmdStmt::MotionRate(r) => self.set_rate(*r),
+                        AcmdStmt::Raw(line) => {
+                            if let Some(rate) = raw_rate_call(line) {
+                                self.set_rate(rate);
+                            }
+                        }
+                        AcmdStmt::Excute(body) => body.iter().for_each(|s| self.excute(s)),
+                        AcmdStmt::Bare(s) => self.excute(s),
+                        AcmdStmt::Loop { count, body, .. } => {
+                            for _ in 0..(*count).min(MAX_LOOP) {
+                                self.stmts(body);
+                            }
+                        }
+                        AcmdStmt::WaitLoopClear
+                        | AcmdStmt::NativeMotionLoopSync
+                        | AcmdStmt::RawBlock { .. } => {}
                     }
-                    spans.push(RateSpan {
-                        from_motion: motion,
-                        to_motion: f32::INFINITY,
-                        from_game: game,
-                        rate: *r,
-                    });
-                    rate = *r;
                 }
-                _ => {}
+            }
+            fn excute(&mut self, stmt: &ExcuteStmt) {
+                match stmt {
+                    ExcuteStmt::MotionModuleSetRate(call) if call.rate > 0.0 => {
+                        self.set_rate(1.0 / call.rate)
+                    }
+                    ExcuteStmt::Raw(line) => {
+                        if let Some(rate) = raw_rate_call(line) {
+                            self.set_rate(rate);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        spans
+        let mut walk = Walk {
+            spans: Vec::new(),
+            motion: 0.0,
+            game: 0.0,
+            rate: 1.0,
+        };
+        walk.stmts(&self.stmts);
+        walk.spans
     }
 
     /// The game frame a motion frame lands on, given this script's rate windows.
@@ -5156,8 +5634,15 @@ impl AcmdScript {
 
     /// Objects the move creates (true) or removes (false), as (script frame, article symbol,
     /// created), in running order.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_spawns(&self) -> Vec<(u32, String, bool)> {
-        self.walk().article_spawns
+        article_spawns(&self.walk().article_calls)
+    }
+
+    /// Every `ArticleModule` call the move makes, as (script frame, call), in running order.
+    /// The closed timeline forms and typed native calls are read into the same [`ArticleCall`].
+    pub fn to_article_calls(&self) -> Vec<(u32, ArticleCall)> {
+        self.walk().article_calls
     }
 
     /// The move's model visibility switches, as (script frame, set, group), in running order.
@@ -5166,18 +5651,21 @@ impl AcmdScript {
     }
 
     /// Objects the move throws, as (script frame, article symbol), in running order.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_shots(&self) -> Vec<(u32, String)> {
-        self.walk().article_shots
+        article_shots(&self.walk().article_calls)
     }
 
     /// Motions the move gives its objects, as (script frame, article symbol, motion).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_motions(&self) -> Vec<(u32, String, String)> {
-        self.walk().article_motions
+        article_motions(&self.walk().article_calls)
     }
 
     /// Objects the move shows (true) or hides (false), as (script frame, article symbol, shown).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_visibility(&self) -> Vec<(u32, String, bool)> {
-        self.walk().article_visibility
+        article_visibility(&self.walk().article_calls)
     }
 
     /// Flatten the script into display hitboxes with computed frame ranges.
@@ -5493,6 +5981,27 @@ impl AcmdScript {
         work_transition_term_stmt_mut: WorkTransitionTerm => WorkTransitionTermCall;
         work_module_set_stmt_mut: WorkModuleSet => WorkModuleSetCall;
         work_module_inc_int_stmt_mut: WorkModuleIncInt => WorkModuleIncIntCall;
+        article_stmt_mut: Article => ArticleCall;
+    }
+
+    /// How many [`ExcuteStmt::Article`] statements the source holds, each `for` body counted
+    /// once: the ordinals [`Self::article_stmt_mut`] takes. When this differs from the number of
+    /// script-read calls [`Self::to_article_calls`] gives, the two cannot be paired by position.
+    pub fn article_site_count(&self) -> usize {
+        fn count(stmts: &[AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    AcmdStmt::Excute(inner) => {
+                        inner.iter().filter(|s| matches!(s, ExcuteStmt::Article(_))).count()
+                    }
+                    AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::Article(_))),
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => count(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+        count(&self.stmts)
     }
 
     /// The hurtbox statement a span's [`site`](HurtboxState::site) refers to.
@@ -6534,17 +7043,11 @@ struct WalkAccum {
     work_flags: Vec<WorkFlagEvent>,
     work_transition_terms: Vec<WorkTransitionTermEvent>,
     work_module_inc_ints: Vec<WorkModuleIncIntEvent>,
-    /// Objects the move creates (true) or removes (false): (script frame, symbol, created).
-    article_spawns: Vec<(u32, String, bool)>,
-    /// Objects the move throws (`ArticleModule::shoot` / `shoot_exist`): (script frame, symbol).
-    article_shots: Vec<(u32, String)>,
+    /// Every `ArticleModule` call, whichever statement form it was read as: (script frame,
+    /// call). The preview's spawn, shot, motion and visibility lists are read from this.
+    pub article_calls: Vec<(u32, ArticleCall)>,
     /// Model visibility switches (`VisibilityModule::set_int64`): (script frame, set, group).
     visibility_changes: Vec<(u32, String, String)>,
-    /// Motions the move gives its objects (`ArticleModule::change_motion`):
-    /// (script frame, symbol, motion).
-    article_motions: Vec<(u32, String, String)>,
-    /// Objects shown or hidden (`ArticleModule::set_visibility_whole`): (script frame, symbol, shown).
-    article_visibility: Vec<(u32, String, bool)>,
     work_module_sets: Vec<WorkModuleSetEvent>,
     /// Next site per [`SiteFamily`], each family numbered independently.
     ///
@@ -6803,34 +7306,77 @@ fn record_raw_partial_frame(line: &str, frame: f32, hurt: &mut WalkAccum) {
     }
 }
 
-/// An `ArticleModule` call kept as a native call, for the preview's objects.
+/// An `ArticleModule` call kept as a native call, for the preview's objects. It is read into
+/// the same [`ArticleCall`] the raw spelling of the call would give.
 fn record_native_article_call(
     call: &crate::move_nodes::native_calls::NativeCall,
     at: u32,
     hurt: &mut WalkAccum,
 ) {
-    let Some(symbol) = call.arguments.first().and_then(|s| s.strip_prefix('*')) else {
-        return;
-    };
-    let symbol = symbol.to_owned();
-    let second = call.arguments.get(1).map(String::as_str);
-    match call.callee.trim_start_matches("ArticleModule::") {
-        "generate_article" => hurt.article_spawns.push((at, symbol, true)),
-        "change_motion" => {
-            if let Some(motion) = second
-                .and_then(|m| m.strip_prefix("Hash40::new(\""))
-                .and_then(|m| m.strip_suffix("\")"))
-            {
-                hurt.article_motions.push((at, symbol, motion.to_owned()));
-            }
-        }
-        "set_visibility_whole" => match second {
-            Some("true") => hurt.article_visibility.push((at, symbol, true)),
-            Some("false") => hurt.article_visibility.push((at, symbol, false)),
-            _ => {}
-        },
-        _ => {}
+    if let Some(call) = ArticleCall::from_native(call) {
+        hurt.article_calls.push((at, call));
     }
+}
+
+/// Objects created (true) or removed (false): (script frame, symbol, created).
+#[cfg_attr(not(test), allow(dead_code))]
+fn article_spawns(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
+    calls
+        .iter()
+        .filter_map(|(at, call)| {
+            let created = match call.op {
+                ArticleOp::Generate | ArticleOp::GenerateEnable => true,
+                ArticleOp::Remove | ArticleOp::RemoveExist => false,
+                _ => return Option::None,
+            };
+            Some((*at, call.symbol().to_owned(), created))
+        })
+        .collect()
+}
+
+/// Objects thrown (`shoot` / `shoot_exist`): (script frame, symbol).
+#[cfg_attr(not(test), allow(dead_code))]
+fn article_shots(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String)> {
+    calls
+        .iter()
+        .filter(|(_, call)| matches!(call.op, ArticleOp::Shoot | ArticleOp::ShootExist))
+        .map(|(at, call)| (*at, call.symbol().to_owned()))
+        .collect()
+}
+
+/// Motions given to objects by name (`change_motion(.., Hash40::new("m"), ..)`):
+/// (script frame, symbol, motion).
+#[cfg_attr(not(test), allow(dead_code))]
+fn article_motions(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, String)> {
+    calls
+        .iter()
+        .filter(|(_, call)| call.op == ArticleOp::ChangeMotion)
+        .filter_map(|(at, call)| {
+            let motion = call
+                .args
+                .first()?
+                .strip_prefix("Hash40::new(\"")?
+                .strip_suffix("\")")?;
+            Some((*at, call.symbol().to_owned(), motion.to_owned()))
+        })
+        .collect()
+}
+
+/// Objects shown (true) or hidden (false) whole: (script frame, symbol, shown).
+#[cfg_attr(not(test), allow(dead_code))]
+fn article_visibility(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
+    calls
+        .iter()
+        .filter(|(_, call)| call.op == ArticleOp::SetVisibilityWhole)
+        .filter_map(|(at, call)| {
+            let shown = match call.args.first()?.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Option::None,
+            };
+            Some((*at, call.symbol().to_owned(), shown))
+        })
+        .collect()
 }
 
 /// Run one statement from inside an `is_excute` block, or one written bare beside it.
@@ -6930,14 +7476,8 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
                 }
             }
         }
-        ExcuteStmt::GrabClearAll => {
-            let end = script_frame(frame).saturating_sub(1);
-            for hb in hitboxes.iter_mut().filter(|hitbox| hitbox.category == 1) {
-                if hb.active_end == u32::MAX {
-                    hb.active_end = end.max(hb.active_start);
-                }
-            }
-        }
+        ExcuteStmt::GrabClearAll => end_grab_boxes(frame, hitboxes),
+        ExcuteStmt::NativeCall(_) if is_grab_clear(s) => end_grab_boxes(frame, hitboxes),
         // Identity is (id, kind), NOT id alone. Every one of the corpus's 32
         // calls writes id `0`, and kirby/ThrowF puts two in a single block —
         // one `..._THROW` and one `..._CATCH` — which are both live at once and
@@ -7071,49 +7611,21 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         | ExcuteStmt::AttackModuleAddReactionFrame { .. }
         | ExcuteStmt::AttackModuleAddReactionFrameRevised { .. }
         | ExcuteStmt::GrabRebound { .. } => {}
-        ExcuteStmt::ArticleLifecycle(
-            ArticleLifecycleCall::Generate { symbol }
-            | ArticleLifecycleCall::GenerateEnabled { symbol },
-        ) => hurt.article_spawns.push((
-            script_frame(frame),
-            symbol.trim_start_matches('*').to_owned(),
-            true,
-        )),
-        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::RemoveAll { symbol }) => {
-            hurt.article_spawns.push((
-                script_frame(frame),
-                symbol.trim_start_matches('*').to_owned(),
-                false,
-            ))
+        // The closed timeline forms keep no text of their own, so they are read through the
+        // line the timeline writes for them (`ArticleOrigin::Timeline`).
+        ExcuteStmt::ArticleLifecycle(_) => {
+            for line in crate::acmd::emit_excute_stmts(std::slice::from_ref(s), "") {
+                if let Some(call) = ArticleCall::from_timeline(&line) {
+                    hurt.article_calls.push((script_frame(frame), call));
+                }
+            }
         }
+        ExcuteStmt::Article(call) => hurt.article_calls.push((script_frame(frame), call.clone())),
         ExcuteStmt::VisibilitySetInt64 { group, status } => {
             hurt.visibility_changes
                 .push((script_frame(frame), group.clone(), status.clone()))
         }
-        ExcuteStmt::ArticleLifecycle(
-            ArticleLifecycleCall::Shoot { symbol, .. }
-            | ArticleLifecycleCall::ShootExist { symbol, .. },
-        ) => hurt.article_shots.push((
-            script_frame(frame),
-            symbol.trim_start_matches('*').to_owned(),
-        )),
-        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion { symbol, motion }) => {
-            hurt.article_motions.push((
-                script_frame(frame),
-                symbol.trim_start_matches('*').to_owned(),
-                motion.clone(),
-            ))
-        }
-        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::SetVisibilityWhole {
-            symbol,
-            visible,
-        }) => hurt.article_visibility.push((
-            script_frame(frame),
-            symbol.trim_start_matches('*').to_owned(),
-            *visible,
-        )),
-        ExcuteStmt::ArticleLifecycle(_)
-        | ExcuteStmt::GimmickEvent { .. }
+        ExcuteStmt::GimmickEvent { .. }
         | ExcuteStmt::GimmickChartEvent { .. }
         | ExcuteStmt::GimmickChartEventValues { .. } => {}
         ExcuteStmt::AttackMod { kind, id, value } => {
@@ -7253,6 +7765,40 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         ),
         ExcuteStmt::SlowWhole(_) | ExcuteStmt::SlowOpponent(_) => {}
         ExcuteStmt::Raw(line) => record_raw_partial_frame(line, frame, hurt),
+    }
+}
+
+/// The `FT_MOTION_RATE` argument a rate call the parser keeps as text amounts to:
+/// `FT_MOTION_RATE_RANGE(agent, start, end, game_frames)` → `game_frames / (end - start)`,
+/// `FT_DESIRED_RATE(agent, motion_frames, game_frames)` → `game_frames / motion_frames`, and a
+/// plain `FT_MOTION_RATE(agent, r)` written somewhere the parser does not type it. Arguments that
+/// are not number literals (a const, an expression) give `None` rather than a guess.
+fn raw_rate_call(line: &str) -> Option<f32> {
+    let args = |name: &str| -> Option<Vec<f32>> {
+        let (_, rest) = line.split_once(name)?;
+        let inner = &rest[..rest.find(')')?];
+        inner
+            .split(',')
+            .skip(1)
+            .map(|arg| {
+                let arg = arg.trim();
+                let arg = arg.strip_suffix("as f32").unwrap_or(arg).trim();
+                let arg = arg.strip_suffix("f32").unwrap_or(arg).trim_end_matches('_');
+                arg.parse::<f32>().ok()
+            })
+            .collect()
+    };
+    if let Some(args) = args("FT_MOTION_RATE_RANGE(") {
+        let [start, end, game] = args[..] else { return None };
+        return (end > start).then(|| game / (end - start));
+    }
+    if let Some(args) = args("FT_DESIRED_RATE(") {
+        let [motion, game] = args[..] else { return None };
+        return (motion > 0.0).then(|| game / motion);
+    }
+    match args("FT_MOTION_RATE(")?[..] {
+        [rate] => Some(rate),
+        _ => None,
     }
 }
 
@@ -7469,6 +8015,60 @@ impl EditLog {
     }
 }
 
+/// Where the open move's ACMD came from.
+///
+/// Three places can supply a move, and the editor has to say which one it is showing: the
+/// vanilla scripts (dumped from the game, read from the GitHub mirror), the user's moveset
+/// source (the linked Rust project, merged over vanilla for categories it leaves out), or this
+/// Visionary project's own saved copy. A modded Falco showing vanilla Falco is only diagnosable
+/// when the label says "vanilla" rather than a host name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ScriptOrigin {
+    /// Nothing loaded yet.
+    #[default]
+    None,
+    /// The vanilla script from the dumped-script mirror.
+    Vanilla,
+    /// The linked moveset source, with vanilla filling any category it does not define.
+    MovesetSource,
+    /// The baseline this Visionary project saved when the move was first opened.
+    Saved,
+    /// A fresh read the user chose over the saved baseline: of the moveset source, or of
+    /// vanilla when the source does not define the move.
+    Refreshed { moveset: bool },
+    /// Rebuilt from a live game capture.
+    LiveCapture,
+}
+
+impl ScriptOrigin {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+
+    /// The same body read again, chosen over the saved baseline.
+    pub fn refreshed(&self) -> Self {
+        Self::Refreshed { moveset: *self == Self::MovesetSource }
+    }
+
+    /// A freshly read source, which replaces anything a live snapshot said about the move.
+    pub fn is_fresh_read(&self) -> bool {
+        matches!(self, Self::Vanilla | Self::Refreshed { .. })
+    }
+
+    /// Short label for status lines: "from {label}".
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Vanilla => "the game's scripts",
+            Self::MovesetSource => "your moveset source",
+            Self::Saved => "this project's saved copy",
+            Self::Refreshed { moveset: true } => "your moveset source (re-read)",
+            Self::Refreshed { moveset: false } => "the game's scripts (re-read)",
+            Self::LiveCapture => "live capture",
+        }
+    }
+}
+
 /// Where a fighter was indexed from. Modded fighters (added-character mods) come from a
 /// user-added mod root and may be missing pieces a vanilla dump always has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7494,6 +8094,10 @@ pub struct FighterEntry {
     /// rescans and modded-fighter lookups don't have to re-derive it from the data root.
     pub fighter_dir: PathBuf,
     pub source: FighterSource,
+    /// The character a mod plays on this fighter's slots (`Shy Guy` on Pac-Man c40–c47), when
+    /// this entry is that character rather than the fighter itself. It shares the fighter's
+    /// agent and scripts; only its slots, files, and name are its own.
+    pub custom_name: Option<String>,
 }
 
 impl FighterEntry {
@@ -7577,8 +8181,8 @@ pub struct AppState {
     pub attack_mods_pristine: Vec<AttackModState>,
     /// Original direct point events for source and live edit comparison.
     pub point_originals: PointOriginals,
-    /// Provenance of the current move's ACMD data ("", "GitHub", "Live capture").
-    pub acmd_source: String,
+    /// Provenance of the current move's ACMD data.
+    pub acmd_source: ScriptOrigin,
     /// "fighter/move" → the warning captured when a live performance observed only one arm of
     /// a branched source script. Kept separately from `acmd_source` so a later project export can
     /// carry the warning even after the move is no longer open.
@@ -7633,6 +8237,9 @@ pub struct MoveEntry {
     pub hash: u64,
     pub frame_count: u32,
     pub anim_path: Option<PathBuf>,
+    /// The motion list's `cancel_frame` for this motion — its first actionable frame — or `0`
+    /// when the motion list sets none.
+    pub cancel_frame: u32,
 }
 
 /// Replace only the display-name placeholder used when a motion hash had no label at load
@@ -7672,7 +8279,7 @@ impl Default for AppState {
             current_frame: 1,
             total_frames: 0,
             playing: false,
-            status: "Select a data root directory to begin.".to_string(),
+            status: "Set your game dump to begin.".to_string(),
             edit_log: EditLog::default(),
             effect_script: EffectScript::default(),
             effects: Vec::new(),
@@ -7690,7 +8297,7 @@ impl Default for AppState {
             hurtbox_conditions_pristine: Vec::new(),
             attack_mods_pristine: Vec::new(),
             point_originals: PointOriginals::default(),
-            acmd_source: String::new(),
+            acmd_source: ScriptOrigin::None,
             capture_branch_warnings: HashMap::new(),
             loaded_body: String::new(),
             effect_call_edits: HashMap::new(),
@@ -7732,6 +8339,7 @@ macro_rules! with_point_families {
             work_transition_term_pristine: WorkTransitionTermEvent => to_work_transition_term_events,
             work_module_inc_int_pristine: WorkModuleIncIntEvent => to_work_module_inc_int_events,
             work_module_set_pristine: WorkModuleSetEvent => to_work_module_set_events,
+            article_calls_pristine: (u32, ArticleCall) => to_article_calls,
         }
     };
 }
@@ -7864,17 +8472,20 @@ pub fn part_costume_slots(part_dir: &std::path::Path) -> Vec<u8> {
 ///
 /// Weapon parts routinely carry a different slot set from the body, and a modded fighter may
 /// ship no `c00` at all — hardcoding `c00` silently dropped that fighter's weapons.
+///
+/// Each slot is resolved the way ARCropolis loads it, so a skeleton shared through
+/// `config.json` or left to the game's own file still counts.
 pub fn find_part_skel(part_dir: &std::path::Path, preferred_slot: u8) -> Option<PathBuf> {
-    let preferred = part_dir
-        .join(format!("c{preferred_slot:02}"))
-        .join("model.nusktb");
-    if preferred.exists() {
-        return Some(preferred);
-    }
-    part_costume_slots(part_dir)
-        .iter()
-        .map(|s| part_dir.join(format!("c{s:02}")).join("model.nusktb"))
-        .find(|p| p.exists())
+    let skel_in = |slot: u8| {
+        crate::costume_files::CostumeFolder::resolve(&part_dir.join(format!("c{slot:02}")))
+            .get("model.nusktb")
+            .map(std::path::Path::to_path_buf)
+    };
+    skel_in(preferred_slot).or_else(|| {
+        part_costume_slots(part_dir)
+            .into_iter()
+            .find_map(skel_in)
+    })
 }
 
 /// Slot index encoded in an eff file name, e.g. `("ef_mario_c08", "mario") → 8`.
@@ -7947,6 +8558,152 @@ pub fn discover_costume_slots(roots: &[PathBuf], fighter: &str) -> Vec<u8> {
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// A character a mod adds on a vanilla fighter's costume slots: Shy Guy on Pac-Man c40–c47.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotCharacter {
+    pub name: String,
+    /// Its slots, ascending; all past the vanilla eight.
+    pub slots: Vec<u8>,
+    /// The mod root its files live in.
+    pub root: PathBuf,
+}
+
+/// The slot characters `roots` add to `fighter`.
+///
+/// A mod root counts when it ships `fighter` slots past c07 *and* names a character of its own
+/// in `ui/message/msg_name.xmsbt`. Slots with no name are a skin pack and stay with the fighter.
+///
+/// Roots are ordered lowest-to-highest priority (dump, then Mod Library, then project `romfs/`).
+/// A higher-priority root's claimed slots shadow overlapping slots from lower-priority roots so
+/// an active project mod does not show up alongside a stale/conflicting lower-priority copy on
+/// the same costume slots. Disjoint slots that resolve to the same character name are merged.
+pub fn slot_characters(roots: &[PathBuf], fighter: &str) -> Vec<SlotCharacter> {
+    let mut claimed_slots: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut found: Vec<SlotCharacter> = Vec::new();
+    for root in roots.iter().rev() {
+        let slots: Vec<u8> = discover_costume_slots(std::slice::from_ref(root), fighter)
+            .into_iter()
+            .filter(|slot| *slot >= VANILLA_SLOT_COUNT && !claimed_slots.contains(slot))
+            .collect();
+        if slots.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::fs::read(root.join("ui/message/msg_name.xmsbt")) else {
+            continue;
+        };
+        let Some(name) = xmsbt_character_name(&decode_xmsbt(&text), fighter) else {
+            continue;
+        };
+        for &slot in &slots {
+            claimed_slots.insert(slot);
+        }
+        if let Some(existing) = found
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(&name))
+        {
+            existing.slots.extend(slots);
+            existing.slots.sort_unstable();
+            existing.slots.dedup();
+        } else {
+            found.push(SlotCharacter {
+                name,
+                slots,
+                root: root.clone(),
+            });
+        }
+    }
+    found.reverse();
+    found
+}
+
+/// Whether `id` in a `nam_chr*_<id>` label belongs to a *different* vanilla fighter (or system
+/// roster entry like `"random"`), so a merged/vanilla `msg_name.xmsbt` cannot mislabel `fighter`'s
+/// extra costume slots as an unrelated vanilla character (e.g. `"Wario"` on `pacman` slots).
+fn is_other_vanilla_fighter_id(id: &str, fighter: &str) -> bool {
+    if id.eq_ignore_ascii_case(fighter) {
+        return false;
+    }
+    let lower = id.to_ascii_lowercase();
+    VANILLA_FIGHTERS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "random"
+                | "fushigisou"
+                | "lizardon"
+                | "eflame_first"
+                | "elight_first"
+                | "eflame_only"
+                | "elight_only"
+        )
+}
+
+/// `.xmsbt` is UTF-16 (either byte order, BOM or not) in practice, and UTF-8 now and then.
+fn decode_xmsbt(bytes: &[u8]) -> String {
+    let utf16 = |big: bool, body: &[u8]| {
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|pair| if big { u16::from_be_bytes([pair[0], pair[1]]) } else { u16::from_le_bytes([pair[0], pair[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, body @ ..] => utf16(false, body),
+        [0xFE, 0xFF, body @ ..] => utf16(true, body),
+        [b'<', 0, ..] => utf16(false, bytes),
+        [0, b'<', ..] => utf16(true, bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The character name an `.xmsbt` gives: the text of a `nam_chr1_NN_<id>` entry (`chr0` when
+/// there is no `chr1`), preferring an id other than `fighter`'s own, which is a rename of the
+/// vanilla character rather than a new one. Entries belonging to other vanilla fighters (from a
+/// vanilla dump or multi-character UI mod) and unmodified default names for `fighter` itself are
+/// ignored.
+fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
+    let default_display = fighter_display_name(fighter);
+    let mut found: Vec<(u8, bool, String)> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("label=\"nam_chr") {
+        rest = &rest[at + "label=\"nam_chr".len()..];
+        let Some(close) = rest.find('"') else { break };
+        let label = &rest[..close];
+        // `1_00_shyguy` → variant 1, id `shyguy`.
+        let mut parts = label.splitn(3, '_');
+        let (Some(variant), Some(_slot), Some(id)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let rank = match variant {
+            "1" => 0,
+            "0" => 1,
+            _ => continue,
+        };
+        if is_other_vanilla_fighter_id(id, fighter) {
+            continue;
+        }
+        let body = &rest[close..];
+        let entry_end = body.find("</entry>").unwrap_or(body.len());
+        let Some(start) = body[..entry_end].find("<text>") else { continue };
+        let Some(len) = body[start + 6..entry_end].find("</text>") else { continue };
+        let name = body[start + 6..start + 6 + len]
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'");
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let own = id.eq_ignore_ascii_case(fighter);
+        if own && name.eq_ignore_ascii_case(&default_display) {
+            continue;
+        }
+        if !name.is_empty() {
+            found.push((rank, own, name));
+        }
+    }
+    found.sort_by_key(|(rank, own, _)| (*own, *rank));
+    found.into_iter().next().map(|(_, _, name)| name)
 }
 
 /// [`discover_costume_slots`] with the vanilla 0..=7 fallback applied — what the UI and the
@@ -9771,30 +10528,30 @@ fn eval_effect_stmts_unchecked(
                             // an effect the script leaves running. Invisible until C2 made trails
                             // parse, because with no trail call the wrong answer was the only
                             // answer.
-                            match calls
-                                .iter_mut()
-                                .rev()
-                                .find(|c| {
-                                    c.active_end == OPEN_ENDED_EFFECT_FRAME
-                                        && c.spawn_func == "AFTER_IMAGE_ON"
-                                })
-                            {
-                                Some(call) => {
-                                    call.active_end = script_frame(frame);
+                            let mut closed_any = false;
+                            let end_frame = script_frame(frame);
+                            for call in calls.iter_mut().rev() {
+                                if call.active_end == OPEN_ENDED_EFFECT_FRAME
+                                    && call.spawn_func == "AFTER_IMAGE_ON"
+                                {
+                                    call.active_end = end_frame;
                                     call.trail_off = Some(*arg);
+                                    closed_any = true;
                                 }
+                            }
+                            if !closed_any {
                                 // A trail this script did not start. Kirby `SpecialHi4` and
                                 // `SpecialAirHi4` end the trail `SpecialHi2` began — the two
                                 // halves of one move, in separate scripts — so there is no call
                                 // here to close and no way to make one. Dropping the line would
                                 // leave the trail running, so it is carried verbatim.
-                                None => walk.residue(
+                                walk.residue(
                                     &format!(
                                         "macros::AFTER_IMAGE_OFF(agent, {});",
                                         crate::acmd::attack_mod_num(*arg)
                                     ),
                                     calls,
-                                ),
+                                );
                             }
                             anchor = None;
                         }
@@ -10088,6 +10845,96 @@ impl EffectScript {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mod_naming_its_own_character_on_extra_slots_is_a_slot_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shyguy = tmp.path().join("shyguy");
+        for slot in [40, 41] {
+            std::fs::create_dir_all(shyguy.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+        }
+        std::fs::create_dir_all(shyguy.join("ui/message")).unwrap();
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<xmsbt>\n  <entry label=\"nam_chr2_00_shyguy\">\n    <text>SHY GUY</text>\n  </entry>\n  <entry label=\"nam_chr1_00_shyguy\">\n    <text>Shy Guy</text>\n  </entry>\n</xmsbt>\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(shyguy.join("ui/message/msg_name.xmsbt"), bytes).unwrap();
+        // A skin pack: extra slots, no name of its own.
+        let skins = tmp.path().join("skins");
+        std::fs::create_dir_all(skins.join("fighter/pacman/model/body/c08")).unwrap();
+
+        let found = super::slot_characters(&[shyguy.clone(), skins], "pacman");
+        assert_eq!(
+            found,
+            [super::SlotCharacter { name: "Shy Guy".into(), slots: vec![40, 41], root: shyguy }]
+        );
+    }
+
+    #[test]
+    fn a_rename_of_the_fighter_itself_is_the_last_resort_name() {
+        let text = r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>
+<entry label="nam_chr0_00_ghost"><text>Inky &amp; Co</text></entry>"#;
+        assert_eq!(super::xmsbt_character_name(text, "pacman").as_deref(), Some("Inky & Co"));
+        assert_eq!(
+            super::xmsbt_character_name(r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>"#, "pacman")
+                .as_deref(),
+            Some("Pac")
+        );
+    }
+
+    #[test]
+    fn other_vanilla_fighters_in_xmsbt_do_not_misname_extra_slots() {
+        // A vanilla or merged msg_name.xmsbt containing Wario and default Pac-Man must not label
+        // Pac-Man's extra slots as "Wario" or duplicate "Pac-Man".
+        let text = r#"<entry label="nam_chr1_00_wario"><text>Wario</text></entry>
+<entry label="nam_chr1_00_pacman"><text>PAC-MAN</text></entry>"#;
+        assert_eq!(super::xmsbt_character_name(text, "pacman"), None);
+
+        // If the same file also has a custom character entry, that custom character wins.
+        let with_custom = format!(
+            "{text}\n<entry label=\"nam_chr1_00_shyguy\"><text>Shy Guy</text></entry>"
+        );
+        assert_eq!(
+            super::xmsbt_character_name(&with_custom, "pacman").as_deref(),
+            Some("Shy Guy")
+        );
+    }
+
+    #[test]
+    fn higher_priority_root_shadows_overlapping_slot_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lower = tmp.path().join("lower_mod");
+        for slot in 40..=44 {
+            std::fs::create_dir_all(lower.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+        }
+        std::fs::create_dir_all(lower.join("ui/message")).unwrap();
+        std::fs::write(
+            lower.join("ui/message/msg_name.xmsbt"),
+            r#"<entry label="nam_chr1_00_oldmod"><text>Old Mod</text></entry>"#,
+        )
+        .unwrap();
+
+        let project_romfs = tmp.path().join("project_romfs");
+        for slot in 40..=48 {
+            std::fs::create_dir_all(project_romfs.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+        }
+        std::fs::create_dir_all(project_romfs.join("ui/message")).unwrap();
+        std::fs::write(
+            project_romfs.join("ui/message/msg_name.xmsbt"),
+            r#"<entry label="nam_chr1_00_shyguy"><text>Shy Guy</text></entry>"#,
+        )
+        .unwrap();
+
+        // project_romfs is last (highest priority) and claims c40..=c48, shadowing lower_mod's c40..=c44.
+        let found = super::slot_characters(&[lower, project_romfs.clone()], "pacman");
+        assert_eq!(
+            found,
+            vec![super::SlotCharacter {
+                name: "Shy Guy".into(),
+                slots: (40..=48).collect(),
+                root: project_romfs,
+            }]
+        );
+    }
+
     use super::*;
 
     /// Byleth's down tilt, as the game has it: the sword's motion is given in a form the
@@ -10486,24 +11333,28 @@ mod tests {
                 hash: first_hash,
                 frame_count: 17,
                 anim_path: Some(path.clone()),
+                cancel_frame: 0,
             },
             MoveEntry {
                 name: format!("{second_hash:#018x}"),
                 hash: second_hash,
                 frame_count: 0,
                 anim_path: None,
+                cancel_frame: 0,
             },
             MoveEntry {
                 name: format!("{missing_hash:#018x}"),
                 hash: missing_hash,
                 frame_count: 8,
                 anim_path: None,
+                cancel_frame: 0,
             },
             MoveEntry {
                 name: "user_favorite_motion".into(),
                 hash: first_hash,
                 frame_count: 4,
                 anim_path: None,
+                cancel_frame: 0,
             },
         ];
         let original_non_names = entries
@@ -10541,12 +11392,14 @@ mod tests {
                 hash,
                 frame_count: 1,
                 anim_path: None,
+                cancel_frame: 0,
             },
             MoveEntry {
                 name: format!("{hash:#018x}"),
                 hash,
                 frame_count: 2,
                 anim_path: Some(PathBuf::from("body/motion.nuanmb")),
+                cancel_frame: 0,
             },
         ];
         let labels = HashMap::from([(hash, "specialhi".to_owned())]);

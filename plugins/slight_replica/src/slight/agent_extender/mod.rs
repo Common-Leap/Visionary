@@ -96,11 +96,14 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
         crate::slight::effect_viewer::effect_reload::pump_asset_carrier(boma);
         crate::slight::effect_viewer::acmd_hooks::pump_carrier_follows(boma);
     }
-    // Live hitbox injection still runs from the per-agent callback. Effect/control retiming is
-    // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, not from this
-    // status callback.
+    // Live hitbox injection runs from the per-agent callback. Effect/control retiming is
+    // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, and from here
+    // for any frame no boundary reaches (see `acmd_hooks::inject_tick`).
     #[cfg(not(feature = "mod_plugin"))]
-    crate::slight::hitbox_viewer::inject_tick(lua_state);
+    {
+        crate::slight::hitbox_viewer::inject_tick(lua_state);
+        crate::slight::effect_viewer::acmd_hooks::inject_tick(lua_state);
+    }
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
     // its auto "live fetch" adopts the WHOLE script instead of the first few frames.
     #[cfg(not(feature = "mod_plugin"))]
@@ -123,10 +126,14 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
 unsafe extern "C" fn weapon_line_main(agent: &mut L2CFighterBase) {
     let lua_state = agent.agent.lua_state_agent;
     handle_init(lua_state);
-    // Article/weapon hitbox capture and injection remain on the existing Main path. ACMD effect
-    // retiming is generic and is handled by the effect coroutine/frame hooks for this agent too.
+    // Article/weapon hitbox and effect injection/capture run strictly against the separate
+    // article tables and only for the selected fighter's own articles.
     #[cfg(not(feature = "mod_plugin"))]
-    crate::slight::hitbox_viewer::capture_tick(lua_state);
+    {
+        crate::slight::hitbox_viewer::inject_tick_article(lua_state);
+        crate::slight::effect_viewer::acmd_hooks::inject_tick_article(lua_state);
+        crate::slight::hitbox_viewer::article_capture_tick(lua_state);
+    }
     crate::slight::gimmicks::deflect_volume::on_weapon_main(agent);
     handle_frame(lua_state);
 }

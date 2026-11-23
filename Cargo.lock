@@ -3217,7 +3217,7 @@ dependencies = [
 [[package]]
 name = "nutexb_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/Common-Leap/ssbh_wgpu?rev=c7ccdb4ad60dea86e5981137ed52f96caff170da#c7ccdb4ad60dea86e5981137ed52f96caff170da"
+source = "git+https://github.com/joobert/ssbh_wgpu.git?rev=6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016#6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016"
 dependencies = [
  "bytemuck",
  "log",
@@ -4575,6 +4575,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4705,6 +4711,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.2",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -4993,7 +5012,7 @@ dependencies = [
 [[package]]
 name = "ssbh_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/Common-Leap/ssbh_wgpu?rev=c7ccdb4ad60dea86e5981137ed52f96caff170da#c7ccdb4ad60dea86e5981137ed52f96caff170da"
+source = "git+https://github.com/joobert/ssbh_wgpu.git?rev=6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016#6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016"
 dependencies = [
  "aho-corasick",
  "bytemuck",
@@ -5131,7 +5150,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa 0.40.0",
+ "skrifa 0.44.0",
  "yazi",
  "zeno",
 ]
@@ -5670,6 +5689,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5829,7 +5854,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "visionary"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5848,6 +5873,7 @@ dependencies = [
  "image",
  "image_dds",
  "motion_list_rs",
+ "naga",
  "nutexb",
  "prc-rs",
  "proc-macro2",
@@ -5855,6 +5881,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sevenz-rust2",
  "ssbh_data",
  "ssbh_wgpu",

@@ -86,8 +86,10 @@ pub fn poll(boid: u32) -> InitAction {
 
 pub fn install() {
     load_defaults();
-    #[cfg(not(feature = "mod_plugin"))]
-    let _ = crate::slight::effect_viewer::resource_reload::register_ui_db_probe();
+    // No ARCropolis callback on ui_chara_db here, not even a "no-op" probe: ARCropolis keeps
+    // one callback per file, so registering one replaces the loader every roster mod's
+    // ui_chara_db patch goes through, and the character select screen came up scrambled
+    // whenever this plugin was installed.
     skyline::println!("[SLight] Init frame gates ready");
 }
 

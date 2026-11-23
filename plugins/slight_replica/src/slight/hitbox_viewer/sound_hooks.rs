@@ -245,7 +245,14 @@ unsafe fn sound_action_for_call(lua_state: u64, func: &'static str, args: &[LuaA
     };
     let motion = super::acting_motion(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let Some((suppress, overrides)) = sound_action(motion, key, frame, func) else {
+    let hit = if smash::app::utility::get_category(&mut *boma)
+        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
+    {
+        super::action_for_boma_func(boma, CAT_SOUND, motion, key, frame, func)
+    } else {
+        sound_action(motion, key, frame, func)
+    };
+    let Some((suppress, overrides)) = hit else {
         return false;
     };
     crate::slight::diag::note(format!(

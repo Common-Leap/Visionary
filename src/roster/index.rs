@@ -87,8 +87,10 @@ impl RosterIndex {
         // the reliable link between a database row and a fighter directory, because `name_id`
         // is not always the directory name — the Ice Climbers' row is `ice_climber` and their
         // directories are `popo` and `nana`.
+        // A slot character's row shares its fighter's kind; the fighter's own row is the one.
         let by_kind: BTreeMap<u64, &FighterEntry> = fighters
             .iter()
+            .filter(|fighter| fighter.custom_name.is_none())
             .map(|fighter| (super::css::fighter_kind_hash(&fighter.name), fighter))
             .collect();
 
@@ -386,6 +388,7 @@ mod tests {
             slots: vec![0],
             fighter_dir: PathBuf::new(),
             source,
+            custom_name: None,
         }
     }
 
@@ -625,6 +628,7 @@ mod reopen_tests {
             slots: vec![0, 8],
             fighter_dir: PathBuf::new(),
             source: FighterSource::DataRoot,
+            custom_name: None,
         }
     }
 

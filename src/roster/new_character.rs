@@ -903,6 +903,7 @@ mod tests {
             slots: vec![0],
             fighter_dir: PathBuf::new(),
             source: crate::data::FighterSource::DataRoot,
+            custom_name: None,
         };
         let mut project = RosterMod::default();
         project.authored.push(authored_entry_multi(

@@ -2931,7 +2931,8 @@ fn movement_stats_hold_across_status_changes_until_their_scope_ends() {
 fn plugin_stat_overlay_is_read_by_both_getters_and_retired_with_the_stock() {
     let source =
         std::fs::read_to_string("plugins/slight_replica/src/slight/gimmicks/live_parameters.rs")
-            .unwrap();
+            .unwrap()
+            .replace("\r\n", "\n");
     let body = |name: &str| {
         let start = source.find(&format!("unsafe fn {name}(")).unwrap();
         let rest = &source[start..];

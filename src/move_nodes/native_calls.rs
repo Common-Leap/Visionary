@@ -13,6 +13,42 @@ pub struct NativeCall {
     pub binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_line: Option<SourceLine>,
+    /// The statement exactly as the script wrote it, when this call was read from one.
+    /// Provenance only: never saved, never emitted, and not part of the call's identity.
+    #[serde(skip)]
+    pub written: WrittenLine,
+}
+
+/// The original text of a parsed statement. It compares equal to every other value, so two
+/// calls that differ only in how they were spelled are the same call.
+#[derive(Debug, Clone, Default)]
+pub struct WrittenLine(Option<String>);
+
+impl WrittenLine {
+    pub fn new(line: &str) -> Self {
+        Self(Some(line.trim().to_owned()))
+    }
+
+    pub fn get(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl PartialEq for WrittenLine {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WrittenLine {}
+
+impl NativeCall {
+    /// The statement as written, if it still spells exactly this call. An edited call no
+    /// longer matches its original text, and then `None` is returned.
+    pub fn written_source(&self) -> Option<&str> {
+        let line = self.written.get()?;
+        (parse(line).as_ref() == Some(self)).then_some(line)
+    }
 }
 
 /// A decompiler statement whose operands do not satisfy the pinned SDK ABI.
@@ -1767,6 +1803,13 @@ pub fn contains_supported_call(source: &str) -> bool {
 }
 
 pub fn parse(source: &str) -> Option<NativeCall> {
+    parse_unwritten(source).map(|call| NativeCall {
+        written: WrittenLine::new(source),
+        ..call
+    })
+}
+
+fn parse_unwritten(source: &str) -> Option<NativeCall> {
     let source = source.trim();
     if let Some(method) = source
         .strip_prefix("methodlua2cpp::")
@@ -1781,6 +1824,7 @@ pub fn parse(source: &str) -> Option<NativeCall> {
             receiver: None,
             binding: None,
             source_line: None,
+            written: WrittenLine::default(),
         });
     }
     let (binding, source) = if let Some(local) = source.strip_prefix("let ") {
@@ -1830,6 +1874,7 @@ pub fn parse(source: &str) -> Option<NativeCall> {
             receiver,
             binding: binding.clone(),
             source_line: None,
+            written: WrittenLine::default(),
         };
         if call.validate().is_ok() {
             return Some(call);
@@ -1850,6 +1895,7 @@ pub fn parse_source_line(source: &str) -> Option<NativeCall> {
         receiver: None,
         binding: None,
         source_line: Some(line),
+        written: WrittenLine::default(),
     })
 }
 

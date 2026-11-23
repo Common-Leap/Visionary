@@ -402,6 +402,7 @@ fn import_stmts(
                                 receiver: None,
                                 binding: None,
                                 source_line: None,
+                                written: Default::default(),
                             });
                             promoted_event = true;
                         }
@@ -2523,6 +2524,43 @@ fn validate_command(fighter: Option<&str>, command: &ExcuteStmt) -> Result<(), S
             // token without broadening the general source-expression validator.
             return Ok(());
         }
+        // A typed `ArticleModule` statement carries its own source line; it is valid when that
+        // line (or its rebuilt form, once edited) reads back as the same call.
+        ExcuteStmt::Article(call) => {
+            // Only the measured shape is authored: the agent's own accessor and the vanilla
+            // argument count. Any other form stays the kept source line it was.
+            if call.op.arity() != Some(call.args.len()) {
+                return Err(format!(
+                    "ArticleModule::{} takes {:?} arguments after the object id, not {}",
+                    call.op.name(),
+                    call.op.arity(),
+                    call.args.len()
+                ));
+            }
+            let receiver = call
+                .source
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split(',').next())
+                .map(str::trim);
+            if !matches!(receiver, Some("agent.module_accessor" | "boma" | "fighter.module_accessor" | "weapon.module_accessor")) {
+                return Err("object call receiver must be the agent's module_accessor".into());
+            }
+            let line = call.emit();
+            return match crate::data::ArticleCall::parse(&line) {
+                Some(read)
+                    if read.op == call.op
+                        && read.article == call.article
+                        && read.target == call.target
+                        && read.args.len() == call.args.len()
+                        && read.args.iter().zip(&call.args).enumerate().all(|(slot, (a, b))| {
+                            Some(slot) == call.op.target_index() || a == b
+                        }) =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!("object call does not read back as written: {line}")),
+            };
+        }
         ExcuteStmt::AttackFp(call) if call.args.len() != crate::data::ATTACK_FP_ARGC => {
             return Err(format!(
                 "ATTACK_FP requires exactly {} arguments",
@@ -2668,6 +2706,11 @@ fn valid_float_literal(value: &str) -> bool {
 fn command_matches_track(track: Track, command: &ExcuteStmt) -> bool {
     if matches!(command, ExcuteStmt::Effect(_)) {
         return track == Track::Effect;
+    }
+    // A typed `ArticleModule` statement is a game-script action: editable there, and saved as
+    // written until it is edited (`ArticleCall::emit`).
+    if matches!(command, ExcuteStmt::Article(_)) {
+        return track == Track::Game;
     }
     if matches!(command, ExcuteStmt::NativeCall(_) | ExcuteStmt::WorkFlag(_)) {
         return true;
@@ -5072,6 +5115,50 @@ mod tests {
                 super::super::live_support::source_only_tracks(&authored)
                     .any(|source_only| source_only == track),
                 "native ItemModule source write must gate {track:?} flat live rules"
+            );
+        }
+    }
+
+    /// A `generate_article` line is an editable game-track command: imported as a node (not a
+    /// kept source block), saved, reloaded and recompiled to exactly the same code.
+    #[test]
+    fn generate_article_line_is_editable_and_recompiles_byte_identically() {
+        // A vanilla id reads as the timeline's closed form; a clone's id (a plain static) stays
+        // the typed `ArticleModule` statement Task 7 models. Both must survive a save.
+        for (line, typed) in [
+            (
+                "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+                false,
+            ),
+            (
+                "ArticleModule::generate_article(agent.module_accessor, FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT, false, -1);",
+                true,
+            ),
+        ] {
+            let text = format!(
+                "unsafe extern \"C\" fn game_specialn(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 8.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+            );
+            let source = crate::acmd::parse_acmd_script(&text);
+            let has_typed = source.stmts.iter().any(|stmt| {
+                matches!(stmt, AcmdStmt::Excute(inner) if matches!(inner.as_slice(), [ExcuteStmt::Article(_)]))
+            });
+            assert_eq!(has_typed, typed, "{line}: {:#?}", source.stmts);
+            let imported = fighter_roundtrip("samus", Track::Game, &source);
+            assert!(
+                imported.nodes.iter().all(|node| !matches!(
+                    node.kind,
+                    NodeKind::Preserved { .. } | NodeKind::MixedExecute { .. }
+                )),
+                "{line} was kept as preserved source: {:#?}",
+                imported.nodes
+            );
+            let stored = serde_json::to_string(&graph(imported)).unwrap();
+            let restored: MoveGraph = serde_json::from_str(&stored).unwrap();
+            let compiled = compile("samus", "attack11", &restored).unwrap();
+            assert_eq!(
+                crate::acmd::preview_game_fn(&compiled[0].1, "specialn"),
+                crate::acmd::preview_game_fn(&source, "specialn"),
+                "{line}"
             );
         }
     }
@@ -7912,10 +7999,14 @@ mod tests {
                 for stmt in stmts {
                     match stmt {
                         AcmdStmt::Excute(commands) => {
-                            *count += commands.iter().filter(|command| matches!(
-                                command,
-                                ExcuteStmt::Raw(raw) if raw.contains("ArticleModule::shoot(")
-                            )).count();
+                            *count += commands.iter().filter(|command| match command {
+                                ExcuteStmt::Raw(raw) => raw.contains("ArticleModule::shoot("),
+                                // Typed but kept as written, like the raw line it replaced.
+                                ExcuteStmt::Article(call) => {
+                                    !call.edited && call.source.contains("ArticleModule::shoot(")
+                                }
+                                _ => false,
+                            }).count();
                         }
                         AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
                             count_raw_shoot(body, count);

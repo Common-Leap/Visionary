@@ -8,6 +8,7 @@
 //! to be fresh.  This module does a best-effort, non-blocking check at startup
 //! and rebuilds+redeploys if the deployed copy is missing or stale.
 
+use crate::console::NoConsoleWindow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,6 +51,7 @@ fn check_and_deploy() -> anyhow::Result<()> {
     if !built_exists || is_source_newer_than(&built)? {
         eprintln!("[visionary] Plugin sources newer than NRO — rebuilding...");
         let status = Command::new("bash")
+            .no_console_window()
             .arg("plugins/slight_replica/scripts/build.sh")
             .current_dir(find_workspace_root()?)
             .status()?;
@@ -61,6 +63,7 @@ fn check_and_deploy() -> anyhow::Result<()> {
     // Now deploy: copy the built NRO to the Eden mod dir.
     // Use the Python helper so stray-copy checks are the same as manual deploy.
     let status = Command::new("python3")
+        .no_console_window()
         .arg("plugins/slight_replica/tools/deploy_plugin.py")
         .arg("--emulator")
         .arg("eden")

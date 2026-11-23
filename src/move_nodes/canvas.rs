@@ -1666,6 +1666,14 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
             },
             call.sounds.join(" / "),
         ),
+        ExcuteStmt::Article(call) => (
+            "Object call",
+            format!(
+                "{} · {}",
+                super::plain::object_name(call.symbol()),
+                call.op.name()
+            ),
+        ),
         command => ("Engine action", variant_name(command)),
     }
 }

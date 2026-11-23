@@ -2844,7 +2844,12 @@ mod tests {
     /// The table's values are hand-transcribed, so compare them with the source of truth.
     #[test]
     fn common_work_values_match_the_pinned_lua_const_table() {
-        let path = std::path::Path::new(env!("HOME"))
+        let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        else {
+            eprintln!("skipped: no HOME or USERPROFILE environment variable");
+            return;
+        };
+        let path = std::path::Path::new(&home)
             .join(".cargo/git/checkouts/skyline-smash-f820da3599566683/258a566/src/lua_const.rs");
         let Ok(source) = std::fs::read_to_string(&path) else {
             eprintln!("skipped: no pinned checkout at {}", path.display());

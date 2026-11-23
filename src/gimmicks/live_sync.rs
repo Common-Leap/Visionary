@@ -688,15 +688,16 @@ mod tests {
     );
 
     /// The body of `fn name(` in `source`, up to the next top-level item.
-    fn plugin_fn<'a>(source: &'a str, name: &str) -> &'a str {
-        let start = source
+    fn plugin_fn(source: &str, name: &str) -> String {
+        let normalized = source.replace("\r\n", "\n");
+        let start = normalized
             .find(&format!("\nfn {name}("))
-            .or_else(|| source.find(&format!("\npub(super) fn {name}(")))
-            .or_else(|| source.find(&format!("\npub(crate) fn {name}(")))
+            .or_else(|| normalized.find(&format!("\npub(super) fn {name}(")))
+            .or_else(|| normalized.find(&format!("\npub(crate) fn {name}(")))
             .unwrap_or_else(|| panic!("plugin has no fn {name}"));
-        let rest = &source[start + 1..];
+        let rest = &normalized[start + 1..];
         let end = rest.find("\n}\n").map_or(rest.len(), |end| end + 3);
-        &rest[..end]
+        rest[..end].to_owned()
     }
 
     /// True when the plugin's dispatch picks the acting fighter's gimmick by its costume, for

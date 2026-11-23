@@ -56,6 +56,23 @@ pub fn load(model_dir: &Path, motion_dir: &Path, motion: &str) -> Option<ObjectK
     })
 }
 
+/// The opponent from `model_dir`, posed by the animation file `anim_path`: the thrown fighter
+/// and motion chosen in the viewport toolbar.
+pub fn load_animated(model_dir: &Path, anim_path: &Path) -> Option<ObjectKind> {
+    let skel = ssbh_data::skel_data::SkelData::from_file(model_dir.join("model.nusktb")).ok()?;
+    let anim = ssbh_data::anim_data::AnimData::from_file(anim_path).ok()?;
+    Some(ObjectKind {
+        name: "Opponent".to_owned(),
+        model_dir: Some(model_dir.to_path_buf()),
+        skel: Some(Arc::new(skel)),
+        anim: Some(Arc::new(anim)),
+        hitboxes: Vec::new(),
+        effects: Vec::new(),
+        flight: Flight::default(),
+        ..ObjectKind::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,4 @@
+use crate::console::NoConsoleWindow;
 use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::move_kinds::plain_name as format_move_name;
 use crate::renderer::{HitboxRenderState, ViewportCallback};
@@ -148,6 +149,65 @@ fn effect_source_timing_matches(
 /// snapshot; it is never installed as a live baseline. A source call must have one best owner.
 /// Ambiguous or missing owners are refused so a repeated sync cannot retune a neighbouring
 /// repeated call by position.
+/// The editor's hitboxes in the order the source now lists them, for the position-paired writer.
+///
+/// The first sync reads a source whose order is the pristine list's. A retime that was written
+/// moves call lines, so the next read of the source lists them differently, and pairing by
+/// position then matched one hitbox's values against another's call — a damage tweak after a
+/// retime came back as "renumbered" or "retimed". Each source hitbox is paired with the editor
+/// hitbox of its family, id and part whose frames it has: its original ones (not yet written) or
+/// its edited ones (already written). Anything that does not pair exactly once keeps the old
+/// positional pairing, which is what the writer expects when the source is untouched.
+fn hitboxes_in_source_order(
+    source: &[crate::data::Hitbox],
+    pristine: &[crate::data::Hitbox],
+    edited: &[crate::data::Hitbox],
+) -> Vec<crate::data::Hitbox> {
+    let identity = |h: &crate::data::Hitbox| (h.category, h.func.clone(), h.id, h.part);
+    // A throw or search box is paired by its start alone. No script call ends one, and the
+    // parser lets a same-id `ATTACK` close it, so moving that attack moves its end on paper.
+    let frames = |h: &crate::data::Hitbox| {
+        let fixed = h.category == crate::data::CAT_ABS || h.category == crate::data::CAT_SEARCH;
+        (h.active_start, if fixed { 0 } else { h.active_end })
+    };
+    let positional = source.len() == pristine.len()
+        && source
+            .iter()
+            .zip(pristine)
+            .all(|(s, p)| identity(s) == identity(p) && frames(s) == frames(p));
+    if positional || pristine.len() > edited.len() {
+        return edited.to_vec();
+    }
+    let mut used = vec![false; edited.len()];
+    let mut ordered = Vec::with_capacity(edited.len());
+    for from_source in source {
+        let candidates: Vec<usize> = (0..pristine.len())
+            .filter(|&i| !used[i] && identity(&edited[i]) == identity(from_source))
+            .filter(|&i| {
+                frames(&pristine[i]) == frames(from_source) || frames(&edited[i]) == frames(from_source)
+            })
+            .collect();
+        // Several candidates are fine when they are interchangeable: the first unused one.
+        let Some(&index) = candidates.first() else {
+            return edited.to_vec();
+        };
+        used[index] = true;
+        let mut paired = edited[index].clone();
+        // An untouched throw or search box takes the source's end, which moved only on paper.
+        let fixed = paired.category == crate::data::CAT_ABS || paired.category == crate::data::CAT_SEARCH;
+        if fixed && paired.active_end == pristine[index].active_end {
+            paired.active_end = from_source.active_end;
+        }
+        ordered.push(paired);
+    }
+    if used[..pristine.len()].iter().any(|u| !u) {
+        return edited.to_vec();
+    }
+    // Hitboxes past the pristine list are additions, which the writer reports after the rest.
+    ordered.extend(edited[pristine.len()..].iter().cloned());
+    ordered
+}
+
 fn effect_calls_in_source_order(
     source: &[crate::data::EffectCall],
     pristine: &[crate::data::EffectCall],
@@ -258,6 +318,104 @@ mod source_sync_status_tests {
     use super::{effect_calls_in_source_order, source_sync_status};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+
+    const ATTACK_TAIL: &str = "50, 90, 0, 50, 3.5, 7.5, 0.5, 0.0, None, None, None, 1.2, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);";
+
+    /// Empoleon's utilt: the late hit is reached by `wait(2)`.
+    fn utilt() -> String {
+        let attack = |id: u32, damage: &str| {
+            format!("macros::ATTACK(agent, {id}, 0, Hash40::new(\"top\"), {damage}, {ATTACK_TAIL}")
+        };
+        format!(
+            "unsafe extern \"C\" fn game_attackhi3(agent: &mut L2CAgentBase) {{
+    frame(agent.lua_state_agent, 11.0);
+    if macros::is_excute(agent) {{
+        {}
+        {}
+    }}
+    wait(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {{
+        {}
+        {}
+    }}
+    frame(agent.lua_state_agent, 22.0);
+    if macros::is_excute(agent) {{
+        AttackModule::clear_all(agent.module_accessor);
+    }}
+}}
+",
+            attack(0, "12.5"),
+            attack(1, "12.5"),
+            attack(0, "7.4"),
+            attack(1, "8.9")
+        )
+    }
+
+    /// Retime, sync, then tweak a value and sync again: the second sync reads a source whose
+    /// lines moved, and must still pair each hitbox with its own call.
+    #[test]
+    fn a_sync_after_a_written_retime_pairs_hitboxes_with_their_own_calls() {
+        let source = utilt();
+        let pristine = crate::acmd::parse_acmd_script(&source).to_hitboxes();
+        let mut edited = pristine.clone();
+        // The late hit comes out a frame earlier; the early one ends where it now starts.
+        edited[2].active_start = 12;
+        edited[3].active_start = 12;
+        edited[0].active_end = 11;
+        edited[1].active_end = 11;
+        let (first, report) = crate::acmd_src::rewrite_hitboxes(&source, "t", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{first}");
+
+        // Now a damage tweak on the late hit's id-1 box, against the rewritten file.
+        edited[3].damage = 10.0;
+        let baseline = crate::acmd::parse_acmd_script(&first).to_hitboxes();
+        let ordered = super::hitboxes_in_source_order(&baseline, &pristine, &edited);
+        let (second, report) = crate::acmd_src::rewrite_hitboxes(&first, "t", &baseline, &ordered).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{second}");
+        assert_eq!(report.changed, 1, "only the damage: {second}");
+        let late = crate::acmd::parse_acmd_script(&second)
+            .to_hitboxes()
+            .into_iter()
+            .find(|h| h.id == 1 && h.active_start == 12)
+            .unwrap();
+        assert_eq!(late.damage, 10.0, "{second}");
+
+        // An untouched source keeps the plain positional pairing.
+        assert_eq!(super::hitboxes_in_source_order(&pristine, &pristine, &edited), edited);
+    }
+
+    /// A hitbox read from the moveset needs no capture to be injected live after a retime: the
+    /// source gave every value, and the Lua types are fixed.
+    #[test]
+    fn a_source_hitbox_injects_live_without_a_capture() {
+        let pristine = crate::acmd::parse_acmd_script(&utilt()).to_hitboxes();
+        let args = super::VisionaryApp::build_attack_args(&pristine[2], None).expect("built from source");
+        assert_eq!(args.len(), 36);
+        assert!(matches!(args[3], crate::game_link::LuaArgWire::Num(d) if (d - 7.4).abs() < 1e-4));
+        assert!(matches!(args[12], crate::game_link::LuaArgWire::Nil), "no capsule end");
+        // An unresolvable constant still needs a capture rather than sending a zero.
+        let mut unknown = pristine[2].clone();
+        unknown.sound_attr = "*SOME_PROJECT_CONSTANT".into();
+        assert!(super::VisionaryApp::build_attack_args(&unknown, None).is_none());
+    }
+
+    /// A spawn read from the moveset carries its whole tail, so a retime previews live without
+    /// a capture. (One with no known tail is filled from the command's measured layout.)
+    #[test]
+    fn a_source_effect_retime_injects_live_without_a_capture() {
+        let source = "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 10.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new(\"sys_attack_arc\"), Hash40::new(\"top\"), 0, 12, 0, 0, 0, 0, 1.0, true);
+    }
+}
+";
+        let mut call = crate::acmd::parse_effect_script(source).to_effect_calls().remove(0);
+        assert!(call.extra_args.is_some());
+        call.active_start = 12;
+        let hash = hash40::hash40("sys_attack_arc").0;
+        assert!(super::VisionaryApp::build_effect_inject_from_captures(&call, &[], Some(hash), 0).is_some());
+    }
 
     #[test]
     fn source_sync_status_distinguishes_written_and_refused_edits() {
@@ -437,6 +595,373 @@ mod linked_acmd_index_tests {
         let replaced = current.clone();
         assert!(rebuild_linked_acmd_source_index(&missing_root, &mut current).is_err());
         assert_eq!(current.unwrap().root, replaced.unwrap().root);
+    }
+}
+
+/// The agent an edit is logged under: the fighter's, or `None` while an object's script is open,
+/// because the edit log, the project file and the export are keyed by fighter and would carry an
+/// object's `game_fly` as the fighter's own `game_fly`.
+fn edit_log_target<'a>(open_article: Option<&str>, fighter: &'a str) -> Option<&'a str> {
+    open_article.is_none().then_some(fighter)
+}
+
+/// Remove everything keyed by an object agent from `project`, returning the agents removed.
+fn strip_object_agents(
+    project: &mut crate::mod_project::ModProjectFile,
+    agents: &BTreeSet<String>,
+) -> Vec<String> {
+    let dropped: Vec<String> = project
+        .fighters
+        .keys()
+        .filter(|name| agents.contains(*name))
+        .cloned()
+        .collect();
+    for agent in &dropped {
+        project.fighters.remove(agent);
+    }
+    dropped
+}
+
+#[cfg(test)]
+mod object_edit_tests {
+    use super::*;
+
+    /// While `samus_lativolt` is open nothing is logged under `samus`; a fighter move still is.
+    #[test]
+    fn object_script_edit_is_never_logged_under_the_fighter() {
+        assert_eq!(edit_log_target(Some("samus_lativolt"), "samus"), None);
+        assert_eq!(edit_log_target(None, "samus"), Some("samus"));
+    }
+
+    /// Whatever an object script left keyed by its agent (effect, sound or source snapshots)
+    /// never reaches the project or the export; the fighter's own entry stays.
+    #[test]
+    fn project_drops_object_agents_only() {
+        let mut project = crate::mod_project::ModProjectFile {
+            version: crate::mod_project::PROJECT_VERSION,
+            name: "t".into(),
+            fighters: HashMap::new(),
+            characters: Default::default(),
+            roster: Default::default(),
+            project_fighters: BTreeSet::new(),
+            moveset_source: None,
+        };
+        project.fighters.insert("samus".into(), Default::default());
+        project.fighters.insert("samus_lativolt".into(), Default::default());
+        let agents = BTreeSet::from(["samus_lativolt".to_string()]);
+        assert_eq!(strip_object_agents(&mut project, &agents), ["samus_lativolt"]);
+        assert!(project.fighters.contains_key("samus"));
+        assert!(!project.fighters.contains_key("samus_lativolt"));
+    }
+}
+
+/// The Settings card for one object: which list entry of its param block it shows, the text
+/// being typed per row, and the last save's result.
+struct ArticleSettingsCard {
+    agent: String,
+    variant: usize,
+    edits: HashMap<usize, String>,
+    message: Option<String>,
+    /// Read when the card opens and after each save, not every frame.
+    settings: Vec<crate::articles::settings::Setting>,
+    block: crate::articles::params::ParamBlock,
+    /// Other blocks the settings read (`param_special_n`), by full name.
+    other_blocks: HashMap<String, crate::articles::params::ParamBlock>,
+    /// The list entry each other block shows and saves to (0 unless picked).
+    other_variants: HashMap<String, usize>,
+    /// The moveset's own param files for the object's owner: the only files a save may change.
+    own: Vec<PathBuf>,
+}
+
+/// The selected fighter's objects, read off the UI thread once per change of the source files.
+struct ArticleCache {
+    fighter: String,
+    /// The index's files and their modification times when this was read; a rebuilt index with
+    /// the same files keeps the cache.
+    fingerprint: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    catalog: crate::articles::ArticleCatalog,
+    /// Article calls in the fighter's own status code, read-only.
+    status_rows: Vec<crate::articles::view::StatusCallRow>,
+    /// Preview spawn plans parsed from the fighter's status bodies, paired with their status kind.
+    status_spawns: Vec<(String, crate::article_preview::SpawnPlan)>,
+    /// Status registrations the index could not place, for the fighter or its objects.
+    unresolved_statuses: Vec<crate::acmd_src::UnresolvedStatus>,
+    /// The moveset's `param_config` overrides for this fighter.
+    overrides: Vec<crate::articles::params::ParamOverride>,
+    /// `param_config` calls the reader could not attribute to a fighter, shown under "Not read".
+    unread_overrides: Vec<crate::articles::params::UnreadOverride>,
+    /// The game's own script names (Pascal case) per object agent; filled in after the catalog,
+    /// since listing them may need the network.
+    dump_scripts: HashMap<String, Vec<String>>,
+    /// Why the game's scripts aren't listed, when they aren't.
+    dump_note: Option<String>,
+}
+
+/// What the background object reader sends back.
+enum ArticleJobResult {
+    Cache(ArticleCache),
+    Dump(HashMap<String, Vec<String>>, Option<String>),
+    /// The read stopped (it panicked); the reason is shown instead of retrying every frame.
+    Failed(String),
+}
+
+/// Where the user was going when an object script with unsynced changes was open: every
+/// user action that replaces the editor's state, run as it was asked once the prompt allows it.
+enum PendingLeave {
+    Script(Option<String>, MoveEntry),
+    /// Kept by name, not row: the list can be re-indexed while the prompt is open.
+    Fighter(crate::mod_project::ProjectFighter),
+    ForgetFighter(crate::mod_project::ProjectFighter),
+    Hub(crate::project_hub::HubAction),
+    LoadProject(PathBuf),
+    NewProject(PathBuf),
+    SetDataRoot(PathBuf),
+    RescanSource,
+    LinkSource(PathBuf),
+    UnlinkSource,
+    SaveSourceBuffer,
+    ReloadSource,
+}
+
+impl PendingLeave {
+    /// What the action does, for the prompt ("open another move").
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Script(..) => "open another script",
+            Self::Fighter(_) => "choose another fighter",
+            Self::ForgetFighter(_) => "remove this fighter from the list",
+            Self::Hub(_) | Self::LoadProject(_) => "open another project",
+            Self::NewProject(_) => "start a new project",
+            Self::SetDataRoot(_) => "change the game dump",
+            Self::RescanSource => "rescan the linked source",
+            Self::LinkSource(_) => "link a moveset source",
+            Self::UnlinkSource => "unlink the moveset source",
+            Self::SaveSourceBuffer => "save the source editor's text and reload the script",
+            Self::ReloadSource => "reload this script from disk",
+        }
+    }
+}
+
+/// What a refresh does when the open fighter vanished from the list (a re-index, a dump without
+/// `fighter/`): it clears the selection unless an object script has unsynced changes, which are
+/// kept on screen instead, since nobody asked to leave them. Inside an action the user allowed in
+/// the prompt (`leave_confirmed`: Discard, or a clean Sync now) the selection is cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VanishedFighter {
+    Clear,
+    KeepEdits,
+}
+
+fn on_fighter_vanished(
+    open_article: Option<&str>,
+    edited_since_sync: bool,
+    leave_confirmed: bool,
+) -> VanishedFighter {
+    if !leave_confirmed && object_leave_needs_prompt(open_article, edited_since_sync) {
+        VanishedFighter::KeepEdits
+    } else {
+        VanishedFighter::Clear
+    }
+}
+
+/// The row of a fighter parked behind the unsynced-changes prompt in the current list, found by
+/// name and slot character (the list is rebuilt and re-sorted by a re-index), or `None` when it
+/// is no longer listed.
+fn resolve_parked_fighter<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    key: &crate::mod_project::ProjectFighter,
+) -> Option<usize> {
+    rows.into_iter()
+        .position(|(name, character)| name == key.name && character == key.character.as_deref())
+}
+
+/// How a fighter parked behind the prompt is named in a status line.
+fn parked_fighter_label(key: &crate::mod_project::ProjectFighter) -> &str {
+    key.character.as_deref().unwrap_or(&key.name)
+}
+
+/// What the user chose in the unsynced-changes prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaveChoice {
+    SyncNow,
+    Discard,
+    Stay,
+}
+
+/// Whether leaving the open move needs the unsynced-changes prompt: only an object's script with
+/// edits since it was loaded or last synced, since its edits are kept nowhere else (they are not
+/// in the edit log or the project).
+fn object_leave_needs_prompt(open_article: Option<&str>, edited_since_sync: bool) -> bool {
+    open_article.is_some() && edited_since_sync
+}
+
+/// Whether the navigation goes ahead after `choice`: a sync only when it wrote everything.
+fn object_leave_goes_ahead(choice: LeaveChoice, sync_clean: bool) -> bool {
+    match choice {
+        LeaveChoice::SyncNow => sync_clean,
+        LeaveChoice::Discard => true,
+        LeaveChoice::Stay => false,
+    }
+}
+
+#[cfg(test)]
+mod object_leave_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_edited_object_script_prompts() {
+        assert!(object_leave_needs_prompt(Some("samus_lativolt"), true));
+        assert!(!object_leave_needs_prompt(Some("samus_lativolt"), false));
+        // A fighter move's edits are already in the edit log, so leaving it never prompts.
+        assert!(!object_leave_needs_prompt(None, true));
+    }
+
+    /// Every action that replaces the editor's state is a prompt target with its own words, and
+    /// none of them is let through while an object script has unsynced changes.
+    #[test]
+    fn every_state_replacing_action_is_a_target() {
+        let entry = MoveEntry {
+            name: "fly".into(),
+            hash: 0,
+            frame_count: 0,
+            anim_path: None,
+            cancel_frame: 0,
+        };
+        let targets = [
+            PendingLeave::Script(None, entry),
+            PendingLeave::Fighter(crate::mod_project::ProjectFighter {
+                name: "samus".into(),
+                character: None,
+            }),
+            PendingLeave::ForgetFighter(crate::mod_project::ProjectFighter::fighter("samus")),
+            PendingLeave::Hub(crate::project_hub::HubAction::BrowseWithoutProject),
+            PendingLeave::LoadProject(PathBuf::from("p.json")),
+            PendingLeave::NewProject(PathBuf::from("w")),
+            PendingLeave::SetDataRoot(PathBuf::from("dump")),
+            PendingLeave::RescanSource,
+            PendingLeave::LinkSource(PathBuf::from("src")),
+            PendingLeave::UnlinkSource,
+            PendingLeave::SaveSourceBuffer,
+            PendingLeave::ReloadSource,
+        ];
+        let mut words: Vec<&str> = targets.iter().map(PendingLeave::describe).collect();
+        assert!(words.iter().all(|w| !w.is_empty()));
+        words.dedup();
+        assert!(words.len() >= 10, "{words:?}");
+        // The gate is the same for all of them.
+        assert!(object_leave_needs_prompt(Some("samus_lativolt"), true));
+    }
+
+    #[test]
+    fn an_automatic_refresh_keeps_unsynced_object_edits() {
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true, false), VanishedFighter::KeepEdits);
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), false, false), VanishedFighter::Clear);
+        assert_eq!(on_fighter_vanished(None, true, false), VanishedFighter::Clear);
+        // The user chose Discard (e.g. on changing the game dump): the edits go with the fighter.
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true, true), VanishedFighter::Clear);
+    }
+
+    /// A fighter parked behind the prompt is found again by name after the list is rebuilt, so a
+    /// re-index while the prompt is open can't open another fighter or a row that's gone.
+    #[test]
+    fn a_parked_fighter_target_follows_its_name() {
+        let samus = crate::mod_project::ProjectFighter { name: "samus".into(), character: None };
+        let toad = crate::mod_project::ProjectFighter {
+            name: "samus".into(),
+            character: Some("Toad".into()),
+        };
+        let before = [("mario", None), ("samus", None)];
+        assert_eq!(resolve_parked_fighter(before, &samus), Some(1));
+        // A mod root came in: the list grew and re-sorted around the parked fighter.
+        let shifted = [("bayonetta", None), ("mario", None), ("samus", Some("Toad")), ("samus", None)];
+        assert_eq!(resolve_parked_fighter(shifted, &samus), Some(3));
+        assert_eq!(resolve_parked_fighter(shifted, &toad), Some(2));
+        // The root went away: the fighter is gone, not some other row.
+        let removed = [("bayonetta", None), ("mario", None)];
+        assert_eq!(resolve_parked_fighter(removed, &samus), None);
+        assert_eq!(resolve_parked_fighter(removed, &toad), None);
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_the_user_on_the_script() {
+        assert!(object_leave_goes_ahead(LeaveChoice::SyncNow, true));
+        assert!(!object_leave_goes_ahead(LeaveChoice::SyncNow, false));
+        assert!(object_leave_goes_ahead(LeaveChoice::Discard, false));
+        assert!(!object_leave_goes_ahead(LeaveChoice::Stay, true));
+    }
+}
+
+/// The files and modification times an object catalog was read from (`None` index: none).
+fn source_fingerprint(index: Option<&crate::acmd_src::SourceIndex>) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let Some(index) = index else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, Option<std::time::SystemTime>)> = std::iter::once(index.root.clone())
+        .chain(index.files.iter().cloned())
+        .map(|file| {
+            let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+            (file, modified)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The param files of `owner` a Settings card may save to: those under the moveset's own roots
+/// (its `romfs/`, the open project's `romfs/`) that exist, never one inside the dump or a Mod
+/// Library root (`shared`), each once however it is spelled.
+fn own_param_files(owner: &str, own_roots: &[PathBuf], shared: &[PathBuf]) -> Vec<PathBuf> {
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shared: Vec<PathBuf> = shared.iter().map(|root| canonical(root)).collect();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for root in own_roots {
+        for name in ["vl.prc", "vl.prcxml"] {
+            let file = root.join("fighter").join(owner).join("param").join(name);
+            if !file.is_file() {
+                continue;
+            }
+            let real = canonical(&file);
+            if shared.iter().any(|root| real.starts_with(root)) || seen.contains(&real) {
+                continue;
+            }
+            seen.push(real);
+            out.push(file);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod own_param_files_tests {
+    use super::*;
+
+    fn put(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn own_files_never_include_the_dump_or_the_mod_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump = tmp.path().join("dump");
+        let library = tmp.path().join("library");
+        let moveset = tmp.path().join("moveset");
+        // A moveset whose romfs sits under the dump, and one that is a Mod Library root.
+        let under_dump = dump.join("mods").join("romfs");
+        put(&under_dump.join("fighter/samus/param/vl.prc"));
+        put(&library.join("fighter/samus/param/vl.prc"));
+        put(&moveset.join("romfs/fighter/samus/param/vl.prc"));
+        let shared = [dump.clone(), library.clone()];
+        assert!(own_param_files("samus", &[under_dump], &shared).is_empty());
+        assert!(own_param_files("samus", &[library.clone()], &shared).is_empty());
+        let own = moveset.join("romfs");
+        // The same root named twice (another spelling of it) gives the file once.
+        let again = moveset.join(".").join("romfs");
+        assert_eq!(
+            own_param_files("samus", &[own.clone(), again], &shared),
+            [own.join("fighter/samus/param/vl.prc")]
+        );
     }
 }
 
@@ -1521,7 +2046,7 @@ fn timeline_content_height(
 fn merge_fetched_body(
     project: Option<crate::acmd_src::ProjectScript>,
     body: Result<String, String>,
-) -> (Result<String, String>, &'static str) {
+) -> (Result<String, String>, crate::data::ScriptOrigin) {
     match project {
         Some(project) => {
             let mirror = body.unwrap_or_default();
@@ -1531,9 +2056,9 @@ fn merge_fetched_body(
                 &project.blocked,
                 &mirror,
             );
-            (Ok(merged), "Project source")
+            (Ok(merged), crate::data::ScriptOrigin::MovesetSource)
         }
-        None => (body, "GitHub"),
+        None => (body, crate::data::ScriptOrigin::Vanilla),
     }
 }
 
@@ -2256,6 +2781,27 @@ fn effect_source_label(source_dir: &str) -> String {
         .map(|part| source_component_label(part))
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| source_dir.to_string())
+}
+
+/// A fighter row prepared for the sidebar list: copied out of the fighter index so the rows can
+/// be drawn (and split into project groups) without holding a borrow of it.
+struct FighterRow {
+    idx: usize,
+    name: String,
+    character: Option<String>,
+    label: String,
+    modded: bool,
+    slot_count: usize,
+    base: u8,
+    reasons: Vec<crate::project_scope::MembershipReason>,
+}
+
+/// What a click in the fighter list asked for, applied after the list is drawn.
+enum FighterRowAction {
+    Select(usize),
+    Forget(crate::mod_project::ProjectFighter),
+    Add(usize),
+    Remove(usize),
 }
 
 /// Read the persisted open state of a collapsing header using the same parent-aware ID that the
@@ -3326,6 +3872,18 @@ fn fighter_key_matches(key: &str, fighter: &str) -> bool {
         .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(fighter))
 }
 
+/// The eff a fighter row plays from `dirs` (in order of preference): its base slot's one-slot
+/// file where one exists, as ARCropolis loads `ef_pacman_c40.eff` for Pac-Man's c40, else the
+/// fighter's own `ef_<fighter>.eff`. A slot character's effects are only in its slot's file.
+fn fighter_eff_path(name: &str, base_slot: u8, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let slot_file = format!("ef_{name}_c{base_slot:02}.eff");
+    let own_file = format!("ef_{name}.eff");
+    [slot_file, own_file]
+        .iter()
+        .flat_map(|file| dirs.iter().map(move |dir| dir.join(file)))
+        .find(|path| path.is_file())
+}
+
 /// True for an Arcropolis-style fighter effect path, accepting either an absolute dump path or
 /// the project-relative spelling used in `EffMod::source_rel` and live-eff manifests.
 fn path_is_fighter_eff(path: &Path, fighter: &str) -> bool {
@@ -3421,6 +3979,66 @@ fn effect_off_kind_flags(ui: &mut egui::Ui, fade: &mut bool, detach: &mut bool) 
     changed
 }
 
+/// Put the viewport camera back on the default side view.
+fn reset_viewport_camera(frame: &eframe::Frame, home: &crate::renderer::CameraView) {
+    if let Some(wgpu_state) = frame.wgpu_render_state() {
+        if let Some(rs) = wgpu_state
+            .renderer
+            .write()
+            .callback_resources
+            .get_mut::<HitboxRenderState>()
+        {
+            rs.camera = crate::renderer::Camera::from_view(home);
+        }
+    }
+}
+
+/// A sphere around `points`: the centre of their bounds, reaching each corner.
+fn bounding_sphere(points: impl Iterator<Item = glam::Vec3>) -> Option<(glam::Vec3, f32)> {
+    let (min, max) = points.fold(None, |bounds: Option<(glam::Vec3, glam::Vec3)>, p| {
+        Some(bounds.map_or((p, p), |(min, max)| (min.min(p), max.max(p))))
+    })?;
+    Some(((min + max) * 0.5, ((max - min) * 0.5).length().max(1.0)))
+}
+
+/// How the mouse moves the camera in `scheme`, for hover text.
+fn navigation_hint(preferences: &crate::preferences::Preferences) -> &'static str {
+    match preferences.navigation_scheme {
+        crate::preferences::NavigationScheme::Ssbh => {
+            "Left drag orbits, right or middle drag pans, scroll zooms"
+        }
+        crate::preferences::NavigationScheme::Blender
+            if preferences.emulate_three_button_mouse =>
+        {
+            "Middle (or Alt + left) drag orbits, add Shift to pan or Ctrl to zoom; scroll zooms"
+        }
+        crate::preferences::NavigationScheme::Blender => {
+            "Middle drag orbits, Shift + middle pans, Ctrl + middle zooms, scroll zooms"
+        }
+    }
+}
+
+/// Costume slots as runs: `c40–c47`, or `c08, c10–c12` when they have gaps.
+fn format_slot_list(slots: &[u8]) -> String {
+    let mut runs: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < slots.len() {
+        let start = slots[index];
+        let mut end = start;
+        while index + 1 < slots.len() && slots[index + 1] == end + 1 {
+            index += 1;
+            end = slots[index];
+        }
+        runs.push(if start == end {
+            format!("c{start:02}")
+        } else {
+            format!("c{start:02}–c{end:02}")
+        });
+        index += 1;
+    }
+    runs.join(", ")
+}
+
 fn effect_call_display_name(call: &crate::data::EffectCall) -> String {
     let name = effect_call_display_name_unfaced(call);
     match crate::data::facing_arm_of(call.guard.as_deref()) {
@@ -3497,6 +4115,137 @@ fn effect_call_display_name_unfaced(call: &crate::data::EffectCall) -> String {
         }
         None => call.effect_name.clone(),
     }
+}
+
+/// World position of a trail edge: `offset` in `bone`'s space, with the same system-bone rule
+/// spawn markers use (translation only).
+fn trail_edge_point(
+    matrices: &std::collections::HashMap<String, glam::Mat4>,
+    bone: &str,
+    offset: [f32; 3],
+) -> Option<glam::Vec3> {
+    let mat = matrices
+        .get(bone)
+        .or_else(|| matrices.get(&bone.to_lowercase()))
+        .copied()?;
+    let mat = if is_system_bone(bone) {
+        glam::Mat4::from_translation(mat.col(3).truncate())
+    } else {
+        mat
+    };
+    Some(mat.transform_point3(glam::Vec3::from(offset)))
+}
+
+/// Paint one trail into the viewport: the swept ribbon between its two edges over the visible
+/// stretch of swing, fading toward the tail, plus the blade segment at the head. A selected
+/// trail outside its window still shows where its edges are now, as a dashed segment.
+///
+/// Returns the screen distance from `click_pos` to the head segment when the click is close
+/// enough to pick the trail.
+#[allow(clippy::too_many_arguments)]
+fn draw_trail_preview(
+    painter: &egui::Painter,
+    rs: &crate::renderer::HitboxRenderState,
+    rect: egui::Rect,
+    current_matrices: &std::collections::HashMap<String, glam::Mat4>,
+    ec: &crate::data::EffectCall,
+    geometry: &crate::trail_preview::TrailGeometry,
+    frame_num: u32,
+    selected: bool,
+    click_pos: Option<egui::Pos2>,
+) -> Option<f32> {
+    let color = if selected {
+        egui::Color32::from_rgb(255, 205, 120)
+    } else {
+        egui::Color32::from_rgb(240, 160, 60)
+    };
+    let edges_at = |matrices: &std::collections::HashMap<String, glam::Mat4>| {
+        let a = trail_edge_point(matrices, &geometry.bone1, geometry.offset1)?;
+        let b = trail_edge_point(matrices, &geometry.bone2, geometry.offset2)?;
+        Some((rs.world_to_screen(a, rect)?, rs.world_to_screen(b, rect)?))
+    };
+    let span = crate::trail_preview::visible_span(
+        ec.active_start,
+        ec.active_end,
+        geometry.frames,
+        frame_num as f32,
+    );
+    let head = match span {
+        Some((tail, head)) => {
+            let samples = crate::trail_preview::sample_frames(tail, head);
+            let edges: Vec<Option<(egui::Pos2, egui::Pos2)>> = samples
+                .iter()
+                .map(|&f| {
+                    // The current frame's matrices are already in hand; reuse them.
+                    if f == frame_num as f32 {
+                        edges_at(current_matrices)
+                    } else {
+                        edges_at(
+                            &rs.bone_world_matrices_at(crate::trail_preview::motion_frame(f)),
+                        )
+                    }
+                })
+                .collect();
+            let mut mesh = egui::Mesh::default();
+            let last = samples.len().saturating_sub(1).max(1) as f32;
+            let peak = if selected { 150.0 } else { 110.0 };
+            for (k, pair) in edges.windows(2).enumerate() {
+                let (Some((a0, b0)), Some((a1, b1))) = (pair[0], pair[1]) else {
+                    continue;
+                };
+                let tint = |at: usize| {
+                    let alpha = (peak * at as f32 / last) as u8;
+                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+                };
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(a0, tint(k));
+                mesh.colored_vertex(b0, tint(k));
+                mesh.colored_vertex(a1, tint(k + 1));
+                mesh.colored_vertex(b1, tint(k + 1));
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base + 1, base + 3, base + 2);
+            }
+            if !mesh.is_empty() {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            let head = edges.last().copied().flatten();
+            if let Some((a, b)) = head {
+                let width = if selected { 2.5 } else { 1.5 };
+                painter.line_segment([a, b], egui::Stroke::new(width, color));
+            }
+            head
+        }
+        None if selected => {
+            let head = edges_at(current_matrices);
+            if let Some((a, b)) = head {
+                painter.extend(egui::Shape::dashed_line(
+                    &[a, b],
+                    egui::Stroke::new(1.5, color),
+                    5.0,
+                    4.0,
+                ));
+            }
+            head
+        }
+        None => None,
+    }?;
+    let (a, b) = head;
+    painter.text(
+        b + egui::vec2(4.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        &ec.effect_name,
+        egui::FontId::monospace(9.0),
+        color,
+    );
+    let cp = click_pos?;
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 {
+        ((cp - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let d = cp.distance(a + ab * t);
+    (d <= 10.0).then_some(d)
 }
 
 fn is_system_bone(name: &str) -> bool {
@@ -3667,6 +4416,8 @@ struct PendingMoveSourceMismatch {
     move_entry: MoveEntry,
     saved: crate::mod_project::MoveSourceSnapshot,
     current: crate::mod_project::MoveSourceSnapshot,
+    /// Where `current` was read from.
+    current_origin: crate::data::ScriptOrigin,
 }
 
 #[derive(Default)]
@@ -3698,7 +4449,7 @@ impl LiveApplyReport {
         }
         if !self.missing_fighter.is_empty() {
             notes.push(format!(
-                "{} fighter(s) are not loaded in the current data roots",
+                "{} fighter(s) are not loaded in the current game dump and mod roots",
                 self.missing_fighter.len()
             ));
         }
@@ -3805,6 +4556,134 @@ fn materialize_effect_calls(
         }
     }
     effects
+}
+
+/// The parts of a spawn that say which call in the script it is: the graphic (compared by hash,
+/// so a `0x…` spelling matches its name), the spawn function, the bone and the frame.
+fn effect_call_identity(call: &crate::data::EffectCall) -> (u64, String, String, u32) {
+    (
+        effect_name_hash(&call.effect_name),
+        call.spawn_func.to_ascii_lowercase(),
+        call.bone_name.to_ascii_lowercase(),
+        call.active_start,
+    )
+}
+
+/// What [`reconcile_saved_effects`] had to discard.
+#[derive(Debug, Default, PartialEq)]
+struct SavedEffectsReconcile {
+    /// The saved full call list was made against a different version of the script.
+    stale_full: bool,
+    /// Edits whose target call no longer exists in the script.
+    dropped_edits: usize,
+    /// Edits whose target call moved to another position and were re-anchored to it.
+    reanchored_edits: usize,
+}
+
+/// A move's saved effect edits, checked against the script as it is now.
+///
+/// `effect_call_full` is the edited call list as it stood when it was saved, and it is only
+/// meaningful against the script it was made from. A moveset's script changes under it — Shy
+/// Guy's forward smash was saved while Visionary still showed the vanilla Pac-Man script — and
+/// applying the old list afterwards replaced the move's real seven effects with one stale call.
+///
+/// Every writer keeps the list and the edit log in step: removed script calls stay in the list
+/// (disabled), added calls are `Add` edits, and every other change is a `Modify` edit. So a list
+/// is current exactly when it is as long as the script plus its adds, and every script call no
+/// edit touches is still in its place. Otherwise the edits are reapplied on their own, each
+/// re-anchored to its call by identity when the script has moved it, and dropped when the call
+/// it was made for is gone.
+fn reconcile_saved_effects(
+    pristine: &[crate::data::EffectCall],
+    full: Option<&Vec<crate::data::EffectCall>>,
+    edits: Option<&[crate::data::EffectCallEdit]>,
+) -> (
+    Vec<crate::data::EffectCall>,
+    Vec<crate::data::EffectCallEdit>,
+    SavedEffectsReconcile,
+) {
+    let mut report = SavedEffectsReconcile::default();
+    let mut kept: Vec<crate::data::EffectCallEdit> = Vec::new();
+    for edit in edits.unwrap_or_default() {
+        let targets_script = !matches!(edit.op, crate::data::EffectCallOp::Add(_));
+        let Some(was) = edit.pristine.as_ref().filter(|_| targets_script) else {
+            kept.push(edit.clone());
+            continue;
+        };
+        let identity = effect_call_identity(was);
+        if pristine
+            .get(edit.index)
+            .is_some_and(|call| effect_call_identity(call) == identity)
+        {
+            kept.push(edit.clone());
+            continue;
+        }
+        let mut matches = pristine
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| effect_call_identity(call) == identity)
+            .map(|(index, _)| index);
+        match (matches.next(), matches.next()) {
+            (Some(index), None) if !kept.iter().any(|e| e.index == index) => {
+                let mut edit = edit.clone();
+                edit.index = index;
+                kept.push(edit);
+                report.reanchored_edits += 1;
+            }
+            _ => report.dropped_edits += 1,
+        }
+    }
+    let adds = kept
+        .iter()
+        .filter(|edit| matches!(edit.op, crate::data::EffectCallOp::Add(_)))
+        .count();
+    if let Some(full) = full {
+        let current = report.dropped_edits == 0
+            && report.reanchored_edits == 0
+            && full.len() == pristine.len() + adds
+            && pristine.iter().enumerate().all(|(index, call)| {
+                kept.iter().any(|edit| {
+                    edit.index == index && !matches!(edit.op, crate::data::EffectCallOp::Add(_))
+                }) || effect_call_identity(&full[index]) == effect_call_identity(call)
+            });
+        if current {
+            let calls = full
+                .iter()
+                .cloned()
+                .map(crate::data::EffectCall::normalized_timing)
+                .collect();
+            return (calls, kept, report);
+        }
+        report.stale_full = true;
+    }
+    let calls = materialize_effect_calls(pristine, Some(&kept));
+    (calls, kept, report)
+}
+
+/// Spell out effect names stored as raw `0x…` hashes wherever `names` knows them.
+///
+/// A capture taken before a name was known (ParamLabels still loading, or an effect that lives
+/// only in a costume's own `.eff`) is saved as its hash, and nothing ever revisited it, so the
+/// panel kept showing `0xfcb698218` for what is `sys_smash_flash`. The hash is the same either
+/// way, so exports and live rules are unaffected.
+fn resolve_raw_effect_names(calls: &mut [crate::data::EffectCall], names: &HashMap<u64, String>) {
+    let resolve = |name: &mut String| {
+        if let Some(hex) = name.strip_prefix("0x") {
+            if let Some(known) = u64::from_str_radix(hex, 16)
+                .ok()
+                .and_then(|hash| names.get(&hash))
+                .filter(|known| !known.starts_with("0x"))
+            {
+                *name = known.clone();
+            }
+        }
+    };
+    for call in calls {
+        resolve(&mut call.effect_name);
+        if let Some(alt) = call.effect_name_alt.as_mut() {
+            resolve(alt);
+        }
+    }
 }
 
 /// Why the source pane has no script to edit. Each state gets its own answer, because
@@ -4065,6 +4944,10 @@ pub struct VisionaryApp {
     /// Which editing surface is open in the right panel, visual effects included: they are a tab
     /// beside the others rather than a second panel competing for the same width.
     primary_tab: PrimaryEditorTab,
+    /// Params frame data needs for one `(fighter, move kind)`, read once rather than per frame.
+    frame_params_cache: Option<(String, String, crate::frame_data::FrameParams)>,
+    /// [`Self::viewport_scales`], keyed by everything it reads.
+    viewport_scales_cache: Option<(String, ViewportScales)>,
     timeline_filters: TimelineFilters,
     /// The selected source command for the non-collision tabs.  The command site is stable for a
     /// source statement, including loop repetitions; the current frame still identifies which
@@ -4118,18 +5001,70 @@ pub struct VisionaryApp {
     pending_project_script: Option<crate::acmd_src::ProjectScript>,
     // Cached bone names for dropdown
     bone_names: Vec<String>,
-    /// Session-only parameter-defined hurtboxes for the selected fighter. These never enter
-    /// AppState, project serialization, or edit history.
+    /// Session-only parameter-defined hurtboxes for the selected fighter (after any linked
+    /// moveset `set_hit_data` / `set_hurtboxes` overrides). These never enter AppState, project
+    /// serialization, or edit history.
     hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
+    /// Unmodified parameter-file hurtboxes for the selected fighter, kept so moveset reloads or
+    /// unlinks can cleanly recompute `hurtbox_volumes`.
+    base_hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
+    /// Canonical bone names from the selected fighter's loaded skeleton(s), for resolving
+    /// source-defined hurtbox bone names.
+    loaded_skeleton_bones: Vec<String>,
     hurtbox_warnings: Vec<crate::data::HurtboxLoadWarning>,
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
     /// no parameter data, while the checkbox itself is disabled for that fighter.
     show_hurtboxes: bool,
+    /// Persistent viewport preference: apply `model.nuhlpb` to the mesh and the overlay.
+    helper_bones: bool,
+    /// Application preferences edited in the Settings window.
+    preferences: crate::preferences::Preferences,
+    settings_open: bool,
+    /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
+    /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
+    viewport_toolbar_rect: Option<egui::Rect>,
+    /// A Blender-style camera drag in progress, decided when it started.
+    nav_drag: Option<crate::viewport_navigation::NavDrag>,
+    /// The fighter's bounding sphere and the selected hitbox's, in world space, from the last
+    /// overlay pass: what Home and Period frame.
+    fighter_sphere: Option<(glam::Vec3, f32)>,
+    selection_sphere: Option<(glam::Vec3, f32)>,
+    /// A camera animation (`.nuanmb`) the viewport camera plays along the timeline while
+    /// `camera_anim_on`, and why the last one picked could not be used.
+    camera_anim: Option<(PathBuf, std::sync::Arc<ssbh_data::anim_data::AnimData>)>,
+    camera_anim_on: bool,
+    camera_anim_error: Option<String>,
+    /// Whether the saved default view is on the camera yet. The renderer makes its camera
+    /// with the built-in view, before it can read Settings.
+    camera_home_applied: bool,
+    /// Where the shown model's and motion's borrowed files come from, for the viewport toolbar.
+    /// Empty when both folders hold all their own files.
+    viewport_file_sources: Vec<ViewportFileSource>,
+    /// The last model check of a Project Files costume, shown in that window.
+    model_report: Option<CostumeModelReport>,
+    /// Persistent viewport preference: show a fighter held by the `throw` bone on throws.
+    thrown_victim: ThrownVictimPref,
+    /// The victim costume's resolved model and thrown motions, read once per costume.
+    victim_cache: Option<VictimCache>,
+    /// Session choice of the victim's thrown motion; `None` picks one for the throw.
+    victim_motion_override: Option<String>,
+    /// [`Self::victim_fighters`], keyed by the indexed fighter count it was built from.
+    victim_fighters: Option<(usize, Vec<VictimFighter>)>,
     show_debug: bool,
     show_capture_debug: bool,
     capture_debug_kind: Option<i32>,
     credits: crate::credits::CreditsWindow,
     show_edit_log: bool,
+    show_sources: bool,
+    /// The Sources row to highlight; kept until the window closes or another row is asked for.
+    sources_focus: Option<SourceRow>,
+    /// Scroll `sources_focus` into view once, on the first frame after `open_sources`.
+    sources_scroll: bool,
+    /// A picked dump folder awaiting the user's decision. Held across frames because egui
+    /// is immediate-mode: the "Use ... instead" / "Use anyway" choice is drawn every frame.
+    pending_dump: Option<(PathBuf, crate::sources::DumpCheck)>,
+    /// The current dump's check, so the window doesn't walk the folder every frame.
+    dump_status: Option<(PathBuf, crate::sources::DumpCheck)>,
     /// Costume slot targeted by Project Files model/motion imports. Session-only: the imported
     /// files themselves live canonically in the project workspace and are rediscovered on open.
     workspace_asset_slot: u8,
@@ -4208,6 +5143,9 @@ pub struct VisionaryApp {
     /// Background cargo-skyline build for a normal export or explicit gimmick package.
     /// Only one build owns this slot at a time; status is polled in `update`.
     export_build: Option<std::sync::Arc<std::sync::Mutex<ExportBuildState>>>,
+    /// The linked moveset's own plugin build (`None` inside while it runs). See
+    /// [`crate::moveset_build`].
+    moveset_build: Option<std::sync::Arc<std::sync::Mutex<Option<crate::moveset_build::Outcome>>>>,
     /// Connection the pin-sync check last ran for (plugin client id).
     pin_sync_client: Option<u64>,
     /// Set on new connection; when the settle window elapses, untracked game pins prompt.
@@ -4315,6 +5253,14 @@ pub struct VisionaryApp {
     /// the donor (GitHub scripts, disk-cached) — not just moves already played/opened.
     use_scan: Option<UseScan>,
     fighter_search: String,
+    /// Open state of the "In this project" and "Everything else" groups captured just before
+    /// fighter search began, so clearing the search puts them back.
+    fighter_group_before_search: Option<[bool; 2]>,
+    /// Groups the user toggled by hand during this search; search stops forcing them open.
+    fighter_group_touched: [bool; 2],
+    /// Title of the open "Add fighter" popup, if any.
+    add_fighter_popup: Option<String>,
+    add_fighter_search: String,
     move_search: String,
     /// Open/closed move categories captured immediately before move search mode began.
     move_expansion_before_search: Option<BTreeMap<crate::move_kinds::MoveGroup, bool>>,
@@ -4325,7 +5271,17 @@ pub struct VisionaryApp {
     /// The user's own smashline project, when linked. Scripts are read from here in
     /// preference to the dumped-script mirror — see `acmd_src`.
     acmd_src: Option<crate::acmd_src::SourceIndex>,
+    /// Why the remembered moveset source could not be re-linked at startup, until the user
+    /// relinks or unlinks it. Without this a moved project silently turned every move vanilla.
+    acmd_src_problem: Option<String>,
+    /// Why the open move shows vanilla even though a moveset source is linked.
+    acmd_source_note: Option<String>,
     show_acmd_src: bool,
+    /// The Motion List window, and the open list when it has been opened.
+    show_motion_list: bool,
+    motion_list_editor: Option<crate::motion_list_editor::MotionListEditor>,
+    /// `.nuanmb` names in the open list's costume folder, for its animation picker.
+    motion_list_anims: Vec<String>,
     /// The script currently open in the source editor window.
     acmd_src_buffer: Option<SourceBuffer>,
     acmd_src_view: SourceView,
@@ -4338,6 +5294,10 @@ pub struct VisionaryApp {
     live_overrides: crate::game_link::LiveOverrides,
     /// Authored .eff edits per fighter (project store; synced from the eff editor).
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
+    /// Entry names read from each `.eff` file, keyed by path and checked against its modified
+    /// time. See [`VisionaryApp::fighter_effect_names`].
+    eff_name_cache:
+        std::cell::RefCell<HashMap<PathBuf, (Option<std::time::SystemTime>, Vec<String>)>>,
     /// The fighter's effect file rebuilt with the project's effect edits, for the 3D preview.
     effect_preview_build: EffectPreviewBuild,
     /// The selected fighter's sets of alternative meshes (sword in hand or sheathed).
@@ -4393,6 +5353,60 @@ pub struct VisionaryApp {
     /// The open project's `modproject.json` path. `None` means in-memory only
     /// ("Browse without project"). Persisted so the hub can Resume last.
     project_path: Option<PathBuf>,
+    /// The fighter rows the open project works on, by row key. Edited fighters are added by
+    /// `build_project` and stay after the edit is undone. Saved in `modproject.json`.
+    project_fighters: BTreeSet<crate::mod_project::ProjectFighter>,
+    /// The open project's moveset crate (absolute). `None` means not linked. Kept even when the
+    /// crate could not be re-opened, so a missing folder is reported rather than forgotten.
+    project_moveset: Option<PathBuf>,
+    /// Costume slots the open project's `romfs/` has files for, by lowercased fighter name.
+    /// Recomputed in `reindex_fighters`.
+    project_romfs_slots: BTreeMap<String, BTreeSet<u8>>,
+    /// The fighters `acmd_src` has scripts for, cached for `row_membership`, which runs per
+    /// row per frame. Refreshed wherever `acmd_src` is replaced.
+    acmd_src_fighters: BTreeSet<String>,
+    /// The selected fighter's objects (fighter name, catalog), built from the linked source on
+    /// first use after the index is (re)built. `None` until then; cleared with every new index.
+    article_catalog: Option<ArticleCache>,
+    /// Bumped whenever `acmd_src` is replaced; the catalog is checked again when it changes.
+    acmd_src_generation: u64,
+    /// The generation the catalog was last checked against.
+    article_catalog_generation: u64,
+    /// The background read of a catalog: (fighter, generation, results).
+    article_catalog_job: Option<(String, u64, std::sync::mpsc::Receiver<ArticleJobResult>)>,
+    /// The object agent (`samus_lativolt`) whose script is open as the move, instead of the
+    /// selected fighter's own. Cleared when a fighter move or another fighter is chosen.
+    open_article: Option<String>,
+    /// Every object agent opened as a move this session. Anything keyed by one of them is kept
+    /// out of the project file and the export (see [`strip_object_agents`]).
+    opened_object_agents: BTreeSet<String>,
+    /// Object-call argument text being typed on the timeline, by (statement, argument).
+    article_arg_edits: HashMap<(usize, usize), String>,
+    /// A background catalog read that stopped: (fighter, generation, reason). Not retried until
+    /// the fighter or the source changes.
+    article_catalog_failed: Option<(String, u64, String)>,
+    /// A fingerprint of the open object script's editable state when it loaded or was last synced.
+    object_baseline: Option<u64>,
+    /// The navigation waiting on the unsynced-changes prompt, and its last message.
+    pending_leave: Option<(PendingLeave, Option<String>)>,
+    /// Set for one navigation the prompt already approved.
+    leave_confirmed: bool,
+    /// Whether the last source sync ran and wrote everything it meant to.
+    last_sync_clean: bool,
+    /// Whether the open object script is defined in the linked source (so a sync saves it).
+    open_article_in_source: bool,
+    /// The Settings card window for one object, when open.
+    article_settings: Option<ArticleSettingsCard>,
+    /// The fighters `acmd_src` installs only on chosen costume slots, refreshed with
+    /// `acmd_src_fighters`. Their scripts and edits belong to the project's slot characters.
+    acmd_src_costume_gated: BTreeSet<String>,
+    /// The fighters the last `build_project` found edits for. A fighter joins
+    /// `project_fighters` only when it first appears here, so removing an edited fighter
+    /// sticks; `row_membership` reports these as "has edits".
+    edited_fighters: BTreeSet<String>,
+    /// The slot characters the last `build_project` found authored in the Roster window; a
+    /// character joins `project_fighters` when it first appears here, as edits do.
+    authored_characters: BTreeSet<crate::mod_project::ProjectFighter>,
     /// Last saved editable snapshot (move sources cleared), for the autosave
     /// pass. `None` means "never saved this session" — dirty iff non-empty.
     last_saved_snapshot: Option<serde_json::Value>,
@@ -4619,6 +5633,8 @@ impl VisionaryApp {
         // nearly invisible on Windows set to light mode.
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let preferences = crate::preferences::Preferences::load();
+        cc.egui_ctx.set_zoom_factor(preferences.ui_scale);
         // Install image loaders — this also ensures font atlas is properly initialized
         egui_extras::install_image_loaders(&cc.egui_ctx);
         // The proportional font has no arrows (→), which labels use throughout; borrow them from
@@ -4713,6 +5729,8 @@ impl VisionaryApp {
             hurtbox_condition_edit_mode: "*DAMAGE_NO_REACTION_MODE_ALWAYS".into(),
             hurtbox_condition_edit_value: "0".into(),
             primary_tab: PrimaryEditorTab::Collisions,
+            frame_params_cache: None,
+            viewport_scales_cache: None,
             gimmicks_editor: crate::gimmicks::editor::GimmicksEditor::default(),
             node_editor: Default::default(),
             node_workspace: false,
@@ -4753,13 +5771,37 @@ impl VisionaryApp {
             pending_project_script: None,
             bone_names: Vec::new(),
             hurtbox_volumes: Vec::new(),
+            base_hurtbox_volumes: Vec::new(),
+            loaded_skeleton_bones: Vec::new(),
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
+            helper_bones: load_helper_bones(),
+            preferences,
+            settings_open: false,
+            viewport_toolbar_rect: None,
+            nav_drag: None,
+            fighter_sphere: None,
+            selection_sphere: None,
+            camera_anim: None,
+            camera_anim_on: true,
+            camera_anim_error: None,
+            camera_home_applied: false,
+            viewport_file_sources: Vec::new(),
+            model_report: None,
+            thrown_victim: load_thrown_victim(),
+            victim_cache: None,
+            victim_motion_override: None,
+            victim_fighters: None,
             show_debug: false,
             show_capture_debug: false,
             capture_debug_kind: None,
             credits: crate::credits::CreditsWindow::default(),
             show_edit_log: false,
+            show_sources: false,
+            sources_focus: None,
+            sources_scroll: false,
+            pending_dump: None,
+            dump_status: None,
             workspace_asset_slot: 0,
             move_has_no_script: false,
             workspace_copy_rx: None,
@@ -4782,6 +5824,7 @@ impl VisionaryApp {
             current_eff_path: None,
             recent_effs: load_recent_effs(),
             export_build: None,
+            moveset_build: None,
             pin_sync_client: None,
             pin_sync_wait: None,
             pin_sync_prompt: None,
@@ -4825,18 +5868,28 @@ impl VisionaryApp {
             downloaded_labels: HashMap::new(),
             use_scan: None,
             fighter_search: String::new(),
+            fighter_group_before_search: None,
+            fighter_group_touched: [false; 2],
+            add_fighter_popup: None,
+            add_fighter_search: String::new(),
             move_search: String::new(),
             move_expansion_before_search: None,
             move_search_opened: BTreeSet::new(),
             move_search_touched: BTreeSet::new(),
             acmd_src: None,
+            acmd_src_problem: None,
+            acmd_source_note: None,
             show_acmd_src: false,
+            show_motion_list: false,
+            motion_list_editor: None,
+            motion_list_anims: Vec::new(),
             acmd_src_buffer: None,
             acmd_src_view: SourceView::Source,
             eff_editor: crate::eff_editor::EffEditor::default(),
             game_link: crate::game_link::GameLink::default(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
+            eff_name_cache: Default::default(),
             effect_preview_build: EffectPreviewBuild::default(),
             visibility_sets: Vec::new(),
             stowed_articles: Vec::new(),
@@ -4861,6 +5914,27 @@ impl VisionaryApp {
             carrier_push_reports: false,
             project_name: "unnamed_mod".into(),
             project_path: None,
+            project_fighters: BTreeSet::new(),
+            project_moveset: None,
+            project_romfs_slots: BTreeMap::new(),
+            acmd_src_fighters: BTreeSet::new(),
+            article_catalog: None,
+            acmd_src_generation: 0,
+            article_catalog_generation: u64::MAX,
+            article_catalog_job: None,
+            open_article: None,
+            opened_object_agents: BTreeSet::new(),
+            article_arg_edits: HashMap::new(),
+            article_catalog_failed: None,
+            object_baseline: None,
+            pending_leave: None,
+            leave_confirmed: false,
+            last_sync_clean: false,
+            open_article_in_source: false,
+            article_settings: None,
+            acmd_src_costume_gated: BTreeSet::new(),
+            edited_fighters: BTreeSet::new(),
+            authored_characters: BTreeSet::new(),
             last_saved_snapshot: None,
             project_autosave_pending_since: None,
             project_autosave_last_check: std::time::Instant::now(),
@@ -4881,10 +5955,13 @@ impl VisionaryApp {
         };
 
         // Keep capture memory consistent with the persisted roster filter even if the user
-        // forgot a fighter in an earlier session and then starts the game before restoring it.
+        // forgot a base fighter in an earlier session and then starts the game before restoring it.
+        // Slot-character keys (`"pacman::shy guy"`) only hide that character row, not the base
+        // fighter's captures.
         let forgotten_kinds: Vec<i32> = app
             .forgotten_fighters
             .iter()
+            .filter(|key| !key.contains("::"))
             .filter_map(|name| fighter_kind_id(name))
             .collect();
         for kind in forgotten_kinds {
@@ -4912,12 +5989,15 @@ impl VisionaryApp {
             app.eff_editor.set_export_root(root);
         }
 
-        // Re-link the user's own ACMD source, quietly: a project that has moved or been
-        // deleted since last session should not open with an error over an unrelated task.
-        if let Some(root) = load_config_path(ACMD_SRC_CONFIG_KEY) {
-            app.acmd_src = crate::acmd_src::SourceIndex::build(&root)
-                .ok()
-                .filter(|index| index.has_scripts());
+        // Re-link the user's own ACMD source. Resuming a project later replaces this with the
+        // project's own link.
+        app.relink_global_acmd_source();
+
+        // First run: the dump comes before the Project Hub. Left showing, the hub covered the
+        // left panel's "Step 1 — your game dump" and let New Project start with no dump;
+        // `apply_game_dump` brings it up once a dump is set.
+        if app.state.data_root.is_none() {
+            app.project_hub.show = false;
         }
 
         // Profiling helper: preselect a fighter by internal name so a `VISIONARY_PROFILE` run
@@ -4989,6 +6069,11 @@ impl VisionaryApp {
             }
             None => {}
         }
+        // The file the eff editor has open wins over dump/mods: an eff opened from a download
+        // or a mod records only its game path, and its edits were made against that file.
+        if let Some(open) = self.eff_editor.loaded_path_for(source_rel) {
+            return open.to_path_buf();
+        }
         if let Some(found) = self.project_eff_source(source_rel) {
             return found;
         }
@@ -4996,7 +6081,7 @@ impl VisionaryApp {
         if primary.exists() {
             return primary;
         }
-        let mut roots = self.all_roots();
+        let mut roots = self.shared_roots();
         if let Some(d) = &self.export_dir {
             roots.push(d.clone());
         }
@@ -5008,8 +6093,20 @@ impl VisionaryApp {
     }
 
     /// Every root fighters and their costume slots are discovered from: the game-data root
-    /// first (so vanilla files win on path lookups), then user-added mod roots.
+    /// first (so vanilla files win on path lookups), then user-added mod roots, then the open
+    /// project's `romfs/`. The romfs comes last so it only adds fighters and slots; where it
+    /// has a file for an indexed fighter, `reindex_fighters` points the entry at it.
     fn all_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.shared_roots();
+        if let Some(romfs) = self.project_romfs().filter(|romfs| romfs.is_dir()) {
+            roots.push(romfs);
+        }
+        roots
+    }
+
+    /// [`Self::all_roots`] without the open project's `romfs/`: the dump and the Mod Library,
+    /// which every project shares.
+    fn shared_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
         if let Some(root) = &self.state.data_root {
             roots.push(root.clone());
@@ -5018,9 +6115,188 @@ impl VisionaryApp {
         roots
     }
 
+    /// The open project's workspace folder: the one holding its `modproject.json`.
+    fn project_workspace(&self) -> Option<PathBuf> {
+        self.project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+    }
+
+    fn project_romfs(&self) -> Option<PathBuf> {
+        self.project_workspace().map(|workspace| workspace.join("romfs"))
+    }
+
+    /// Why fighter row `idx` belongs to the open project; empty when it does not, and always
+    /// empty with no project open.
+    fn row_membership(&self, idx: usize) -> Vec<crate::project_scope::MembershipReason> {
+        if self.project_path.is_none() {
+            return Vec::new();
+        }
+        let Some(entry) = self.state.fighters.get(idx) else {
+            return Vec::new();
+        };
+        let inputs = crate::project_scope::MembershipInputs {
+            added: &self.project_fighters,
+            romfs_slots: &self.project_romfs_slots,
+            moveset_fighters: &self.acmd_src_fighters,
+            has_edits: &self.edited_fighters,
+            costume_gated: &self.acmd_src_costume_gated,
+        };
+        crate::project_scope::membership(entry, &self.state.fighters, &inputs)
+    }
+
+    /// The project rows `fighter`'s scripts and edits belong to: Empoleon's row for a moveset
+    /// that installs Falco's agent only on Empoleon's costumes, the fighter's own row otherwise.
+    fn script_owner_rows(&self, fighter: &str) -> Vec<crate::mod_project::ProjectFighter> {
+        let inputs = crate::project_scope::MembershipInputs {
+            added: &self.project_fighters,
+            romfs_slots: &self.project_romfs_slots,
+            moveset_fighters: &self.acmd_src_fighters,
+            has_edits: &self.edited_fighters,
+            costume_gated: &self.acmd_src_costume_gated,
+        };
+        crate::project_scope::script_owners(fighter, &self.state.fighters, &inputs)
+    }
+
+    fn project_fighter_key(&self, idx: usize) -> Option<crate::mod_project::ProjectFighter> {
+        self.state
+            .fighters
+            .get(idx)
+            .map(|entry| crate::mod_project::ProjectFighter {
+                name: entry.name.clone(),
+                character: entry.custom_name.clone(),
+            })
+    }
+
+    /// Add fighter row `idx` to the project. Autosave picks it up: `build_project` writes
+    /// `project_fighters`, so the dirty check sees the change.
+    fn add_to_project(&mut self, idx: usize) {
+        if let Some(key) = self.project_fighter_key(idx) {
+            self.project_fighters.insert(key);
+        }
+    }
+
+    /// Take fighter row `idx` out of the project's added list. A row that is in for another
+    /// reason (romfs files, moveset scripts) stays listed.
+    fn remove_from_project(&mut self, idx: usize) {
+        if let Some(key) = self.project_fighter_key(idx) {
+            self.project_fighters.remove(&key);
+        }
+    }
+
+    /// Re-derive [`Self::acmd_src_fighters`] after `acmd_src` was replaced.
+    fn refresh_acmd_src_fighters(&mut self) {
+        // A new index may add, drop or rename the moveset's objects; the catalog checks its
+        // files against it on next use and is kept when they are unchanged.
+        self.acmd_src_generation = self.acmd_src_generation.wrapping_add(1);
+        self.acmd_src_fighters = self
+            .acmd_src
+            .as_ref()
+            .map(crate::project_scope::moveset_fighters)
+            .unwrap_or_default();
+        self.acmd_src_costume_gated = self
+            .acmd_src
+            .as_ref()
+            .map(|index| index.costume_gated.iter().cloned().collect())
+            .unwrap_or_default();
+        if let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .cloned()
+        {
+            let eff_dirs = self.fighter_effect_dirs(&fighter);
+            let slot = self.active_article_slot(&fighter);
+            if let Some(eff_path) = fighter_eff_path(&fighter.name, slot, &eff_dirs) {
+                if self.current_eff_path.as_ref() != Some(&eff_path) {
+                    self.current_eff_path = Some(eff_path.clone());
+                    self.eff_editor.queue_load(&eff_path);
+                }
+            }
+        }
+        self.refresh_hurtbox_volumes();
+    }
+
+    fn is_row_forgotten(&self, name: &str, character: Option<&str>) -> bool {
+        self.forgotten_fighters
+            .contains(&forgotten_row_key(name, character))
+    }
+
+    /// Recompute `self.hurtbox_volumes` from the selected fighter's parameter file plus any
+    /// runtime `FighterUtil::set_hit_data` / `set_hurtboxes` overrides in the linked moveset.
+    fn refresh_hurtbox_volumes(&mut self) {
+        self.hurtbox_volumes = self.base_hurtbox_volumes.clone();
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(index) = self
+            .acmd_src
+            .as_ref()
+            .filter(|index| index.has_fighter(&fighter.name))
+        else {
+            return;
+        };
+        let owns_source_hurtboxes = if self.project_path.is_some()
+            && self
+                .acmd_src_costume_gated
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&fighter.name))
+        {
+            let key = crate::mod_project::ProjectFighter {
+                name: fighter.name.clone(),
+                character: fighter.custom_name.clone(),
+            };
+            self.script_owner_rows(&fighter.name).contains(&key)
+        } else {
+            true
+        };
+        if !owns_source_hurtboxes {
+            return;
+        }
+        let fighter_key = fighter.name.to_ascii_lowercase();
+        let Some(overrides) = index.hurtboxes.get(&fighter_key).or_else(|| {
+            (index.hurtboxes.len() == 1)
+                .then(|| index.hurtboxes.values().next())
+                .flatten()
+        }) else {
+            return;
+        };
+        apply_source_hurtbox_overrides(
+            &mut self.hurtbox_volumes,
+            overrides,
+            &self.loaded_skeleton_bones,
+        );
+    }
+
+    /// Link the moveset remembered in the app config, quietly, as startup does: a source that
+    /// has moved or been deleted should not open with an error over an unrelated task. An
+    /// index with no scripts is kept: dropping it made every move read as vanilla with nothing
+    /// on screen saying the link had gone, and the header now explains it instead.
+    fn relink_global_acmd_source(&mut self) {
+        let (_, index, problem) = crate::project_scope::moveset_on_load(
+            load_config_path(ACMD_SRC_CONFIG_KEY),
+            crate::acmd_src::SourceIndex::build,
+        );
+        self.acmd_src = index;
+        self.acmd_src_problem = problem;
+        self.acmd_src_buffer = None;
+        self.refresh_acmd_src_fighters();
+    }
+
     fn set_data_root(&mut self, path: PathBuf) {
+        if self.leave_gate(|| PendingLeave::SetDataRoot(path.clone())) {
+            return;
+        }
         save_config_path("data_root", &path);
-        self.state.fighters.clear();
+        // The fighter list is left in place for `reindex_fighters`, which re-finds the selected
+        // row by name in the new dump (and reloads it there); clearing it here first made the
+        // selection a stale index into the new list.
         self.state.labels.clear();
         self.state.status = format!("Loading from {}...", path.display());
 
@@ -5070,6 +6346,10 @@ impl VisionaryApp {
         // Index fighters
         let fighter_dir = path.join("fighter");
         if !fighter_dir.is_dir() {
+            // Reached through the prompt gate above, so unsynced object edits were already
+            // synced or discarded by the user.
+            self.clear_fighter_selection();
+            self.state.fighters.clear();
             self.state.status = "No fighter/ directory found.".to_string();
             return;
         }
@@ -5096,6 +6376,17 @@ impl VisionaryApp {
         // Aegis cell the roster already collapses; listing it here produced a third,
         // unloadable entry next to the real Pyra (`eflame`) and Mythra (`elight`).
         let roots = self.all_roots();
+        let shared_roots = self.shared_roots();
+        // The list is rebuilt and re-sorted, so the selection is re-found by row, not index.
+        let selected = self.state.selected_fighter.and_then(|idx| {
+            let entry = self.state.fighters.get(idx)?;
+            let files = (
+                entry.model_dir.clone(),
+                entry.motion_dir.clone(),
+                entry.param_path.clone(),
+            );
+            Some((self.project_fighter_key(idx)?, files))
+        });
         self.state.fighters.clear();
 
         // Fighter name → the root that owns it. A mod root may either ADD a new fighter or
@@ -5119,7 +6410,6 @@ impl VisionaryApp {
                     None => continue,
                 };
                 if editor_source_is_excluded(&name)
-                    || self.forgotten_fighters.contains(&name.to_ascii_lowercase())
                     || !seen.insert(name.clone())
                 {
                     continue;
@@ -5163,11 +6453,61 @@ impl VisionaryApp {
                     crate::data::FighterSource::ModRoot
                 };
 
-                // Prefer the effect folder from whichever root actually has one.
-                let effect_dir = roots
+                // Prefer the effect folder from whichever root actually has one. The project's
+                // romfs is not asked: effects resolve from the dump and the mods only (see
+                // `project_scope::apply_romfs_overlay`).
+                let effect_dir = shared_roots
                     .iter()
                     .map(|r| r.join("effect").join("fighter").join(&name))
                     .find(|d| d.is_dir());
+
+                // A mod that plays its own character on this fighter's extra slots gets its
+                // own row, named for the character; the fighter's row keeps the rest. Only a
+                // vanilla fighter from the data root is split this way. The data root itself
+                // is searched too: a moveset project's romfs is often opened as the data root,
+                // and then it is the only root that names the character.
+                let characters = match source {
+                    crate::data::FighterSource::DataRoot => {
+                        let mut distinct: Vec<PathBuf> = Vec::new();
+                        for root in &roots {
+                            if !distinct.contains(root) {
+                                distinct.push(root.clone());
+                            }
+                        }
+                        crate::data::slot_characters(&distinct, &name)
+                    }
+                    crate::data::FighterSource::ModRoot => Vec::new(),
+                };
+                let mut slots = slots;
+                slots.retain(|slot| !characters.iter().any(|c| c.slots.contains(slot)));
+                // Every slot belongs to a character: there is no fighter left to list.
+                let keep_fighter = (!slots.is_empty() || characters.is_empty())
+                    && !self.is_row_forgotten(&name, None);
+                let custom_entries: Vec<crate::data::FighterEntry> = characters
+                    .into_iter()
+                    .filter(|character| !self.is_row_forgotten(&name, Some(&character.name)))
+                    .map(|character| {
+                        let costume = format!("c{:02}", character.slots[0]);
+                        let own = character.root.join("fighter").join(&name);
+                        let or_base = |dir: PathBuf, base: &PathBuf| {
+                            if dir.is_dir() { dir } else { base.clone() }
+                        };
+                        crate::data::FighterEntry {
+                            name: name.clone(),
+                            display_name: character.name.clone(),
+                            param_path: param_path.clone(),
+                            motion_dir: or_base(own.join("motion").join("body").join(&costume), &motion_dir),
+                            model_dir: or_base(own.join("model").join("body").join(&costume), &model_dir),
+                            effect_dir: Some(character.root.join("effect").join("fighter").join(&name))
+                                .filter(|dir| shared_roots.contains(&character.root) && dir.is_dir())
+                                .or_else(|| effect_dir.clone()),
+                            slots: character.slots,
+                            fighter_dir: own,
+                            source: crate::data::FighterSource::ModRoot,
+                            custom_name: Some(character.name),
+                        }
+                    })
+                    .collect();
 
                 let entry = crate::data::FighterEntry {
                     name,
@@ -5179,17 +6519,88 @@ impl VisionaryApp {
                     slots,
                     fighter_dir: fighter_path,
                     source,
+                    custom_name: None,
                 };
-                if entry.is_modded() {
-                    modded_added += 1;
+                if keep_fighter {
+                    if entry.is_modded() {
+                        modded_added += 1;
+                    }
+                    self.state.fighters.push(entry);
                 }
-                self.state.fighters.push(entry);
+                modded_added += custom_entries.len();
+                self.state.fighters.extend(custom_entries);
             }
         }
 
         self.state
             .fighters
             .sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+        // A file in the project's romfs wins over the dump and the mods for every row.
+        self.project_romfs_slots = match self.project_romfs() {
+            Some(romfs) => {
+                for entry in &mut self.state.fighters {
+                    crate::project_scope::apply_romfs_overlay(entry, &romfs);
+                }
+                crate::project_scope::romfs_fighter_slots(&romfs)
+            }
+            None => BTreeMap::new(),
+        };
+
+        // Said after the fighter count, which would otherwise overwrite them.
+        let mut notes: Vec<String> = Vec::new();
+        if let Some((selected, files)) = selected {
+            let found = self.state.fighters.iter().position(|entry| {
+                entry.name == selected.name && entry.custom_name == selected.character
+            });
+            match found {
+                // The row now reads other files (a romfs overlay came or went): load them,
+                // or the viewport keeps showing the old ones.
+                Some(idx) => {
+                    let entry = &self.state.fighters[idx];
+                    let changed = (
+                        entry.model_dir.clone(),
+                        entry.motion_dir.clone(),
+                        entry.param_path.clone(),
+                    ) != files;
+                    // Re-pointed first: `select_fighter` commits the open move through this
+                    // index, and may return early with it left as is.
+                    self.state.selected_fighter = Some(idx);
+                    if changed {
+                        self.select_fighter(idx);
+                    }
+                }
+                None => match on_fighter_vanished(
+                    self.open_article.as_deref(),
+                    self.object_script_dirty(),
+                    self.leave_confirmed,
+                ) {
+                    VanishedFighter::Clear => self.clear_fighter_selection(),
+                    VanishedFighter::KeepEdits => {
+                        // The fighter is gone, but the object script's unsynced edits stay on
+                        // screen (the sync goes by the object's own agent) until the user
+                        // syncs or discards them.
+                        self.state.selected_fighter = None;
+                        // A parked move belongs to the fighter that is gone.
+                        if matches!(self.pending_leave, Some((PendingLeave::Script(..), _))) {
+                            self.pending_leave = None;
+                        }
+                        notes.push(format!(
+                            "{}'s fighter is no longer in the list; its unsynced changes are kept — sync or discard them",
+                            self.open_article.clone().unwrap_or_default()
+                        ));
+                    }
+                },
+            }
+        }
+        // A fighter parked behind the prompt is kept by name; drop it if it's no longer listed.
+        if let Some((PendingLeave::Fighter(key), _)) = &self.pending_leave {
+            let rows = self.state.fighters.iter().map(|f| (f.name.as_str(), f.custom_name.as_deref()));
+            if resolve_parked_fighter(rows, key).is_none() {
+                notes.push(format!("{} is no longer in the list, so it won't be opened", parked_fighter_label(key)));
+                self.pending_leave = None;
+            }
+        }
 
         let extra_slots: usize = self
             .state
@@ -5209,6 +6620,11 @@ impl VisionaryApp {
             status.push_str(&format!(", {extra_slots} with slots past c07"));
         }
         status.push('.');
+        for note in notes {
+            status.push(' ');
+            status.push_str(&note);
+            status.push('.');
+        }
         self.state.status = status;
     }
 
@@ -5220,10 +6636,10 @@ impl VisionaryApp {
         if count == 0 {
             return;
         }
-        let restored_kinds: Vec<i32> = self
+        let restored_kinds: BTreeSet<i32> = self
             .forgotten_fighters
             .iter()
-            .filter_map(|name| fighter_kind_id(name))
+            .filter_map(|key| fighter_kind_id(forgotten_key_base_fighter(key)))
             .collect();
         self.forgotten_fighters.clear();
         for kind in restored_kinds {
@@ -5234,195 +6650,184 @@ impl VisionaryApp {
         self.state.status = format!("Restored {count} forgotten fighter(s).");
     }
 
-    /// Remove one fighter from Visionary's remembered roster and clear state owned by the app.
+    /// Remove one fighter row from Visionary's remembered roster and clear state owned by the app.
     /// The data/mod roots are never modified: forgetting is a reversible roster action, not a
     /// request to delete the user's dump or installed mod files.
-    fn forget_fighter(&mut self, requested: &str) {
-        let Some(index) = self
-            .state
-            .fighters
-            .iter()
-            .position(|fighter| fighter.name.eq_ignore_ascii_case(requested))
-        else {
+    fn forget_fighter(&mut self, requested: &crate::mod_project::ProjectFighter) {
+        if self.leave_gate(|| PendingLeave::ForgetFighter(requested.clone())) {
+            return;
+        }
+        let Some(index) = self.state.fighters.iter().position(|fighter| {
+            fighter.name.eq_ignore_ascii_case(&requested.name)
+                && fighter.custom_name == requested.character
+        }) else {
             return;
         };
         let fighter = self.state.fighters[index].name.clone();
+        let custom_name = self.state.fighters[index].custom_name.clone();
+        let display_label = self.state.fighters[index].display_name.clone();
         let was_selected = self.state.selected_fighter == Some(index);
+        let has_sibling = self.state.fighters.iter().enumerate().any(|(i, other)| {
+            i != index && other.name.eq_ignore_ascii_case(&fighter)
+        });
+        // A slot character shares the base fighter's internal id (`pacman`). Only wipe shared
+        // fighter-level edits, captures, and script caches when forgetting the base fighter row
+        // itself or when no sibling row for that fighter remains in the list.
+        let clear_shared_fighter_data = custom_name.is_none() || !has_sibling;
 
-        // Remove only app-owned merged previews and overlays. The source effect file remains the
-        // canonical file in the dump/mod root.
-        let source_rels: Vec<String> = self
-            .eff_mods
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(&fighter))
-            .map(|(_, eff)| eff.source_rel.clone())
-            .collect();
-        for source_rel in source_rels {
-            let base = self.resolve_eff_source(&source_rel);
-            self.eff_editor.set_merged_overlay(&base, None);
-            if let Some(dir) = base.parent() {
-                crate::scratch_dirs::remove_transplant_previews(dir);
-            }
-        }
-        let live_removed = self.remove_live_eff_for_fighter(&fighter);
-        if live_removed {
-            self.live_eff_probe_due = None;
-        }
-        self.eff_editor.forget_fighter(&fighter);
-        self.eff_mods
-            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
-        self.merged_build_failed
-            .retain(|name| !name.eq_ignore_ascii_case(&fighter));
-        self.effect_pool = None;
-        self.use_scan = self
-            .use_scan
-            .take()
-            .filter(|scan| !scan.fighter.eq_ignore_ascii_case(&fighter));
-        if self.redirect_prompt.as_ref().is_some_and(|prompt| {
-            prompt
-                .uses
+        let cache_result = if clear_shared_fighter_data {
+            // Remove only app-owned merged previews and overlays. The source effect file remains
+            // the canonical file in the dump/mod root.
+            let source_rels: Vec<String> = self
+                .eff_mods
                 .iter()
-                .any(|u| fighter_key_matches(&u.move_key, &fighter))
-        }) {
-            self.redirect_prompt = None;
-        }
-        if self
-            .transplant_target
-            .as_deref()
-            .is_some_and(|target| target.eq_ignore_ascii_case(&fighter))
-        {
-            self.transplant_target = None;
-        }
-        if self
-            .transplant_sel
-            .as_ref()
-            .is_some_and(|(path, _)| path_is_fighter_eff(Path::new(path), &fighter))
-        {
-            self.transplant_sel = None;
-        }
-        self.transplant_replace = None;
-        self.transplant_replace_search.clear();
-        self.current_eff_path = self
-            .current_eff_path
-            .take()
-            .filter(|path| !path_is_fighter_eff(path, &fighter));
-        self.recent_effs
-            .retain(|path| !path_is_fighter_eff(path, &fighter));
-        save_recent_effs(&self.recent_effs);
+                .filter(|(name, _)| name.eq_ignore_ascii_case(&fighter))
+                .map(|(_, eff)| eff.source_rel.clone())
+                .collect();
+            for source_rel in source_rels {
+                let base = self.resolve_eff_source(&source_rel);
+                self.eff_editor.set_merged_overlay(&base, None);
+                if let Some(dir) = base.parent() {
+                    crate::scratch_dirs::remove_transplant_previews(dir);
+                }
+            }
+            let live_removed = self.remove_live_eff_for_fighter(&fighter);
+            if live_removed {
+                self.live_eff_probe_due = None;
+            }
+            self.eff_editor.forget_fighter(&fighter);
+            self.eff_mods
+                .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+            self.merged_build_failed
+                .retain(|name| !name.eq_ignore_ascii_case(&fighter));
+            self.effect_pool = None;
+            self.use_scan = self
+                .use_scan
+                .take()
+                .filter(|scan| !scan.fighter.eq_ignore_ascii_case(&fighter));
+            if self.redirect_prompt.as_ref().is_some_and(|prompt| {
+                prompt
+                    .uses
+                    .iter()
+                    .any(|u| fighter_key_matches(&u.move_key, &fighter))
+            }) {
+                self.redirect_prompt = None;
+            }
+            if self
+                .transplant_target
+                .as_deref()
+                .is_some_and(|target| target.eq_ignore_ascii_case(&fighter))
+            {
+                self.transplant_target = None;
+            }
+            if self
+                .transplant_sel
+                .as_ref()
+                .is_some_and(|(path, _)| path_is_fighter_eff(Path::new(path), &fighter))
+            {
+                self.transplant_sel = None;
+            }
+            self.transplant_replace = None;
+            self.transplant_replace_search.clear();
+            self.current_eff_path = self
+                .current_eff_path
+                .take()
+                .filter(|path| !path_is_fighter_eff(path, &fighter));
+            self.recent_effs
+                .retain(|path| !path_is_fighter_eff(path, &fighter));
+            save_recent_effs(&self.recent_effs);
 
-        // ACMD, effect-call, sound, expression, warning, and live-rule stores all use either a
-        // fighter key or a fighter-prefixed key. Remove only this fighter's entries so other
-        // projects and live previews remain intact.
-        self.state
-            .edit_log
-            .entries
-            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
-        self.state
-            .effect_call_edits
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .effect_call_full
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .effect_dropped_lines
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .effect_frame_residue
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .sound_script_edits
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .expression_script_edits
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .capture_branch_warnings
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.move_source_cache
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.move_graphs
-            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
-        self.node_effect_scripts
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.node_live_cache = None;
-        self.node_editor.invalidate();
-        if self
-            .source_mismatch_prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.fighter.eq_ignore_ascii_case(&fighter))
-        {
-            self.source_mismatch_prompt = None;
-        }
-        self.hitbox_rules_store
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.effect_rules_store
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.effect_control_rules_store
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        if let Some(kind) = fighter_kind_id(&fighter) {
-            self.game_link.forget_captures_for_kind(kind);
-        }
-        let cache_result = crate::acmd::forget_fighter_cache(&fighter);
+            // ACMD, effect-call, sound, expression, warning, and live-rule stores all use either
+            // a fighter key or a fighter-prefixed key. Remove only this fighter's entries so
+            // other projects and live previews remain intact.
+            self.state
+                .edit_log
+                .entries
+                .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+            self.state
+                .effect_call_edits
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .effect_call_full
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .effect_dropped_lines
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .effect_frame_residue
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .sound_script_edits
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .expression_script_edits
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .capture_branch_warnings
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.move_source_cache
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.move_graphs
+                .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+            self.node_effect_scripts
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.node_live_cache = None;
+            self.node_editor.invalidate();
+            if self
+                .source_mismatch_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.fighter.eq_ignore_ascii_case(&fighter))
+            {
+                self.source_mismatch_prompt = None;
+            }
+            self.hitbox_rules_store
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.effect_rules_store
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.effect_control_rules_store
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            if let Some(kind) = fighter_kind_id(&fighter) {
+                self.game_link.forget_captures_for_kind(kind);
+            }
+            Some(crate::acmd::forget_fighter_cache(&fighter))
+        } else {
+            None
+        };
 
         self.state.fighters.remove(index);
         if was_selected {
-            self.state.selected_fighter = None;
-            self.state.selected_move = None;
-            clear_move_state(&mut self.state);
-            self.state.current_frame = FIRST_GAME_FRAME;
-            self.state.total_frames = 0;
-            self.state.playing = false;
-            self.move_list.clear();
-            self.move_list_receiver = None;
-            self.acmd_receiver = None;
-            self.pending_project_script = None;
-            self.pending_capture = None;
-            self.current_model_dir = None;
-            self.current_anim_path = None;
-            self.current_default_eyelid_path = None;
-            self.current_skel_path = None;
-            self.pending_model_load = None;
-            self.model_folder_load = None;
-            self.current_eff_path = None;
-            self.bone_names.clear();
-            self.hurtbox_volumes.clear();
-            self.hurtbox_warnings.clear();
-            self.selected_hitbox = None;
-            self.selected_hurtbox = None;
-            self.hurtbox_editor_selection = None;
-            self.hurtbox_condition_edit_start = FIRST_GAME_FRAME;
-            self.hurtbox_condition_edit_end = FIRST_GAME_FRAME;
-            self.hitbox_watch = None;
-            self.hitbox_dirty_at = None;
-            self.acmd_error = None;
-            self.acmd_src_buffer = None;
+            self.clear_fighter_selection();
         } else if let Some(selected) = self.state.selected_fighter {
             if selected > index {
                 self.state.selected_fighter = Some(selected - 1);
             }
         }
 
-        // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
-        // every other fighter's rules remain live. The alias/carrier publication is coalesced
-        // and flushed later in the normal update loop.
-        let spawn: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_effect_control_rules(&controls);
-        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&hitboxes);
-        self.push_effect_aliases();
+        if clear_shared_fighter_data {
+            // Replace the plugin's full rule lists so the forgotten fighter's rules disappear
+            // while every other fighter's rules remain live. The alias/carrier publication is
+            // coalesced and flushed later in the normal update loop.
+            self.publish_live_rule_union();
+            self.push_effect_aliases();
+        }
 
-        self.forgotten_fighters.insert(fighter.to_ascii_lowercase());
+        self.forgotten_fighters
+            .insert(forgotten_row_key(&fighter, custom_name.as_deref()));
         save_forgotten_fighters(&self.forgotten_fighters);
-        let cache_note = match cache_result {
-            Ok(true) => "cached scripts removed",
-            Ok(false) => "no cached scripts found",
-            Err(_) => "cached scripts could not be removed",
+        self.state.status = match cache_result {
+            Some(Ok(true)) => format!(
+                "Forgot {display_label} — cached scripts removed; edits and live previews cleared. Source files were left untouched."
+            ),
+            Some(Ok(false)) => format!(
+                "Forgot {display_label} — no cached scripts found; edits and live previews cleared. Source files were left untouched."
+            ),
+            Some(Err(_)) => format!(
+                "Forgot {display_label} — cached scripts could not be removed; edits and live previews cleared. Source files were left untouched."
+            ),
+            None => format!(
+                "Forgot {display_label} — hidden from the roster. Source files were left untouched."
+            ),
         };
-        self.state.status = format!(
-            "Forgot {fighter} — {cache_note}; edits and live previews cleared. Source files were left untouched."
-        );
     }
 
     /// Re-scan costume slots for every indexed fighter — after a mod root is added/removed,
@@ -5437,10 +6842,60 @@ impl VisionaryApp {
         }
     }
 
+    /// Select no fighter and empty the viewport, move list and every per-fighter view.
+    fn clear_fighter_selection(&mut self) {
+        self.state.selected_fighter = None;
+        self.state.selected_move = None;
+        self.open_article = None;
+        self.article_settings = None;
+        // A prompt for a script that is no longer open must not Discard into a later one.
+        self.pending_leave = None;
+        self.object_baseline = None;
+        self.open_article_in_source = false;
+        clear_move_state(&mut self.state);
+        self.state.current_frame = FIRST_GAME_FRAME;
+        self.state.total_frames = 0;
+        self.state.playing = false;
+        self.move_list.clear();
+        self.move_list_receiver = None;
+        self.acmd_receiver = None;
+        self.pending_project_script = None;
+        self.pending_capture = None;
+        self.current_model_dir = None;
+        self.current_anim_path = None;
+        self.current_default_eyelid_path = None;
+        self.current_skel_path = None;
+        self.pending_model_load = None;
+        self.model_folder_load = None;
+        self.current_eff_path = None;
+        self.bone_names.clear();
+        self.hurtbox_volumes.clear();
+        self.base_hurtbox_volumes.clear();
+        self.loaded_skeleton_bones.clear();
+        self.hurtbox_warnings.clear();
+        self.selected_hitbox = None;
+        self.selected_hurtbox = None;
+        self.hurtbox_editor_selection = None;
+        self.hurtbox_condition_edit_start = FIRST_GAME_FRAME;
+        self.hurtbox_condition_edit_end = FIRST_GAME_FRAME;
+        self.hitbox_watch = None;
+        self.hitbox_dirty_at = None;
+        self.acmd_error = None;
+        self.acmd_src_buffer = None;
+        self.send_selected_fighter_to_game();
+    }
+
     fn select_fighter(&mut self, idx: usize) {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
+        let Some(key) = self.project_fighter_key(idx) else {
+            return;
+        };
+        if self.leave_gate(|| PendingLeave::Fighter(key)) {
+            return;
+        }
+        self.object_baseline = None;
         // A click is an explicit navigation decision, so it supersedes a project-resume move
         // that may still be waiting for this fighter's background motion scan.
         self.pending_project_move_selection = None;
@@ -5448,6 +6903,9 @@ impl VisionaryApp {
         self.source_mismatch_prompt = None;
         self.state.selected_fighter = Some(idx);
         self.state.selected_move = None;
+        self.open_article = None;
+        self.article_settings = None;
+        self.send_selected_fighter_to_game();
         // A fighter switch is also a move-state boundary.  Clearing only the editable hitboxes
         // left the previous fighter's ACMD script alive, so a stale WHOLE_HIT/HIT_NODE OFF event
         // could hide every newly loaded parameter volume until the next move was opened.
@@ -5455,6 +6913,8 @@ impl VisionaryApp {
         // Clear the old fighter's parameter geometry before any new file or skeleton work. A
         // missing/malformed mod parameter file must never leave the previous fighter visible.
         self.hurtbox_volumes.clear();
+        self.base_hurtbox_volumes.clear();
+        self.loaded_skeleton_bones.clear();
         self.hurtbox_warnings.clear();
         self.selected_hurtbox = None;
         self.hurtbox_editor_selection = None;
@@ -5476,6 +6936,20 @@ impl VisionaryApp {
         self.workspace_asset_slot = fighter.base_slot();
         let model_dir = fighter.model_dir.clone();
         let motion_dir = fighter.motion_dir.clone();
+        // What ARCropolis would load from each folder: its own files, its config.json shares,
+        // and the game's files for a vanilla slot.
+        let model_files = crate::costume_files::CostumeFolder::resolve(&model_dir);
+        let motion_files = crate::costume_files::CostumeFolder::resolve(&motion_dir);
+        self.viewport_file_sources = [("Model", &model_files), ("Motion", &motion_files)]
+            .into_iter()
+            .filter_map(|(label, folder)| {
+                Some(ViewportFileSource {
+                    label,
+                    summary: folder.summary()?,
+                    detail: folder.detail(),
+                })
+            })
+            .collect();
         self.current_default_eyelid_path = find_default_eyelid_nuanmb(&motion_dir);
         // A mod may not ship c00 at all, so weapon lookups follow the fighter's own base
         // slot rather than assuming slot 0 exists.
@@ -5483,37 +6957,31 @@ impl VisionaryApp {
         let model_root = fighter.fighter_dir.join("model");
 
         // Set skel path and eagerly load bone names for the dropdown
-        let skel = model_dir.join("model.nusktb");
-        self.current_skel_path = if skel.exists() {
-            Some(skel.clone())
-        } else {
-            None
-        };
-        let mut loaded_bone_names: Vec<String> = skel
-            .exists()
-            .then(|| ssbh_data::skel_data::SkelData::from_file(&skel).ok())
-            .flatten()
+        self.current_skel_path = model_files.get("model.nusktb").map(Path::to_path_buf);
+        let mut loaded_bone_names: Vec<String> = self
+            .current_skel_path
+            .as_ref()
+            .and_then(|skel| ssbh_data::skel_data::SkelData::from_file(skel).ok())
             .map(|s| s.bones.into_iter().map(|b| b.name).collect())
             .unwrap_or_default();
 
         // Also collect weapon bone names from sibling model dirs (sword, hammer, etc.)
         // model_root = fighter/{name}/model, each part holding cNN subdirs.
-        if let Ok(entries) = std::fs::read_dir(&model_root) {
-            for entry in entries.flatten() {
-                let dir_name = entry.file_name();
-                if dir_name.to_string_lossy() == "body" {
-                    continue;
-                }
-                // The weapon's slot set can differ from the body's, so fall back to any slot
-                // it does have rather than giving up when the base slot is missing.
-                let part_dir = entry.path();
-                let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot)
-                else {
-                    continue;
-                };
-                if let Ok(wskel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel_path) {
-                    loaded_bone_names.extend(wskel.bones.into_iter().map(|bone| bone.name));
-                }
+        for part_dir in crate::costume_files::sibling_dirs(&model_root) {
+            if part_dir
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("body"))
+            {
+                continue;
+            }
+            // The weapon's slot set can differ from the body's, so fall back to any slot
+            // it does have rather than giving up when the base slot is missing.
+            let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot)
+            else {
+                continue;
+            };
+            if let Ok(wskel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel_path) {
+                loaded_bone_names.extend(wskel.bones.into_iter().map(|bone| bone.name));
             }
         }
         // Keep the text-edit fallback when no skeleton could be loaded. Once there is a
@@ -5546,7 +7014,8 @@ impl VisionaryApp {
         );
         let hurtbox_result =
             crate::data::load_hurtbox_volumes(&fighter.param_path, &loaded_bone_names);
-        self.hurtbox_volumes = hurtbox_result.volumes;
+        self.base_hurtbox_volumes = hurtbox_result.volumes;
+        self.loaded_skeleton_bones = loaded_bone_names;
         self.hurtbox_warnings = hurtbox_result.warnings;
         self.add_bone = self.add_bone.to_ascii_lowercase();
         self.current_model_dir = Some(model_dir.clone());
@@ -5557,29 +7026,28 @@ impl VisionaryApp {
             &fighter.fighter_dir.join("param").join("expression_vl.prc"),
         );
 
-        // The desktop no longer simulates or renders particles. Keep the selected fighter's
-        // effect file queued for the editor; live preview is provided by slight_replica in game.
+        // The moveset's romfs / slot-scoped eff is checked first (e.g. Shy Guy's
+        // `romfs/effect/fighter/pacman/ef_pacman_c40.eff`), then any project/linked effect folder,
+        // then the fighter's own or vanilla effect file.
         let eff_rel = format!("effect/fighter/{0}/ef_{0}.eff", fighter.name);
+        let eff_dirs = self.fighter_effect_dirs(fighter);
+        let slot = self.active_article_slot(fighter);
+        let slot_eff = fighter_eff_path(&fighter.name, slot, &eff_dirs).filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("_c"))
+        });
         let own_eff = Some(self.resolve_eff_source(&eff_rel))
             .filter(|path| *path != self.eff_editor.export_root().join(&eff_rel) && path.is_file());
-        let eff_path = fighter
-            .effect_dir
-            .as_ref()
-            .map(|d| d.join(format!("ef_{}.eff", fighter.name)))
-            .or_else(|| {
-                self.state.data_root.as_ref().map(|root| {
-                    root.join("effect")
-                        .join("fighter")
-                        .join(&fighter.name)
-                        .join(format!("ef_{}.eff", fighter.name))
-                })
-            })
-            .filter(|path| path.exists());
-        if let Some(path) = own_eff {
+        if let Some(path) = slot_eff {
+            self.current_eff_path = Some(path.clone());
+            self.eff_editor.queue_load(&path);
+        } else if let Some(path) = own_eff {
             // The project's effect file, or one in a folder picked for it, stands for the game's.
             self.current_eff_path = Some(path.clone());
             self.eff_editor.load_as(&path, eff_rel);
         } else {
+            let eff_path = fighter_eff_path(&fighter.name, slot, &eff_dirs);
             self.current_eff_path = eff_path.clone();
             if let Some(path) = eff_path {
                 self.eff_editor.queue_load(&path);
@@ -5591,23 +7059,57 @@ impl VisionaryApp {
         let fighter_dir = fighter.fighter_dir.clone();
         let fighter_name = fighter.name.clone();
         let base_slot = fighter.base_slot();
+        self.refresh_hurtbox_volumes();
+        // Where a moveset spells out the motion and script names it adds: its linked source and
+        // the compiled plugins under the data/mod roots. Read on the worker thread.
+        let source_files: Vec<PathBuf> = self
+            .acmd_src
+            .as_ref()
+            .map(|index| index.files.clone())
+            .unwrap_or_default();
+        let name_roots = self.all_roots();
         let (tx, rx) = std::sync::mpsc::channel();
         self.move_list_receiver = Some(rx);
         self.state.status = "Loading moves...".to_string();
 
         std::thread::spawn(move || {
-            let motion_list_path = motion_dir.join("motion_list.bin");
-            let Ok(mlist) = motion_lib::open(&motion_list_path) else {
+            // The binary or the YAML, whichever was written last, so an edit made in the Motion
+            // List window (or by hand in the YAML) shows before the next build converts it.
+            let Some(mlist) = crate::motion_list::load_current_in(&motion_dir) else {
                 return;
             };
+            // ParamLabels only knows vanilla names. A custom motion (Shy Guy's
+            // `attack_s4_s_reverse`) is named only by the moveset itself, so fill the gaps from
+            // there; ParamLabels still wins wherever it has an answer.
+            let mut names = crate::motion_scripts::moveset_names(&source_files, &name_roots);
+            names.extend(labels.iter().map(|(hash, name)| (*hash, name.clone())));
+            // A yamlist `motion_list.yml` beside the binary is the author's own text of this
+            // list — every motion, script and animation by name — so it outranks all of the
+            // above. Released mods usually ship only the `.bin`, which is what the rest is for.
+            let motion_files = crate::costume_files::CostumeFolder::resolve(&motion_dir);
+            if let Some(yml) = motion_files
+                .get("motion_list.yml")
+                .and_then(|path| std::fs::read_to_string(path).ok())
+            {
+                names.extend(crate::motion_scripts::names_from_motion_list_yml(&yml));
+            }
 
-            let anim_index = index_nuanmb(&motion_dir);
+            let anim_index = index_nuanmb(&motion_files);
             // Kirby's body motion list points at copy-ability animations stored in sibling
             // motion parts (`cloudbody`, `shulkbody`, ...). Index every part once so the
             // animation named by the motion list wins over the old body-only suffix guess.
             // Other fighters use the same layout for weapon and helper parts, so this is a
             // fighter-data rule rather than a Kirby special case.
             let animation_files = index_fighter_nuanmb(&fighter_dir, base_slot);
+            // Animation file names name motions too (`a04walkfallr.nuanmb` → `walk_fall_r`), for
+            // the motions neither ParamLabels nor the moveset spells out.
+            for (hash, path) in &animation_files {
+                if let Some(file) = path.file_name() {
+                    names
+                        .entry(*hash)
+                        .or_insert_with(|| file.to_string_lossy().to_ascii_lowercase());
+                }
+            }
             let mut moves: Vec<MoveEntry> = mlist
                 .list
                 .iter()
@@ -5615,10 +7117,26 @@ impl VisionaryApp {
                 // change — every motion in the list reaches the panel now.
                 .map(|(hash_key, motion)| {
                     let hash_val = hash_key.0;
-                    let name = labels
-                        .get(&hash_val)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{:#018x}", hash_val));
+                    // The scripts this motion runs, as the motion list states them. Every
+                    // script lookup goes through `move_script_aliases`, which now puts this
+                    // first whenever the name-based guess would have missed it.
+                    let script_hashes: Vec<u64> = std::iter::once(motion.game_script.0)
+                        .chain(motion.scripts.iter().map(|script| script.0))
+                        .collect();
+                    let animation_name_hashes: Vec<u64> =
+                        motion.animations.iter().map(|a| a.name.0).collect();
+                    let name = crate::motion_scripts::motion_name(
+                        hash_val,
+                        &script_hashes,
+                        &animation_name_hashes,
+                        &names,
+                    )
+                    .unwrap_or_else(|| format!("{:#018x}", hash_val));
+                    if let Some(suffix) =
+                        crate::motion_scripts::script_suffix(&name, &script_hashes, &names)
+                    {
+                        crate::motion_scripts::register_if_unguessable(&name, &suffix);
+                    }
 
                     // **No family filter.** This used to keep only six substrings — attack,
                     // special, throw, catch, cliff, final — which hid 65% of the corpus's sound
@@ -5638,7 +7156,6 @@ impl VisionaryApp {
                     let anim_path = find_motion_nuanmb(
                         &animation_hashes,
                         &animation_files,
-                        &motion_dir,
                         &anim_index,
                         &name,
                         hash_val,
@@ -5652,6 +7169,10 @@ impl VisionaryApp {
                         // ever shown for the move a user has actually opened.
                         frame_count: 0,
                         anim_path,
+                        cancel_frame: motion
+                            .extra
+                            .as_ref()
+                            .map_or(0, |extra| u32::from(extra.cancel_frame)),
                     }
                 })
                 .collect();
@@ -5708,24 +7229,45 @@ impl VisionaryApp {
     }
 
     fn select_move(&mut self, move_entry: MoveEntry) {
+        self.select_script(None, move_entry);
+    }
+
+    /// Open one of an object's scripts (`agent` such as `samus_lativolt`, `move_entry` named
+    /// after the script without its category, `fly`) as the move, the way a fighter move opens.
+    fn open_article_script(&mut self, agent: String, move_name: &str) {
+        let move_entry = MoveEntry {
+            name: move_name.to_string(),
+            hash: hash40::hash40(&format!("{agent}/{move_name}")).0,
+            frame_count: 0,
+            anim_path: None,
+            cancel_frame: 0,
+        };
+        self.opened_object_agents.insert(agent.clone());
+        self.game_link.send_article_probe(&agent);
+        self.select_script(Some(agent), move_entry);
+    }
+
+    fn select_script(&mut self, article: Option<String>, move_entry: MoveEntry) {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
+        if self.leave_gate(|| PendingLeave::Script(article.clone(), move_entry.clone())) {
+            return;
+        }
+        self.object_baseline = None;
         // Panel edits are keyed at the end of the frame, but a click can navigate before that
         // pass runs. Commit explicitly at the navigation boundary so leaving a move cannot lose
         // the last drag or source-point edit.
         self.commit_current_edits();
+        self.open_article = article;
+        self.article_arg_edits.clear();
 
-        let fighter_name = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|fighter| fighter.name.clone());
+        let fighter_name = self.script_agent();
         if let Some(fighter_name) = fighter_name {
             self.refresh_linked_acmd_source_index();
             let key = Self::move_key(&self.owner_spelling(&fighter_name), &move_entry.name);
             if let Some(saved) = self.move_source_cache.get(&key).cloned() {
-                if let Some((body, _)) = self.warm_source_body(&fighter_name, &move_entry.name) {
+                if let Some((body, origin)) = self.warm_source_body(&fighter_name, &move_entry.name) {
                     if body != saved.body {
                         let captures = self.captures_for_move(&fighter_name, move_entry.hash);
                         let captures = if captures.is_empty() {
@@ -5744,15 +7286,16 @@ impl VisionaryApp {
                             move_entry,
                             saved,
                             current,
+                            current_origin: origin,
                         });
                         return;
                     }
                 }
-                self.activate_move(move_entry, Some(saved), "Saved project source");
+                self.activate_move(move_entry, Some(saved), crate::data::ScriptOrigin::Saved);
                 return;
             }
         }
-        self.activate_move(move_entry, None, "");
+        self.activate_move(move_entry, None, crate::data::ScriptOrigin::None);
     }
 
     /// Finish a move selection after source resolution has made its choice. The old selection
@@ -5762,13 +7305,14 @@ impl VisionaryApp {
         &mut self,
         mut move_entry: MoveEntry,
         snapshot: Option<crate::mod_project::MoveSourceSnapshot>,
-        snapshot_label: &str,
+        snapshot_origin: crate::data::ScriptOrigin,
     ) {
         // Dropping the receiver is cancellation: each worker owns only the sender for its own
         // channel, so a result from the previous selection has nowhere to land. Clear the
         // project half of that request at the same boundary.
         self.acmd_receiver = None;
         self.pending_project_script = None;
+        self.acmd_source_note = None;
         self.fetching_acmd = false;
         self.state.current_frame = FIRST_GAME_FRAME;
         self.selected_hitbox = None;
@@ -5836,13 +7380,13 @@ impl VisionaryApp {
                     &fighter,
                     &move_name,
                     Ok(snapshot.body),
-                    if snapshot_label.is_empty() {
-                        "Saved source"
+                    if snapshot_origin.is_none() {
+                        crate::data::ScriptOrigin::Saved
                     } else {
-                        snapshot_label
+                        snapshot_origin.clone()
                     },
                 );
-                if snapshot_label == "Current source" {
+                if matches!(snapshot_origin, crate::data::ScriptOrigin::Refreshed { .. }) {
                     self.rebase_current_edit_record();
                 }
                 self.refresh_current_live_rules();
@@ -5881,18 +7425,17 @@ impl VisionaryApp {
         // edited record current before a mismatch prompt or the eventual source apply rebuilds
         // the visible move from its keyed maps.
         self.commit_current_edits();
-        let (fighter_name, move_name) = match (
-            self.state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i)),
-            &self.state.selected_move,
-        ) {
-            (Some(f), Some(m)) => (f.name.clone(), m.name.clone()),
+        // An open object script (`samus_lativolt`) is fetched under its own agent.
+        let (fighter_name, move_name) = match (self.script_agent(), &self.state.selected_move) {
+            (Some(agent), Some(m)) => (agent, m.name.clone()),
             _ => return,
         };
 
         self.acmd_error = None;
         self.pending_project_script = None;
+        self.acmd_source_note = None;
+        // The editor is about to be refilled from disk: its baseline is taken again once loaded.
+        self.object_baseline = None;
 
         // A linked project is the authoritative script for anyone who has already modded the
         // move — but only for the categories it actually defines. The mirror still supplies
@@ -5903,12 +7446,27 @@ impl VisionaryApp {
             .acmd_src
             .as_ref()
             .and_then(|index| index.script_source(&fighter_name, &move_name));
+        self.open_article_in_source = self.open_article.is_some() && project.is_some();
+        // A linked source that has nothing for this move is why vanilla shows; say so, or a
+        // modded fighter reading as vanilla looks like the link silently failed.
+        if project.is_none() {
+            self.acmd_source_note = self
+                .acmd_src
+                .as_ref()
+                .map(|index| index.why_no_script(&fighter_name, &move_name));
+        }
 
         if let Some(project) = project {
+            // A forwarding script whose shared body depends on values the index could not
+            // resolve still shows, but its frames may be wrong; say which, rather than guess.
+            if !project.notes.is_empty() {
+                self.state.status = project.notes.join("; ");
+            }
             // A complete override needs nothing else, and a warm disk cache is a local file
             // read — either way this resolves inline instead of paying for a thread and a
             // repaint.
-            let mirror = if project.needs_mirror() {
+            // A cloned object has no game script of its own to fill gaps from.
+            let mirror = if project.needs_mirror() && !self.open_article_is_clone() {
                 crate::acmd::cached_script_body(&fighter_name, &move_name)
             } else {
                 Some(String::new())
@@ -5928,7 +7486,7 @@ impl VisionaryApp {
                     &fighter_name,
                     &move_name,
                     body,
-                    "Project source",
+                    crate::data::ScriptOrigin::MovesetSource,
                 );
                 return;
             }
@@ -5937,12 +7495,44 @@ impl VisionaryApp {
             self.pending_project_script = Some(project);
         }
 
+        // An object's script comes from the dump's folder for that object
+        // (`lua2cpp_samus/samus_cshot/Shoot.txt`), never the fighter-move URL, which would cache
+        // an empty file under the object's name. A clone has none in the game.
+        let object = self.open_article.as_ref().map(|agent| {
+            let owner = self
+                .article_catalog
+                .as_ref()
+                .and_then(|cache| cache.catalog.get(agent))
+                .map(|article| article.owner.clone())
+                .unwrap_or_else(|| agent.split('_').next().unwrap_or(agent).to_string());
+            (owner, self.open_article_is_clone())
+        });
         self.fetching_acmd = true;
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
-            let body = crate::acmd::fetch_script_body_cached(&fighter_name, &move_name)
-                .map_err(|e| e.to_string());
+            let body = match &object {
+                Some((_, true)) => Ok(String::new()),
+                Some((owner, false)) => {
+                    let script = crate::acmd::move_name_to_pascal(&move_name);
+                    match crate::acmd::fetch_object_script(owner, &fighter_name, &script) {
+                        Some(body) => Ok(body),
+                        // A missing script is cached as an empty file; no file means the fetch
+                        // itself failed.
+                        None if crate::scratch_dirs::app_storage_root()
+                            .join("script-cache")
+                            .join(&fighter_name)
+                            .join(format!("{script}.txt"))
+                            .exists() =>
+                        {
+                            Ok(String::new())
+                        }
+                        None => Err("Couldn't fetch the game's script (offline?)".to_string()),
+                    }
+                }
+                None => crate::acmd::fetch_script_body_cached(&fighter_name, &move_name)
+                    .map_err(|e| e.to_string()),
+            };
             let _ = tx.send((fighter_name, move_name, body));
             // The app is reactive and may be sitting idle; without this the finished fetch
             // would not appear until the user happened to move the mouse.
@@ -5960,7 +7550,7 @@ impl VisionaryApp {
         fighter: &str,
         move_name: &str,
         body: String,
-        source_label: &str,
+        origin: crate::data::ScriptOrigin,
     ) {
         let key = Self::move_key(&self.owner_spelling(fighter), move_name);
         if let Some(saved) = self.move_source_cache.get(&key).cloned() {
@@ -5990,17 +7580,21 @@ impl VisionaryApp {
                     move_entry,
                     saved,
                     current: crate::mod_project::MoveSourceSnapshot { body, captures },
+                    current_origin: origin,
                 });
                 return;
             }
         }
-        self.apply_acmd_body(fighter, move_name, Ok(body), source_label);
+        self.apply_acmd_body(fighter, move_name, Ok(body), origin);
     }
 
     // ── Linked ACMD source project ────────────────────────────────────────────
 
     /// Index `root` as the ACMD source project and remember it for next session.
     fn link_acmd_source(&mut self, root: PathBuf) {
+        if self.leave_gate(|| PendingLeave::LinkSource(root.clone())) {
+            return;
+        }
         match crate::acmd_src::SourceIndex::build(&root) {
             Ok(index) => {
                 let scripts = index.script_count();
@@ -6036,7 +7630,18 @@ impl VisionaryApp {
                     }
                 );
                 self.acmd_src = Some(index);
-                save_config_path(ACMD_SRC_CONFIG_KEY, &root);
+                self.acmd_src_problem = None;
+                self.refresh_acmd_src_fighters();
+                // What the previous moveset said about a move nobody edited is not this one's.
+                self.drop_unedited_move_sources();
+                // An open project records its own link; the global one is for browsing
+                // without a project and is left alone.
+                match crate::project_scope::link_target(self.project_path.is_some()) {
+                    crate::project_scope::LinkTarget::Project => self.project_moveset = Some(root),
+                    crate::project_scope::LinkTarget::Global => {
+                        save_config_path(ACMD_SRC_CONFIG_KEY, &root)
+                    }
+                }
                 // The open move was loaded from the mirror; re-read it from source now.
                 self.reload_move_scripts();
             }
@@ -6046,6 +7651,9 @@ impl VisionaryApp {
 
     /// Re-read the linked project from disk, keeping the same root.
     fn rescan_acmd_source(&mut self) {
+        if self.leave_gate(|| PendingLeave::RescanSource) {
+            return;
+        }
         if self.refresh_linked_acmd_source_index() {
             if let Some(index) = self.acmd_src.as_ref() {
                 let ownership = if index.has_unattributed_scripts() {
@@ -6085,7 +7693,9 @@ impl VisionaryApp {
         let Some(root) = self.acmd_src.as_ref().map(|index| index.root.clone()) else {
             return false;
         };
-        match rebuild_linked_acmd_source_index(&root, &mut self.acmd_src) {
+        let rebuilt = rebuild_linked_acmd_source_index(&root, &mut self.acmd_src);
+        self.refresh_acmd_src_fighters();
+        match rebuilt {
             Ok(has_scripts) => {
                 if !has_scripts {
                     self.state.status = format!(
@@ -6106,9 +7716,17 @@ impl VisionaryApp {
     }
 
     fn unlink_acmd_source(&mut self) {
+        if self.leave_gate(|| PendingLeave::UnlinkSource) {
+            return;
+        }
         self.acmd_src = None;
+        self.acmd_src_problem = None;
         self.acmd_src_buffer = None;
-        clear_config_path(ACMD_SRC_CONFIG_KEY);
+        self.refresh_acmd_src_fighters();
+        match crate::project_scope::link_target(self.project_path.is_some()) {
+            crate::project_scope::LinkTarget::Project => self.project_moveset = None,
+            crate::project_scope::LinkTarget::Global => clear_config_path(ACMD_SRC_CONFIG_KEY),
+        }
         self.state.status = "Unlinked the ACMD source project — scripts come from the \
                              online archive again"
             .into();
@@ -6127,15 +7745,11 @@ impl VisionaryApp {
         let Some(index) = self.acmd_src.as_ref() else {
             return;
         };
-        let (Some(fighter), Some(move_entry)) = (
-            self.state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i)),
-            self.state.selected_move.as_ref(),
-        ) else {
+        let (Some(fighter), Some(move_entry)) = (self.script_agent(), self.state.selected_move.as_ref())
+        else {
             return;
         };
-        let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
+        let move_name = move_entry.name.clone();
         // Resolve the motion to the spelling the project carries (`game_attacks3`
         // for `attack_s3_s`) so the opened buffer names the function it shows.
         let mut script: Option<String> = None;
@@ -6230,6 +7844,9 @@ impl VisionaryApp {
     /// first: an external edit between checkout and save would otherwise have its text
     /// overwritten by whatever the stale span happened to point at.
     fn save_source_buffer(&mut self) {
+        if self.leave_gate(|| PendingLeave::SaveSourceBuffer) {
+            return;
+        }
         let Some(buffer) = self.acmd_src_buffer.as_mut() else {
             return;
         };
@@ -6282,12 +7899,7 @@ impl VisionaryApp {
         let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.clone()) else {
             return (String::new(), Default::default());
         };
-        let fighter_name = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|fighter| fighter.name.clone())
-            .unwrap_or_default();
+        let fighter_name = self.script_agent().unwrap_or_default();
         // `attack_s3_s` is installed as `game_attacks3` upstream: preview the
         // spelling the export will write so the two cannot drift apart.
         let script_move = crate::acmd::resolve_script_move_name(&fighter_name, &move_name);
@@ -6726,14 +8338,30 @@ impl VisionaryApp {
             return;
         };
         let label = format!("{}/{}", buffer.fighter, buffer.move_name);
+        // Same agent-name rule the parser applied to this text (see `acmd::is_agent_arg`).
+        let _agent = crate::acmd::agent_scope(&buffer.text);
+        // Values written as project consts are recognised, but this buffer is one function:
+        // their definitions are changed by syncing to the project, not by mirroring here.
+        let _consts = self
+            .acmd_src
+            .as_ref()
+            .map(|index| crate::project_consts::scope(std::sync::Arc::clone(&index.consts)));
+        let _helpers = self
+            .acmd_src
+            .as_ref()
+            .map(|index| crate::project_helpers::scope(std::sync::Arc::clone(&index.helpers)));
+        // The buffer is its own baseline: once a mirror has moved a retimed hitbox, pairing the
+        // editor's original pristine list with that text would try to move it a second time.
+        let mut baseline = crate::acmd::parse_acmd_script(&buffer.text).to_hitboxes();
+        self.normalize_hitbox_bones(&mut baseline);
+        let edited_hitboxes = hitboxes_in_source_order(
+            &baseline,
+            &self.state.hitboxes_pristine,
+            &self.state.hitboxes,
+        );
         let (label, state) = (label.as_str(), &self.state);
         let mut outcome = if buffer.is_game_script() {
-            src::rewrite_hitboxes(
-                &buffer.text,
-                label,
-                &state.hitboxes_pristine,
-                &state.hitboxes,
-            )
+            src::rewrite_hitboxes(&buffer.text, label, &baseline, &edited_hitboxes)
         } else if buffer.is_effect_script() {
             src::rewrite_effect_calls(&buffer.text, label, &state.effects_pristine, &state.effects)
         } else if buffer.is_sound_script() {
@@ -6890,13 +8518,31 @@ impl VisionaryApp {
                 work_module_set_pristine,
                 script.to_work_module_set_events
             );
+            step!(
+                rewrite_editor_article_calls,
+                article_calls_pristine,
+                script.to_article_calls
+            );
         }
         let Some(buffer) = self.acmd_src_buffer.as_mut() else {
             return;
         };
         match outcome {
-            Ok((updated, report)) => {
+            Ok((updated, mut report)) => {
                 buffer.text = updated;
+                let refused = crate::project_helpers::take_refused();
+                if refused > 0 {
+                    report.skipped.push(format!(
+                        "{refused} edit(s) changed a value that one of the project's helper \
+                         functions fixes — change it in the helper itself"
+                    ));
+                }
+                for edit in crate::project_consts::take_pending() {
+                    report.skipped.push(format!(
+                        "{} is a constant — sync to the project to change its definition to {}",
+                        edit.name, edit.value
+                    ));
+                }
                 buffer.note = (!report.skipped.is_empty()).then(|| report.skipped.join("; "));
             }
             Err(e) => buffer.note = Some(e.to_string()),
@@ -6907,19 +8553,50 @@ impl VisionaryApp {
     }
 
     /// Write the editor's hitbox and effect-spawn edits for the open move back into source.
+    /// [`Self::sync_edits_to_source_for_row`], with the status naming the row being edited. The
+    /// writers name the agent (`falco/attack_hi3`), which is right for the code and wrong for a
+    /// person editing Empoleon, who reads it as the sync having gone to vanilla Falco.
     fn sync_edits_to_source(&mut self) {
+        self.sync_edits_to_source_for_row();
+        // An object script synced cleanly has nothing left to lose on leaving it.
+        if self.open_article.is_some() && self.last_sync_clean {
+            self.object_baseline = Some(self.object_edit_fingerprint());
+        }
+        let row = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .and_then(|entry| entry.custom_name.clone().map(|name| (entry.name.clone(), name)));
+        if let Some((agent, character)) = row {
+            self.state.status = self
+                .state
+                .status
+                .replace(&format!("{agent}/"), &format!("{character}/"));
+        }
+    }
+
+    fn sync_edits_to_source_for_row(&mut self) {
+        self.last_sync_clean = false;
         if self.acmd_src.is_none() {
             return;
         }
-        let (Some(fighter), Some(move_entry)) = (
-            self.state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i)),
-            self.state.selected_move.as_ref(),
-        ) else {
+        // An open object script saves under its own agent, which the index keys it by.
+        let (Some(fighter), Some(move_entry)) = (self.script_agent(), self.state.selected_move.as_ref())
+        else {
             return;
         };
-        let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
+        let move_name = move_entry.name.clone();
+        if self.open_article.is_some()
+            && self
+                .acmd_src
+                .as_ref()
+                .is_none_or(|index| index.script_source(&fighter, &move_name).is_none())
+        {
+            // Creating an object's first script would need its own agent registration, which
+            // the category writer doesn't make; refusing keeps the fighter's files untouched.
+            self.state.status = format!("{fighter}/{move_name} wasn't synced. {}", self.unsaveable_object_script_words());
+            return;
+        }
 
         // Rebuild spans before reading the source snapshot. A source edit made outside Visionary
         // can leave an old span in bounds while pointing at a different function.
@@ -7043,10 +8720,13 @@ impl VisionaryApp {
             .is_some()
         {
             ran = true;
-            sync!(sync_hitboxes(
+            // Pair each source call with the editor's hitbox it came from, retimes included.
+            let edited_hitboxes = hitboxes_in_source_order(
                 &source_hitboxes_pristine,
-                &self.state.hitboxes
-            ));
+                &self.state.hitboxes_pristine,
+                &self.state.hitboxes,
+            );
+            sync!(sync_hitboxes(&source_hitboxes_pristine, &edited_hitboxes));
             // A value replacement can change the byte length of the function. Re-index before
             // the next family pass, or its stale function span can truncate the source body and
             // make a later family (especially structural REVERSE_LR) target the wrong bytes.
@@ -7209,6 +8889,13 @@ impl VisionaryApp {
                     .script
                     .to_kinetic_set_consider_ground_friction_events()
             ));
+            refresh_acmd_index(&mut index, &mut notes);
+            // Article calls are matched by their own `ArticleModule` statements, and a frame
+            // change moves a line between frame blocks, so they get their own pass too.
+            sync!(sync_article_calls(
+                &self.state.point_originals.article_calls_pristine,
+                &self.state.script.to_article_calls()
+            ));
             // The last game pass above has no later game family to protect, but sound
             // and expression live in their own functions that can share the file. Without
             // this, a game write that changes the byte length leaves their spans stale
@@ -7307,6 +8994,7 @@ impl VisionaryApp {
             // original calls that the running game needs suppressed/replayed, and replacing them
             // here would make a successful source sync turn off its live preview.
             self.acmd_src = Some(index);
+            self.refresh_acmd_src_fighters();
             if !self.note_synced_source_body(&fighter, &move_name) {
                 notes.push(
                     "source changed, but the updated move could not be re-read; rescan the project"
@@ -7315,6 +9003,7 @@ impl VisionaryApp {
             }
             self.refresh_source_buffer_after_sync(&fighter, &move_name, &mut notes);
         }
+        self.last_sync_clean = ran && notes.is_empty();
         self.state.status =
             source_sync_status(&fighter, &move_name, ran, changed, files.len(), &notes);
     }
@@ -7415,6 +9104,7 @@ impl VisionaryApp {
         };
         if let Ok(index) = crate::acmd_src::SourceIndex::build(&root) {
             self.acmd_src = Some(index);
+            self.refresh_acmd_src_fighters();
         }
     }
 
@@ -7482,11 +9172,7 @@ impl VisionaryApp {
 
         // The user can switch fighter or move while a fetch is in flight; applying a stale
         // result would silently overwrite the new selection's hitboxes.
-        let still_current = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .is_some_and(|f| f.name == fighter_name)
+        let still_current = self.script_agent().is_some_and(|agent| agent == fighter_name)
             && self
                 .state
                 .selected_move
@@ -7572,7 +9258,7 @@ impl VisionaryApp {
         fighter_name: &str,
         move_name: &str,
         body: Result<String, String>,
-        source_label: &str,
+        origin: crate::data::ScriptOrigin,
     ) {
         match body {
             Ok(body) => {
@@ -7584,7 +9270,7 @@ impl VisionaryApp {
                 // branch warning from that snapshot is no longer applicable. Project-source
                 // loads deliberately retain a saved note, allowing an exported project to
                 // preserve the provenance it was created from.
-                if matches!(source_label, "GitHub" | "Current source") {
+                if origin.is_fresh_read() {
                     let key = Self::move_key(&self.owner_spelling(fighter_name), move_name);
                     self.state.capture_branch_warnings.remove(&key);
                 }
@@ -7629,7 +9315,7 @@ impl VisionaryApp {
                 {
                     self.normalize_hitbox_bones(&mut hitboxes);
                     self.state.hitboxes_pristine = hitboxes.clone();
-                    self.state.acmd_source = source_label.into();
+                    self.state.acmd_source = origin;
                     self.state.hitboxes = hitboxes;
                     self.state.set_script(script);
 
@@ -7730,7 +9416,9 @@ impl VisionaryApp {
                     .selected_fighter
                     .and_then(|i| self.state.fighters.get(i))
                     .is_some_and(|f| f.is_modded());
-                self.acmd_error = Some(if modded {
+                self.acmd_error = Some(if self.open_article.is_some() {
+                    e.to_string()
+                } else if modded {
                     format!(
                         "'{fighter_name}' is a modded character — the online script archive \
                          only covers the vanilla roster. Use live capture (play the move in \
@@ -7948,6 +9636,209 @@ impl VisionaryApp {
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
     /// that script in place, and push editor edits back into it.
+    /// Config key for the deploy destination chosen for the linked project.
+    fn moveset_deploy_key(&self) -> Option<String> {
+        let root = self.acmd_src.as_ref()?.root.to_string_lossy().to_lowercase();
+        Some(format!("moveset_deploy_{:010x}", hash40::hash40(&root).0))
+    }
+
+    /// Everything a build plan needs, read off `self` so the plan itself — which reads source
+    /// files and scans deployed plugins — can run on a worker thread.
+    fn moveset_build_inputs(&self) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
+        let index = self.acmd_src.as_ref()?;
+        let remembered = self.moveset_deploy_key().and_then(|key| load_config_path(&key));
+        Some((index.files.clone(), remembered))
+    }
+
+    fn moveset_build_plan(
+        files: &[PathBuf],
+        remembered: Option<&std::path::Path>,
+    ) -> anyhow::Result<crate::moveset_build::Plan> {
+        let sources: Vec<String> = files
+            .iter()
+            .filter_map(|file| std::fs::read_to_string(file).ok())
+            .collect();
+        crate::moveset_build::plan(
+            files,
+            &sources,
+            crate::scratch_dirs::emulator_sd_root().as_deref(),
+            remembered,
+        )
+    }
+
+    fn spawn_moveset_build(&mut self) {
+        let Some((files, remembered)) = self.moveset_build_inputs() else {
+            self.state.status = "Build & Deploy: no source project is linked".into();
+            return;
+        };
+        self.state.status = "Building the linked moveset…".into();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.moveset_build = Some(state.clone());
+        std::thread::spawn(move || {
+            let outcome = match Self::moveset_build_plan(&files, remembered.as_deref()) {
+                Ok(plan) => crate::moveset_build::run(&plan),
+                Err(error) => crate::moveset_build::Outcome {
+                    ok: false,
+                    message: error.to_string(),
+                    log: None,
+                },
+            };
+            if let Ok(mut slot) = state.lock() {
+                *slot = Some(outcome);
+            }
+        });
+    }
+
+    /// Report a finished build once, on the status line.
+    fn poll_moveset_build(&mut self) {
+        let Some(state) = self.moveset_build.as_ref() else {
+            return;
+        };
+        let finished = state.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(outcome) = finished {
+            let log = outcome
+                .log
+                .as_ref()
+                .map(|log| format!(" (full output: {})", log.display()))
+                .unwrap_or_default();
+            self.state.status = format!("Build & Deploy: {}{log}", outcome.message);
+            self.moveset_build = None;
+        }
+    }
+
+    fn choose_moveset_deploy_target(&mut self) {
+        let plan = self
+            .moveset_build_inputs()
+            .and_then(|(files, remembered)| Self::moveset_build_plan(&files, remembered.as_deref()).ok());
+        let (Some(plan), Some(key)) = (plan, self.moveset_deploy_key()) else {
+            self.state.status = "Deploy to…: link the moveset's source project first".into();
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Where should the built plugin go?")
+            .set_file_name(&plan.nro_name);
+        if let Some(sd) = crate::scratch_dirs::emulator_sd_root() {
+            dialog = dialog.set_directory(sd.join("ultimate").join("mods"));
+        }
+        if let Some(path) = dialog.save_file() {
+            save_config_path(&key, &path);
+            self.state.status = format!(
+                "Build & Deploy will also copy {} to {}",
+                plan.nro_name,
+                path.display()
+            );
+        }
+    }
+
+    /// The Motion List window. It follows the selected fighter's costume folder, unless the open
+    /// list has unsaved edits, which keep it open until they are saved or discarded.
+    fn draw_motion_list_window(&mut self, ctx: &egui::Context) {
+        let motion_dir = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|fighter| fighter.motion_dir.clone());
+        let wanted = motion_dir.as_deref().and_then(crate::motion_list::editable_in);
+        let stale = match (&self.motion_list_editor, &wanted) {
+            (None, Some(_)) => true,
+            (Some(editor), Some(path)) => editor.file.path != *path && !editor.file.changed,
+            _ => false,
+        };
+        if stale {
+            if let (Some(path), Some(dir)) = (wanted.as_ref(), motion_dir.as_ref()) {
+                self.open_motion_list(path, dir);
+            }
+        }
+        let Some(editor) = self.motion_list_editor.as_mut() else {
+            let mut open = true;
+            egui::Window::new("Motion List")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(match motion_dir {
+                        Some(dir) => format!("No motion_list.yml or motion_list.bin in {}", dir.display()),
+                        None => "Select a fighter to edit its motion list.".to_string(),
+                    });
+                });
+            self.show_motion_list = open;
+            return;
+        };
+        let response = editor.show(ctx, &self.motion_list_anims);
+        self.show_motion_list = response.open;
+        if let Some(path) = &response.saved {
+            self.state.status = format!("Saved {}", path.display());
+        }
+        if response.changed {
+            self.apply_motion_list_to_moves();
+        }
+    }
+
+    fn open_motion_list(&mut self, path: &Path, dir: &Path) {
+        crate::motion_list::add_known_labels(self.state.labels.iter());
+        match crate::motion_list::MotionListFile::open(path) {
+            Ok(file) => {
+                let mut anims: Vec<String> = std::fs::read_dir(dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                    .filter(|name| name.to_ascii_lowercase().ends_with(".nuanmb"))
+                    .collect();
+                anims.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+                crate::motion_list::add_derived_labels(&file.mlist, anims.iter().map(String::as_str));
+                let mut editor = crate::motion_list_editor::MotionListEditor::new(file);
+                let selected = self
+                    .state
+                    .selected_move
+                    .as_ref()
+                    .map(|entry| crate::motion_list::Hash40(entry.hash))
+                    .filter(|hash| editor.file.mlist.list.contains_key(hash));
+                if let Some(hash) = selected {
+                    editor.select(hash);
+                }
+                self.motion_list_editor = Some(editor);
+                self.motion_list_anims = anims;
+            }
+            Err(error) => {
+                self.motion_list_editor = None;
+                self.state.status = format!("Could not open {}: {error:#}", path.display());
+            }
+        }
+    }
+
+    /// Carry the open list's cancel frames into the move list, so frame data follows an edit
+    /// at once. Only when the list is the selected fighter's own.
+    fn apply_motion_list_to_moves(&mut self) {
+        let Some(editor) = &self.motion_list_editor else {
+            return;
+        };
+        let current = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .is_some_and(|fighter| editor.file.path.parent() == Some(fighter.motion_dir.as_path()));
+        if !current {
+            return;
+        }
+        let cancel_of = |hash: u64| {
+            editor
+                .file
+                .mlist
+                .list
+                .get(&crate::motion_list::Hash40(hash))
+                .map(|motion| motion.extra.as_ref().map_or(0, |extra| u32::from(extra.cancel_frame)))
+        };
+        for entry in &mut self.move_list {
+            if let Some(cancel) = cancel_of(entry.hash) {
+                entry.cancel_frame = cancel;
+            }
+        }
+        if let Some(entry) = self.state.selected_move.as_mut() {
+            if let Some(cancel) = cancel_of(entry.hash) {
+                entry.cancel_frame = cancel;
+            }
+        }
+    }
+
     fn draw_acmd_source_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_acmd_src;
         let saved = self.window_geometry.get("acmd_source").copied();
@@ -7961,8 +9852,10 @@ impl VisionaryApp {
 
         // Actions are recorded and run after the closure: every one of them needs `&mut self`,
         // which the borrow of `self.acmd_src` for display rules out inside it.
-        let mut link: Option<PathBuf> = None;
+        let mut open_moveset_sources = false;
         let mut rescan = false;
+        let mut build_plugin = false;
+        let mut choose_deploy = false;
         let mut unlink = false;
         let mut checkout: Option<&'static str> = None;
         let mut save = false;
@@ -7979,56 +9872,124 @@ impl VisionaryApp {
             // nothing was linked, when the fighter was not in the project, or when no script
             // was open — which meant a live-captured move, the one case with no source file
             // anywhere, showed an empty window instead of the code it would export.
-            ui.horizontal_wrapped(|ui| match self.acmd_src.as_ref() {
-                None => {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            "Moves load from the game's own scripts. If you have your own \
-                             smashline project, link it: its moves load instead, and \
-                             \"Write edits into your source\" puts your changes back into it.",
-                        );
+            //
+            // Two layers feed a move, and they are named apart here because they are easy to
+            // confuse: the base game (the dump vanilla fighters are read from) and the moveset
+            // source (the Rust project whose scripts replace vanilla's).
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Game dump").small().strong()).on_hover_text(
+                    "The ArcExplorer game dump vanilla fighters, models and motions are read \
+                     from (File → Sources…). Vanilla ACMD itself comes from the \
+                     dumped-script mirror on GitHub.",
+                );
+                match &self.state.data_root {
+                    Some(root) => ui.label(
+                        egui::RichText::new(root.display().to_string()).small().monospace(),
+                    ),
+                    None => ui.label(
+                        egui::RichText::new("not set").small().color(egui::Color32::GRAY),
+                    ),
+                };
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Moveset source").small().strong()).on_hover_text(
+                    "Your Rust moveset project. Every script it defines replaces vanilla's; \
+                     vanilla fills in the rest.",
+                );
+                match self.acmd_src.as_ref() {
+                    None => {
+                        let (text, color) = match &self.acmd_src_problem {
+                            Some(problem) => (problem.clone(), egui::Color32::from_rgb(220, 180, 90)),
+                            None => ("not linked — moves show vanilla".to_string(), egui::Color32::GRAY),
+                        };
+                        ui.label(egui::RichText::new(text).small().color(color));
                         if ui
-                            .button("Link your smashline project")
-                            .on_hover_text("The folder with your plugin's Cargo.toml")
+                            .small_button("Link…")
+                            .on_hover_text(
+                                "Pick any folder of the Rust project that builds your plugin: its \
+                                 root, plugin/, or src/. Cargo works out which crates it builds.",
+                            )
                             .clicked()
                         {
-                            link = rfd::FileDialog::new()
-                                .set_title("Link your smashline project")
-                                .pick_folder();
+                            open_moveset_sources = true;
                         }
-                    });
-                }
-                Some(index) => {
-                    ui.label(
-                        egui::RichText::new(index.root.display().to_string())
-                            .small()
-                            .monospace(),
-                    );
-                    let conflict_summary = if index.conflict_count() == 0 {
-                        String::new()
-                    } else {
-                        format!(" · {} defined twice", index.conflict_count())
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "· {} scripts for {} fighters{conflict_summary}",
-                            index.script_count(),
-                            index.fighters.len()
-                        ))
-                        .small()
-                        .color(egui::Color32::GRAY),
-                    );
-                    if ui
-                        .small_button("Rescan")
-                        .on_hover_text(
-                            "Re-read the project from disk, picking up edits made elsewhere",
-                        )
-                        .clicked()
-                    {
-                        rescan = true;
                     }
-                    if ui.small_button("Unlink").clicked() {
-                        unlink = true;
+                    Some(index) => {
+                        ui.label(
+                            egui::RichText::new(index.root.display().to_string())
+                                .small()
+                                .monospace(),
+                        );
+                        let conflict_summary = if index.conflict_count() == 0 {
+                            String::new()
+                        } else {
+                            format!(" · {} ambiguous", index.conflict_count())
+                        };
+                        let mut agents: Vec<&str> = index
+                            .fighters
+                            .keys()
+                            .map(String::as_str)
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        agents.sort_unstable();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "· {} usable scripts · {} agents{conflict_summary}",
+                                index.script_count(),
+                                index.fighters.len()
+                            ))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        )
+                        .on_hover_text(if agents.is_empty() {
+                            "No script is attributed to a named agent.".to_string()
+                        } else {
+                            format!("Scripts for: {}", agents.join(", "))
+                        });
+                        if ui
+                            .small_button("Rescan")
+                            .on_hover_text(
+                                "Re-read the project from disk, picking up edits made elsewhere",
+                            )
+                            .clicked()
+                        {
+                            rescan = true;
+                        }
+                        let building = self
+                            .moveset_build
+                            .as_ref()
+                            .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
+                        if ui
+                            .add_enabled(!building, egui::Button::new(if building {
+                                "Building…"
+                            } else {
+                                "Build & Deploy"
+                            }).small())
+                            .on_hover_text(
+                                "Run `cargo skyline build --release` on this project and replace \
+                                 every deployed copy of its plugin on the emulator SD (and any \
+                                 destination chosen with Deploy to…). If the plugin exports \
+                                 `smashline_install`, it is also written as smashline's \
+                                 development.nro: press L + R + D-pad Up in the game's menus to \
+                                 reload it without restarting.",
+                            )
+                            .clicked()
+                        {
+                            build_plugin = true;
+                        }
+                        if ui
+                            .small_button("Deploy to…")
+                            .on_hover_text(
+                                "Choose where this project's built plugin should be copied, for a \
+                                 mod folder Build & Deploy cannot find on its own",
+                            )
+                            .clicked()
+                        {
+                            choose_deploy = true;
+                        }
+                        if ui.small_button("Unlink").clicked() {
+                            unlink = true;
+                        }
                     }
                 }
             });
@@ -8050,11 +10011,18 @@ impl VisionaryApp {
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
-                if !self.state.acmd_source.is_empty() {
+                if !self.state.acmd_source.is_none() {
                     ui.label(
-                        egui::RichText::new(format!("from {}", self.state.acmd_source))
+                        egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
                             .small()
                             .color(egui::Color32::GRAY),
+                    );
+                }
+                if let Some(note) = &self.acmd_source_note {
+                    ui.label(
+                        egui::RichText::new(format!("— {note}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 180, 90)),
                     );
                 }
             });
@@ -8072,6 +10040,35 @@ impl VisionaryApp {
                 ui.selectable_value(&mut view, SourceView::Split, "Side by side");
             });
             ui.separator();
+
+            // The fighter's own row is open, but the moveset installs these scripts only on a
+            // slot character's costumes: say whose they are before anyone edits them as Falco's.
+            let gated_characters = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .filter(|entry| entry.custom_name.is_none())
+                .map(|entry| {
+                    self.script_owner_rows(&entry.name)
+                        .into_iter()
+                        .filter_map(|row| row.character)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|characters| !characters.is_empty());
+            if let Some(characters) = gated_characters {
+                let base = fighter_display_name(&fighter);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This moveset installs {fighter}'s scripts only on {}'s costume slots \
+                         (set_costume); {base}'s own slots play the game's. Edits made here \
+                         change {}.",
+                        characters.join(", "),
+                        characters.join(", "),
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 190, 90)),
+                );
+            }
 
             // Everything that needs `&self` is resolved before the buffer is borrowed
             // mutably below — closures capturing both would not borrow-check.
@@ -8222,9 +10219,16 @@ impl VisionaryApp {
         self.show_acmd_src = open;
         self.acmd_src_view = view;
 
-        if let Some(root) = link {
-            self.link_acmd_source(root);
+        if open_moveset_sources {
+            self.open_sources(SourceRow::MovesetCode);
         }
+        if build_plugin {
+            self.spawn_moveset_build();
+        }
+        if choose_deploy {
+            self.choose_moveset_deploy_target();
+        }
+        self.poll_moveset_build();
         if rescan {
             self.rescan_acmd_source();
         }
@@ -8982,8 +10986,7 @@ impl VisionaryApp {
                 self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<_> = self.live_hitbox_rule_union();
-            self.game_link.send_hitbox_rules(&all);
+            self.publish_hitbox_rules();
             let name = self.character_name(&crate::character::CharacterKey::parse(&f));
             self.state.status = format!(
                 "Restored {name}'s {} hitboxes to the source data.",
@@ -9017,8 +11020,7 @@ impl VisionaryApp {
                 }
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<_> = self.live_hitbox_rule_union();
-            self.game_link.send_hitbox_rules(&all);
+            self.publish_hitbox_rules();
             let name = self.character_name(&crate::character::CharacterKey::parse(&f));
             self.state.status = format!("Restored all {name}'s hitboxes to their source data.");
         }
@@ -9140,6 +11142,12 @@ impl VisionaryApp {
     }
 
     fn commit_current_edits(&mut self) {
+        if edit_log_target(self.open_article.as_deref(), "").is_none() {
+            // The edit log and the export are keyed by fighter: logging an object's script here
+            // would export it as the fighter's move of the same name. Its edits reach disk only
+            // through a source sync, and the editor says so while it is open.
+            return;
+        }
         commit_open_move(&mut self.state);
     }
 
@@ -9181,27 +11189,215 @@ impl VisionaryApp {
         }
     }
 
+    /// Whether a fighter passes the sidebar search: internal name, shown name, or (for a slot
+    /// character) its base fighter's name.
+    fn fighter_matches_query(f: &crate::data::FighterEntry, query: &str) -> bool {
+        query.is_empty()
+            || f.display_name.to_lowercase().contains(query)
+            || f.name.to_lowercase().contains(query)
+            || (f.custom_name.is_some()
+                && fighter_display_name(&f.name).to_lowercase().contains(query))
+    }
+
+    /// One fighter row, shared by both project groups and the project-less list. Modded
+    /// fighters and non-vanilla skin counts are called out so an added-character mod is visibly
+    /// picked up rather than silently indistinguishable from vanilla; a slot character's label
+    /// already names it and its fighter, so it skips the tag. Clicks are pushed onto `actions`
+    /// for the caller to apply once the list's borrows end.
+    fn draw_fighter_row(
+        &self,
+        ui: &mut Ui,
+        row: &FighterRow,
+        in_project: bool,
+        actions: &mut Vec<FighterRowAction>,
+    ) {
+        let i = row.idx;
+        let selected = self.state.selected_fighter == Some(i);
+        let mut label = row.label.clone();
+        if row.modded {
+            label.push_str("  [mod]");
+        }
+        let custom = self.state.fighters[i].custom_name.is_some();
+        if !custom && row.slot_count != crate::data::VANILLA_SLOT_COUNT as usize {
+            label.push_str(&format!("  ({} skins)", row.slot_count));
+        }
+        let mut hover = format!("{} costume slot(s), base c{:02}", row.slot_count, row.base);
+        if custom {
+            let base_name = fighter_display_name(&row.name);
+            hover = format!(
+                "Base fighter: {base_name} ({})\nSlots: {}\n\nA mod \
+                 character played on {base_name}'s slots: it shares {base_name}'s \
+                 scripts, with its own models and motions",
+                row.name,
+                format_slot_list(&self.state.fighters[i].slots)
+            );
+        } else if row.modded {
+            hover.push_str("\nModded character (not in the vanilla roster)");
+        }
+        if in_project {
+            hover.push_str(&format!(
+                "\nIn the project because it {}",
+                crate::project_scope::join_reasons(&row.reasons)
+            ));
+        }
+        let response = ui.selectable_label(selected, &label).on_hover_text(hover);
+        if response.clicked() {
+            actions.push(FighterRowAction::Select(i));
+        }
+        response.context_menu(|ui| {
+            if self.project_path.is_some() {
+                if in_project {
+                    use crate::project_scope::MembershipReason;
+                    let has_added = row.reasons.contains(&MembershipReason::Added);
+                    let others: Vec<MembershipReason> = row
+                        .reasons
+                        .iter()
+                        .copied()
+                        .filter(|r| *r != MembershipReason::Added)
+                        .collect();
+                    let remove =
+                        ui.add_enabled(has_added, egui::Button::new("Remove from project"));
+                    let remove = if others.is_empty() {
+                        remove
+                    } else {
+                        let why = format!(
+                            "Still in the project because it {}",
+                            crate::project_scope::join_reasons(&others)
+                        );
+                        remove.on_hover_text(why.clone()).on_disabled_hover_text(why)
+                    };
+                    if remove.clicked() {
+                        actions.push(FighterRowAction::Remove(i));
+                        ui.close();
+                    }
+                } else if ui.button("Add to project").clicked() {
+                    actions.push(FighterRowAction::Add(i));
+                    ui.close();
+                }
+                ui.separator();
+            }
+            editor_subsection_heading(
+                ui,
+                "Cached fighter data",
+                "Scripts, edits, and live-preview data Visionary has remembered for this fighter during editing.",
+            );
+            ui.label(
+                egui::RichText::new(concat!(
+                    "Clears cached scripts, edits, and live effect previews. ",
+                    "Source files stay on disk."
+                ))
+                .small(),
+            );
+            if ui.button("Forget fighter").clicked() {
+                actions.push(FighterRowAction::Forget(
+                    crate::mod_project::ProjectFighter {
+                        name: row.name.clone(),
+                        character: row.character.clone(),
+                    },
+                ));
+                ui.close();
+            }
+        });
+    }
+
+    /// Close the "Add fighter…" popup and forget its search. It belongs to one project, so
+    /// leaving or switching the project closes it.
+    fn close_add_fighter_popup(&mut self) {
+        self.add_fighter_popup = None;
+        self.add_fighter_search.clear();
+    }
+
+    /// The "Add fighter…" popup: a search field over the fighters not yet in the project.
+    /// Clicking one adds it and the list keeps going, so several can be added in a row; closing
+    /// the window skips the rest. New Project opens it with a title that asks the question.
+    fn draw_add_fighter_popup(&mut self, ctx: &egui::Context) {
+        // It adds to the open project; with none open there is nothing to add to.
+        if self.project_path.is_none() {
+            self.close_add_fighter_popup();
+            return;
+        }
+        let Some(title) = self.add_fighter_popup.clone() else {
+            return;
+        };
+        let query = self.add_fighter_search.trim().to_lowercase();
+        let candidates: Vec<(usize, String)> = self
+            .state
+            .fighters
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| {
+                self.row_membership(*i).is_empty() && Self::fighter_matches_query(f, &query)
+            })
+            .map(|(i, f)| (i, f.display_name.clone()))
+            .collect();
+        let mut open = true;
+        let mut add: Option<usize> = None;
+        egui::Window::new(title)
+            .id(egui::Id::unique("add_fighter_popup"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                crate::ui::search_field(
+                    ui,
+                    "add_fighter_search",
+                    &mut self.add_fighter_search,
+                    "Search fighters…",
+                );
+                ScrollArea::vertical()
+                    .id_salt("add_fighter_list")
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        if candidates.is_empty() {
+                            ui.weak("No matching fighters");
+                        }
+                        for (i, name) in &candidates {
+                            if ui.selectable_label(false, name).clicked() {
+                                add = Some(*i);
+                            }
+                        }
+                    });
+            });
+        if let Some(i) = add {
+            self.add_to_project(i);
+        }
+        if !open {
+            self.add_fighter_popup = None;
+        }
+    }
+
     fn draw_left_panel(&mut self, ui: &mut Ui) {
         if self.state.data_root.is_none() {
+            ui.add_space(6.0);
+            ui.strong("Step 1 — your game dump");
+            ui.label(
+                "Choose the folder ArcExplorer exported from data.arc.\n\
+                 It holds fighter/ and effect/.",
+            );
+            ui.add_space(4.0);
             if ui
-                .button("Open Data Root")
+                .button("Choose game dump…")
                 .on_hover_text("Choose the folder containing extracted fighter files")
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.set_data_root(path);
-                }
+                self.pick_game_dump();
             }
             return;
         }
 
         let available = ui.available_height();
         // Keep both lists proportional to the panel while retaining a usable minimum when the
-        // window is compressed below its normal height.
-        let half = ((available - 80.0) / 2.0).max(1.0);
+        // window is compressed below its normal height. With a fighter selected, a share goes
+        // to its Objects list below the moves.
+        let objects_height = if self.state.selected_fighter.is_some() {
+            ((available - 80.0) * 0.25).max(60.0)
+        } else {
+            0.0
+        };
+        let half = ((available - 80.0 - objects_height) / 2.0).max(1.0);
 
         let mut restore_forgotten = false;
-        let mut forget_fighter: Option<String> = None;
+        let mut forget_fighter: Option<crate::mod_project::ProjectFighter> = None;
         ui.horizontal_wrapped(|ui| {
             sidebar_section_heading(
                 ui,
@@ -9224,123 +11420,152 @@ impl VisionaryApp {
             "Search fighters…",
         );
         let fighter_query = self.fighter_search.trim().to_lowercase();
+        let fighter_searching = !fighter_query.is_empty();
+        let has_project = self.project_path.is_some();
+        let mut row_actions: Vec<FighterRowAction> = Vec::new();
+        let mut open_add_fighter = false;
         ScrollArea::both()
             .id_salt("fighters")
             .max_height(half)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // (index, internal name, label, modded, slot count, base slot) — modded fighters and
-                // non-vanilla skin counts are called out so an added-character mod is
-                // visibly picked up rather than silently indistinguishable from vanilla.
-                let fighters: Vec<(usize, String, String, bool, usize, u8)> = self
+                let rows: Vec<FighterRow> = self
                     .state
                     .fighters
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| {
-                        fighter_query.is_empty()
-                            || f.display_name.to_lowercase().contains(&fighter_query)
-                            || f.name.to_lowercase().contains(&fighter_query)
-                    })
-                    .map(|(i, f)| {
-                        (
-                            i,
-                            f.name.clone(),
-                            f.display_name.clone(),
-                            f.is_modded(),
-                            f.slots.len(),
-                            f.base_slot(),
-                        )
+                    .filter(|(_, f)| Self::fighter_matches_query(f, &fighter_query))
+                    .map(|(i, f)| FighterRow {
+                        idx: i,
+                        name: f.name.clone(),
+                        character: f.custom_name.clone(),
+                        label: f.display_name.clone(),
+                        modded: f.is_modded() && f.custom_name.is_none(),
+                        slot_count: f.slots.len(),
+                        base: f.base_slot(),
+                        reasons: self.row_membership(i),
                     })
                     .collect();
-                if fighters.is_empty() {
-                    ui.weak("No matching fighters");
+                if !has_project {
+                    if rows.is_empty() {
+                        ui.weak("No matching fighters");
+                    }
+                    for row in &rows {
+                        self.draw_fighter_row(ui, row, false, &mut row_actions);
+                    }
+                    return;
                 }
+                let (project_rows, other_rows): (Vec<&FighterRow>, Vec<&FighterRow>) =
+                    rows.iter().partition(|row| !row.reasons.is_empty());
+
+                // Searching force-opens any group with matches (as the move list does for its
+                // categories) and puts the groups back as the user had them afterwards.
+                const GROUPS: [(&str, bool); 2] = [("project", true), ("rest", false)];
+                let has_matches = [!project_rows.is_empty(), !other_rows.is_empty()];
+                if fighter_searching {
+                    if self.fighter_group_before_search.is_none() {
+                        self.fighter_group_touched = [false; 2];
+                        self.fighter_group_before_search = Some(GROUPS.map(|(key, default)| {
+                            persistent_collapsing_open(ui, ("fighter_group", key), default)
+                        }));
+                    }
+                } else if let Some(before) = self.fighter_group_before_search.take() {
+                    for (n, (key, _)) in GROUPS.iter().enumerate() {
+                        set_persistent_collapsing_open(ui, ("fighter_group", *key), before[n]);
+                    }
+                    self.fighter_group_touched = [false; 2];
+                }
+
                 let active = self.active_key();
                 let mut pick_character: Option<crate::character::CharacterKey> = None;
                 let mut open_on: Option<(
                     crate::character::CharacterKey,
                     crate::character::CharacterPage,
                 )> = None;
-                for (i, fighter_name, name, modded, _, base) in fighters {
-                    let base_key = crate::character::CharacterKey::base(&fighter_name);
-                    let selected = self.state.selected_fighter == Some(i)
-                        && active.as_ref() == Some(&base_key);
-                    // A donor lists only its own costumes; its made characters have theirs.
-                    let slot_count = crate::character::base_costumes(
-                        &fighter_name,
-                        &self.state.fighters[i].slots,
-                        &self.roster.project,
-                    )
-                    .len();
-                    let mut label = name.clone();
-                    if modded {
-                        label.push_str("  [mod]");
+                for (n, (key, default_open)) in GROUPS.iter().enumerate() {
+                    let group = if n == 0 { &project_rows } else { &other_rows };
+                    if fighter_searching && has_matches[n] && !self.fighter_group_touched[n] {
+                        set_persistent_collapsing_open(ui, ("fighter_group", *key), true);
                     }
-                    if slot_count != crate::data::VANILLA_SLOT_COUNT as usize {
-                        label.push_str(&format!("  ({slot_count} skins)"));
-                    }
-                    let mut hover = format!("{slot_count} costume slot(s), base c{base:02}");
-                    if modded {
-                        hover.push_str("\nModded character (not in the vanilla roster)");
-                    }
-                    let response = ui.selectable_label(selected, &label).on_hover_text(hover);
-                    let clicked = response.clicked();
-                    response.context_menu(|ui| {
-                        editor_subsection_heading(
-                            ui,
-                            "Cached fighter data",
-                            "Scripts, edits, and live-preview data Visionary has remembered for this fighter during editing.",
-                        );
-                        if ui
-                            .button("Forget fighter")
-                            .on_hover_text(
-                                "Clears cached scripts, edits, and live effect previews. Source files stay on disk.",
-                            )
-                            .clicked()
-                        {
-                            forget_fighter = Some(fighter_name.clone());
-                            ui.close();
-                        }
-                    });
-                    if clicked && !selected {
-                        pick_character = Some(base_key);
-                    }
-                    // Characters made on this fighter, under it, each with its own costumes.
-                    let made: Vec<(crate::character::CharacterKey, String)> =
-                        crate::character::made_on(&fighter_name, &self.roster.project)
-                            .map(|entry| {
-                                let key = crate::character::CharacterKey::made(entry.key.clone());
-                                let range = key.costume_range(&self.roster.project).unwrap_or_default();
-                                (key, range)
-                            })
-                            .collect();
-                    for (key, range) in made {
-                        let selected = self.state.selected_fighter == Some(i)
-                            && active.as_ref() == Some(&key);
-                        let label = format!("    {}", self.character_name(&key));
-                        let counts = self.character_edit_counts(&key);
-                        let mut hover = format!("{name} {range}");
-                        if !counts.is_empty() {
-                            hover.push_str(&format!(
-                                "\n{} moves edited, {} with nodes",
-                                counts.game_moves, counts.node_graphs
-                            ));
-                        }
-                        let response = ui.selectable_label(selected, label).on_hover_text(hover);
-                        if response.clicked() && !selected {
-                            pick_character = Some(key.clone());
-                        }
-                        response.context_menu(|ui| {
-                            if ui.button("Edit as nodes").clicked() {
-                                open_on = Some((key.clone(), crate::character::CharacterPage::MoveNodes));
-                                ui.close();
+                    let title = if n == 0 {
+                        format!("In this project ({})", group.len())
+                    } else {
+                        format!("Everything else ({})", group.len())
+                    };
+                    let response = egui::CollapsingHeader::new(title)
+                        .id_salt(("fighter_group", *key))
+                        .default_open(*default_open)
+                        .show(ui, |ui| {
+                            for row in group {
+                                self.draw_fighter_row(ui, row, n == 0, &mut row_actions);
+                                // Characters made on this fighter, under it, each with its own costumes.
+                                if row.character.is_none() {
+                                    let made: Vec<(crate::character::CharacterKey, String)> =
+                                        crate::character::made_on(&row.name, &self.roster.project)
+                                            .map(|entry| {
+                                                let key = crate::character::CharacterKey::made(
+                                                    entry.key.clone(),
+                                                );
+                                                let range = key
+                                                    .costume_range(&self.roster.project)
+                                                    .unwrap_or_default();
+                                                (key, range)
+                                            })
+                                            .collect();
+                                    for (key, range) in made {
+                                        let selected = self.state.selected_fighter == Some(row.idx)
+                                            && active.as_ref() == Some(&key);
+                                        let label = format!("    {}", self.character_name(&key));
+                                        let counts = self.character_edit_counts(&key);
+                                        let mut hover = format!("{} {range}", row.label);
+                                        if !counts.is_empty() {
+                                            hover.push_str(&format!(
+                                                "\n{} moves edited, {} with nodes",
+                                                counts.game_moves, counts.node_graphs
+                                            ));
+                                        }
+                                        let response = ui
+                                            .selectable_label(selected, label)
+                                            .on_hover_text(hover);
+                                        if response.clicked() && !selected {
+                                            pick_character = Some(key.clone());
+                                        }
+                                        response.context_menu(|ui| {
+                                            if ui.button("Edit as nodes").clicked() {
+                                                open_on = Some((
+                                                    key.clone(),
+                                                    crate::character::CharacterPage::MoveNodes,
+                                                ));
+                                                ui.close();
+                                            }
+                                            if ui.button("Edit gimmicks").clicked() {
+                                                open_on = Some((
+                                                    key.clone(),
+                                                    crate::character::CharacterPage::Gimmicks,
+                                                ));
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                }
                             }
-                            if ui.button("Edit gimmicks").clicked() {
-                                open_on = Some((key.clone(), crate::character::CharacterPage::Gimmicks));
-                                ui.close();
+                            if n == 0 {
+                                if group.is_empty() && !fighter_searching {
+                                    ui.weak(
+                                        "No fighters yet — use Add fighter… or right-click one below.",
+                                    );
+                                }
+                                if ui
+                                    .small_button("Add fighter…")
+                                    .on_hover_text("Pick fighters that belong to this project")
+                                    .clicked()
+                                {
+                                    open_add_fighter = true;
+                                }
                             }
                         });
+                    if fighter_searching && response.header_response.clicked() {
+                        self.fighter_group_touched[n] = true;
                     }
                 }
                 if let Some(key) = pick_character {
@@ -9352,11 +11577,30 @@ impl VisionaryApp {
                     self.open_character(key, None, page);
                 }
             });
-        if let Some(fighter) = forget_fighter {
-            self.forget_fighter(&fighter);
+        if open_add_fighter {
+            self.add_fighter_popup = Some("Add fighters to this project".to_string());
+            self.add_fighter_search.clear();
+        }
+        for action in row_actions {
+            match action {
+                FighterRowAction::Select(i) => {
+                    if self.state.selected_fighter != Some(i) {
+                        let t = self.perf.start();
+                        self.select_fighter(i);
+                        self.perf.end("select_fighter", t);
+                    }
+                }
+                FighterRowAction::Forget(target) => forget_fighter = Some(target),
+                FighterRowAction::Add(i) => self.add_to_project(i),
+                FighterRowAction::Remove(i) => self.remove_from_project(i),
+            }
+        }
+        if let Some(target) = forget_fighter {
+            self.forget_fighter(&target);
         } else if restore_forgotten {
             self.restore_forgotten_fighters();
         }
+        self.draw_add_fighter_popup(ui.ctx());
 
         ui.separator();
         sidebar_section_heading(
@@ -9513,14 +11757,204 @@ impl VisionaryApp {
                     }
                 }
             });
+        if self.state.selected_fighter.is_some() {
+            self.draw_objects_list(ui, objects_height);
+        }
     }
 
-    /// The 3D character preview with its hitbox overlays, shared by both editor layouts.
+    /// The selected move's frame data, from the hitboxes as currently edited.
+    fn current_frame_data(&mut self) -> Option<crate::frame_data::FrameData> {
+        let move_entry = self.state.selected_move.as_ref()?;
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))?
+            .name
+            .clone();
+        let kind = crate::frame_data::MoveKind::of(&move_entry.name);
+        let roots: Vec<PathBuf> = self.all_roots().iter().map(|root| root.join("fighter")).collect();
+        let overrides = self
+            .acmd_src
+            .as_ref()
+            .filter(|index| index.has_fighter(&fighter))
+            .map(|index| index.param_overrides.clone())
+            .unwrap_or_default();
+        // Everything the params depend on, so a new data root, a reordered mod or an edited
+        // `params.rs` re-reads them instead of showing stale numbers.
+        let mut sorted_overrides: Vec<_> = overrides.iter().collect();
+        sorted_overrides.sort_by(|a, b| a.0.cmp(b.0));
+        let kind_key = format!("{kind:?}|{roots:?}|{sorted_overrides:?}");
+        let cached = self
+            .frame_params_cache
+            .as_ref()
+            .is_some_and(|(f, k, _)| *f == fighter && *k == kind_key);
+        if !cached {
+            let params = crate::frame_data::load_params(&roots, &fighter, kind, &overrides);
+            self.frame_params_cache = Some((fighter, kind_key, params));
+        }
+        let params = &self.frame_params_cache.as_ref()?.2;
+        let move_entry = self.state.selected_move.as_ref()?;
+        Some(crate::frame_data::compute(&crate::frame_data::Inputs {
+            motion: &move_entry.name,
+            hitboxes: &self.state.hitboxes,
+            script: &self.state.script,
+            animation_frames: self.state.total_frames,
+            cancel_frame: Some(move_entry.cancel_frame),
+            params,
+        }))
+    }
+
+    /// The scales the viewport draws the selected fighter at: what its frame callback sets, over
+    /// its `fighter_param` `scale` (or the moveset's `param_config` override of it).
+    fn viewport_scales(&mut self) -> ViewportScales {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|entry| entry.name.clone())
+        else {
+            return ViewportScales::default();
+        };
+        let roots: Vec<PathBuf> = self.all_roots().iter().map(|root| root.join("fighter")).collect();
+        let index = self.acmd_src.as_ref().filter(|index| index.has_fighter(&fighter));
+        let source = index.and_then(|index| {
+            let scales = index
+                .scales
+                .get(&fighter)
+                // A project that never names its fighter keeps its scripts under "".
+                .or_else(|| (index.scales.len() == 1).then(|| index.scales.values().next()).flatten())?;
+            Some((index.root.clone(), scales.clone()))
+        });
+        let override_scale = index.and_then(|index| index.param_scale);
+        let key = format!("{fighter}|{roots:?}|{source:?}|{override_scale:?}");
+        if let Some((cached, scales)) = &self.viewport_scales_cache {
+            if *cached == key {
+                return scales.clone();
+            }
+        }
+        let base = match override_scale {
+            Some(value) => ScaleValue {
+                value,
+                source: "the moveset's param_config override of fighter_param scale".to_string(),
+            },
+            None => match crate::frame_data::fighter_param_scale(&roots, &fighter) {
+                Some(value) => ScaleValue {
+                    value,
+                    source: "fighter_param.prc scale".to_string(),
+                },
+                None => ScaleValue {
+                    value: 1.0,
+                    source: "default (no fighter_param scale found)".to_string(),
+                },
+            },
+        };
+        let from_call = |call: Option<&crate::fighter_scale::ScaleCall>, root: &Path| {
+            call.map(|call| ScaleValue {
+                value: call.value,
+                source: format!(
+                    "{}:{}",
+                    call.file.strip_prefix(root).unwrap_or(&call.file).display(),
+                    call.line
+                ),
+            })
+        };
+        let (model, attack, grab) = match &source {
+            Some((root, scales)) => (
+                from_call(scales.model.as_ref(), root),
+                from_call(scales.attack.as_ref(), root),
+                from_call(scales.grab.as_ref(), root),
+            ),
+            None => (None, None, None),
+        };
+        let scales = ViewportScales {
+            model: model.unwrap_or_else(|| base.clone()),
+            attack: attack.unwrap_or_else(|| base.clone()),
+            grab: grab.unwrap_or(base),
+        };
+        self.viewport_scales_cache = Some((key, scales.clone()));
+        scales
+    }
+
+    /// One line of frame data above the collision list: what a moveset author checks after
+    /// every hitbox change. Each figure explains its own source on hover.
+    fn draw_frame_data_strip(&mut self, ui: &mut Ui) {
+        let Some(data) = self.current_frame_data() else {
+            return;
+        };
+        if data.startup.is_none() && data.faf.is_none() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let rate_note = if self.state.script.rate_spans().is_empty() {
+                ""
+            } else {
+                " FT_MOTION_RATE is applied, so these are game frames, not script frames."
+            };
+            match data.startup {
+                Some(startup) => {
+                    ui.label(egui::RichText::new(format!("Startup {startup}")).strong())
+                        .on_hover_text(format!(
+                            "First game frame a damaging hitbox is out.{rate_note}"
+                        ));
+                }
+                None => {
+                    ui.label(egui::RichText::new("No hitbox").weak())
+                        .on_hover_text("No damaging hitbox in this move's game script.");
+                }
+            }
+            if !data.active.is_empty() {
+                let windows = data
+                    .active
+                    .iter()
+                    .map(|(start, end)| {
+                        if start == end {
+                            start.to_string()
+                        } else {
+                            format!("{start}-{end}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(format!("Active {windows}"))
+                    .on_hover_text("Game frames any damaging hitbox is out, inclusive.");
+            }
+            if let Some((faf, source)) = &data.faf {
+                ui.label(format!("FAF {faf}"))
+                    .on_hover_text(format!("First actionable frame, from {}.", source.describe()));
+            }
+            if let Some((lag, source)) = &data.landing_lag {
+                ui.label(format!("Landing lag {lag}"))
+                    .on_hover_text(format!("From {}.", source.describe()));
+            }
+            if let Some(stun) = data.shieldstun {
+                let advantage = data
+                    .shield_advantage
+                    .map(|adv| format!(", {adv:+} on shield"))
+                    .unwrap_or_default();
+                let explain = match data.kind {
+                    Some(crate::frame_data::MoveKind::Aerial(_)) => {
+                        "For an aerial, the advantage assumes it lands right after hitting \
+                         (shieldstun − landing lag)."
+                    }
+                    _ => "Advantage is shieldstun − (FAF − startup): hitting on the first active frame.",
+                };
+                ui.label(format!("Shieldstun {stun}{advantage}")).on_hover_text(format!(
+                    "Shieldstun of the strongest hitbox out on the startup frame: \
+                     floor(damage × 0.8 × multiplier + 2), with the smash-attack or aerial \
+                     multiplier from common.prc where it applies. {explain}"
+                ));
+            }
+        });
+        ui.separator();
+    }
+
     /// The selected move's objects that are out at the current frame, loading any not seen yet.
     fn preview_objects(
         &mut self,
         frame: &eframe::Frame,
     ) -> Vec<crate::article_preview::PlacedObject> {
+        self.ensure_article_catalog();
         self.object_loads.retain(|rx| match rx.try_recv() {
             Ok((key, kind)) => {
                 self.object_pending.remove(&key);
@@ -9538,51 +11972,133 @@ impl VisionaryApp {
         else {
             return Vec::new();
         };
+        // When an article's own script is open from the Objects panel, display that article
+        // directly at the origin playing its open script's motion so its 3D model, skeleton,
+        // live editable hitboxes, and effects all appear in the viewport.
+        if let Some(open_name) = self.open_article_name(&fighter) {
+            let Some(mut kind) = self.object_kind(&fighter, &open_name) else {
+                return Vec::new();
+            };
+            if let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.clone()) {
+                kind = self.object_in_motion(&fighter, &open_name, kind, &move_name);
+            }
+            if self.state.total_frames == 0 {
+                let anim_frames = kind
+                    .anim
+                    .as_ref()
+                    .map(|a| a.final_frame_index.max(0.0).ceil() as u32 + 1)
+                    .unwrap_or(0);
+                let hitbox_end = self
+                    .state
+                    .hitboxes
+                    .iter()
+                    .map(|hb| hb.active_end)
+                    .filter(|&end| end < 9000)
+                    .max()
+                    .unwrap_or(0);
+                let effect_end = self
+                    .state
+                    .effects
+                    .iter()
+                    .map(|ec| ec.active_end)
+                    .filter(|&end| end < 9000)
+                    .max()
+                    .unwrap_or(0);
+                let life = if kind.flight.life.is_finite() && kind.flight.life > 0.0 {
+                    kind.flight.life.round() as u32
+                } else {
+                    0
+                };
+                self.state.total_frames = anim_frames
+                    .max(hitbox_end)
+                    .max(effect_end)
+                    .max(life)
+                    .max(60);
+            }
+            let scale = if kind.scale.is_finite() && kind.scale > 0.0 {
+                kind.scale
+            } else {
+                1.0
+            };
+            return vec![crate::article_preview::PlacedObject {
+                kind,
+                spawned: 1,
+                removed: None,
+                shot: None,
+                hand: None,
+                age: animation_frame_for_game_frame(self.state.current_frame),
+                placement: glam::Mat4::from_scale(glam::Vec3::splat(scale)),
+            }];
+        }
         let mut spawns: Vec<crate::article_preview::Spawn> = Vec::new();
         // Objects are spawned from any of the move's scripts; Fox draws his blaster in the
-        // expression script.
-        let mut events = self.state.script.to_article_spawns();
-        events.extend(self.state.expression_script.to_article_spawns());
-        events.extend(self.state.sound_script.to_article_spawns());
-        events.sort_by_key(|(frame, ..)| *frame);
-        let mut shots = self.state.script.to_article_shots();
-        shots.extend(self.state.expression_script.to_article_shots());
-        shots.sort_by_key(|(frame, _)| *frame);
-        let mut motions = Vec::new();
-        let mut shown = Vec::new();
-        for script in [
-            &self.state.script,
-            &self.state.expression_script,
-            &self.state.sound_script,
-        ] {
-            motions.extend(script.to_article_motions());
-            shown.extend(script.to_article_visibility());
-        }
-        motions.sort_by_key(|(frame, ..)| *frame);
-        shown.sort_by_key(|(frame, ..)| *frame);
-        for (spawned, symbol, created) in &events {
-            if !created {
-                continue;
+        // expression script. Use the typed ArticleCall stream so remove/shoot/visibility/motion
+        // honor ArticleTarget::All, First and Last, and resolve cloned/rewritten article IDs
+        // through the moveset catalog when available.
+        let mut owned_calls = self.state.script.to_article_calls();
+        owned_calls.extend(self.state.expression_script.to_article_calls());
+        owned_calls.extend(self.state.sound_script.to_article_calls());
+        let call_refs: Vec<(u32, &crate::data::ArticleCall)> = owned_calls
+            .iter()
+            .map(|(f, call)| (*f, call))
+            .collect();
+        let empty_locals: HashMap<String, String> = HashMap::new();
+        let mut plans = crate::article_preview::plan_spawns_from_calls(&call_refs, &|call| {
+            self.article_catalog
+                .as_ref()
+                .filter(|cache| cache.fighter == fighter.name)
+                .and_then(|cache| cache.catalog.resolve_id(&call.article, &empty_locals))
+                .map(|article| article.name.clone())
+                .or_else(|| crate::article_preview::article_name(&call.article))
+        });
+        // Also pick up project-defined wrapper spawn calls (e.g. Sceptile's
+        // `generate_sceptile_article(..., ArticleKind::LeafStorm)` and Shy Guy's
+        // `generate_stacked_article(..., ArticleKind::Pellet)`) and cached status-code spawns
+        // when the catalog is ready.
+        if let Some(cache) = self
+            .article_catalog
+            .as_ref()
+            .filter(|cache| cache.fighter == fighter.name)
+        {
+            for script in [
+                &self.state.script,
+                &self.state.expression_script,
+                &self.state.sound_script,
+            ] {
+                for plan in crate::article_preview::plan_wrapper_spawns_from_script(
+                    script,
+                    &cache.catalog,
+                    self.acmd_src.as_ref(),
+                ) {
+                    if !plans
+                        .iter()
+                        .any(|p| p.name == plan.name && p.spawned == plan.spawned)
+                    {
+                        plans.push(plan);
+                    }
+                }
             }
-            let spawned = *spawned;
-            // The first removal of this object after it appears.
-            let removed = events
-                .iter()
-                .find(|(at, other, created)| !created && other == symbol && *at > spawned)
-                .map(|(at, ..)| *at);
-            let Some(name) = crate::article_preview::article_name(symbol) else {
+            if let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.as_str()) {
+                for (status, plan) in &cache.status_spawns {
+                    if !crate::articles::view::status_matches_move(status, move_name) {
+                        continue;
+                    }
+                    if !plans
+                        .iter()
+                        .any(|p| p.name == plan.name && p.motion == plan.motion)
+                    {
+                        plans.push(plan.clone());
+                    }
+                }
+            }
+        }
+        for plan in plans {
+            let Some(mut kind) = self.object_kind(&fighter, &plan.name) else {
                 continue;
             };
-            let Some(mut kind) = self.object_kind(&fighter, &name) else {
-                continue;
-            };
-            let alive = |at: u32| at >= spawned && removed.is_none_or(|removed| at < removed);
             // The motion the move gives it (Samus's grab beam plays `catch`), in place of its own.
-            if let Some((_, _, motion)) = motions
-                .iter()
-                .find(|(at, other, _)| other == symbol && alive(*at))
-            {
-                kind = self.object_in_motion(&fighter, &name, kind, motion);
+            if let Some(motion) = &plan.motion {
+                kind = self.object_in_motion(&fighter, &plan.name, kind, motion);
             }
             // The hand the move's effect is on as the object appears: the flame in Sephiroth's
             // hand as his flare leaves it.
@@ -9592,30 +12108,18 @@ impl VisionaryApp {
                 .iter()
                 .filter(|effect| {
                     crate::article_preview::HANDS.contains(&effect.bone_name.as_str())
-                        && effect.active_start <= spawned
-                        && (effect.follows_bone || effect.active_end >= spawned)
+                        && effect.active_start <= plan.spawned
+                        && (effect.follows_bone || effect.active_end >= plan.spawned)
                 })
                 .max_by_key(|effect| effect.active_start)
                 .map(|effect| effect.bone_name.clone());
             spawns.push(crate::article_preview::Spawn {
                 kind,
                 hand,
-                shown: shown
-                    .iter()
-                    .filter(|(at, other, _)| other == symbol && alive(*at))
-                    .map(|(at, _, visible)| (*at, *visible))
-                    .collect(),
-                spawned,
-                removed,
-                // The first throw of it while it is out.
-                shot: shots
-                    .iter()
-                    .find(|(at, other)| {
-                        other == symbol
-                            && *at >= spawned
-                            && removed.is_none_or(|removed| *at < removed)
-                    })
-                    .map(|(at, _)| *at),
+                shown: plan.shown,
+                spawned: plan.spawned,
+                removed: plan.removed,
+                shot: plan.shot,
             });
         }
         // Objects the fighter's status code creates for a special, final smash, entrance, taunt
@@ -9753,6 +12257,7 @@ impl VisionaryApp {
                             crate::renderer::compute_bone_world_matrices(
                                 skel,
                                 kind.anim.as_deref(),
+                                None,
                                 &[],
                                 0.0,
                             )
@@ -9783,6 +12288,7 @@ impl VisionaryApp {
                         crate::renderer::compute_bone_world_matrices(
                             skel,
                             kind.anim.as_deref(),
+                            None,
                             &[],
                             0.0,
                         )
@@ -9812,6 +12318,7 @@ impl VisionaryApp {
                         crate::renderer::compute_bone_world_matrices(
                             skel,
                             kind.anim.as_deref(),
+                            None,
                             &[],
                             animation_frame,
                         )
@@ -9849,9 +12356,31 @@ impl VisionaryApp {
         if calls.is_empty() {
             return Vec::new();
         }
-        let Some(effect_dir) = self.current_eff_path.as_ref().and_then(|p| p.parent()) else {
+        let selected_fighter = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i));
+        let mut effect_dirs: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = self.current_eff_path.as_ref().and_then(|p| p.parent()) {
+            effect_dirs.push(dir.to_path_buf());
+        }
+        if let Some(fighter) = selected_fighter {
+            for dir in self.fighter_effect_dirs(fighter) {
+                if !effect_dirs.contains(&dir) {
+                    effect_dirs.push(dir);
+                }
+            }
+        }
+        if effect_dirs.is_empty() {
             return Vec::new();
-        };
+        }
+        let slot = selected_fighter
+            .map(|fighter| self.active_article_slot(fighter))
+            .or_else(|| {
+                self.current_eff_path
+                    .as_deref()
+                    .and_then(crate::preview_trail::slot_from_eff_path)
+            });
         let Some(wgpu_state) = frame.wgpu_render_state() else {
             return Vec::new();
         };
@@ -9875,11 +12404,26 @@ impl VisionaryApp {
             }
             let root = self.state.data_root.as_deref();
             let (Some(texture), Some(fade)) = (
-                crate::preview_trail::texture_path(effect_dir, root, &spec.texture),
-                crate::preview_trail::texture_path(effect_dir, root, &spec.fade),
+                crate::preview_trail::texture_path_for_slot(
+                    &effect_dirs,
+                    slot,
+                    root,
+                    &spec.texture,
+                ),
+                crate::preview_trail::texture_path_for_slot(&effect_dirs, slot, root, &spec.fade),
             ) else {
                 continue;
             };
+            let bone_a = if ec.bone_name.is_empty() {
+                spec.bone_a.as_str()
+            } else {
+                ec.bone_name.as_str()
+            };
+            let bone_b = ec
+                .trail_bone2
+                .as_deref()
+                .filter(|b| !b.is_empty())
+                .unwrap_or(spec.bone_b.as_str());
             // A sword sweeps a long way in one frame; the game's ribbon is a smooth curve, so the
             // blade is sampled finely and the ribbon smoothed between samples when drawn.
             let steps = ((newest - oldest) * 12.0).ceil().max(1.0) as usize;
@@ -9894,8 +12438,8 @@ impl VisionaryApp {
                             .map(|m| m.transform_point3(p))
                     };
                     Some([
-                        point(&spec.bone_a, spec.point_a)?,
-                        point(&spec.bone_b, spec.point_b)?,
+                        point(bone_a, spec.point_a)?,
+                        point(bone_b, spec.point_b)?,
                     ])
                 })
                 .collect();
@@ -9908,6 +12452,75 @@ impl VisionaryApp {
         out
     }
 
+    /// Candidate `effect/fighter/<fighter>` directories for `.eff` and `trail`/`trail_cNN`
+    /// lookup: linked moveset/project `romfs/` first, then the fighter's own `effect_dir`, then
+    /// the base data dump.
+    fn fighter_effect_dirs(&self, fighter: &crate::data::FighterEntry) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut push_unique = |dir: PathBuf| {
+            if dir.is_dir() && !out.contains(&dir) {
+                out.push(dir);
+            }
+        };
+        for romfs in self.acmd_romfs_roots() {
+            push_unique(romfs.join("effect").join("fighter").join(&fighter.name));
+        }
+        if let Some(dir) = &fighter.effect_dir {
+            push_unique(dir.clone());
+        }
+        if let Some(root) = &self.state.data_root {
+            push_unique(root.join("effect").join("fighter").join(&fighter.name));
+        }
+        out
+    }
+
+    /// The moveset's own `romfs/` directories: `<index root>/romfs`, `<index root>/../romfs`
+    /// (for crates nested under `plugin/` such as Shy Guy and Sceptile), and the open project's
+    /// `romfs/`.
+    fn acmd_romfs_roots(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut push_unique = |dir: PathBuf| {
+            if dir.is_dir() && !out.contains(&dir) {
+                out.push(dir);
+            }
+        };
+        if let Some(index) = self.acmd_src.as_ref() {
+            push_unique(index.root.join("romfs"));
+            if let Some(parent) = index.root.parent() {
+                push_unique(parent.join("romfs"));
+            }
+        }
+        if let Some(romfs) = self.project_romfs() {
+            push_unique(romfs);
+        }
+        out
+    }
+
+    /// The costume slot currently viewed for `fighter` (for slot characters like Latios c32,
+    /// Shy Guy c40, Sceptile c40).
+    fn active_article_slot(&self, fighter: &crate::data::FighterEntry) -> u8 {
+        if fighter.slots.is_empty() || fighter.slots.contains(&self.workspace_asset_slot) {
+            self.workspace_asset_slot
+        } else {
+            fighter.base_slot()
+        }
+    }
+
+    /// Short article name (`"lativolt"`, `"bulletseed"`, `"trampoline"`) when an article script
+    /// is open from the Objects panel.
+    fn open_article_name(&self, fighter: &crate::data::FighterEntry) -> Option<String> {
+        let agent = self.open_article.as_deref()?;
+        if let Some(article) = self
+            .article_catalog
+            .as_ref()
+            .and_then(|cache| cache.catalog.get(agent))
+        {
+            return Some(article.name.clone());
+        }
+        let prefix = format!("{}_", fighter.name);
+        Some(agent.strip_prefix(&prefix).unwrap_or(agent).to_owned())
+    }
+
     /// A fighter object's kind if it is loaded; otherwise starts loading it on a thread and
     /// returns `None` (the viewport repaints until it arrives).
     fn object_kind(
@@ -9915,7 +12528,8 @@ impl VisionaryApp {
         fighter: &crate::data::FighterEntry,
         name: &str,
     ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
-        let key = format!("{}/{name}", fighter.name);
+        let slot = self.active_article_slot(fighter);
+        let key = format!("{}/c{slot:02}/{name}", fighter.name);
         match self.object_kinds.get(&key) {
             Some(kind) => kind.clone(),
             None => {
@@ -9925,16 +12539,135 @@ impl VisionaryApp {
                     let labels = self.state.labels.clone();
                     let fighter = fighter.clone();
                     let name = name.to_owned();
+                    let catalog_article = self
+                        .article_catalog
+                        .as_ref()
+                        .filter(|cache| cache.fighter == fighter.name)
+                        .and_then(|cache| {
+                            let direct = format!("{}_{name}", fighter.name);
+                            cache
+                                .catalog
+                                .get(&direct)
+                                .or_else(|| {
+                                    cache.catalog.articles.iter().find(|a| a.name == name)
+                                })
+                                .cloned()
+                        });
+                    let agent = catalog_article
+                        .as_ref()
+                        .map(|a| a.agent.clone())
+                        .unwrap_or_else(|| format!("{}_{name}", fighter.name));
+                    let owner = catalog_article
+                        .as_ref()
+                        .map(|a| a.owner.clone())
+                        .unwrap_or_else(|| fighter.name.clone());
+                    let mut extra_scripts: Vec<String> = Vec::new();
+                    if let Some(article) = &catalog_article {
+                        // Prefer game_ scripts first so hitbox scripts win over effect-only ones.
+                        for want_game in [true, false] {
+                            for raw in &article.source_scripts {
+                                let is_game = raw.starts_with("game_");
+                                if is_game != want_game {
+                                    continue;
+                                }
+                                let stripped = raw
+                                    .strip_prefix("game_")
+                                    .or_else(|| raw.strip_prefix("effect_"))
+                                    .or_else(|| raw.strip_prefix("sound_"))
+                                    .or_else(|| raw.strip_prefix("expression_"))
+                                    .unwrap_or(raw);
+                                if !stripped.is_empty()
+                                    && !extra_scripts.iter().any(|s| s == stripped)
+                                {
+                                    extra_scripts.push(stripped.to_owned());
+                                }
+                            }
+                        }
+                    }
+                    let acmd_src = self.acmd_src.clone();
+                    let (param_layers, _) = self.article_param_layers(&owner);
+                    let param_overrides: Vec<crate::articles::params::ParamOverride> = self
+                        .article_catalog
+                        .as_ref()
+                        .filter(|cache| cache.fighter == fighter.name)
+                        .map(|cache| cache.overrides.clone())
+                        .unwrap_or_default();
+                    let mut extra_fighter_dirs: Vec<PathBuf> = Vec::new();
+                    for romfs in self.acmd_romfs_roots() {
+                        let dir = romfs.join("fighter").join(&owner);
+                        if dir.is_dir() && !extra_fighter_dirs.contains(&dir) {
+                            extra_fighter_dirs.push(dir);
+                        }
+                    }
+                    if !extra_fighter_dirs.contains(&fighter.fighter_dir) {
+                        extra_fighter_dirs.push(fighter.fighter_dir.clone());
+                    }
+                    for root in self.shared_roots().into_iter().rev() {
+                        let dir = root.join("fighter").join(&owner);
+                        if dir.is_dir() && !extra_fighter_dirs.contains(&dir) {
+                            extra_fighter_dirs.push(dir);
+                        }
+                    }
                     std::thread::spawn(move || {
-                        let agent = format!("{}_{name}", fighter.name);
-                        let kind = crate::article_preview::load_kind(
+                        let settings = acmd_src
+                            .as_ref()
+                            .map(|index| crate::articles::settings_for(index, &agent))
+                            .unwrap_or_default();
+                        let block_of = |block_short: &str| {
+                            let full = format!("param_{block_short}");
+                            let set = crate::articles::params::block_overrides(
+                                &param_overrides,
+                                &owner,
+                                &full,
+                            );
+                            crate::articles::params::param_block(
+                                &param_layers,
+                                &set,
+                                block_short,
+                                &labels,
+                            )
+                        };
+                        // Clones read the new owner's `param_<new_name>`, never the source's.
+                        let params = block_of(&name);
+                        let own_block = format!("param_{name}");
+                        let other_blocks: HashMap<String, crate::articles::params::ParamBlock> =
+                            settings
+                                .iter()
+                                .filter_map(|s| match &s.value {
+                                    crate::articles::settings::SettingValue::Param {
+                                        block,
+                                        ..
+                                    } if *block != own_block => Some(block.clone()),
+                                    _ => None,
+                                })
+                                .collect::<BTreeSet<String>>()
+                                .into_iter()
+                                .filter_map(|full| {
+                                    let short = full.strip_prefix("param_")?.to_owned();
+                                    Some((full, block_of(&short)))
+                                })
+                                .collect();
+                        let inputs = crate::article_preview::ResolvedArticleInputs {
+                            extra_fighter_dirs: &extra_fighter_dirs,
+                            extra_scripts: &extra_scripts,
+                            params: Some(&params),
+                            other_blocks: Some(&other_blocks),
+                            settings: &settings,
+                        };
+                        let kind = crate::article_preview::load_kind_resolved(
                             &fighter.fighter_dir,
                             &fighter.param_path,
-                            fighter.base_slot(),
+                            slot,
                             &name,
                             &labels,
+                            &inputs,
                             &|script| {
-                                crate::acmd::fetch_object_script(&fighter.name, &agent, script)
+                                crate::article_preview::script_from_index_or_dump(
+                                    acmd_src.as_ref(),
+                                    &agent,
+                                    script,
+                                    &|s| crate::acmd::fetch_object_script(&owner, &agent, s),
+                                )
                             },
                         );
                         let _ = tx.send((key, kind));
@@ -9945,8 +12678,17 @@ impl VisionaryApp {
         }
     }
 
+    /// Drop cached preview `ObjectKind`s for `fighter` so edits to settings, params, or scripts
+    /// take effect immediately in the 3D preview.
+    fn invalidate_object_kinds(&mut self, fighter: &str) {
+        let prefix = format!("{fighter}/");
+        self.object_kinds.retain(|k, _| !k.starts_with(&prefix));
+        self.object_pending.retain(|k| !k.starts_with(&prefix));
+    }
+
     /// `kind` playing `motion` (by name) when it has one, placed by that motion's own space;
-    /// `kind` unchanged otherwise.
+    /// also loads motion-specific hitboxes/effects from the moveset source when available (for
+    /// multi-use carriers like Shy Guy's trampoline). `kind` unchanged otherwise.
     fn object_in_motion(
         &mut self,
         fighter: &crate::data::FighterEntry,
@@ -9954,20 +12696,137 @@ impl VisionaryApp {
         kind: std::sync::Arc<crate::article_preview::ObjectKind>,
         motion: &str,
     ) -> std::sync::Arc<crate::article_preview::ObjectKind> {
-        let key = format!("{}/{name}@{motion}", fighter.name);
+        let slot = self.active_article_slot(fighter);
+        let key = format!("{}/c{slot:02}/{name}@{motion}", fighter.name);
         if let Some(Some(cached)) = self.object_kinds.get(&key) {
             return cached.clone();
         }
         let hash = hash40::hash40(motion).0;
-        let Some((_, anim)) = kind.motions.iter().find(|(m, _)| *m == hash) else {
+        let anim = kind
+            .motions
+            .iter()
+            .find(|(m, _)| *m == hash)
+            .map(|(_, a)| a.clone());
+        let agent = format!("{}_{name}", fighter.name);
+        let motion_body = self
+            .acmd_src
+            .as_ref()
+            .and_then(|index| index.script_source(&agent, motion))
+            .map(|p| p.body)
+            .filter(|b| !b.trim().is_empty());
+        let handler_fn = self.acmd_src.as_ref().and_then(|index| {
+            let fs = index.fighters.get(&agent)?;
+            fs.scripts
+                .get(&format!("game_{motion}"))
+                .or_else(|| fs.scripts.get(&format!("effect_{motion}")))
+                .map(|site| site.function.clone())
+        });
+        let motion_settings = self
+            .acmd_src
+            .as_ref()
+            .map(|index| {
+                let all = crate::articles::settings_for(index, &agent);
+                crate::article_preview::settings_for_motion(&all, motion, handler_fn.as_deref())
+            })
+            .unwrap_or_default();
+        if anim.is_none() && motion_body.is_none() && motion_settings.is_empty() {
             return kind;
+        }
+        let (hitboxes, effects) = match motion_body {
+            Some(body) => {
+                let hbs = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+                let effs = crate::article_preview::object_effects(&body);
+                (
+                    if hbs.is_empty() { kind.hitboxes.clone() } else { hbs },
+                    if effs.is_empty() { kind.effects.clone() } else { effs },
+                )
+            }
+            None => (kind.hitboxes.clone(), kind.effects.clone()),
         };
-        let playing = std::sync::Arc::new(crate::article_preview::ObjectKind {
-            anim: Some(anim.clone()),
-            synced: kind
-                .skel
+        // For multi-use carriers (e.g. Shy Guy's `bigpacman` hosting carrot, fryguy,
+        // carpet_camera, and autobomb_blast), recompute flight and scale from ONLY the
+        // matching status's settings so sibling statuses cannot flatten or overwrite the arc.
+        let (flight, scale) = if !motion_settings.is_empty() {
+            let (param_layers, _) = self.article_param_layers(&fighter.name);
+            let param_overrides: Vec<crate::articles::params::ParamOverride> = self
+                .article_catalog
+                .as_ref()
+                .filter(|cache| cache.fighter == fighter.name)
+                .map(|cache| cache.overrides.clone())
+                .unwrap_or_default();
+            let block_of = |block_short: &str| {
+                let full = format!("param_{block_short}");
+                let set = crate::articles::params::block_overrides(
+                    &param_overrides,
+                    &fighter.name,
+                    &full,
+                );
+                crate::articles::params::param_block(
+                    &param_layers,
+                    &set,
+                    block_short,
+                    &self.state.labels,
+                )
+            };
+            let params = block_of(name);
+            let base_flight = if params.present {
+                crate::article_preview::flight_from_param_block(&params)
+            } else {
+                crate::article_preview::flight_from_params(
+                    &fighter.param_path,
+                    name,
+                    &self.state.labels,
+                )
+            };
+            let own_block = format!("param_{name}");
+            let other_blocks: HashMap<String, crate::articles::params::ParamBlock> =
+                motion_settings
+                    .iter()
+                    .filter_map(|s| match &s.value {
+                        crate::articles::settings::SettingValue::Param { block, .. }
+                            if *block != own_block =>
+                        {
+                            Some(block.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<String>>()
+                    .into_iter()
+                    .filter_map(|full| {
+                        let short = full.strip_prefix("param_")?.to_owned();
+                        Some((full, block_of(&short)))
+                    })
+                    .collect();
+            let flight = if other_blocks.is_empty() {
+                base_flight.with_settings(&motion_settings, &params)
+            } else {
+                base_flight.with_settings_and_blocks(&motion_settings, &params, &other_blocks)
+            };
+            let scale = if other_blocks.is_empty() {
+                crate::article_preview::scale_from_settings(&motion_settings, &params)
+            } else {
+                crate::article_preview::scale_from_settings_and_blocks(
+                    &motion_settings,
+                    &params,
+                    &other_blocks,
+                )
+            };
+            (flight, scale)
+        } else {
+            (kind.flight, kind.scale)
+        };
+        let synced = anim.as_deref().is_some_and(|a| {
+            kind.skel
                 .as_deref()
-                .is_some_and(|skel| crate::article_preview::plays_in_fighter_space(skel, anim)),
+                .is_some_and(|skel| crate::article_preview::plays_in_fighter_space(skel, a))
+        });
+        let playing = std::sync::Arc::new(crate::article_preview::ObjectKind {
+            anim: anim.or_else(|| kind.anim.clone()),
+            hitboxes,
+            effects,
+            flight,
+            scale,
+            synced,
             ..(*kind).clone()
         });
         self.object_kinds.insert(key, Some(playing.clone()));
@@ -10034,21 +12893,46 @@ impl VisionaryApp {
         Some((name, dir))
     }
 
-    /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
-    /// training stage's usual partner, or the fighter itself when Mario is not installed.
+    /// The opponent a grab or throw holds, posed for the open move: the fighter and costume
+    /// picked in the viewport toolbar, else Mario, as the training stage's usual partner, or the
+    /// fighter itself when Mario is not installed.
     fn preview_opponent_kind(
         &mut self,
     ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
-        let motion = self
-            .state
-            .selected_move
-            .as_ref()
-            .and_then(|m| crate::preview_opponent::victim_motion(&m.name))?;
+        use crate::preview_opponent::{load, load_animated, victim_motion};
+        // The viewport toolbar's "Thrown fighter" toggle shows or hides the opponent.
+        if !self.thrown_victim.enabled {
+            return None;
+        }
+        // A throw with a fighter picked there plays that costume's thrown animation.
+        if let Some((model_dir, anim)) = self.picked_thrown_animation() {
+            let key = format!("opponent/{}/{}", model_dir.display(), anim.display());
+            if let Some(kind) = self.cached_object_kind(key, || load_animated(&model_dir, &anim)) {
+                return Some(kind);
+            }
+        }
+        let motion = victim_motion(&self.state.selected_move.as_ref()?.name)?;
+        // Grabs (and throws the picker found no thrown motion for) hold the picked costume too,
+        // so the fighter doesn't swap between grab and throw.
+        let picked_costume = self
+            .victim_cache()
+            .filter(|cache| !cache.model_files.is_empty())
+            .map(|cache| (cache.model_dir.clone(), cache.motion_dir.clone()));
+        if let Some((model_dir, motion_dir)) = picked_costume {
+            let key = format!("opponent/{}/{motion}", model_dir.display());
+            if let Some(kind) =
+                self.cached_object_kind(key, || load(&model_dir, &motion_dir, motion))
+            {
+                return Some(kind);
+            }
+        }
+        let picked = &self.thrown_victim.fighter;
         let opponent = self
             .state
             .fighters
             .iter()
-            .find(|f| f.name == "mario")
+            .find(|f| f.name == *picked && f.custom_name.is_none())
+            .or_else(|| self.state.fighters.iter().find(|f| f.name == "mario"))
             .or_else(|| {
                 self.state
                     .selected_fighter
@@ -10056,24 +12940,41 @@ impl VisionaryApp {
             })?
             .clone();
         let key = format!("opponent/{}/{motion}", opponent.name);
+        self.cached_object_kind(key, || {
+            load(&opponent.model_dir, &opponent.motion_dir, motion)
+        })
+    }
+
+    /// The object kind cached under `key`, loading it the first time. A failed load is cached
+    /// too, so it is not retried every frame.
+    fn cached_object_kind(
+        &mut self,
+        key: String,
+        load: impl FnOnce() -> Option<crate::article_preview::ObjectKind>,
+    ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
         self.object_kinds
             .entry(key)
-            .or_insert_with(|| {
-                crate::preview_opponent::load(&opponent.model_dir, &opponent.motion_dir, motion)
-                    .map(std::sync::Arc::new)
-            })
+            .or_insert_with(|| load().map(std::sync::Arc::new))
             .clone()
     }
 
     /// Effect sets out at the playhead, placed on their bones, for the game-shader preview.
     /// The path the 3D preview draws the effect editor's open file under: the selected
-    /// fighter's own effect path when the editor has that fighter's file open, so the move's
+    /// fighter's own effect path when the editor has that same file open, so the move's
     /// effects pick up the edits, otherwise the file itself.
+    ///
+    /// Same file, not just same fighter: with Pac-Man's `ef_pacman.eff` as the fighter's and
+    /// Shy Guy's `ef_pacman_c40.eff` open in the editor, drawing the fighter's path showed the
+    /// wrong file, where none of Shy Guy's own effects exist.
     fn effect_editor_draw_path(&self) -> Option<(String, PathBuf)> {
         let rel = self.eff_editor.loaded_rel()?;
         let owner = self.eff_owner(&rel);
+        let same_file = |own: &Path| {
+            crate::mod_project::eff_game_rel(own, Some(self.eff_editor.export_root()))
+                .eq_ignore_ascii_case(&rel)
+        };
         let path = match (&self.current_eff_path, self.active_key()) {
-            (Some(own), Some(active)) if active.as_str() == owner => own.clone(),
+            (Some(own), Some(active)) if active.as_str() == owner && same_file(own) => own.clone(),
             _ => self.eff_editor.loaded_path()?.to_path_buf(),
         };
         Some((owner, path))
@@ -10409,14 +13310,26 @@ impl VisionaryApp {
         egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
     }
 
-    /// The effect files a move can draw from: the fighter's own, then the shared one.
+    /// The effect files a move can draw from: the fighter's own, then the shared one. The
+    /// fighter's own is the one the Effects page has open for it when it has one, so a move
+    /// plays the effects being edited, from whichever of the fighter's files they are in.
     fn preview_effect_files(&self) -> Vec<std::path::PathBuf> {
         let common = self
             .state
             .data_root
             .as_ref()
             .map(|root| root.join("effect/system/common/ef_common.eff"));
-        [self.current_eff_path.clone(), common]
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.as_str());
+        let own = self
+            .effect_editor_draw_path()
+            .filter(|(fighter, _)| Some(fighter.as_str()) == selected)
+            .map(|(_, path)| path)
+            .or_else(|| self.current_eff_path.clone());
+        [own, common]
             .into_iter()
             .flatten()
             .collect()
@@ -10444,9 +13357,20 @@ impl VisionaryApp {
                 .borrow_mut()
                 .entry(game_frame)
                 .or_insert_with(|| {
-                    std::rc::Rc::new(
-                        rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame)),
-                    )
+                    if self.open_article.is_some() {
+                        let map = if let Some(object) = objects.first() {
+                            let mut probe = object.clone();
+                            probe.age = animation_frame_for_game_frame(game_frame);
+                            crate::article_preview::object_bones(&probe)
+                        } else {
+                            HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)])
+                        };
+                        std::rc::Rc::new(map)
+                    } else {
+                        std::rc::Rc::new(
+                            rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame)),
+                        )
+                    }
                 })
                 .clone()
         };
@@ -10557,8 +13481,9 @@ impl VisionaryApp {
             }
         }
         // Objects' own effects, on the object's bones at each age. Many projectiles have no
-        // mesh and these are all the game shows of them.
-        for object in objects {
+        // mesh and these are all the game shows of them. Skip when an article's own script is
+        // open, because `self.state.effects` above already renders its live editable effects.
+        for object in objects.iter().filter(|_| self.open_article.is_none()) {
             let object_frame = object.age.floor() as u32 + 1;
             let object_at = |age_frame: u32| {
                 let at = object.spawned + age_frame.saturating_sub(1);
@@ -10682,8 +13607,13 @@ impl VisionaryApp {
     /// The Effects page's switch between the selected effect alone and a move that plays it,
     /// over the top of the view.
     fn draw_effect_view_switch(&mut self, ui: &mut Ui, rect: egui::Rect, alone: bool) {
+        // Beside or under the stage picker, which sits under the viewport toolbar.
+        let under_toolbar = self
+            .viewport_toolbar_rect
+            .map_or(0.0, |toolbar| toolbar.bottom() + 6.0 - (rect.top() + 8.0));
+        let at = effect_view_switch_offset(rect.width()) + egui::vec2(0.0, under_toolbar);
         egui::Area::new(egui::Id::unique("effect_view_switch"))
-            .fixed_pos(rect.left_top() + effect_view_switch_offset(rect.width()))
+            .fixed_pos(rect.left_top() + at)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -10712,7 +13642,7 @@ impl VisionaryApp {
         crate::preview_stage::stage_shift(spot, &self.preview_ledges.1)
     }
 
-    /// The stage picker over the preview's top-left corner.
+    /// The stage picker at the preview's top-left, under the viewport toolbar.
     fn draw_stage_picker(&mut self, ui: &mut Ui, rect: egui::Rect) {
         let root = self.state.data_root.clone();
         if self.preview_stages.0 != root {
@@ -10737,8 +13667,12 @@ impl VisionaryApp {
             .map(crate::preview_stage::label)
             .unwrap_or_else(|| "No stage".to_owned());
         let before = self.preview_stage.clone();
+        // Under the viewport toolbar (last frame's rect), which holds the same corner.
+        let top = self
+            .viewport_toolbar_rect
+            .map_or(rect.top() + 8.0, |toolbar| toolbar.bottom() + 6.0);
         egui::Area::new(egui::Id::unique("preview_stage_picker"))
-            .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
+            .fixed_pos(egui::pos2(rect.left() + 8.0, top))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::ComboBox::from_id_salt("preview_stage_combo")
@@ -10795,9 +13729,14 @@ impl VisionaryApp {
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
             // Camera controls — apply to render state
+            let viewport_scales = self.viewport_scales();
             if let Some(wgpu_state) = frame.wgpu_render_state() {
                 let mut renderer = wgpu_state.renderer.write();
                 if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                    // Before the overlay reads bone matrices below, so both see one setting.
+                    rs.set_helper_bones(self.helper_bones);
+                    rs.set_model_scale(viewport_scales.model.value);
+                    rs.apply_preferences(&wgpu_state.queue, &self.preferences);
                     // Keep the fighter in view as the move carries it: follow its root over
                     // the ground, not up and down, so a jump still reads as height.
                     let bones = rs.bone_world_matrices_at(animation_frame_for_game_frame(
@@ -10817,35 +13756,80 @@ impl VisionaryApp {
                     } else {
                         0.0
                     };
-                    rs.camera.follow = glam::Vec3::new(root.x, -lift, root.z);
-                    if self.eff_editor.open
-                        && self.eff_editor.view == crate::eff_editor::EffectView::Alone
-                        && self.eff_editor.selected_entry_name().is_some()
+                    let home = self.preferences.home_camera();
+                    if !self.camera_home_applied {
+                        rs.camera = crate::renderer::Camera::from_view(&home);
+                        self.camera_home_applied = true;
+                    }
+                    // A camera animation places the camera in the world itself.
+                    let animated = self.camera_anim_on && self.camera_anim.is_some();
+                    rs.camera.follow = if animated
+                        || self.open_article.is_some()
+                        || (self.eff_editor.open
+                            && self.eff_editor.view == crate::eff_editor::EffectView::Alone
+                            && self.eff_editor.selected_entry_name().is_some())
                     {
-                        rs.camera.follow = glam::Vec3::ZERO;
-                    }
-                    // Left drag: pan in camera plane (left/right + up/down)
-                    if response.dragged_by(egui::PointerButton::Primary) {
-                        let delta = response.drag_delta();
-                        rs.camera.pan(delta.x, delta.y);
-                        ctx.request_repaint();
-                    }
-                    // Right or middle drag: turn around the fighter. Double-click: side view.
-                    if response.dragged_by(egui::PointerButton::Secondary)
-                        || response.dragged_by(egui::PointerButton::Middle)
-                    {
-                        let delta = response.drag_delta();
-                        rs.camera.orbit(delta.x, delta.y);
-                        ctx.request_repaint();
-                    }
+                        glam::Vec3::ZERO
+                    } else {
+                        glam::Vec3::new(root.x, -lift, root.z)
+                    };
+                    // SSBH Studio's controls, in the scheme picked in Settings.
+                    let controls = crate::viewport_navigation::Controls {
+                        scheme: self.preferences.navigation_scheme,
+                        emulate_three_button_mouse: self.preferences.emulate_three_button_mouse,
+                    };
+                    let keyboard = response.hovered() && !ctx.egui_wants_keyboard_input();
+                    let nav_drag = &mut self.nav_drag;
+                    // A copy, not a closure: the drag checks on `response` read the input
+                    // themselves, and doing that inside `ui.input` can deadlock.
+                    let input = ui.input(|input| input.clone());
+                    let (mut moved, frame_request) = crate::viewport_navigation::navigate(
+                        &mut rs.camera,
+                        &response,
+                        &input,
+                        controls,
+                        h,
+                        nav_drag,
+                        keyboard,
+                    );
+                    // Double-click: back to the default angle, keeping the zoom.
                     if response.double_clicked() {
-                        rs.camera.reset_turn();
-                        ctx.request_repaint();
+                        rs.camera.reset_turn(&home);
+                        moved = true;
                     }
-                    // Scroll: zoom
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll != 0.0 && response.hovered() {
-                        rs.camera.zoom(scroll * 0.05);
+                    if let Some(request) = frame_request {
+                        let sphere = match request {
+                            crate::viewport_navigation::FrameRequest::Selection => {
+                                self.selection_sphere.or(self.fighter_sphere)
+                            }
+                            crate::viewport_navigation::FrameRequest::All => self.fighter_sphere,
+                        };
+                        let (center, radius) = sphere.unwrap_or((
+                            rs.camera.follow + glam::Vec3::new(0.0, 8.0, 0.0),
+                            12.0,
+                        ));
+                        rs.camera.frame(center, radius);
+                        moved = true;
+                    }
+                    if let Some((_, anim)) = self.camera_anim.as_ref().filter(|_| animated) {
+                        // Moving the camera by hand holds the animation off for that frame,
+                        // so a drag starts from where the animation had it.
+                        if !moved {
+                            let anim_frame =
+                                animation_frame_for_game_frame(self.state.current_frame)
+                                    .clamp(0.0, anim.final_frame_index.max(0.0));
+                            if let Some(values) = ssbh_wgpu::animation::camera::animate_camera(
+                                anim,
+                                anim_frame,
+                                rs.camera.fov_y,
+                                rs.camera.near,
+                                rs.camera.far,
+                            ) {
+                                rs.camera.apply_animation(&values);
+                            }
+                        }
+                    }
+                    if moved {
                         ctx.request_repaint();
                     }
                 }
@@ -10907,6 +13891,7 @@ impl VisionaryApp {
                     },
                     hide_body: alone
                         || no_fighter
+                        || self.open_article.is_some()
                         || objects
                             .iter()
                             .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
@@ -10948,7 +13933,16 @@ impl VisionaryApp {
                     // `last_frame` is one paint behind. Evaluate the requested frame
                     // directly to keep moving bones/root motion and grabboxes synchronized.
                     let t = self.perf.start();
-                    let bone_matrices = rs.bone_world_matrices_at(animation_frame);
+                    let bone_matrices = if self.open_article.is_some() {
+                        objects
+                            .first()
+                            .map(crate::article_preview::object_bones)
+                            .unwrap_or_else(|| {
+                                HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)])
+                            })
+                    } else {
+                        rs.bone_world_matrices_at(animation_frame)
+                    };
                     self.perf.end("bone_matrices", t);
                     // Keep a positions map for debug display
                     let bone_positions: std::collections::HashMap<String, glam::Vec3> =
@@ -10956,6 +13950,9 @@ impl VisionaryApp {
                             .iter()
                             .map(|(k, m)| (k.clone(), m.col(3).truncate()))
                             .collect();
+                    // What Home frames, and Period when no hitbox is selected.
+                    self.fighter_sphere = bounding_sphere(bone_positions.values().copied());
+                    self.selection_sphere = None;
 
                     if self.show_debug {
                         let mut names: Vec<&String> = bone_positions.keys().collect();
@@ -11001,6 +13998,7 @@ impl VisionaryApp {
                     // Parameter-defined hurtboxes sit underneath editable collision geometry,
                     // so attacks, grabs, wind areas, and effect markers remain easy to select.
                     if self.show_hurtboxes
+                        && self.open_article.is_none()
                         && self.hurtbox_volumes.iter().any(|volume| {
                             matches!(volume.shape, crate::data::HurtboxShape::Capsule)
                         })
@@ -11096,10 +14094,18 @@ impl VisionaryApp {
                         }
                     }
 
-                    // Each object's own hitboxes, on the object's bones.
-                    for object in &objects {
+                    // Each object's own hitboxes, on the object's bones. When an article script
+                    // is open directly, `self.state.hitboxes` below draws its live editable
+                    // hitboxes on the article's bones instead.
+                    for object in objects.iter().filter(|_| self.open_article.is_none()) {
                         let bones = crate::article_preview::object_bones(object);
-                        let (_, facing, _) = object.placement.to_scale_rotation_translation();
+                        let (obj_scale, facing, _) =
+                            object.placement.to_scale_rotation_translation();
+                        let scale_factor = if obj_scale.x.is_finite() && obj_scale.x > 0.0 {
+                            obj_scale.x
+                        } else {
+                            1.0
+                        };
                         let object_frame = object.age.floor() as u32 + 1;
                         let mut label_at = None;
                         for hb in &object.kind.hitboxes {
@@ -11120,7 +14126,8 @@ impl VisionaryApp {
                             let bone = if is_system_bone(&hb.bone_name)
                                 || !bones.contains_key(&hb.bone_name)
                             {
-                                glam::Mat4::from_rotation_translation(
+                                glam::Mat4::from_scale_rotation_translation(
+                                    glam::Vec3::splat(scale_factor),
                                     facing,
                                     bone.col(3).truncate(),
                                 )
@@ -11144,7 +14151,7 @@ impl VisionaryApp {
                                 ProjectedCapsule {
                                     world_start: start,
                                     world_end: end,
-                                    world_radius: hb.size,
+                                    world_radius: hb.size * scale_factor,
                                     stroke,
                                     fill,
                                 },
@@ -11307,23 +14314,38 @@ impl VisionaryApp {
                             .copied()
                             .unwrap_or(glam::Mat4::IDENTITY);
 
-                        let bone_mat = if is_system_bone(&hb.bone_name) {
-                            // Keep only the translation — offsets are world-space
-                            glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                        } else {
-                            bone_mat
-                        };
-
-                        // Transform offset from bone local space to world space
-                        let offset = glam::Vec3::new(hb.offset_x, hb.offset_y, hb.offset_z);
-                        let world_pos = bone_mat.transform_point3(offset);
-
-                        let capsule_world_end = hb.capsule_end.map(|[ex, ey, ez]| {
-                            bone_mat.transform_point3(glam::Vec3::new(ex, ey, ez))
-                        });
+                        let (hitbox_model_scale, hitbox_collision_scale) =
+                            if self.open_article.is_some() {
+                                let s = objects
+                                    .first()
+                                    .map(|o| {
+                                        if o.kind.scale.is_finite() && o.kind.scale > 0.0 {
+                                            o.kind.scale
+                                        } else {
+                                            1.0
+                                        }
+                                    })
+                                    .unwrap_or(1.0);
+                                (s, s)
+                            } else {
+                                (rs.model_scale(), viewport_scales.collision(hb.category))
+                            };
+                        let (world_pos, capsule_world_end, world_radius) =
+                            collision_world_placement(
+                                bone_mat,
+                                hb,
+                                hitbox_model_scale,
+                                hitbox_collision_scale,
+                            );
                         let launch_center = capsule_world_end
                             .map(|world_end| (world_pos + world_end) * 0.5)
                             .unwrap_or(world_pos);
+                        if selected {
+                            let half_length = capsule_world_end
+                                .map_or(0.0, |world_end| (world_end - world_pos).length() * 0.5);
+                            self.selection_sphere =
+                                Some((launch_center, world_radius + half_length));
+                        }
 
                         let label_pos = draw_projected_capsule(
                             ui.painter(),
@@ -11332,15 +14354,15 @@ impl VisionaryApp {
                             ProjectedCapsule {
                                 world_start: world_pos,
                                 world_end: capsule_world_end,
-                                world_radius: hb.size,
+                                world_radius,
                                 stroke,
                                 fill,
                             },
                         );
                         if let Some(label_pos) = label_pos {
                             let label_radius = rs
-                                .world_radius_to_screen(world_pos, hb.size, rect)
-                                .unwrap_or(hb.size * 4.0)
+                                .world_radius_to_screen(world_pos, world_radius, rect)
+                                .unwrap_or(world_radius * 4.0)
                                 .max(4.0);
                             ui.painter().text(
                                 label_pos + egui::vec2(label_radius + 2.0, 0.0),
@@ -11353,7 +14375,7 @@ impl VisionaryApp {
 
                         if hb.category == 0 {
                             let (direction, _) = hitbox_launch_direction(hb.angle);
-                            let launch_end = launch_center + direction * hb.size;
+                            let launch_end = launch_center + direction * world_radius;
                             if let (Some(screen_center), Some(screen_end)) = (
                                 rs.world_to_screen(launch_center, rect),
                                 rs.world_to_screen(launch_end, rect),
@@ -11370,7 +14392,9 @@ impl VisionaryApp {
                     // timeline click.  The draw loop above deliberately stays paint-only;
                     // this small second pass uses the same bone convention to hit-test the
                     // visible center of each active collision without changing export data.
-                    let click_pos = viewport_pick_position(&response);
+                    let toolbar_rect = self.viewport_toolbar_rect;
+                    let click_pos = viewport_pick_position(&response)
+                        .filter(|p| !toolbar_rect.is_some_and(|r| r.contains(*p)));
                     let mut best_hitbox_pick: Option<(usize, f32)> = None;
                     if let Some(cp) = click_pos {
                         for (i, hb) in self.state.hitboxes.iter().enumerate() {
@@ -11412,25 +14436,14 @@ impl VisionaryApp {
                                 else {
                                     continue;
                                 };
-                                let bone_mat = if is_system_bone(&hb.bone_name) {
-                                    glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                                } else {
-                                    bone_mat
-                                };
-                                let start = bone_mat.transform_point3(glam::Vec3::new(
-                                    hb.offset_x,
-                                    hb.offset_y,
-                                    hb.offset_z,
-                                ));
-                                let center = hb
-                                    .capsule_end
-                                    .map(|[x, y, z]| {
-                                        (start
-                                            + bone_mat.transform_point3(glam::Vec3::new(x, y, z)))
-                                            * 0.5
-                                    })
-                                    .unwrap_or(start);
-                                (center, hb.size.max(0.5))
+                                let (start, end, radius) = collision_world_placement(
+                                    bone_mat,
+                                    hb,
+                                    rs.model_scale(),
+                                    viewport_scales.collision(hb.category),
+                                );
+                                let center = end.map(|end| (start + end) * 0.5).unwrap_or(start);
+                                (center, radius.max(0.5))
                             };
                             let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
                                 continue;
@@ -11506,6 +14519,30 @@ impl VisionaryApp {
                         }
                         if ec.disabled {
                             continue;
+                        }
+                        // A trail is a swept ribbon between two edges, not a point.
+                        if effect_call_is_trail(ec) {
+                            if let Some(geometry) = crate::trail_preview::trail_geometry(ec) {
+                                let t = self.perf.start();
+                                let picked = draw_trail_preview(
+                                    ui.painter(),
+                                    rs,
+                                    rect,
+                                    &bone_matrices,
+                                    ec,
+                                    &geometry,
+                                    frame_num,
+                                    self.state.selected_effect_call == Some(i),
+                                    click_pos,
+                                );
+                                self.perf.end("trail_preview", t);
+                                if let Some(d) = picked {
+                                    if best_pick.map(|(_, bd)| d < bd).unwrap_or(true) {
+                                        best_pick = Some((i, d));
+                                    }
+                                }
+                                continue;
+                            }
                         }
                         let active = frame_num >= ec.active_start && frame_num <= ec.active_end;
                         if !active && self.state.selected_effect_call != Some(i) {
@@ -11591,6 +14628,8 @@ impl VisionaryApp {
                     }
                 }
             }
+            self.draw_viewport_toolbar(ui, rect, frame);
+            self.draw_orientation_widget(ui, rect, frame);
         }
     }
 
@@ -11787,6 +14826,19 @@ impl VisionaryApp {
                 .on_hover_text("Select a move to build it with nodes.");
             return;
         };
+        if let Some(agent) = &self.open_article {
+            // Graphs, the edit log and the export are all keyed by fighter; an object's script
+            // saved there would land on the fighter's move of the same name.
+            ui.weak(format!(
+                "{agent} is an object's script, and Move nodes don't edit object scripts yet. {}",
+                if self.open_article_in_source {
+                    "Edit it in the Classic editor; syncing saves its changes into the linked source."
+                } else {
+                    self.unsaveable_object_script_words()
+                }
+            ));
+            return;
+        }
         if self.fetching_acmd {
             ui.weak("Loading move scripts…");
             return;
@@ -12169,7 +15221,7 @@ impl VisionaryApp {
                 ui.menu_button("Move", |ui| {
                     let btn_text = if self.fetching_acmd {
                         "Loading…"
-                    } else if self.state.acmd_source.is_empty() {
+                    } else if self.state.acmd_source.is_none() {
                         "Retry source"
                     } else {
                         "Reload source"
@@ -12183,7 +15235,9 @@ impl VisionaryApp {
                         )
                         .clicked()
                     {
-                        self.fetch_acmd();
+                        if !self.leave_gate(|| PendingLeave::ReloadSource) {
+                            self.fetch_acmd();
+                        }
                         ui.close();
                     }
                     let has_capture = self
@@ -12400,6 +15454,7 @@ impl VisionaryApp {
         }
 
         if matches!(self.primary_tab, PrimaryEditorTab::Collisions) {
+            self.draw_frame_data_strip(ui);
             ui.vertical(|ui| {
                 let master_height =
                     hitbox_selector_height(self.state.hitboxes.len(), ui.available_height());
@@ -12415,7 +15470,7 @@ impl VisionaryApp {
                         // the first person to open one concluded the editor could not edit its sounds,
                         // because nothing on screen said where they were. Say it.
                         if self.state.hitboxes.is_empty() && self.state.selected_move.is_some() {
-                            let fetched = !self.state.acmd_source.is_empty();
+                            let fetched = !self.state.acmd_source.is_none();
                             if !fetched {
                                 ui.weak("Nothing loaded yet")
                                     .on_hover_text("Use Move › Reload source.");
@@ -13301,6 +16356,7 @@ impl VisionaryApp {
             self.draw_work_module_inc_int_section(ui);
             self.draw_work_module_set_section(ui);
             self.draw_motion_rate_section(ui);
+            self.draw_article_calls_section(ui);
         }
         if matches!(self.primary_tab, PrimaryEditorTab::AudioFeedback) {
             self.draw_sound_section(ui);
@@ -13598,8 +16654,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if structural {
             self.state.status = if structural_live_supported {
                 "Move updated.".into()
@@ -14262,8 +17317,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(frame_key, frame_rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 || partial_unrepresentable > 0 || frame_unrepresentable > 0 {
             if unrepresentable > 0 {
                 self.note_live_replay_capture_limit("expression");
@@ -15896,6 +18950,731 @@ impl VisionaryApp {
     /// Edits go straight into `state.script`. Hurtbox statements are carried through the script
     /// rather than rebuilt from a list the way collisions are, so the script is the model here
     /// and there is no second copy to keep in step.
+    /// Whether the selected move throws: a `throw_*` motion (or a special that throws) on a
+    /// fighter whose skeleton has the `throw` bone a thrown fighter is carried by.
+    fn selected_move_is_throw(&self) -> bool {
+        let Some(name) = self.state.selected_move.as_ref().map(|m| m.name.as_str()) else {
+            return false;
+        };
+        name.contains("throw")
+            && !name.contains("thrown")
+            // Throwing an item is not throwing a fighter.
+            && !name.starts_with("item_")
+            && self.bone_names.iter().any(|bone| bone == "throw")
+    }
+
+    /// Fighters that can be shown being thrown: the indexed ones, plus every fighter in the
+    /// vanilla dump, since a mod's data root often holds only the fighter it changes.
+    fn victim_fighters(&mut self) -> &[VictimFighter] {
+        let key = self.state.fighters.len();
+        if self.victim_fighters.as_ref().map(|(k, _)| *k) != Some(key) {
+            let mut fighters: Vec<VictimFighter> = self
+                .state
+                .fighters
+                .iter()
+                .filter(|entry| entry.custom_name.is_none())
+                .map(|entry| VictimFighter {
+                    name: entry.name.clone(),
+                    display: entry.display_name.clone(),
+                    fighter_dir: entry.fighter_dir.clone(),
+                    slots: entry.slots.clone(),
+                })
+                .collect();
+            if let Some(vanilla) = load_config_path(VANILLA_ROOT_CONFIG_KEY) {
+                for dir in crate::costume_files::sibling_dirs(&vanilla.join("fighter")) {
+                    let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if fighters.iter().any(|f| f.name == name) {
+                        continue;
+                    }
+                    let slots: Vec<u8> = crate::data::part_costume_slots(&dir.join("model").join("body"))
+                        .into_iter()
+                        .filter(|slot| dir.join("model").join("body").join(format!("c{slot:02}")).is_dir())
+                        .collect();
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    fighters.push(VictimFighter {
+                        display: crate::data::fighter_display_name(&name),
+                        name,
+                        fighter_dir: dir,
+                        slots,
+                    });
+                }
+            }
+            fighters.sort_by(|a, b| a.display.cmp(&b.display));
+            self.victim_fighters = Some((key, fighters));
+        }
+        self.victim_fighters.as_ref().map_or(&[], |(_, list)| list.as_slice())
+    }
+
+    fn victim_fighter(&mut self) -> Option<VictimFighter> {
+        let wanted = self.thrown_victim.fighter.clone();
+        self.victim_fighters()
+            .iter()
+            .find(|fighter| fighter.name == wanted)
+            .cloned()
+    }
+
+    /// The victim costume's model and thrown motions, read again only when the costume changes.
+    fn victim_cache(&mut self) -> Option<&VictimCache> {
+        let key = (self.thrown_victim.fighter.clone(), self.thrown_victim.slot);
+        if self.victim_cache.as_ref().map(|cache| &cache.key) != Some(&key) {
+            let fighter_dir = self.victim_fighter()?.fighter_dir;
+            let slot = key.1;
+            let costume = format!("c{slot:02}");
+            let model_dir = fighter_dir.join("model").join("body").join(&costume);
+            let model = crate::costume_files::CostumeFolder::resolve(&model_dir);
+            let motion_dir = fighter_dir.join("motion").join("body").join(&costume);
+            let animation_files = index_fighter_nuanmb(&fighter_dir, slot);
+            let mut motions: Vec<(String, PathBuf)> = crate::motion_list::load_current_in(&motion_dir)
+                .map(|mlist| {
+                    mlist
+                        .list
+                        .iter()
+                        .filter_map(|(hash, motion)| {
+                            let name = self.state.labels.get(&hash.0)?;
+                            if !name.contains("thrown") {
+                                return None;
+                            }
+                            let animation = motion.animations.first()?;
+                            let path = animation_files.get(&animation.name.0)?;
+                            Some((name.clone(), path.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            motions.sort();
+            self.victim_cache = Some(VictimCache {
+                key,
+                model_dir,
+                motion_dir,
+                model_files: model.model_files(),
+                motions,
+            });
+        }
+        self.victim_cache.as_ref()
+    }
+
+    /// The thrown fighter the picker chose for this throw: its costume's model folder and the
+    /// thrown animation (picked by hand, or the attacker's own set or the throw's direction).
+    /// `None` when the move doesn't throw, the picker has nothing, or the costume has no model.
+    fn picked_thrown_animation(&mut self) -> Option<(PathBuf, PathBuf)> {
+        if !self.selected_move_is_throw() {
+            return None;
+        }
+        let attacker = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|entry| entry.name.clone())?;
+        let move_name = self.state.selected_move.as_ref()?.name.clone();
+        let wanted = self.victim_motion_override.clone();
+        let cache = self.victim_cache()?;
+        if cache.model_files.is_empty() {
+            return None;
+        }
+        let anim_path = match wanted {
+            Some(name) => cache
+                .motions
+                .iter()
+                .find(|(motion, _)| *motion == name)
+                .map(|(_, path)| path.clone()),
+            None => auto_thrown_motion(&attacker, &move_name, &cache.motions)
+                .map(|index| cache.motions[index].1.clone()),
+        }?;
+        Some((cache.model_dir.clone(), anim_path))
+    }
+
+    fn draw_thrown_victim_controls(&mut self, ui: &mut Ui) {
+        let mut changed = ui
+            .checkbox(&mut self.thrown_victim.enabled, "Thrown fighter")
+            .on_hover_text(
+                "Show a second fighter carried by this one's throw bone, playing its own thrown \
+                 animation, the way the game positions a thrown opponent.",
+            )
+            .changed();
+        if self.thrown_victim.enabled {
+            let fighters: Vec<(String, String)> = self
+                .victim_fighters()
+                .iter()
+                .map(|fighter| (fighter.name.clone(), fighter.display.clone()))
+                .collect();
+            let selected = fighters
+                .iter()
+                .find(|(name, _)| *name == self.thrown_victim.fighter)
+                .map(|(_, display)| display.clone())
+                .unwrap_or_else(|| self.thrown_victim.fighter.clone());
+            egui::ComboBox::from_id_salt("thrown_victim_fighter")
+                .selected_text(selected)
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for (name, display) in &fighters {
+                        changed |= ui
+                            .selectable_value(&mut self.thrown_victim.fighter, name.clone(), display)
+                            .changed();
+                    }
+                });
+            let slots = self
+                .victim_fighter()
+                .map(|fighter| fighter.slots)
+                .unwrap_or_default();
+            if !slots.is_empty() && !slots.contains(&self.thrown_victim.slot) {
+                self.thrown_victim.slot = slots[0];
+                changed = true;
+            }
+            egui::ComboBox::from_id_salt("thrown_victim_slot")
+                .selected_text(format!("c{:02}", self.thrown_victim.slot))
+                .width(52.0)
+                .show_ui(ui, |ui| {
+                    for slot in &slots {
+                        changed |= ui
+                            .selectable_value(&mut self.thrown_victim.slot, *slot, format!("c{slot:02}"))
+                            .changed();
+                    }
+                });
+
+            let attacker = self
+                .state
+                .selected_fighter
+                .and_then(|index| self.state.fighters.get(index))
+                .map(|entry| entry.name.clone())
+                .unwrap_or_default();
+            let move_name = self
+                .state
+                .selected_move
+                .as_ref()
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+            let motions = self
+                .victim_cache()
+                .map(|cache| cache.motions.clone())
+                .unwrap_or_default();
+            let auto = auto_thrown_motion(&attacker, &move_name, &motions)
+                .map(|index| motions[index].0.clone());
+            let auto_label = format!("Auto ({})", auto.as_deref().unwrap_or("none found"));
+            let selected = self.victim_motion_override.clone().unwrap_or(auto_label.clone());
+            egui::ComboBox::from_id_salt("thrown_victim_motion")
+                .selected_text(selected)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.victim_motion_override, None, auto_label);
+                    for (name, _) in &motions {
+                        ui.selectable_value(&mut self.victim_motion_override, Some(name.clone()), name);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The victim's own thrown animation. Auto matches the throw's direction \
+                     (throw_f → thrown_f) or this fighter's own thrown set when the victim has \
+                     one. The game also picks a _dx, _big or _girl variant depending on the \
+                     thrower, which Visionary doesn't detect yet; choose it here.",
+                );
+        }
+        if changed {
+            save_thrown_victim(&self.thrown_victim);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// The Settings window the viewport toolbar's gear opens: application preferences, the
+    /// viewport's look, and the camera.
+    fn draw_settings_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // Ctrl +/- zooms the interface too; keep the saved scale in step with it.
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.preferences.ui_scale).abs() > 1e-3 {
+            self.preferences.ui_scale = zoom;
+            self.preferences.save();
+        }
+        if !self.settings_open {
+            return;
+        }
+        let has_helper_bones = frame.wgpu_render_state().is_some_and(|wgpu_state| {
+            wgpu_state
+                .renderer
+                .read()
+                .callback_resources
+                .get::<HitboxRenderState>()
+                .is_some_and(HitboxRenderState::has_helper_bones)
+        });
+        let before = self.preferences.clone();
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let defaults = crate::preferences::Preferences::default();
+
+                ui.label(RichText::new("General").strong());
+                let console = ui.add_enabled(
+                    crate::console::SUPPORTED && !crate::console::from_terminal(),
+                    egui::Checkbox::new(
+                        &mut self.preferences.show_console,
+                        "Show console window",
+                    ),
+                );
+                if console.changed() {
+                    crate::console::set_visible(self.preferences.show_console);
+                }
+                console.on_hover_text(
+                    "A console window with Visionary's log output: model loading, plugin \
+                     deploys, builds and the game link. Turn it off here rather than closing \
+                     the console, which would close Visionary with it.",
+                )
+                .on_disabled_hover_text(if crate::console::SUPPORTED {
+                    "Visionary was started from a terminal, which already shows its log output."
+                } else {
+                    "Log output goes to the terminal that started Visionary."
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Interface scale");
+                    let mut scale = self.preferences.ui_scale;
+                    let response = ui.add(
+                        egui::Slider::new(&mut scale, crate::preferences::Preferences::UI_SCALE_RANGE)
+                            .step_by(0.05)
+                            .fixed_decimals(2),
+                    );
+                    if response.changed() {
+                        self.preferences.ui_scale = scale;
+                        ctx.set_zoom_factor(scale);
+                    }
+                    if ui
+                        .add_enabled(scale != defaults.ui_scale, egui::Button::new("Reset").small())
+                        .clicked()
+                    {
+                        self.preferences.ui_scale = defaults.ui_scale;
+                        ctx.set_zoom_factor(defaults.ui_scale);
+                    }
+                })
+                .response
+                .on_hover_text("Size of all text and controls. Ctrl + and Ctrl - also change it.");
+
+                ui.separator();
+                ui.label(RichText::new("Viewport").strong());
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut self.preferences.viewport_color);
+                    ui.label("Background");
+                    if ui
+                        .add_enabled(
+                            self.preferences.viewport_color != defaults.viewport_color,
+                            egui::Button::new("Reset").small(),
+                        )
+                        .on_hover_text("SSBH Editor's dark grey")
+                        .clicked()
+                    {
+                        self.preferences.viewport_color = defaults.viewport_color;
+                    }
+                });
+                ui.checkbox(&mut self.preferences.floor_grid, "Floor grid")
+                    .on_hover_text("A grid on the ground plane (y = 0) under the fighter.");
+                ui.checkbox(&mut self.preferences.world_axes, "World axes")
+                    .on_hover_text(
+                        "A red X line and a blue Z line through the origin on the ground, \
+                         where the fighter starts.",
+                    );
+                ui.checkbox(&mut self.preferences.bloom, "Bloom")
+                    .on_hover_text("The game's glow around bright and emissive materials.");
+                let response = ui.add_enabled(
+                    has_helper_bones,
+                    egui::Checkbox::new(&mut self.helper_bones, "Enable helper bones"),
+                );
+                if response.changed() {
+                    save_helper_bones(self.helper_bones);
+                }
+                response.on_hover_text(if has_helper_bones {
+                    "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
+                     They move H_ bones such as elbow and knee helpers, which changes the mesh \
+                     and any hitbox, hurtbox or effect placed on those bones."
+                } else {
+                    "This model has no model.nuhlpb. The saved preference is kept for models \
+                     that do."
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Camera").strong());
+                self.draw_navigation_settings(ui);
+                ui.label(RichText::new(navigation_hint(&self.preferences)).small().weak());
+                if let Some(wgpu_state) = frame.wgpu_render_state() {
+                    let mut renderer = wgpu_state.renderer.write();
+                    if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                        let camera = &mut rs.camera;
+                        let home = self.preferences.home_camera();
+                        egui::Grid::new("settings_camera").num_columns(4).show(ui, |ui| {
+                            ui.label("Translation");
+                            for value in [
+                                &mut camera.translation.x,
+                                &mut camera.translation.y,
+                                &mut camera.translation.z,
+                            ] {
+                                ui.add(egui::DragValue::new(value).speed(0.1).fixed_decimals(2));
+                            }
+                            ui.end_row();
+                            ui.label("Rotation (°)");
+                            for value in [
+                                &mut camera.rotation.x,
+                                &mut camera.rotation.y,
+                                &mut camera.rotation.z,
+                            ] {
+                                let mut degrees = value.to_degrees();
+                                if ui
+                                    .add(egui::DragValue::new(&mut degrees).speed(0.5).fixed_decimals(1))
+                                    .changed()
+                                {
+                                    *value = degrees.to_radians();
+                                }
+                            }
+                            ui.end_row();
+                            ui.label("Field of view (°)");
+                            let mut degrees = camera.fov_y.to_degrees();
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut degrees)
+                                        .range(1.0..=120.0)
+                                        .speed(0.25)
+                                        .fixed_decimals(1),
+                                )
+                                .changed()
+                            {
+                                camera.fov_y = degrees.to_radians();
+                            }
+                            ui.end_row();
+                            ui.label("Near clip").on_hover_text("The nearest distance drawn.");
+                            let far = camera.far;
+                            ui.add(
+                                egui::DragValue::new(&mut camera.near)
+                                    .range(0.001..=far)
+                                    .speed(0.05),
+                            );
+                            ui.end_row();
+                            ui.label("Far clip").on_hover_text("The farthest distance drawn.");
+                            let near = camera.near;
+                            ui.add(
+                                egui::DragValue::new(&mut camera.far)
+                                    .range(near..=f32::MAX)
+                                    .speed(100.0),
+                            );
+                            ui.end_row();
+                        });
+                        camera.translation.z = camera.translation.z.min(-1.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!camera.is_at(&home), egui::Button::new("⟲ Reset view"))
+                                .on_hover_text("Back to the default view")
+                                .clicked()
+                            {
+                                *camera = crate::renderer::Camera::from_view(&home);
+                            }
+                            if ui
+                                .add_enabled(
+                                    !camera.is_at(&home),
+                                    egui::Button::new("Save as default"),
+                                )
+                                .on_hover_text(
+                                    "Start at this view, and come back to it with ⟲ and a \
+                                     double-click",
+                                )
+                                .clicked()
+                            {
+                                self.preferences.default_camera = Some(camera.view());
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.preferences.default_camera.is_some(),
+                                    egui::Button::new("Reset default"),
+                                )
+                                .on_hover_text("Go back to the built-in side view as the default")
+                                .clicked()
+                            {
+                                self.preferences.default_camera = None;
+                                *camera = crate::renderer::Camera::default();
+                            }
+                        });
+                    } else {
+                        ui.weak("Load a fighter to adjust the camera.");
+                    }
+                }
+                self.draw_camera_animation_settings(ui);
+            });
+        self.settings_open = open;
+        if self.preferences != before {
+            self.preferences.save();
+            ctx.request_repaint();
+        }
+    }
+
+    /// Settings: which mouse buttons move the camera, and the orientation widget's style.
+    fn draw_navigation_settings(&mut self, ui: &mut Ui) {
+        use crate::preferences::{NavigationScheme, NavigationWidget};
+        let preferences = &mut self.preferences;
+        egui::Grid::new("settings_navigation").num_columns(2).show(ui, |ui| {
+            ui.label("Mouse navigation").on_hover_text(
+                "SSBH: left drag orbits, right or middle drag pans.\nBlender: middle drag \
+                 orbits, Shift + middle pans, Ctrl + middle zooms.",
+            );
+            egui::ComboBox::from_id_salt("settings_navigation_scheme")
+                .selected_text(match preferences.navigation_scheme {
+                    NavigationScheme::Ssbh => "SSBH",
+                    NavigationScheme::Blender => "Blender",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut preferences.navigation_scheme,
+                        NavigationScheme::Ssbh,
+                        "SSBH",
+                    );
+                    ui.selectable_value(
+                        &mut preferences.navigation_scheme,
+                        NavigationScheme::Blender,
+                        "Blender",
+                    );
+                });
+            ui.end_row();
+            ui.label("Orientation widget").on_hover_text(
+                "The gizmo in the viewport's top right corner. Click an axis or face to look \
+                 along it, drag it to orbit.",
+            );
+            egui::ComboBox::from_id_salt("settings_navigation_widget")
+                .selected_text(match preferences.navigation_widget {
+                    NavigationWidget::Axes => "Axes",
+                    NavigationWidget::Cube => "Cube",
+                    NavigationWidget::Hidden => "Hidden",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut preferences.navigation_widget,
+                        NavigationWidget::Axes,
+                        "Axes (Blender)",
+                    );
+                    ui.selectable_value(
+                        &mut preferences.navigation_widget,
+                        NavigationWidget::Cube,
+                        "Cube",
+                    );
+                    ui.selectable_value(
+                        &mut preferences.navigation_widget,
+                        NavigationWidget::Hidden,
+                        "Hidden",
+                    );
+                });
+            ui.end_row();
+        });
+        ui.add_enabled(
+            preferences.navigation_scheme == NavigationScheme::Blender,
+            egui::Checkbox::new(
+                &mut preferences.emulate_three_button_mouse,
+                "Emulate 3 button mouse",
+            ),
+        )
+        .on_hover_text("Use Alt + left drag in place of the middle button, for trackpads and two-button mice.")
+        .on_disabled_hover_text("Available with Blender mouse navigation.");
+    }
+
+    /// Settings: a camera animation (`.nuanmb`, such as a Final Smash camera) for the viewport
+    /// camera to play along the timeline.
+    fn draw_camera_animation_settings(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Camera animation");
+            match &self.camera_anim {
+                Some((path, _)) => {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(RichText::new(name).monospace())
+                        .on_hover_text(path.display().to_string());
+                }
+                None => {
+                    ui.weak("none");
+                }
+            }
+            if ui.button("Choose…").clicked() {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Camera animation", &["nuanmb"])
+                    .set_title("Choose a camera animation");
+                // The fighter's own cameras sit in fighter/<name>/camera/.
+                let camera_dir = self
+                    .current_model_dir
+                    .as_ref()
+                    .and_then(|dir| dir.ancestors().nth(3))
+                    .map(|fighter| fighter.join("camera"))
+                    .filter(|dir| dir.is_dir());
+                if let Some(dir) = camera_dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    self.load_camera_animation(path);
+                }
+            }
+            if ui
+                .add_enabled(self.camera_anim.is_some(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                self.camera_anim = None;
+                self.camera_anim_error = None;
+            }
+        });
+        ui.add_enabled(
+            self.camera_anim.is_some(),
+            egui::Checkbox::new(&mut self.camera_anim_on, "Play camera animation"),
+        )
+        .on_hover_text(
+            "The viewport camera follows the animation along the timeline. Turn it off to move \
+             the camera freely again without clearing the file.",
+        );
+        if let Some(error) = &self.camera_anim_error {
+            ui.colored_label(Color32::from_rgb(220, 120, 90), error);
+        }
+    }
+
+    fn load_camera_animation(&mut self, path: PathBuf) {
+        match ssbh_data::anim_data::AnimData::from_file(&path) {
+            Ok(anim) => {
+                let has_camera = ssbh_wgpu::animation::camera::animate_camera(
+                    &anim, 0.0, 0.5, 1.0, 400_000.0,
+                )
+                .is_some();
+                if has_camera {
+                    self.camera_anim = Some((path, std::sync::Arc::new(anim)));
+                    self.camera_anim_on = true;
+                    self.camera_anim_error = None;
+                } else {
+                    self.camera_anim_error = Some(format!(
+                        "{} has no camera (a gya_camera or camera_stage transform).",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                self.camera_anim_error = Some(format!("Could not read {}: {error}", path.display()));
+            }
+        }
+    }
+
+    /// The axis balls or cube in the viewport's top right corner (Settings picks which).
+    fn draw_orientation_widget(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
+        let style = self.preferences.navigation_widget;
+        if style == crate::preferences::NavigationWidget::Hidden {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else {
+            return;
+        };
+        let mut renderer = wgpu_state.renderer.write();
+        let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() else {
+            return;
+        };
+        if crate::orientation_widget::orientation_widget(
+            ui,
+            viewport,
+            self.viewport_toolbar_rect,
+            style,
+            &mut rs.camera,
+        ) {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Viewport display options, drawn over the model's top-left corner.
+    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
+        let area = egui::Rect::from_min_size(
+            viewport.left_top() + egui::vec2(8.0, 8.0),
+            egui::vec2(
+                (viewport.width() - 16.0).max(0.0),
+                (viewport.height() - 16.0).max(0.0),
+            ),
+        );
+        let mut toolbar = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(area)
+                .layout(egui::Layout::left_to_right(egui::Align::TOP)),
+        );
+        let inner = egui::Frame::popup(toolbar.style())
+            .inner_margin(egui::Margin::symmetric(6, 2))
+            .show(&mut toolbar, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let home = self.preferences.home_camera();
+                    let camera_moved = frame.wgpu_render_state().is_some_and(|wgpu_state| {
+                        wgpu_state
+                            .renderer
+                            .read()
+                            .callback_resources
+                            .get::<HitboxRenderState>()
+                            .is_some_and(|rs| !rs.camera.is_at(&home))
+                    });
+                    let hint = navigation_hint(&self.preferences);
+                    if ui
+                        .add_enabled(camera_moved, egui::Button::new("⟲"))
+                        .on_hover_text(format!(
+                            "Reset view: back to the default view. {hint}. Numpad 1, 3 and 7 \
+                             look from the front, right and top; Home frames the fighter and \
+                             Period the selected hitbox."
+                        ))
+                        .on_disabled_hover_text(format!(
+                            "{hint}. This button returns to the default view."
+                        ))
+                        .clicked()
+                    {
+                        reset_viewport_camera(frame, &home);
+                        ui.ctx().request_repaint();
+                    }
+                    let scales = self.viewport_scales();
+                    if [&scales.model, &scales.attack, &scales.grab]
+                        .iter()
+                        .any(|scale| (scale.value - 1.0).abs() > 1e-4)
+                    {
+                        ui.separator();
+                        let uniform = scales.attack.value == scales.model.value
+                            && scales.grab.value == scales.model.value;
+                        let text = if uniform {
+                            format!("Scale {:.2}", scales.model.value)
+                        } else {
+                            format!(
+                                "Scale {:.2} · hit {:.2} · grab {:.2}",
+                                scales.model.value, scales.attack.value, scales.grab.value
+                            )
+                        };
+                        ui.label(RichText::new(text).small().weak()).on_hover_text(format!(
+                            "The fighter is drawn at the scales the game would give it:\n\n\
+                             Model (ModelModule::set_scale): {:.3}, from {}\n\
+                             Hitboxes (AttackModule::set_attack_scale): {:.3}, from {}\n\
+                             Grab boxes (GrabModule::set_size_mul): {:.3}, from {}\n\n\
+                             A call in the fighter's frame callback (on_line) wins over the \
+                             fighter_param scale. Branches that only run on the results screen \
+                             or on entry are skipped.",
+                            scales.model.value,
+                            scales.model.source,
+                            scales.attack.value,
+                            scales.attack.source,
+                            scales.grab.value,
+                            scales.grab.source,
+                        ));
+                    }
+                    if self.selected_move_is_throw() {
+                        ui.separator();
+                        self.draw_thrown_victim_controls(ui);
+                    }
+                    for source in &self.viewport_file_sources {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("{}: {}", source.label, source.summary))
+                                .small()
+                                .weak(),
+                        )
+                        .on_hover_text(format!(
+                            "Files this costume's {} folder doesn't hold itself, loaded from where \
+                             ARCropolis would load them:\n\n{}",
+                            source.label.to_lowercase(),
+                            source.detail
+                        ));
+                    }
+                });
+            });
+        self.viewport_toolbar_rect = Some(inner.response.rect);
+    }
+
     fn draw_hurtbox_toggle(&mut self, ui: &mut Ui) {
         let available = self
             .hurtbox_volumes
@@ -16249,7 +20028,7 @@ impl VisionaryApp {
         let conditions = self.state.script.to_hurtbox_conditions();
 
         if states.is_empty() && conditions.is_empty() && pris.is_empty() {
-            if self.state.acmd_source.is_empty() {
+            if self.state.acmd_source.is_none() {
                 ui.weak("No hurtbox commands loaded yet")
                     .on_hover_text("Use Move › Reload source.");
             } else {
@@ -16558,7 +20337,7 @@ impl VisionaryApp {
         ui.separator();
 
         // A loaded move with no effect script still takes new effects.
-        let has_effect_data = !self.state.acmd_source.is_empty()
+        let has_effect_data = !self.state.acmd_source.is_none()
             || !self.state.effect_script.stmts.is_empty()
             || !self.state.effects.is_empty();
 
@@ -18215,17 +21994,1119 @@ impl VisionaryApp {
         picked
     }
 
+    /// Whether the move under `key` (`fighter/move`) holds an edit of any category.
+    fn move_has_edits(&self, key: &str) -> bool {
+        let Some((fighter, move_name)) = crate::character::split_move_key(key) else {
+            return false;
+        };
+        self.state
+            .edit_log
+            .entries
+            .get(fighter)
+            .is_some_and(|moves| moves.contains_key(move_name))
+            || self.state.effect_call_edits.get(key).is_some_and(|edits| !edits.is_empty())
+            || self.state.effect_call_full.contains_key(key)
+            || self.state.sound_script_edits.contains_key(key)
+            || self.state.expression_script_edits.contains_key(key)
+    }
+
+    /// Forget the source snapshots of moves that were only looked at.
+    ///
+    /// A snapshot is the baseline an edit was made against, which is worth keeping. One for a
+    /// move nobody edited is only a record of what some source said once, and keeping it made
+    /// it outlive that source: browse Falco with Shy Guy's moveset linked and Shy Guy's jab was
+    /// saved as `falco/attack_12`, then loaded into Empoleon's project as Falco's jab.
+    fn drop_unedited_move_sources(&mut self) {
+        let keys: Vec<String> = self.move_source_cache.keys().cloned().collect();
+        for key in keys {
+            if !self.move_has_edits(&key) {
+                self.move_source_cache.remove(&key);
+            }
+        }
+    }
+
     /// Key for `effect_call_edits`: fighter-scoped so moves with the same name on
     /// different fighters don't collide ("mario/attack_air_n").
     fn move_key(fighter: &str, move_name: &str) -> String {
         format!("{fighter}/{move_name}")
     }
 
-    /// The open move's key in every per-move store: the character it was opened for, which is
-    /// not always the active one while navigation is switching characters.
+    /// The agent the open move's scripts belong to: the open object's (`samus_lativolt`) when
+    /// one is open, else the selected fighter's.
+    fn script_agent(&self) -> Option<String> {
+        if let Some(agent) = &self.open_article {
+            return Some(agent.clone());
+        }
+        self.state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|fighter| fighter.name.clone())
+    }
+
+    // ── Objects (articles) ────────────────────────────────────────────────────
+
+    /// Keep the selected fighter's object catalog current: read it off the UI thread when the
+    /// source files changed since it was read (or the fighter changed), and keep it otherwise.
+    /// The game's own script names for its objects arrive after it, since they may need the
+    /// network.
+    fn ensure_article_catalog(&mut self) {
+        let Some(entry) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .cloned()
+        else {
+            self.article_catalog = None;
+            self.article_catalog_job = None;
+            return;
+        };
+        let fighter = entry.name.clone();
+        // Take what the background read has sent.
+        if let Some((job_fighter, job_generation, rx)) = self.article_catalog_job.take() {
+            let mut keep = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(ArticleJobResult::Cache(cache)) => {
+                        if cache.fighter == fighter {
+                            self.invalidate_object_kinds(&cache.fighter);
+                            self.article_catalog = Some(cache);
+                            self.article_catalog_generation = job_generation;
+                        }
+                    }
+                    Ok(ArticleJobResult::Dump(scripts, note)) => {
+                        if let Some(cache) = self.article_catalog.as_mut().filter(|c| c.fighter == job_fighter) {
+                            cache.dump_scripts = scripts;
+                            cache.dump_note = note;
+                        }
+                    }
+                    Ok(ArticleJobResult::Failed(reason)) => {
+                        self.article_catalog_failed = Some((job_fighter.clone(), job_generation, reason));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        keep = false;
+                        let delivered = self.article_catalog_generation == job_generation
+                            && self.article_catalog.as_ref().is_some_and(|c| c.fighter == job_fighter);
+                        if !delivered && self.article_catalog_failed.is_none() {
+                            self.article_catalog_failed = Some((
+                                job_fighter.clone(),
+                                job_generation,
+                                "the reader stopped before it finished".into(),
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+            if keep && job_fighter == fighter {
+                self.article_catalog_job = Some((job_fighter, job_generation, rx));
+            }
+        }
+        let generation = self.acmd_src_generation;
+        let have = self.article_catalog.as_ref().is_some_and(|c| c.fighter == fighter);
+        if have && self.article_catalog_generation == generation {
+            return;
+        }
+        if self
+            .article_catalog_failed
+            .as_ref()
+            .is_some_and(|(f, g, _)| *f == fighter && *g == generation)
+        {
+            return;
+        }
+        if self
+            .article_catalog_job
+            .as_ref()
+            .is_some_and(|(f, g, _)| *f == fighter && *g == generation)
+        {
+            return;
+        }
+        let fingerprint = source_fingerprint(self.acmd_src.as_ref());
+        if have && self.article_catalog.as_ref().is_some_and(|c| c.fingerprint == fingerprint) {
+            self.article_catalog_generation = generation;
+            return;
+        }
+        if !have {
+            self.article_catalog = None;
+        }
+        // The game's own objects come from the dump's folders for this fighter.
+        let fighter_dir = self
+            .state
+            .data_root
+            .as_ref()
+            .map(|root| root.join("fighter").join(&fighter))
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| entry.fighter_dir.clone());
+        let names: Vec<String> = self.state.fighters.iter().map(|f| f.name.clone()).collect();
+        let index = self.acmd_src.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        let job_fighter = fighter.clone();
+        self.article_catalog_failed = None;
+        std::thread::spawn(move || {
+            let fighter = job_fighter;
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match index.as_ref() {
+                Some(index) => {
+                    let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
+                    let bodies = index.status_bodies(&fighter);
+                    let rows = crate::articles::view::status_call_rows(&bodies, &catalog, Some(&index.root));
+                    let mut status_spawns: Vec<(String, crate::article_preview::SpawnPlan)> =
+                        Vec::new();
+                    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+                    for (site, body) in &bodies {
+                        let file_text = file_cache
+                            .entry(site.file.clone())
+                            .or_insert_with(|| std::fs::read_to_string(&site.file).unwrap_or_default());
+                        for plan in crate::article_preview::plan_spawns_from_status_body(
+                            body,
+                            Some(file_text.as_str()),
+                            &catalog,
+                            Some(index),
+                        ) {
+                            if !status_spawns
+                                .iter()
+                                .any(|(s, p)| s == &site.kind_expr && p.name == plan.name && p.motion == plan.motion)
+                            {
+                                status_spawns.push((site.kind_expr.clone(), plan));
+                            }
+                        }
+                    }
+                    let agents: Vec<&str> = std::iter::once(fighter.as_str())
+                        .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
+                        .collect();
+                    let unresolved = index
+                        .unresolved_statuses
+                        .iter()
+                        .filter(|u| u.agent_hint.as_deref().is_none_or(|hint| agents.contains(&hint)))
+                        .cloned()
+                        .collect();
+                    let (overrides, unread_overrides) =
+                        crate::articles::param_overrides_for(index, &fighter, &names);
+                    (catalog, rows, status_spawns, unresolved, overrides, unread_overrides)
+                }
+                None => (
+                    crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            }));
+            let (
+                catalog,
+                status_rows,
+                status_spawns,
+                unresolved_statuses,
+                overrides,
+                unread_overrides,
+            ) = match read {
+                Ok(read) => read,
+                Err(panic) => {
+                    let reason = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "the reader stopped unexpectedly".into());
+                    let _ = tx.send(ArticleJobResult::Failed(reason));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let agents: Vec<(String, String)> = catalog
+                .articles
+                .iter()
+                .filter(|a| !matches!(a.origin, crate::articles::ArticleOrigin::Clone(_)))
+                .map(|a| (a.owner.clone(), a.agent.clone()))
+                .collect();
+            let _ = tx.send(ArticleJobResult::Cache(ArticleCache {
+                fighter,
+                fingerprint,
+                catalog,
+                status_rows,
+                status_spawns,
+                unresolved_statuses,
+                overrides,
+                unread_overrides,
+                dump_scripts: HashMap::new(),
+                dump_note: None,
+            }));
+            ctx.request_repaint();
+            // The game's own scripts per object, from the script dump (cached after the first
+            // listing). An object the dump has no folder for simply has none.
+            let mut scripts = HashMap::new();
+            let mut failed = 0usize;
+            for (owner, agent) in agents {
+                match crate::effect_uses::script_names(&owner, &agent) {
+                    Ok(names) => {
+                        scripts.insert(agent, names);
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+            let note = (failed > 0 && scripts.is_empty()).then(|| {
+                "The game's own object scripts couldn't be listed (no connection to the script dump?)".to_string()
+            });
+            let _ = tx.send(ArticleJobResult::Dump(scripts, note));
+            ctx.request_repaint();
+        });
+        self.article_catalog_job = Some((fighter, generation, rx));
+    }
+
+    /// The param files the object's owner is read from, lowest first: the dump, the Mod Library,
+    /// then the moveset's own (its `romfs/`, then the open project's `romfs/`). The second list is
+    /// only the moveset's own, which is all a save may change.
+    fn article_param_layers(&self, owner: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let param_dir = |root: &Path| root.join("fighter").join(owner).join("param");
+        let mut layers = Vec::new();
+        for root in self.shared_roots() {
+            for name in ["vl.prc", "vl.prcxml"] {
+                layers.push(param_dir(&root).join(name));
+            }
+        }
+        let own_roots = self.acmd_romfs_roots();
+        let own = own_param_files(owner, &own_roots, &self.shared_roots());
+        layers.retain(|file| file.exists() && !own.contains(file));
+        layers.extend(own.iter().cloned());
+        (layers, own)
+    }
+
+    fn open_article_settings(&mut self, agent: String) {
+        let mut card = ArticleSettingsCard {
+            agent,
+            variant: 0,
+            edits: HashMap::new(),
+            message: None,
+            settings: Vec::new(),
+            block: Default::default(),
+            other_blocks: HashMap::new(),
+            other_variants: HashMap::new(),
+            own: Vec::new(),
+        };
+        self.reload_article_settings(&mut card);
+        self.article_settings = Some(card);
+    }
+
+    /// Re-read a card's settings and param block from disk.
+    fn reload_article_settings(&self, card: &mut ArticleSettingsCard) {
+        let Some(article) = self
+            .article_catalog
+            .as_ref()
+            .and_then(|cache| cache.catalog.get(&card.agent))
+            .cloned()
+        else {
+            return;
+        };
+        card.settings = self
+            .acmd_src
+            .as_ref()
+            .map(|index| crate::articles::settings_for(index, &article.agent))
+            .unwrap_or_default();
+        let (layers, own) = self.article_param_layers(&article.owner);
+        let overrides: Vec<crate::articles::params::ParamOverride> = self
+            .article_catalog
+            .as_ref()
+            .map(|cache| cache.overrides.clone())
+            .unwrap_or_default();
+        let block_of = |name: &str| {
+            let full = format!("param_{name}");
+            let set = crate::articles::params::block_overrides(&overrides, &article.owner, &full);
+            crate::articles::params::param_block(&layers, &set, name, &self.state.labels)
+        };
+        // A clone reads its NEW owner's `param_<new_name>`, which is `article.name` here.
+        card.block = block_of(&article.name);
+        // Each other block a setting reads is loaded under its own name, never shown as this one.
+        let own_block = format!("param_{}", article.name);
+        card.other_blocks = card
+            .settings
+            .iter()
+            .filter_map(|s| match &s.value {
+                crate::articles::settings::SettingValue::Param { block, .. } if *block != own_block => {
+                    Some(block.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .filter_map(|full| {
+                let name = full.strip_prefix("param_")?.to_string();
+                Some((full, block_of(&name)))
+            })
+            .collect();
+        card.own = own;
+        if card.variant >= card.block.variants.len().max(1) {
+            card.variant = 0;
+        }
+    }
+
+    /// Save one Settings card value, through the setting writer: only the moveset's own files.
+    /// `variant` is the list entry of the block the setting reads (see `view::setting_variant`).
+    fn save_article_setting(
+        &mut self,
+        card: &mut ArticleSettingsCard,
+        setting: &crate::articles::settings::Setting,
+        text: &str,
+        variant: usize,
+    ) {
+        let Ok(value) = text.trim().parse::<f64>() else {
+            card.message = Some(format!("`{}` is not a number", text.trim()));
+            return;
+        };
+        let plan = crate::articles::settings::plan_setting_write(setting, value, variant, &card.own);
+        let result: anyhow::Result<String> = match plan {
+            Err(error) => Err(error),
+            Ok(crate::articles::settings::SettingWrite::Source { file, text }) => std::fs::write(&file, text)
+                .map(|_| format!("Saved {} in {}", setting.field.label(), file.display()))
+                .map_err(Into::into),
+            Ok(crate::articles::settings::SettingWrite::Const(edit)) => {
+                let Some(index) = self.acmd_src.as_ref() else {
+                    return;
+                };
+                let (files, notes, _) = crate::project_consts::apply_edits(&index.consts, &[edit]);
+                if files.is_empty() {
+                    Err(anyhow::anyhow!("nothing was written: {}", notes.join("; ")))
+                } else {
+                    let mut said = format!("Saved {} in {}", setting.field.label(), files[0].display());
+                    if !notes.is_empty() {
+                        said.push_str(&format!(" — {}", notes.join("; ")));
+                    }
+                    Ok(said)
+                }
+            }
+            Ok(crate::articles::settings::SettingWrite::Param { file, block, field, variant }) => {
+                crate::articles::params::write_param_field(&file, &block, &field, variant, value, &self.state.labels)
+                    .map(|_| format!("Saved {block} › {field} in {}", file.display()))
+            }
+        };
+        match result {
+            Ok(said) => {
+                card.message = Some(said);
+                card.edits.clear();
+                if let Some(fighter) = self
+                    .state
+                    .selected_fighter
+                    .and_then(|i| self.state.fighters.get(i))
+                    .map(|f| f.name.clone())
+                {
+                    self.invalidate_object_kinds(&fighter);
+                }
+                self.rebuild_acmd_index();
+                self.ensure_article_catalog();
+                self.reload_article_settings(card);
+            }
+            Err(error) => card.message = Some(format!("Not saved: {error}")),
+        }
+    }
+
+    /// The Objects list under the fighter's moves: each object with where it comes from, its
+    /// scripts as moves, and its Settings card; then what the source has that isn't modelled.
+    fn draw_objects_list(&mut self, ui: &mut Ui, max_height: f32) {
+        self.ensure_article_catalog();
+        let Some(cache) = self.article_catalog.as_ref() else {
+            let fighter = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+            if let Some((_, _, reason)) = self.article_catalog_failed.as_ref().filter(|(f, _, _)| *f == fighter) {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 170, 90),
+                    format!("Visionary couldn't read this fighter's objects: {reason}"),
+                );
+            } else if self.article_catalog_job.is_some() {
+                ui.separator();
+                ui.weak("Reading this fighter's objects…");
+            }
+            return;
+        };
+        let rows = crate::articles::view::object_rows_with(&cache.catalog, &cache.dump_scripts);
+        let dump_note = cache.dump_note.clone();
+        let agents: Vec<String> = cache.catalog.articles.iter().map(|a| a.agent.clone()).collect();
+        let unresolved_clones = cache.catalog.unresolved_clones.clone();
+        let unresolved_statuses = cache.unresolved_statuses.clone();
+        let unread_overrides = cache.unread_overrides.clone();
+        let root = self.acmd_src.as_ref().map(|index| index.root.clone());
+        ui.separator();
+        sidebar_section_heading(
+            ui,
+            "Objects",
+            "Projectiles and other objects this fighter can create: the game's own, ones the linked moveset rewrites, and clones it adds. Click a script to open it like a move.",
+        );
+        if let Some(agent) = &self.open_article {
+            ui.colored_label(
+                egui::Color32::from_rgb(235, 170, 90),
+                RichText::new(if self.open_article_in_source && self.acmd_src.is_some() {
+                    format!(
+                        "{agent} is open. Syncing saves its changes into the linked source; they \
+                         are not kept in the project or exported yet."
+                    )
+                } else {
+                    self.unsaveable_object_script_words().to_string()
+                })
+                .small(),
+            );
+            if self.game_link.article_live_status(agent)
+                == Some(crate::game_link::ArticleLiveSupport::Unsupported)
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 170, 90),
+                    RichText::new("Live edits for this clone aren't supported").small(),
+                );
+            }
+        }
+        let selected_move = self.state.selected_move.as_ref().map(|m| m.name.clone());
+        let mut to_open: Option<(String, String)> = None;
+        let mut settings_for: Option<String> = None;
+        let warn = egui::Color32::from_rgb(235, 170, 90);
+        ScrollArea::vertical()
+            .id_salt("objects")
+            .max_height(max_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if rows.is_empty() {
+                    ui.weak("No objects found for this fighter");
+                }
+                if let Some(note) = &dump_note {
+                    ui.weak(RichText::new(note).small());
+                }
+                for (row, agent) in rows.iter().zip(&agents) {
+                    egui::CollapsingHeader::new(format!("{}  ·  {}", row.title, row.badge))
+                        .id_salt(("object", agent.as_str()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for warning in &row.warnings {
+                                ui.colored_label(warn, RichText::new(warning).small());
+                            }
+                            if row.scripts.is_empty() && row.game_scripts.is_empty() {
+                                ui.weak(RichText::new("No scripts listed for it: the linked source has none, and the game's weren't found.").small());
+                            }
+                            for script in &row.scripts {
+                                let open = self.open_article.as_deref() == Some(agent.as_str())
+                                    && selected_move.as_deref() == Some(script.as_str());
+                                if ui
+                                    .selectable_label(open, format_move_name(script))
+                                    .on_hover_text(format!("{agent} · {script}"))
+                                    .clicked()
+                                    && !open
+                                {
+                                    to_open = Some((agent.clone(), script.clone()));
+                                }
+                            }
+                            for script in &row.game_scripts {
+                                let open = self.open_article.as_deref() == Some(agent.as_str())
+                                    && selected_move.as_deref() == Some(script.as_str());
+                                if ui
+                                    .selectable_label(
+                                        open,
+                                        RichText::new(format!("{} · game's", format_move_name(script))).weak(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{agent} · {script}: the game's own script. It opens like a vanilla move; \
+                                         to change it, add it to the moveset's source."
+                                    ))
+                                    .clicked()
+                                    && !open
+                                {
+                                    to_open = Some((agent.clone(), script.clone()));
+                                }
+                            }
+                            if ui
+                                .small_button("Settings…")
+                                .on_hover_text("Size, speed, life and params, each with where it is set")
+                                .clicked()
+                            {
+                                settings_for = Some(agent.clone());
+                            }
+                        });
+                }
+                if !unresolved_clones.is_empty() || !unresolved_statuses.is_empty() || !unread_overrides.is_empty() {
+                    egui::CollapsingHeader::new(format!(
+                        "Not read ({})",
+                        unresolved_clones.len() + unresolved_statuses.len() + unread_overrides.len()
+                    ))
+                    .id_salt("objects_unread")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let short = |file: &Path| crate::articles::view::short_path(file, root.as_deref());
+                        for clone in &unresolved_clones {
+                            ui.colored_label(
+                                warn,
+                                RichText::new(format!(
+                                    "A clone at {}:{} isn't listed: {}",
+                                    short(&clone.file),
+                                    clone.line,
+                                    clone.reason
+                                ))
+                                .small(),
+                            )
+                            .on_hover_text(&clone.text);
+                        }
+                        for call in &unread_overrides {
+                            ui.colored_label(
+                                warn,
+                                RichText::new(format!(
+                                    "A param_config call at {}:{} isn't read: {}",
+                                    short(&call.file),
+                                    call.line,
+                                    call.reason
+                                ))
+                                .small(),
+                            )
+                            .on_hover_text(&call.text);
+                        }
+                        for status in &unresolved_statuses {
+                            ui.colored_label(
+                                warn,
+                                RichText::new(format!(
+                                    "A status script at {}:{} ({} {}) isn't read: {}",
+                                    short(&status.file),
+                                    status.line,
+                                    status.kind_expr,
+                                    status.phase,
+                                    status.reason
+                                ))
+                                .small(),
+                            );
+                        }
+                    });
+                }
+            });
+        if let Some((agent, script)) = to_open {
+            self.open_article_script(agent, &script);
+        }
+        if let Some(agent) = settings_for {
+            self.open_article_settings(agent);
+        }
+    }
+
+    /// The Settings card window for one object.
+    fn draw_article_settings_window(&mut self, ctx: &egui::Context) {
+        self.ensure_article_catalog();
+        let Some(mut card) = self.article_settings.take() else {
+            return;
+        };
+        let Some(article) = self
+            .article_catalog
+            .as_ref()
+            .and_then(|cache| cache.catalog.get(&card.agent))
+            .cloned()
+        else {
+            let fighter_now = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(|f| f.name.clone());
+            let current = self.article_catalog_job.is_none()
+                && self.article_catalog_generation == self.acmd_src_generation
+                && self
+                    .article_catalog
+                    .as_ref()
+                    .is_some_and(|c| Some(&c.fighter) == fighter_now.as_ref());
+            if current {
+                // The source no longer has this object: the card has nothing left to show.
+                self.state.status = format!("{} is no longer one of this fighter's objects", card.agent);
+            } else {
+                // Still being read (or re-read): keep the card for the next frame.
+                self.article_settings = Some(card);
+            }
+            return;
+        };
+        let overrides: Vec<crate::articles::params::ParamOverride> = self
+            .article_catalog
+            .as_ref()
+            .map(|cache| cache.overrides.clone())
+            .unwrap_or_default();
+        let root = self.acmd_src.as_ref().map(|index| index.root.clone());
+        let consts = self.acmd_src.as_ref().map(|index| index.consts.clone());
+        let mut open = true;
+        let mut save: Option<(crate::articles::settings::Setting, String)> = None;
+        let mut reveal: Option<PathBuf> = None;
+        let block_name = format!("param_{}", article.name);
+        egui::Window::new(format!("{} settings", article.name))
+            .id(egui::Id::unique(("article_settings", card.agent.as_str())))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([620.0, 420.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(crate::articles::view::badge(&article)).strong());
+                for note in crate::articles::view::clone_notes(&article) {
+                    ui.label(RichText::new(note).small());
+                }
+                if matches!(article.origin, crate::articles::ArticleOrigin::Clone(_)) {
+                    ui.hyperlink_to(
+                        RichText::new("Clone compatibility sheet (community-verified)").small(),
+                        crate::articles::clone_compat::SOURCE_URL,
+                    );
+                }
+                if let Some(note) = crate::articles::view::missing_block_note(&article, &card.block, &card.settings) {
+                    ui.colored_label(egui::Color32::from_rgb(235, 170, 90), note);
+                }
+                let variants = card.block.variants.len();
+                if variants > 1 {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt(("article_variant", card.agent.as_str()))
+                            .selected_text(format!("variant {} of {variants}", card.variant))
+                            .show_ui(ui, |ui| {
+                                for v in 0..variants {
+                                    if ui.selectable_label(card.variant == v, format!("variant {v}")).clicked() {
+                                        card.variant = v;
+                                        card.edits.clear();
+                                    }
+                                }
+                            });
+                    });
+                    ui.label(RichText::new(crate::articles::view::VARIANT_NOTE).small().weak());
+                }
+                for (path, reason) in &card.block.skipped {
+                    ui.label(RichText::new(format!("Not read: {path} — {reason}")).small().weak());
+                }
+                // Each other list block a setting reads has its own entry picker.
+                let mut others: Vec<(&String, usize)> = card
+                    .other_blocks
+                    .iter()
+                    .map(|(name, block)| (name, block.variants.len()))
+                    .filter(|(_, n)| *n > 1)
+                    .collect();
+                others.sort();
+                for (name, count) in others {
+                    let current = card.other_variants.get(name).copied().unwrap_or(0);
+                    let mut picked = current;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name.as_str()).small());
+                        egui::ComboBox::from_id_salt(("article_other_variant", card.agent.as_str(), name.as_str()))
+                            .selected_text(format!("variant {current} of {count}"))
+                            .show_ui(ui, |ui| {
+                                for v in 0..count {
+                                    ui.selectable_value(&mut picked, v, format!("variant {v}"));
+                                }
+                            });
+                    });
+                    if picked != current {
+                        card.other_variants.insert(name.clone(), picked);
+                        card.edits.clear();
+                    }
+                }
+                let cx = crate::articles::view::SettingContext {
+                    variant: card.variant,
+                    consts: consts.as_deref(),
+                    root: root.as_deref(),
+                    block_name: Some(&block_name),
+                    other_blocks: Some(&card.other_blocks),
+                    other_variants: Some(&card.other_variants),
+                    overrides: &overrides,
+                };
+                let rows = crate::articles::view::setting_rows_in(&card.settings, &card.block, cx);
+                // Params nothing in the status code reads still show, editable the same way.
+                let extra = crate::articles::view::unread_param_rows(&card.settings, &card.block, &block_name, cx);
+                let extra_settings: Vec<crate::articles::settings::Setting> = extra
+                    .iter()
+                    .map(|row| crate::articles::settings::Setting {
+                        field: crate::articles::settings::SettingField::OtherMovement,
+                        value: crate::articles::settings::SettingValue::Param {
+                            block: block_name.clone(),
+                            field: row.label.clone(),
+                        },
+                        status: String::new(),
+                        phase: String::new(),
+                        file: PathBuf::new(),
+                        span: 0..0,
+                        facing_factor: false,
+                        referenced_params: Vec::new(),
+                    })
+                    .collect();
+                if rows.is_empty() && extra.is_empty() {
+                    ui.weak("Nothing in the linked source or the param files sets this object's size, speed or life.");
+                }
+                ScrollArea::vertical().id_salt("article_settings_rows").show(ui, |ui| {
+                    egui::Grid::new(("article_settings_grid", card.agent.as_str()))
+                        .striped(true)
+                        .num_columns(4)
+                        .show(ui, |ui| {
+                            let all = rows
+                                .iter()
+                                .zip(card.settings.iter())
+                                .chain(extra.iter().zip(extra_settings.iter()));
+                            for (n, (row, setting)) in all.enumerate() {
+                                ui.label(&row.label);
+                                if row.editable {
+                                    let text = card.edits.entry(n).or_insert_with(|| {
+                                        row.value.trim_end_matches(" × facing").to_string()
+                                    });
+                                    let response = ui.add(egui::TextEdit::singleline(text).desired_width(80.0));
+                                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        save = Some((setting.clone(), text.clone()));
+                                    }
+                                } else {
+                                    ui.label(&row.value);
+                                }
+                                ui.label(RichText::new(&row.origin).small().weak());
+                                ui.horizontal(|ui| {
+                                    if row.editable && ui.small_button("Save").clicked() {
+                                        if let Some(text) = card.edits.get(&n) {
+                                            save = Some((setting.clone(), text.clone()));
+                                        }
+                                    }
+                                    if !setting.file.as_os_str().is_empty()
+                                        && ui.small_button("Open").on_hover_text(setting.file.display().to_string()).clicked()
+                                    {
+                                        reveal = Some(setting.file.clone());
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+                if let Some(message) = &card.message {
+                    ui.separator();
+                    ui.label(message);
+                }
+            });
+        if let Some((setting, text)) = save {
+            let variant = crate::articles::view::setting_variant(
+                &setting,
+                Some(&block_name),
+                card.variant,
+                Some(&card.other_variants),
+            );
+            self.save_article_setting(&mut card, &setting, &text, variant);
+        }
+        if let Some(path) = reveal {
+            if let Err(error) = crate::roster::reveal::reveal(&path) {
+                self.state.status = format!("Could not open {}: {error:#}", path.display());
+            }
+        }
+        if open {
+            self.article_settings = Some(card);
+        }
+    }
+
+    /// The open move's object calls in plain words: the script's own (editable on the game
+    /// track) and, read-only, the ones its status code makes.
+    fn draw_article_calls_section(&mut self, ui: &mut Ui) {
+        self.ensure_article_catalog();
+        let calls = self.state.script.to_article_calls();
+        let move_name = self.state.selected_move.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+        let Some(cache) = self.article_catalog.as_ref() else {
+            return;
+        };
+        let status_rows: Vec<crate::articles::view::StatusCallRow> = if self.open_article.is_some() {
+            Vec::new()
+        } else {
+            cache
+                .status_rows
+                .iter()
+                .filter(|row| crate::articles::view::status_matches_move(&row.status, &move_name))
+                .cloned()
+                .collect()
+        };
+        if calls.is_empty() && status_rows.is_empty() {
+            return;
+        }
+        let labels: Vec<String> = calls
+            .iter()
+            .map(|(_, call)| crate::articles::view::timeline_label(call, &cache.catalog))
+            .collect();
+        // A script call is edited through its statement; that needs the calls in running order to
+        // be the statements in source order, which a loop or a timeline form breaks.
+        let script_calls = calls
+            .iter()
+            .filter(|(_, call)| call.origin == crate::data::ArticleOrigin::Script)
+            .count();
+        let addressable = script_calls == self.state.script.article_site_count();
+        ui.separator();
+        editor_command_subsection_heading(
+            ui,
+            "Objects",
+            "What this move does with its objects, in plain words. Calls in the game_ script can be changed here and synced; calls made from status code are shown with where they are and open in your editor.",
+            egui::Color32::from_rgb(200, 180, 240),
+            "ArticleModule",
+        );
+        let mut edit: Option<(usize, crate::data::ArticleCall)> = None;
+        let mut arg_edits = std::mem::take(&mut self.article_arg_edits);
+        let mut site = 0usize;
+        for ((frame, call), label) in calls.iter().zip(&labels) {
+            let is_script = call.origin == crate::data::ArticleOrigin::Script;
+            let this_site = site;
+            if is_script {
+                site += 1;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("f{frame}"));
+                ui.label(label).on_hover_text(&call.source);
+                if !(is_script && addressable) {
+                    ui.weak(RichText::new(match call.origin {
+                        crate::data::ArticleOrigin::Script => "inside a loop, kept as written",
+                        crate::data::ArticleOrigin::Native => "edited as a native call",
+                        crate::data::ArticleOrigin::Timeline => "edited in its timeline form",
+                    }).small());
+                    return;
+                }
+                if let Some(slot) = call.op.target_index() {
+                    let mut target = call.target;
+                    egui::ComboBox::from_id_salt(("article_target", this_site))
+                        .selected_text(match target {
+                            crate::data::ArticleTarget::All => "every one",
+                            crate::data::ArticleTarget::Last => "the last",
+                            crate::data::ArticleTarget::First => "the first",
+                            _ => "as written",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (choice, words) in [
+                                (crate::data::ArticleTarget::All, "every one"),
+                                (crate::data::ArticleTarget::Last, "the last"),
+                                (crate::data::ArticleTarget::First, "the first"),
+                            ] {
+                                ui.selectable_value(&mut target, choice, words);
+                            }
+                        });
+                    if target != call.target && call.args.get(slot).is_some() {
+                        let mut changed = call.clone();
+                        changed.target = target;
+                        changed.edited = true;
+                        edit = Some((this_site, changed));
+                    }
+                }
+                for (n, arg) in call.args.iter().enumerate() {
+                    if Some(n) == call.op.target_index() {
+                        continue;
+                    }
+                    // The text being typed lives across frames, keyed by statement and argument,
+                    // and is applied when the box loses focus.
+                    let text = arg_edits.entry((this_site, n)).or_insert_with(|| arg.clone());
+                    let width = (text.len() as f32 * 7.0).clamp(30.0, 200.0);
+                    let response = ui.add(egui::TextEdit::singleline(text).desired_width(width));
+                    if response.lost_focus() {
+                        let typed = text.trim().to_string();
+                        arg_edits.remove(&(this_site, n));
+                        if typed != arg.trim() && !typed.is_empty() {
+                            let mut changed = call.clone();
+                            changed.args[n] = typed;
+                            changed.edited = true;
+                            edit = Some((this_site, changed));
+                        }
+                    } else if !response.has_focus() && text.as_str() == arg.as_str() {
+                        // Not being typed in: follow the script, so a later edit shows.
+                        arg_edits.remove(&(this_site, n));
+                    }
+                }
+            });
+        }
+        self.article_arg_edits = arg_edits;
+        let mut reveal: Option<PathBuf> = None;
+        for row in &status_rows {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&row.label);
+                ui.weak(RichText::new(&row.origin).small());
+                if ui.small_button("Open").on_hover_text(row.file.display().to_string()).clicked() {
+                    reveal = Some(row.file.clone());
+                }
+            });
+        }
+        if let Some((site, changed)) = edit {
+            if let Some(call) = self.state.script.article_stmt_mut(site) {
+                *call = changed;
+                // Under R16 an object script's edits reach disk only through a sync.
+                self.state.status = if self.open_article.is_some() {
+                    "Object call edit staged — sync it into the linked source.".into()
+                } else {
+                    "Object call edit staged — export or sync it into the linked source project.".into()
+                };
+            }
+        }
+        if let Some(path) = reveal {
+            if let Err(error) = crate::roster::reveal::reveal(&path) {
+                self.state.status = format!("Could not open {}: {error:#}", path.display());
+            }
+        }
+    }
+
+    /// Hold a state-replacing user action while an object script has unsynced changes: park it
+    /// for the prompt and return `true`. Inside an action the prompt already allowed
+    /// (`leave_confirmed`), everything goes through.
+    fn leave_gate(&mut self, target: impl FnOnce() -> PendingLeave) -> bool {
+        if self.leave_confirmed
+            || !object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
+        {
+            return false;
+        }
+        if self.pending_leave.is_none() {
+            self.pending_leave = Some((target(), None));
+        } else {
+            self.state.status = "Finish the open 'Unsynced changes' prompt first".into();
+        }
+        true
+    }
+
+    /// A fingerprint of everything an edit to the open script can change.
+    fn object_edit_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            self.state.hitboxes,
+            self.state.script,
+            self.state.sound_script,
+            self.state.sounds,
+            self.state.expression_script,
+            self.state.expressions,
+            self.state.effects,
+        )
+        .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Whether the open object script changed since it loaded or was last synced.
+    fn object_script_dirty(&self) -> bool {
+        self.open_article.is_some()
+            && self
+                .object_baseline
+                .is_some_and(|baseline| baseline != self.object_edit_fingerprint())
+    }
+
+    /// Take the open object script's baseline once its load has finished.
+    fn settle_object_baseline(&mut self) {
+        if self.open_article.is_some()
+            && self.object_baseline.is_none()
+            && !self.fetching_acmd
+            && self.acmd_receiver.is_none()
+            && self.source_mismatch_prompt.is_none()
+            && self.state.selected_move.is_some()
+        {
+            self.object_baseline = Some(self.object_edit_fingerprint());
+        }
+    }
+
+    /// The prompt shown when leaving an object script with unsynced changes.
+    fn draw_object_leave_prompt(&mut self, ctx: &egui::Context) {
+        let Some((pending, message)) = self.pending_leave.take() else {
+            return;
+        };
+        let agent = self.open_article.clone().unwrap_or_default();
+        let move_name = self.state.selected_move.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+        let can_sync = self.open_article_in_source && self.acmd_src.is_some();
+        let mut choice: Option<LeaveChoice> = None;
+        egui::Window::new("Unsynced changes")
+            .id(egui::Id::unique("object_leave_prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{agent} · {move_name} has changes that aren't saved anywhere yet. An object's \
+                     script isn't kept in the project, so if you {} now they are lost.",
+                    pending.describe()
+                ));
+                if let Some(message) = &message {
+                    ui.colored_label(egui::Color32::from_rgb(235, 170, 90), message);
+                }
+                ui.horizontal(|ui| {
+                    let sync = ui.add_enabled(can_sync, egui::Button::new("Sync now"));
+                    let sync = if can_sync {
+                        sync.on_hover_text("Write the changes into the linked source, then go on")
+                    } else {
+                        sync.on_disabled_hover_text(self.unsaveable_object_script_words())
+                    };
+                    if sync.clicked() {
+                        choice = Some(LeaveChoice::SyncNow);
+                    }
+                    if ui.button("Discard").on_hover_text("Go on without the changes").clicked() {
+                        choice = Some(LeaveChoice::Discard);
+                    }
+                    if ui.button("Stay").clicked() {
+                        choice = Some(LeaveChoice::Stay);
+                    }
+                });
+            });
+        let Some(choice) = choice else {
+            self.pending_leave = Some((pending, message));
+            return;
+        };
+        let mut clean = false;
+        if choice == LeaveChoice::SyncNow {
+            self.sync_edits_to_source();
+            clean = self.last_sync_clean;
+        }
+        if !object_leave_goes_ahead(choice, clean) {
+            if choice == LeaveChoice::SyncNow {
+                let said = format!("Not everything was synced: {}", self.state.status);
+                self.pending_leave = Some((pending, Some(said)));
+            }
+            return;
+        }
+        self.leave_confirmed = true;
+        match pending {
+            PendingLeave::Script(article, entry) => self.select_script(article, entry),
+            PendingLeave::Fighter(key) => {
+                let rows = self.state.fighters.iter().map(|f| (f.name.as_str(), f.custom_name.as_deref()));
+                match resolve_parked_fighter(rows, &key) {
+                    Some(index) => self.select_fighter(index),
+                    None => {
+                        self.state.status =
+                            format!("{} is no longer in the list, so it wasn't opened", parked_fighter_label(&key));
+                    }
+                }
+            }
+            PendingLeave::ForgetFighter(target) => {
+                if self.state.fighters.iter().any(|f| {
+                    f.name.eq_ignore_ascii_case(&target.name) && f.custom_name == target.character
+                }) {
+                    self.forget_fighter(&target);
+                } else {
+                    self.state.status = format!(
+                        "{} is no longer in the list",
+                        parked_fighter_label(&target)
+                    );
+                }
+            }
+            PendingLeave::Hub(action) => self.execute_hub_action_now(action),
+            PendingLeave::LoadProject(path) => self.load_project_from(&path),
+            PendingLeave::NewProject(path) => self.new_project_in(&path),
+            PendingLeave::SetDataRoot(path) => self.set_data_root(path),
+            PendingLeave::RescanSource => self.rescan_acmd_source(),
+            PendingLeave::LinkSource(root) => self.link_acmd_source(root),
+            PendingLeave::UnlinkSource => self.unlink_acmd_source(),
+            PendingLeave::SaveSourceBuffer => self.save_source_buffer(),
+            PendingLeave::ReloadSource => self.fetch_acmd(),
+        }
+        self.leave_confirmed = false;
+    }
+
+    /// Why the open object script can't be saved: the game's own script the moveset doesn't
+    /// define, or, for a clone (which has no game scripts), one the moveset hasn't written yet.
+    fn unsaveable_object_script_words(&self) -> &'static str {
+        if self.open_article_is_clone() {
+            "Changes to this script can't be saved yet: the moveset doesn't define this script for \
+             its clone yet."
+        } else {
+            "Changes to this script can't be saved yet: it's the game's own script and the moveset \
+             doesn't define it."
+        }
+    }
+
+    /// Whether the open object script is a clone's, which the game has no scripts for.
+    fn open_article_is_clone(&self) -> bool {
+        let Some(agent) = &self.open_article else {
+            return false;
+        };
+        self.article_catalog.as_ref().is_some_and(|cache| {
+            cache
+                .catalog
+                .get(agent)
+                .is_some_and(|a| matches!(a.origin, crate::articles::ArticleOrigin::Clone(_)))
+        })
+    }
+
+    /// The open move's key in every per-move store: the open article agent when an object script
+    /// is open, otherwise the character it was opened for (which is not always the active one
+    /// while navigation is switching characters).
     fn current_move_key(&self) -> Option<String> {
-        let owner = crate::character::CharacterKey::parse(self.state.open_move_owner()?);
         let mv = &self.state.selected_move.as_ref()?.name;
+        if let Some(agent) = &self.open_article {
+            return Some(Self::move_key(agent, mv));
+        }
+        let owner = crate::character::CharacterKey::parse(self.state.open_move_owner()?);
         Some(crate::character::move_key(&owner, mv))
     }
 
@@ -19010,7 +23891,11 @@ impl VisionaryApp {
     /// Return the merged source body when every required input is already local. This is used
     /// for mismatch detection; normal move navigation never performs a network request merely to
     /// compare a saved project snapshot.
-    fn warm_source_body(&self, fighter: &str, move_name: &str) -> Option<(String, &'static str)> {
+    fn warm_source_body(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Option<(String, crate::data::ScriptOrigin)> {
         if let Some(project) = self
             .acmd_src
             .as_ref()
@@ -19028,12 +23913,12 @@ impl VisionaryApp {
                     &project.blocked,
                     &mirror,
                 ),
-                "Project source",
+                crate::data::ScriptOrigin::MovesetSource,
             ));
         }
         crate::acmd::cached_script_body(fighter, move_name)
             .filter(|body| !body.is_empty())
-            .map(|body| (body, "GitHub"))
+            .map(|body| (body, crate::data::ScriptOrigin::Vanilla))
     }
 
     /// Resolve a local linked body even when the mirror cache is cold. A project that owns only
@@ -19043,7 +23928,7 @@ impl VisionaryApp {
         &self,
         fighter: &str,
         move_name: &str,
-    ) -> Option<(String, &'static str)> {
+    ) -> Option<(String, crate::data::ScriptOrigin)> {
         self.warm_source_body(fighter, move_name).or_else(|| {
             let project = self
                 .acmd_src
@@ -19059,7 +23944,7 @@ impl VisionaryApp {
                     &self.state.loaded_body,
                 )
             };
-            Some((body, "Project source"))
+            Some((body, crate::data::ScriptOrigin::MovesetSource))
         })
     }
 
@@ -19429,8 +24314,7 @@ impl VisionaryApp {
                 self.hitbox_rules_store.remove(&store_key);
             }
         }
-        self.game_link
-            .send_hitbox_rules(&self.live_hitbox_rule_union());
+        self.publish_hitbox_rules();
     }
 
     fn note_live_replay_capture_limit(&mut self, category: &str) {
@@ -19486,23 +24370,13 @@ impl VisionaryApp {
             self.state.expression_script_edits.get(&key).cloned(),
         )
         .0;
-        let effects = self
-            .state
-            .effect_call_full
-            .get(&key)
-            .cloned()
-            .map(|calls| {
-                calls
-                    .into_iter()
-                    .map(crate::data::EffectCall::normalized_timing)
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                materialize_effect_calls(
-                    &effect_pristine,
-                    self.state.effect_call_edits.get(&key).map(Vec::as_slice),
-                )
-            });
+        // Same check the open move gets: a saved list made against an older script is not
+        // replayed over the current one.
+        let (effects, _, _) = reconcile_saved_effects(
+            &effect_pristine,
+            self.state.effect_call_full.get(&key),
+            self.state.effect_call_edits.get(&key).map(Vec::as_slice),
+        );
         let record = self
             .state
             .edit_log
@@ -19558,7 +24432,7 @@ impl VisionaryApp {
             &context.fighter,
             &context.move_name,
             Ok(context.source.body.clone()),
-            "Saved project source",
+            crate::data::ScriptOrigin::Saved,
         );
         // `apply_acmd_body` has already established these same values, but using the context
         // here makes the project-wide path independent of whichever move happened to be open
@@ -19588,6 +24462,30 @@ impl VisionaryApp {
             .to_motion_module_set_rate_partial_events();
     }
 
+    /// Tell the plugin which fighter (and slot scope, for slot-scoped characters like Shy Guy)
+    /// is selected so article capture/injection scopes strictly to that fighter's own articles.
+    fn send_selected_fighter_to_game(&self) {
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|idx| self.state.fighters.get(idx));
+        let kind = selected.and_then(|f| fighter_kind_id(&f.name));
+        let costumes: &[u8] = selected
+            .filter(|f| f.custom_name.is_some())
+            .map(|f| f.slots.as_slice())
+            .unwrap_or(&[]);
+        self.game_link.send_selected_fighter(kind, costumes);
+    }
+
+    fn article_agent_from_rule_key(key: &str) -> Option<String> {
+        let agent = key.split(['/', '#']).next().unwrap_or_default();
+        if !agent.is_empty() && crate::gimmicks::registry::fighter_kind_value(agent).is_none() {
+            Some(agent.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Withhold source-only node tracks at the final publication boundary, including watcher
     /// and reconnect sends. Retain keyed rules so reverting a recipe can restore flat preview.
     fn live_hitbox_rule_union(
@@ -19596,7 +24494,9 @@ impl VisionaryApp {
         let roster = &self.roster.project;
         self.hitbox_rules_store
             .iter()
-            .filter(|(key, _)| self.allows_flat(key, false))
+            .filter(|(key, _)| {
+                Self::article_agent_from_rule_key(key).is_none() && self.allows_flat(key, false)
+            })
             .flat_map(|(key, rules)| {
                 // A call added inside an If only fires when the If passes.
                 let guards = crate::character::parse_move_key(&rule_move_key(key))
@@ -19617,6 +24517,24 @@ impl VisionaryApp {
                             .map(|(_, guard)| guard.clone());
                     }
                     crate::game_link::ForFighter::scoped(key, rule, roster)
+                })
+            })
+            .collect()
+    }
+
+    fn live_article_hitbox_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForArticle<crate::game_link::HitboxRuleWire>> {
+        self.hitbox_rules_store
+            .iter()
+            .filter_map(|(key, rules)| {
+                let agent = Self::article_agent_from_rule_key(key)?;
+                Some((agent, rules))
+            })
+            .flat_map(|(agent, rules)| {
+                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
+                    agent: agent.clone(),
+                    rule,
                 })
             })
             .collect()
@@ -19660,7 +24578,10 @@ impl VisionaryApp {
         let roster = &self.roster.project;
         self.effect_rules_store
             .iter()
-            .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .filter(|(key, _)| {
+                Self::article_agent_from_rule_key(key).is_none()
+                    && self.allows_flat_effect_rules(key)
+            })
             .flat_map(|(key, rules)| {
                 // An effect added inside an If only fires when the If passes.
                 let guards = crate::character::parse_move_key(key)
@@ -19686,13 +24607,34 @@ impl VisionaryApp {
             .collect()
     }
 
+    fn live_article_effect_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForArticle<crate::game_link::SpawnRuleWire>> {
+        self.effect_rules_store
+            .iter()
+            .filter_map(|(key, rules)| {
+                let agent = Self::article_agent_from_rule_key(key)?;
+                Some((agent, rules))
+            })
+            .flat_map(|(agent, rules)| {
+                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
+                    agent: agent.clone(),
+                    rule,
+                })
+            })
+            .collect()
+    }
+
     fn live_effect_control_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::EffectControlRuleWire>> {
         let roster = &self.roster.project;
         self.effect_control_rules_store
             .iter()
-            .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .filter(|(key, _)| {
+                Self::article_agent_from_rule_key(key).is_none()
+                    && self.allows_flat_effect_rules(key)
+            })
             .flat_map(|(key, rules)| {
                 rules
                     .iter()
@@ -19702,16 +24644,53 @@ impl VisionaryApp {
             .collect()
     }
 
+    fn live_article_effect_control_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForArticle<crate::game_link::EffectControlRuleWire>> {
+        self.effect_control_rules_store
+            .iter()
+            .filter_map(|(key, rules)| {
+                let agent = Self::article_agent_from_rule_key(key)?;
+                Some((agent, rules))
+            })
+            .flat_map(|(agent, rules)| {
+                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
+                    agent: agent.clone(),
+                    rule,
+                })
+            })
+            .collect()
+    }
+
+    fn publish_hitbox_rules(&self) {
+        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
+        self.game_link.send_hitbox_rules(&hitboxes);
+        let article_hitboxes: Vec<_> = self.live_article_hitbox_rule_union();
+        self.game_link.send_article_hitbox_rules(&article_hitboxes);
+    }
+
+    fn publish_effect_rules(&self) {
+        let effects: Vec<_> = self.live_effect_rule_union();
+        self.game_link.send_spawn_rules(&effects);
+        let article_effects: Vec<_> = self.live_article_effect_rule_union();
+        self.game_link.send_article_spawn_rules(&article_effects);
+    }
+
+    fn publish_effect_control_rules(&self) {
+        let controls: Vec<_> = self.live_effect_control_rule_union();
+        self.game_link.send_effect_control_rules(&controls);
+        let article_controls: Vec<_> = self.live_article_effect_control_rule_union();
+        self.game_link
+            .send_article_effect_control_rules(&article_controls);
+    }
+
     /// Publish the complete safe ACMD live-rule union currently staged in the keyed stores.
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
-        let effects: Vec<_> = self.live_effect_rule_union();
-        let controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_hitbox_rules(&hitboxes);
-        self.game_link.send_spawn_rules(&effects);
-        self.game_link.send_effect_control_rules(&controls);
+        self.publish_hitbox_rules();
+        self.publish_effect_rules();
+        self.publish_effect_control_rules();
     }
 
     /// Rehydrate every move represented by a loaded project through the same source parser and
@@ -19795,6 +24774,7 @@ impl VisionaryApp {
                     hash: context.motion,
                     frame_count: 0,
                     anim_path: None,
+                    cancel_frame: 0,
                 },
             );
             if context.source.body.is_empty() && context.captures.is_empty() {
@@ -20224,18 +25204,66 @@ impl VisionaryApp {
         let Some(mv) = self.current_move_key() else {
             return;
         };
-        if let Some(full) = self.state.effect_call_full.get(&mv) {
-            self.state.effects = full
-                .iter()
-                .cloned()
-                .map(crate::data::EffectCall::normalized_timing)
-                .collect();
-            return;
+        let names = self.effect_reverse_map();
+        resolve_raw_effect_names(&mut self.state.effects_pristine, &names);
+        let (mut effects, kept, report) = reconcile_saved_effects(
+            &self.state.effects_pristine,
+            self.state.effect_call_full.get(&mv),
+            self.state.effect_call_edits.get(&mv).map(Vec::as_slice),
+        );
+        resolve_raw_effect_names(&mut effects, &names);
+        self.state.effects = effects;
+        if report != SavedEffectsReconcile::default() {
+            // Store what is shown, so the next save writes the reconciled record rather than the
+            // stale one, and the move does not have to be reconciled again.
+            if kept.is_empty() {
+                self.state.effect_call_edits.remove(&mv);
+            } else {
+                self.state.effect_call_edits.insert(mv.clone(), kept);
+            }
+            if report.stale_full {
+                if self.state.effect_call_edits.contains_key(&mv) {
+                    self.state
+                        .effect_call_full
+                        .insert(mv.clone(), self.state.effects.clone());
+                } else {
+                    self.state.effect_call_full.remove(&mv);
+                }
+            }
+            let mut parts = Vec::new();
+            if report.stale_full {
+                parts.push(
+                    "the saved effect list for this move was made against an older version of \
+                     its script, so the script's effects are shown with your edits reapplied"
+                        .to_string(),
+                );
+            }
+            if report.reanchored_edits > 0 {
+                parts.push(format!(
+                    "{} effect edit(s) followed their call to its new place in the script",
+                    report.reanchored_edits
+                ));
+            }
+            if report.dropped_edits > 0 {
+                parts.push(format!(
+                    "{} effect edit(s) were dropped because the call they changed is no longer \
+                     in the script",
+                    report.dropped_edits
+                ));
+            }
+            self.state.status = format!("{mv}: {}.", parts.join("; "));
+        } else if let Some(edits) = self.state.effect_call_edits.get_mut(&mv) {
+            for edit in edits.iter_mut() {
+                if let crate::data::EffectCallOp::Modify(call) | crate::data::EffectCallOp::Add(call) =
+                    &mut edit.op
+                {
+                    resolve_raw_effect_names(std::slice::from_mut(call), &names);
+                }
+            }
         }
-        let Some(edits) = self.state.effect_call_edits.get(&mv) else {
-            return;
-        };
-        self.state.effects = materialize_effect_calls(&self.state.effects_pristine, Some(edits));
+        if let Some(full) = self.state.effect_call_full.get_mut(&mv) {
+            resolve_raw_effect_names(full, &names);
+        }
     }
 
     fn restore_node_effects_to_current(&mut self) -> bool {
@@ -20368,6 +25396,11 @@ impl VisionaryApp {
             fighters: HashMap::new(),
             characters: Default::default(),
             roster: self.roster.project.clone(),
+            project_fighters: BTreeSet::new(),
+            moveset_source: self
+                .project_moveset
+                .as_ref()
+                .map(|path| path.display().to_string()),
         };
         let roster = self.roster.project.clone();
         // Trait edits are authored in the Roster window and have no edit-log entry, so a
@@ -20487,6 +25520,10 @@ impl VisionaryApp {
             let Some((fighter, move_name)) = crate::character::split_move_key(key) else {
                 continue;
             };
+            // Only an edited move's baseline is worth saving; see `drop_unedited_move_sources`.
+            if !self.move_has_edits(key) {
+                continue;
+            }
             if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
                 fm.move_sources
                     .insert(move_name.to_string(), snapshot.clone());
@@ -20572,6 +25609,34 @@ impl VisionaryApp {
                     .insert(move_name.to_string(), warning.clone());
             }
         }
+        // An object script's edits are keyed by its agent (`samus_lativolt/fly`); the project and
+        // the export know only fighters, so they never carry one.
+        let dropped = strip_object_agents(&mut project, &self.opened_object_agents);
+        if !dropped.is_empty() {
+            self.state.status = format!(
+                "Object script edits ({}) are not kept in the project — sync them into the linked source",
+                dropped.join(", ")
+            );
+        }
+        // A fighter's first edit adds it to the project, and it stays after the edit is undone:
+        // recorded on `self`, which outlives this build, then copied into the file.
+        let edited_now = crate::project_scope::edited_fighters(&project);
+        let owners: HashMap<String, Vec<crate::mod_project::ProjectFighter>> = edited_now
+            .difference(&self.edited_fighters)
+            .map(|name| (name.clone(), self.script_owner_rows(name)))
+            .collect();
+        self.edited_fighters = crate::project_scope::absorb_edited_fighters(
+            &mut self.project_fighters,
+            &self.edited_fighters,
+            &project,
+            |name| owners.get(name).cloned().unwrap_or_default(),
+        );
+        self.authored_characters = crate::project_scope::absorb_authored_characters(
+            &mut self.project_fighters,
+            &self.authored_characters,
+            &project.roster,
+        );
+        project.project_fighters = self.project_fighters.clone();
         project
     }
 
@@ -20677,7 +25742,15 @@ impl VisionaryApp {
                 "Wait for the base game files to finish copying before Save As.".into();
             return;
         }
+        // From Browse without project, the new file records the crate in use now. Only for
+        // this build: the field is taken on below once the file is written, so a cancelled or
+        // failed Save As leaves Browse mode without a project link.
+        let previous_moveset = self.project_moveset.clone();
+        if self.project_path.is_none() {
+            self.project_moveset = self.acmd_src.as_ref().map(|index| index.root.clone());
+        }
         let project = self.build_project();
+        let saved_moveset = std::mem::replace(&mut self.project_moveset, previous_moveset);
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save project as…")
             .set_file_name(crate::mod_project::PROJECT_FILE_NAME)
@@ -20713,7 +25786,10 @@ impl VisionaryApp {
                         .collect();
                     crate::project_hub::preserve_workspace_files(current, &path, &made_roots)
                 });
+                self.project_moveset = saved_moveset;
                 self.adopt_project_path(&path, &project);
+                // The new workspace's romfs is the index root now.
+                self.reindex_fighters();
                 self.state.status = format!("Saved {}", path.display());
                 match overlay_report {
                     Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
@@ -20861,6 +25937,9 @@ impl VisionaryApp {
     /// Start empty in a picked workspace folder: scaffold it so every edit has
     /// a home from the first save, then clear every edit store and the live game.
     fn new_project_in(&mut self, workspace: &std::path::Path) {
+        if self.leave_gate(|| PendingLeave::NewProject(workspace.to_path_buf())) {
+            return;
+        }
         let name = workspace
             .file_name()
             .and_then(|n| n.to_str())
@@ -20873,6 +25952,7 @@ impl VisionaryApp {
                 return;
             }
         };
+        self.close_add_fighter_popup();
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
         self.eff_editor.reset_project_state();
@@ -20902,6 +25982,14 @@ impl VisionaryApp {
         self.roster.meters.clear();
         self.gimmicks_editor.invalidate();
         self.edit_history.clear();
+        self.project_fighters.clear();
+        self.edited_fighters.clear();
+        self.authored_characters.clear();
+        self.project_moveset = None;
+        self.acmd_src = None;
+        self.acmd_src_problem = None;
+        self.acmd_src_buffer = None;
+        self.refresh_acmd_src_fighters();
         self.game_link.end_project_batch();
         self.game_link.send_reset_pins();
         self.publish_live_rule_union();
@@ -20909,9 +25997,16 @@ impl VisionaryApp {
         // Adopt the scaffolded file immediately: edits autosave here from now on.
         let project = self.build_project();
         self.adopt_project_path(&file, &project);
+        // The workspace's romfs is an index root now. Nothing stays selected: re-selecting
+        // would commit the previous project's open move into this one.
+        self.clear_fighter_selection();
+        self.reindex_fighters();
         self.import_report = None;
         self.project_hub.show = false;
         self.state.status = format!("New project at {}.", workspace.display());
+        // Ask which fighters it is for; closing the popup skips it.
+        self.add_fighter_popup = Some("Which fighters is this project for?".to_string());
+        self.add_fighter_search.clear();
     }
 
     /// A hub choice was clicked: flush any pending autosave first, then guard
@@ -20926,6 +26021,20 @@ impl VisionaryApp {
     }
 
     fn execute_hub_action(&mut self, action: crate::project_hub::HubAction) {
+        if self.leave_confirmed
+            || !object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
+        {
+            self.execute_hub_action_now(action);
+            return;
+        }
+        if self.pending_leave.is_none() {
+            self.pending_leave = Some((PendingLeave::Hub(action), None));
+        } else {
+            self.state.status = "Finish the open 'Unsynced changes' prompt first".into();
+        }
+    }
+
+    fn execute_hub_action_now(&mut self, action: crate::project_hub::HubAction) {
         match action {
             crate::project_hub::HubAction::ResumeLast(path)
             | crate::project_hub::HubAction::Open(path)
@@ -20941,7 +26050,24 @@ impl VisionaryApp {
             }
             crate::project_hub::HubAction::BrowseWithoutProject => {
                 self.project_hub.show = false;
-                self.state.status = String::new();
+                self.close_add_fighter_popup();
+                // Leaving an open project (autosave flushed it above): its romfs stops being an
+                // index root and the global moveset link applies again. In-memory edits stay.
+                if self.project_path.take().is_some() {
+                    self.last_saved_snapshot = None;
+                    self.project_autosave_pending_since = None;
+                    self.project_autosave_error = None;
+                    self.project_moveset = None;
+                    // No project, no membership; a later Save As re-absorbs edited fighters.
+                    self.project_fighters.clear();
+                    self.edited_fighters.clear();
+                    self.authored_characters.clear();
+                    self.relink_global_acmd_source();
+                    self.reindex_fighters();
+                    self.reload_move_scripts();
+                }
+                self.state.status =
+                    "Browsing without a project — edits stay in memory until File → Save As… gives them a home.".into();
             }
         }
     }
@@ -20978,7 +26104,9 @@ impl VisionaryApp {
         // Param labels: the downloaded CSV first, then whatever the dump carries.
         let mut labels = self.downloaded_labels.clone();
         labels.extend(self.state.labels.clone());
-        let base_roots = self.all_roots();
+        // What the import overrides is the dump and the Mod Library, not whichever project
+        // happens to be open.
+        let base_roots = self.shared_roots();
         let options = crate::mod_import::ImportOptions {
             known_fighters: &known_fighters,
             labels: &labels,
@@ -20994,6 +26122,13 @@ impl VisionaryApp {
                 }
             };
         project.name = stem.clone();
+        // Everything the mod touches is what the project is about, edits or not.
+        let touched: Vec<String> = project.fighters.keys().cloned().collect();
+        for name in touched {
+            project
+                .project_fighters
+                .insert(crate::mod_project::ProjectFighter::fighter(&name));
+        }
         // Write the adopted project beside its assets so later edits autosave onto it.
         match crate::mod_export::write_portable_project(&project, &project_file, &asset_dir) {
             Ok(()) => {}
@@ -21022,6 +26157,405 @@ impl VisionaryApp {
         // report visible even though the hub closes.
         self.import_report = Some(report);
         self.project_hub.show = false;
+    }
+
+    /// Show the Sources window with `row` highlighted and scrolled into view.
+    fn open_sources(&mut self, row: SourceRow) {
+        self.show_sources = true;
+        self.sources_focus = Some(row);
+        self.sources_scroll = true;
+        // Re-read the dump on every open, so a folder fixed outside the app is noticed.
+        self.dump_status = None;
+    }
+
+    /// Apply a dump the user has accepted. On first run (no dump yet, no project open) this is
+    /// step 1 of setup, so step 2 follows: the Project Hub.
+    fn apply_game_dump(&mut self, path: PathBuf) {
+        // No recent-projects condition: a returning user whose dump setting was lost had the
+        // hub held back at startup too, and gets it here.
+        let first_run = self.state.data_root.is_none() && self.project_path.is_none();
+        self.set_data_root(path);
+        if first_run && self.state.data_root.is_some() {
+            self.project_hub.show = true;
+        }
+    }
+
+    /// Pick a folder as the ArcExplorer dump. A folder that passes `check_dump` is applied
+    /// straight away; anything else is held in `pending_dump` for the Sources window to ask
+    /// about, since the answer arrives on a later frame. Shared by the Sources window and
+    /// the left panel.
+    fn pick_game_dump(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose your ArcExplorer dump")
+            .pick_folder()
+        else {
+            return;
+        };
+        match crate::sources::check_dump(&path) {
+            crate::sources::DumpCheck::Ok => {
+                self.pending_dump = None;
+                self.apply_game_dump(path);
+            }
+            other => {
+                self.pending_dump = Some((path, other));
+                // The question is drawn in the Sources window, so make sure it is showing.
+                self.open_sources(SourceRow::Dump);
+            }
+        }
+    }
+
+    fn draw_sources_window(&mut self, ctx: &egui::Context) {
+        if !self.show_sources {
+            return;
+        }
+        use crate::sources::{hint_text, DumpCheck};
+        if let Some(root) = self.state.data_root.clone() {
+            if self.dump_status.as_ref().map(|(p, _)| p) != Some(&root) {
+                let check = crate::sources::check_dump(&root);
+                self.dump_status = Some((root, check));
+            }
+        } else {
+            self.dump_status = None;
+        }
+        let focus = self.sources_focus;
+        let scroll = std::mem::take(&mut self.sources_scroll);
+        let has_project = self.project_path.is_some();
+        let global_link = if has_project && self.project_moveset.is_none() {
+            load_config_path(ACMD_SRC_CONFIG_KEY)
+        } else {
+            None
+        };
+        let dump_path = self.state.data_root.clone();
+        let dump_status = self.dump_status.clone();
+        let pending = self.pending_dump.clone();
+        let mods_total = self.roster.library.mods.len();
+        let mods_enabled = self.roster.library.enabled().count();
+        let fighters_with_files = self.project_romfs_slots.len();
+        let romfs = self.project_romfs();
+        let linked = self
+            .acmd_src
+            .as_ref()
+            .map(|index| (index.root.clone(), index.has_unattributed_scripts()));
+        let problem = self.acmd_src_problem.clone();
+
+        let mut open = true;
+        let mut change_dump = false;
+        let mut use_pending: Option<PathBuf> = None;
+        let mut drop_pending = false;
+        let mut reveal_path: Option<PathBuf> = None;
+        let mut open_library = false;
+        let mut open_workspace = false;
+        let mut link = false;
+        let mut unlink = false;
+        let mut use_global: Option<PathBuf> = None;
+
+        let weak = egui::Color32::GRAY;
+        let warn = egui::Color32::from_rgb(220, 180, 90);
+        // Which of fighter/ and effect/ a folder lacks, as "fighter/ and effect/" style text.
+        let missing_text = |fighter: bool, effect: bool, joiner: &str| {
+            let mut gone = Vec::new();
+            if fighter {
+                gone.push("fighter/");
+            }
+            if effect {
+                gone.push("effect/");
+            }
+            gone.join(joiner)
+        };
+        // One row: a framed block, highlighted when it is the one asked for.
+        let row = |ui: &mut Ui,
+                   which: SourceRow,
+                   title: &str,
+                   description: &str,
+                   body: &mut dyn FnMut(&mut Ui)| {
+            let stroke = if focus == Some(which) {
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke
+            };
+            let framed = egui::Frame::group(ui.style()).stroke(stroke).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(title).strong());
+                ui.label(RichText::new(description).small().color(weak));
+                ui.add_space(2.0);
+                body(ui);
+            });
+            if scroll && focus == Some(which) {
+                framed.response.scroll_to_me(Some(egui::Align::Center));
+            }
+        };
+
+        egui::Window::new("Sources")
+            .open(&mut open)
+            .default_width(520.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    row(
+                        ui,
+                        SourceRow::Dump,
+                        "Game dump (ArcExplorer)",
+                        "The fighter/, effect/ and ui/ folders you exported from data.arc. \
+                         Shared by every project.",
+                        &mut |ui| {
+                            match (&dump_path, &dump_status) {
+                                (Some(path), Some((_, check))) => {
+                                    ui.label(
+                                        RichText::new(path.display().to_string()).monospace().small(),
+                                    );
+                                    match check {
+                                        DumpCheck::Ok => {
+                                            ui.label(
+                                                RichText::new("Looks like a full game dump.").small(),
+                                            );
+                                        }
+                                        DumpCheck::Missing { fighter, effect, .. } => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Missing {}.",
+                                                    missing_text(*fighter, *effect, " and ")
+                                                ))
+                                                .small()
+                                                .color(warn),
+                                            );
+                                        }
+                                        DumpCheck::LooksLikeMod(hints) => {
+                                            ui.label(
+                                                RichText::new(
+                                                    "This folder looks like a mod, not a game dump:",
+                                                )
+                                                .small()
+                                                .color(warn),
+                                            );
+                                            for hint in hints {
+                                                ui.label(
+                                                    RichText::new(format!("• it {}", hint_text(hint)))
+                                                        .small()
+                                                        .color(warn),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    ui.label(RichText::new("not set").small().color(weak));
+                                }
+                            }
+                            if let Some((picked, check)) = &pending {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(picked.display().to_string()).monospace().small(),
+                                );
+                                match check {
+                                    DumpCheck::Missing { fighter, effect, suggestion } => {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "That folder has no {}, so it isn't a game dump.",
+                                                missing_text(*fighter, *effect, " or ")
+                                            ))
+                                            .small()
+                                            .color(warn),
+                                        );
+                                        if let Some(better) = suggestion {
+                                            if ui
+                                                .button(format!("Use {} instead", better.display()))
+                                                .clicked()
+                                            {
+                                                use_pending = Some(better.clone());
+                                            }
+                                        }
+                                    }
+                                    DumpCheck::LooksLikeMod(hints) => {
+                                        ui.label(
+                                            RichText::new(
+                                                "That folder looks like a mod, not a game dump:",
+                                            )
+                                            .small()
+                                            .color(warn),
+                                        );
+                                        for hint in hints {
+                                            ui.label(
+                                                RichText::new(format!("• it {}", hint_text(hint)))
+                                                    .small()
+                                                    .color(warn),
+                                            );
+                                        }
+                                        if ui.button("Use anyway").clicked() {
+                                            use_pending = Some(picked.clone());
+                                        }
+                                    }
+                                    DumpCheck::Ok => {}
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Pick another").clicked() {
+                                        change_dump = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        drop_pending = true;
+                                    }
+                                });
+                                ui.separator();
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Change…").clicked() {
+                                    change_dump = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        dump_path.is_some(),
+                                        egui::Button::new("Open folder"),
+                                    )
+                                    .clicked()
+                                {
+                                    reveal_path = dump_path.clone();
+                                }
+                            });
+                        },
+                    );
+                    row(
+                        ui,
+                        SourceRow::ReferenceMods,
+                        "Reference mods",
+                        "Other people's mods to view alongside the game. Shared by every project.",
+                        &mut |ui| {
+                            ui.label(
+                                RichText::new(format!("{mods_enabled} of {mods_total} enabled"))
+                                    .small(),
+                            );
+                            if ui.button("Open Mod Library").clicked() {
+                                open_library = true;
+                            }
+                        },
+                    );
+                    row(
+                        ui,
+                        SourceRow::ProjectFiles,
+                        "This project's files",
+                        "Your edited game files (romfs/). These win over the dump in previews and \
+                         are included when you export.",
+                        &mut |ui| {
+                            if !has_project {
+                                ui.label(
+                                    RichText::new("Open or create a project to have its own files.")
+                                        .small()
+                                        .color(weak),
+                                );
+                                return;
+                            }
+                            ui.label(
+                                RichText::new(format!("{fighters_with_files} fighters with files"))
+                                    .small(),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Open folder").clicked() {
+                                    reveal_path = romfs.clone();
+                                }
+                                if ui.button("Project Files…").clicked() {
+                                    open_workspace = true;
+                                }
+                            });
+                        },
+                    );
+                    row(
+                        ui,
+                        SourceRow::MovesetCode,
+                        "Moveset code",
+                        if has_project {
+                            "The Rust project that builds your plugin. Saved with this project."
+                        } else {
+                            "The Rust project that builds your plugin. Used while browsing without a project."
+                        },
+                        &mut |ui| {
+                            match (&linked, &problem) {
+                                (Some((root, _)), _) => {
+                                    ui.label(
+                                        RichText::new(root.display().to_string()).monospace().small(),
+                                    );
+                                }
+                                (None, Some(problem)) => {
+                                    ui.label(RichText::new(problem).small().color(warn));
+                                }
+                                (None, None) => {
+                                    ui.label(RichText::new("not linked").small().color(weak));
+                                }
+                            }
+                            if matches!(linked, Some((_, true))) {
+                                ui.label(
+                                    RichText::new(
+                                        "this crate doesn't name its fighters — add the fighter \
+                                         to the project yourself",
+                                    )
+                                    .small()
+                                    .color(warn),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Link…").clicked() {
+                                    link = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        linked.is_some() || problem.is_some(),
+                                        egui::Button::new("Unlink"),
+                                    )
+                                    .clicked()
+                                {
+                                    unlink = true;
+                                }
+                                if linked.is_none() {
+                                    if let Some(global) = &global_link {
+                                        if ui.button(format!("Use {}", global.display())).clicked() {
+                                            use_global = Some(global.clone());
+                                        }
+                                    }
+                                }
+                            });
+                        },
+                    );
+                });
+            });
+
+        if !open {
+            self.show_sources = false;
+            self.sources_focus = None;
+            self.pending_dump = None;
+        }
+        if drop_pending {
+            self.pending_dump = None;
+        }
+        if let Some(path) = use_pending {
+            self.pending_dump = None;
+            self.apply_game_dump(path);
+        }
+        if change_dump {
+            self.pending_dump = None;
+            self.pick_game_dump();
+        }
+        if let Some(path) = reveal_path {
+            if let Err(error) = crate::roster::reveal::reveal(&path) {
+                self.state.status = format!("Could not open {}: {error:#}", path.display());
+            }
+        }
+        if open_library {
+            self.roster.open = true;
+        }
+        if open_workspace {
+            self.roster.open = true;
+        }
+        if link {
+            if let Some(root) = rfd::FileDialog::new()
+                .set_title("Link moveset source")
+                .pick_folder()
+            {
+                self.link_acmd_source(root);
+            }
+        }
+        if unlink {
+            self.unlink_acmd_source();
+        }
+        if let Some(path) = use_global {
+            self.link_acmd_source(path);
+        }
     }
 
     fn draw_project_hub(&mut self, ctx: &egui::Context) {
@@ -21304,6 +26838,55 @@ impl VisionaryApp {
     /// Stage the selected workspace model/motion files on the emulator SD and publish one full
     /// carrier snapshot. The plugin reports callback reads separately; queuing this snapshot is
     /// not presented as proof that a parsed game resource has already changed.
+    /// The selected data's model folder for `fighter`'s costume `slot`: the base a preview's
+    /// workspace files go over.
+    fn costume_model_dir(&self, fighter: &str, slot: u8) -> Option<std::path::PathBuf> {
+        self.state
+            .fighters
+            .iter()
+            .find(|entry| entry.name == fighter)
+            .map(|entry| {
+                entry
+                    .fighter_dir
+                    .join("model")
+                    .join("body")
+                    .join(format!("c{slot:02}"))
+            })
+    }
+
+    /// Check the model a preview of this costume would load, keep the report for Project
+    /// Files, and return it. Issues the costume's base model already has are left out.
+    fn check_workspace_model(
+        &mut self,
+        workspace: &std::path::Path,
+        fighter: &str,
+        slot: u8,
+    ) -> Option<&crate::model_checks::ModelReport> {
+        let base = self.costume_model_dir(fighter, slot);
+        let sources =
+            crate::project_hub::carrier_model_sources(workspace, fighter, slot, base.as_deref())
+                .ok()?;
+        // Compare against the game's own model, never the data root's: when the data root is
+        // this project's romfs, that is the model being checked and would hide every issue.
+        // An added slot has no vanilla model, so it is compared with the fighter's c00.
+        let vanilla_body = load_config_path(VANILLA_ROOT_CONFIG_KEY)
+            .map(|root| root.join("fighter").join(fighter).join("model").join("body"));
+        let baseline = vanilla_body.and_then(|body| {
+            [slot, 0]
+                .into_iter()
+                .map(|s| body.join(format!("c{s:02}")))
+                .find(|dir| dir.is_dir())
+                .map(|dir| crate::costume_files::list_files(&dir))
+        });
+        let report = crate::model_checks::check_files_against(sources, baseline);
+        self.model_report = Some(CostumeModelReport {
+            fighter: fighter.to_string(),
+            slot,
+            report,
+        });
+        self.model_report.as_ref().map(|entry| &entry.report)
+    }
+
     fn send_workspace_asset_bundle(
         &mut self,
         workspace: &std::path::Path,
@@ -21314,6 +26897,17 @@ impl VisionaryApp {
         if !self.game_link.status().is_connected() {
             self.state.status = self.game_link.status().label().into();
             return;
+        }
+        // Refuse a model that would reach the game broken: invisible meshes, unknown shaders,
+        // files that can't be read. Warnings are listed in Project Files and don't stop it.
+        if let Some(report) = self.check_workspace_model(workspace, fighter, slot) {
+            if report.has_blocking() {
+                self.state.status = format!(
+                    "Reload stopped: {} in c{slot:02}. See Project Files for what to fix.",
+                    report.summary().unwrap_or_default()
+                );
+                return;
+            }
         }
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
             self.state.status = "Emulator SD card not found. Set it in Visionary before sending model or animation files."
@@ -22106,6 +27700,20 @@ impl VisionaryApp {
             );
             warnings.extend(shipped.warnings);
             errors.extend(shipped.errors);
+            // Report model checks, never refuse: an export is the user's to ship as it is.
+            let overlay = crate::project_hub::workspace_romfs(&workspace);
+            if overlay.is_dir() {
+                for (fighter, slot) in workspace_model_costumes(&overlay) {
+                    if let Some(summary) = self
+                        .check_workspace_model(&workspace, &fighter, slot)
+                        .and_then(crate::model_checks::ModelReport::summary)
+                    {
+                        report.push(format!(
+                            "Model check {fighter} c{slot:02}: {summary}"
+                        ));
+                    }
+                }
+            }
         }
 
         // A binary-overlay-only export has neither generated EFF nor ACMD source, so
@@ -22218,6 +27826,7 @@ impl VisionaryApp {
         self.export_build = Some(state.clone());
         std::thread::spawn(move || {
             let out = std::process::Command::new("cargo")
+                .no_console_window()
                 .args(["skyline", "build", "--release"])
                 .current_dir(&src_root)
                 .output();
@@ -22261,6 +27870,9 @@ impl VisionaryApp {
     }
 
     fn load_project_from(&mut self, path: &std::path::Path) {
+        if self.leave_gate(|| PendingLeave::LoadProject(path.to_path_buf())) {
+            return;
+        }
         let mut project: crate::mod_project::ModProjectFile = match std::fs::read_to_string(path)
             .map_err(anyhow::Error::from)
             .and_then(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
@@ -22271,6 +27883,8 @@ impl VisionaryApp {
                 return;
             }
         };
+        // A file from before v4 has its fighter list seeded by `migrate`, from edits alone.
+        let seeded = project.version < 4;
         // Before anything reads the project: bring it to the current format, and refuse a file
         // written by a newer build. Loading one of those would present it as complete and then
         // re-save it with whatever this build cannot read silently removed.
@@ -22290,6 +27904,8 @@ impl VisionaryApp {
             return;
         }
 
+        // An "Add fighter…" popup left open adds to whichever project is open: close it.
+        self.close_add_fighter_popup();
         let stored_move_graphs = project
             .fighters
             .iter()
@@ -22350,6 +27966,41 @@ impl VisionaryApp {
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
+        // The project's fighters and moveset link. Adopted before the edits below, which read
+        // the linked source and the indexed fighters; `migrate` seeded a v1-v3 file's list.
+        self.project_fighters = std::mem::take(&mut project.project_fighters);
+        // Already edited when saved: these are not first edits, so the next build adds nothing
+        // (a fighter the user removed while it had edits stays removed).
+        self.edited_fighters = crate::project_scope::edited_fighters(&project);
+        self.authored_characters = crate::project_scope::authored_characters(&project.roster);
+        // A project saved before projects recorded their moveset, or one never linked, that lives
+        // in the moveset's own crate (`Empoleon-Moveset/modproject.json`) is about that crate.
+        let stored = project.moveset_source.take().map(PathBuf::from).or_else(|| {
+            path.parent().and_then(crate::project_scope::workspace_moveset)
+        });
+        let (moveset, index, problem) =
+            crate::project_scope::moveset_on_load(stored, crate::acmd_src::SourceIndex::build);
+        self.project_moveset = moveset;
+        self.acmd_src = index;
+        self.acmd_src_problem = problem;
+        self.acmd_src_buffer = None;
+        self.refresh_acmd_src_fighters();
+        // The path is adopted in full at the end; the fighter list needs this project's romfs
+        // now, before the editor selection below is restored against it.
+        self.project_path = Some(path.to_path_buf());
+        // Deselect first: a reload from the reindex would commit the previous project's open
+        // move into this one. The selection is restored below.
+        self.clear_fighter_selection();
+        self.reindex_fighters();
+        // The seeding knew only fighter names. With the rows and the moveset known, edits on a
+        // costume-gated agent go to the slot character (Empoleon), not Falco's own row.
+        if seeded {
+            let mut rows = self.project_fighters.clone();
+            crate::project_scope::reassign_seeded_fighters(&mut rows, |name| {
+                self.script_owner_rows(name)
+            });
+            self.project_fighters = rows;
+        }
         if let Some(relative) = previously_loaded_eff {
             let base = self.resolve_eff_source(&relative);
             if base.is_file() {
@@ -22406,6 +28057,16 @@ impl VisionaryApp {
                 .engine_fighter()
                 .to_owned();
             for (move_name, snapshot) in &fm.move_sources {
+                // A snapshot of a move with no edit is browsing provenance, possibly from
+                // another moveset linked at the time; it is not a baseline for anything.
+                let edited = fm.acmd.contains_key(move_name)
+                    || fm.effect_calls.get(move_name).is_some_and(|edits| !edits.is_empty())
+                    || fm.effect_calls_full.contains_key(move_name)
+                    || fm.sound_scripts.contains_key(move_name)
+                    || fm.expression_scripts.contains_key(move_name);
+                if !edited {
+                    continue;
+                }
                 self.move_source_cache
                     .insert(Self::move_key(&fighter, move_name), snapshot.clone());
             }
@@ -22785,11 +28446,13 @@ impl VisionaryApp {
             "saved" => self.activate_move(
                 prompt.move_entry,
                 Some(prompt.saved),
-                "Saved project source",
+                crate::data::ScriptOrigin::Saved,
             ),
-            "current" => {
-                self.activate_move(prompt.move_entry, Some(prompt.current), "Current source")
-            }
+            "current" => self.activate_move(
+                prompt.move_entry,
+                Some(prompt.current),
+                prompt.current_origin.refreshed(),
+            ),
             _ => {}
         }
     }
@@ -22918,6 +28581,12 @@ impl VisionaryApp {
             .send_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
         self.game_link
             .send_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
+        self.game_link
+            .send_article_spawn_rules::<crate::game_link::SpawnRuleWire>(&[]);
+        self.game_link
+            .send_article_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
+        self.game_link
+            .send_article_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
@@ -23173,6 +28842,13 @@ impl VisionaryApp {
     ///
     /// (Frame-space helpers live just below — see [`Self::motion_to_script_frame`].)
     fn current_motion_hash(&self) -> Option<u64> {
+        if self.open_article.is_some() {
+            return self
+                .state
+                .selected_move
+                .as_ref()
+                .map(|m| Self::motion_hash_from_name(&m.name));
+        }
         self.state
             .selected_move
             .as_ref()
@@ -23195,8 +28871,11 @@ impl VisionaryApp {
     ///     performing a move grounded and then aerial left the union of both branches and the
     ///     editor showed spawns that never occur together.
     fn captures_for_move(&self, fighter: &str, motion: u64) -> Vec<crate::game_link::CaptureLine> {
-        self.game_link
-            .latest_run_for(motion, fighter_kind_id(fighter))
+        if let Some(kind) = fighter_kind_id(fighter) {
+            self.game_link.latest_run_for(motion, Some(kind))
+        } else {
+            self.game_link.latest_article_run_for(fighter, motion)
+        }
     }
 
     /// Forget the persisted donor for the current move as well as the plugin's in-memory
@@ -23207,7 +28886,7 @@ impl VisionaryApp {
         let Some(key) = self.current_move_key() else {
             return;
         };
-        if self.state.acmd_source == "Live capture" {
+        if self.state.acmd_source == crate::data::ScriptOrigin::LiveCapture {
             self.move_source_cache.remove(&key);
         } else if let Some(snapshot) = self.move_source_cache.get_mut(&key) {
             snapshot.captures.clear();
@@ -23250,8 +28929,12 @@ impl VisionaryApp {
                     && self.replay_live_fallback_key.as_deref() != Some(key.as_str())
             });
         select_donor_captures(stored_is_authoritative, snapshot_captures, || {
-            self.game_link
-                .latest_run_for(motion, self.current_fighter_kind())
+            if let Some(agent) = &self.open_article {
+                self.game_link.latest_article_run_for(agent, motion)
+            } else {
+                self.game_link
+                    .latest_run_for(motion, self.current_fighter_kind())
+            }
         })
     }
 
@@ -23262,6 +28945,57 @@ impl VisionaryApp {
             .iter()
             .map(|n| (hash40::hash40(&n.to_lowercase()).0, n.clone()))
             .collect()
+    }
+
+    /// Lowercase entry names from every `.eff` the selected fighter has under any data or mod
+    /// root: the base file and each costume's, vanilla and modded alike. Files are parsed once
+    /// and re-read only when they change on disk.
+    fn fighter_effect_names(&self) -> Vec<String> {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+        else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = fighter.effect_dir.iter().cloned().collect();
+        for root in self.all_roots() {
+            dirs.push(root.join("effect").join("fighter").join(&fighter.name));
+        }
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("eff"))
+                    && !files.contains(&path)
+                {
+                    files.push(path);
+                }
+            }
+        }
+        let mut cache = self.eff_name_cache.borrow_mut();
+        let mut names = Vec::new();
+        for path in files {
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let fresh = cache
+                .get(&path)
+                .is_some_and(|(stamp, _)| *stamp == modified);
+            if !fresh {
+                let read = crate::effects::entry_names(&path).unwrap_or_default();
+                cache.insert(path.clone(), (modified, read));
+            }
+            if let Some((_, read)) = cache.get(&path) {
+                names.extend(read.iter().map(|name| name.to_lowercase()));
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 
     fn effect_reverse_map(&self) -> HashMap<u64, String> {
@@ -23281,6 +29015,12 @@ impl VisionaryApp {
                 (!label.is_empty()).then(|| (*hash, label.to_lowercase()))
             })
             .collect();
+        // Every effect file this fighter has, not just the one the effect editor opened: a
+        // moveset's custom effects usually live in its costume files (`ef_pacman_c40.eff`), and
+        // reading only `ef_pacman.eff` left every one of them showing as a hash.
+        for name in self.fighter_effect_names() {
+            m.insert(hash40::hash40(&name).0, name);
+        }
         if let Some(idx) = self
             .current_eff_path
             .as_deref()
@@ -23307,6 +29047,9 @@ impl VisionaryApp {
     /// Register newly-arrived capture lines for the open move, arming (or extending) the
     /// settle window. Cheap — only does work when the link's capture counter actually moved.
     fn note_new_captures(&mut self) {
+        if self.open_article.is_some() {
+            return;
+        }
         let seq = self.game_link.captures_seq();
         if seq == self.captures_seen_seq {
             return;
@@ -23334,10 +29077,10 @@ impl VisionaryApp {
             None => {
                 // Arm on an EMPTY move (nothing to lose) or on its UNEDITED live snapshot. A
                 // GitHub fetch, or a live capture the user has since edited, is never clobbered.
-                let empty = self.state.acmd_source.is_empty()
+                let empty = self.state.acmd_source.is_none()
                     && self.state.hitboxes.is_empty()
                     && self.state.effects.is_empty();
-                let live_unedited = self.state.acmd_source == "Live capture"
+                let live_unedited = self.state.acmd_source == crate::data::ScriptOrigin::LiveCapture
                     && self.state.hitboxes == self.state.hitboxes_pristine
                     // Effect timing edits are live state too. The old check only compared
                     // hitboxes, so playing a move after changing an effect could auto-adopt a
@@ -23377,7 +29120,10 @@ impl VisionaryApp {
         // run to completion means the click still works and then self-corrects to the full
         // script instead of leaving the truncated one in place.
         if self.current_motion_hash() != Some(motion)
-            || (!self.state.acmd_source.is_empty() && self.state.acmd_source != "Live capture")
+            || !matches!(
+                self.state.acmd_source,
+                crate::data::ScriptOrigin::None | crate::data::ScriptOrigin::LiveCapture
+            )
         {
             self.pending_capture = None;
             return;
@@ -23650,7 +29396,7 @@ impl VisionaryApp {
             }
         }
         if can_adopt_live_script {
-            self.state.acmd_source = "Live capture".into();
+            self.state.acmd_source = crate::data::ScriptOrigin::LiveCapture;
         }
         self.acmd_error = None;
         if self.apply_saved_hitbox_edits_to_current() {
@@ -23838,7 +29584,7 @@ impl VisionaryApp {
     /// those direct observations before this gate is consulted.
     fn live_capture_can_replace_script(
         script_kept: bool,
-        _source_label: &str,
+        _origin: &crate::data::ScriptOrigin,
         loaded_body: &str,
     ) -> bool {
         !script_kept && loaded_body.trim().is_empty()
@@ -24241,6 +29987,14 @@ impl VisionaryApp {
                 for hb in hitboxes.iter_mut().filter(|h| {
                     crate::data::is_attack_category(h.category) && h.active_end == u32::MAX
                 }) {
+                    hb.active_end = end.max(hb.active_start);
+                }
+            } else if line.func == "GRAB_CLEAR_ALL" {
+                let end = Self::motion_to_script_frame(line.frame).saturating_sub(1);
+                for hb in hitboxes
+                    .iter_mut()
+                    .filter(|h| h.category == 1 && h.active_end == u32::MAX)
+                {
                     hb.active_end = end.max(hb.active_start);
                 }
             } else if line.func == "AREA_WIND_ERASE" {
@@ -25508,18 +31262,23 @@ impl VisionaryApp {
                 None => missing_donor = true,
             }
         }
+        let (grab_clears, grab_cut_short) = Self::grab_clear_rules(motion, &pristine, &current);
+        rules.extend(grab_clears);
 
         if rules.is_empty() {
             self.hitbox_rules_store.remove(&mv_key);
         } else {
             self.hitbox_rules_store.insert(mv_key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if missing_donor {
             self.state.status =
                 "This hitbox could not be sent live: perform the move in game once, then try again."
                     .into();
+        } else if grab_cut_short {
+            self.state.status = "Grab boxes ending on different frames: in game, one grab clear \
+                                 ends every grab box, so the longer one ends with the shorter."
+                .into();
         }
     }
 
@@ -25913,8 +31672,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
     }
 
     /// Send this move's `FT_MOTION_RATE` values to the running game.
@@ -25977,8 +31735,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
         // what makes a live feature feel broken when it is merely unplugged.
@@ -26080,8 +31837,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if let Some(category) = limits.filter(|_| unrepresentable > 0 && !sent_as_steps) {
             self.note_live_replay_capture_limit(category);
             self.state.status = live_limit_status(unrepresentable);
@@ -26789,8 +32545,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
             self.state.status = live_limit_status(unrepresentable);
@@ -26830,8 +32585,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
             self.state.status = live_limit_status(unrepresentable);
@@ -27139,8 +32893,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
             self.state.status = live_limit_status(unrepresentable);
@@ -27180,8 +32933,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
             self.state.status = live_limit_status(unrepresentable);
@@ -28127,8 +33879,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
     }
 
     /// Rebuild live hitbox rules for every move in a loaded project, not just the move currently
@@ -28317,14 +34068,14 @@ impl VisionaryApp {
                     incomplete.insert(key.clone());
                 }
             }
+            rules.extend(Self::grab_clear_rules(motion, pristine, current).0);
             if rules.is_empty() {
                 self.hitbox_rules_store.remove(&key);
             } else {
                 self.hitbox_rules_store.insert(key, rules);
             }
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         incomplete
     }
 
@@ -28491,8 +34242,8 @@ impl VisionaryApp {
     }
 
     /// Full 36-slot ATTACK arg vector for injection: donor capture args (exact tail) with
-    /// the modeled slots overwritten from the Hitbox. Without a donor: None (template
-    /// injection is too risky — masks/flags would be guesses).
+    /// the modeled slots overwritten from the Hitbox. Without a donor, each slot's Lua type
+    /// comes from ATTACK's own signature.
     fn build_attack_args(
         h: &crate::data::Hitbox,
         donor: Option<&crate::game_link::CaptureLine>,
@@ -28503,6 +34254,27 @@ impl VisionaryApp {
         let mut args = donor
             .filter(|d| d.args.len() >= 36)
             .map_or_else(Self::attack_arg_types, |d| d.args.clone());
+        // Without a donor an unresolved name would leave its slot at the typed zero, a value
+        // the script never wrote (a project's own constant, say): wait for a capture instead.
+        if !donor.is_some_and(|d| d.args.len() >= 36) {
+            use crate::param_labels as pl;
+            let resolved = [
+                pl::encode_const(pl::SETOFF_KIND, &h.setoff_kind),
+                pl::encode_const(pl::LR_CHECK, &h.lr_check),
+                pl::encode_const(pl::SITUATION_MASK, &h.situation_mask),
+                pl::encode_const(pl::CATEGORY_MASK, &h.category_mask),
+                pl::encode_const(pl::PART_MASK, &h.part_mask),
+                pl::encode_const(pl::SOUND_LEVEL, &h.sound_level),
+                pl::encode_const(pl::SOUND_ATTR, &h.sound_attr),
+                pl::encode_const(pl::ATTACK_REGION, &h.attack_region),
+            ]
+            .iter()
+            .all(Option::is_some)
+                && pl::encode_collision_attr(&h.collision_attr).is_some();
+            if !resolved {
+                return None;
+            }
+        }
         args[0] = A::Int(h.id as i64);
         args[1] = A::Int(h.part as i64);
         args[2] = A::Hash(hash40::hash40(&h.bone_name.to_lowercase()).0);
@@ -28768,8 +34540,8 @@ impl VisionaryApp {
         if h.active_end >= 9999 {
             return None;
         }
+        // Grab boxes are not ended one at a time: `grab_clear_rules` ends them per move.
         let (command, args) = match h.category {
-            1 => ("GRAB_CLEAR_ALL", Vec::new()),
             2 => ("AREA_WIND_ERASE", vec![A::Int(h.id as i64)]),
             _ => return None,
         };
@@ -28780,6 +34552,67 @@ impl VisionaryApp {
             command: Some(command.into()),
             guard: None,
         })
+    }
+
+    /// Live rules that end a move's grab boxes on their edited frames.
+    ///
+    /// The script has no per-box grab clear: one `grab!(…GRAB_CLEAR_ALL)` ends every box, so
+    /// ends are compared as the set of frames a clear runs on. A clear the script runs where no
+    /// box ends any more is suppressed; a frame a box now ends on with no clear gets one
+    /// injected. Lengthening a grab used to do nothing in game because the script's clear still
+    /// ran on the old frame.
+    ///
+    /// The second value is true when a box would be cut short by a clear that ends another, which
+    /// a single clear-all cannot avoid.
+    fn grab_clear_rules(
+        motion: u64,
+        pristine: &[crate::data::Hitbox],
+        current: &[crate::data::Hitbox],
+    ) -> (Vec<crate::game_link::HitboxRuleWire>, bool) {
+        let clears = |list: &[crate::data::Hitbox]| -> std::collections::BTreeSet<u32> {
+            list.iter()
+                .filter(|h| h.category == 1 && h.active_end < 9999)
+                .map(|h| h.active_end.saturating_add(1))
+                .collect()
+        };
+        let (was, now) = (clears(pristine), clears(current));
+        let mut rules = Vec::new();
+        for &frame in was.difference(&now) {
+            let (frame_start, frame_end) = Self::rule_frame_window(frame);
+            rules.push(crate::game_link::HitboxRuleWire {
+                motion,
+                category: crate::game_link::CAT_GRAB_CLEAR,
+                hitbox_id: Some(0),
+                suppress: true,
+                frame_start,
+                frame_end,
+                overrides: None,
+                inject: None,
+                func: None,
+            });
+        }
+        for &frame in now.difference(&was) {
+            rules.push(crate::game_link::HitboxRuleWire {
+                motion,
+                category: crate::game_link::wire_category(1),
+                hitbox_id: None,
+                suppress: false,
+                frame_start: None,
+                frame_end: None,
+                overrides: None,
+                inject: Some(crate::game_link::InjectRuleWire {
+                    frame: Self::script_to_motion_frame(frame),
+                    args: Vec::new(),
+                    command: Some("GRAB_CLEAR_ALL".into()),
+                    guard: None,
+                }),
+                func: None,
+            });
+        }
+        let cut_short = current.iter().filter(|h| h.category == 1).any(|h| {
+            now.iter().any(|&frame| h.active_start < frame && frame <= h.active_end)
+        });
+        (rules, cut_short)
     }
 
     // ── EFF Transplant Studio ─────────────────────────────────────────────────
@@ -28833,12 +34666,18 @@ impl VisionaryApp {
                 crate::character::CharacterKey::parse(name).made_slots(&self.roster.project)
             })
             .filter(|slots| !slots.is_empty());
-        let avail_slots: Vec<u8> = match target
+        let rows: Vec<&crate::data::FighterEntry> = target
             .as_ref()
-            .and_then(|name| self.state.fighters.iter().find(|f| f.name == *name))
-        {
+            .map(|name| self.state.fighters.iter().filter(|f| f.name == *name).collect())
+            .unwrap_or_default();
+        let avail_slots: Vec<u8> = match rows.first() {
             _ if made_slots.is_some() => made_slots.unwrap_or_default(),
-            Some(f) => f.slots.clone(),
+            Some(_) => {
+                let mut slots: Vec<u8> = rows.iter().flat_map(|f| f.slots.iter().copied()).collect();
+                slots.sort_unstable();
+                slots.dedup();
+                slots
+            }
             None => match target.as_ref() {
                 Some(name) => crate::data::costume_slots_or_default(&self.all_roots(), name),
                 None => crate::data::default_slots(),
@@ -28917,8 +34756,8 @@ impl VisionaryApp {
                 // Draw inside a CentralPanel so the viewport gets the normal panel background.
                 egui::CentralPanel::default().show(ui, |ui| {
                 if fighter_names.is_empty() {
-                    ui.colored_label(egui::Color32::GRAY, "No game data root")
-                        .on_hover_text("Load a game data root first.");
+                    ui.colored_label(egui::Color32::GRAY, "No game dump set")
+                        .on_hover_text("Set your game dump in File → Sources first.");
                     return;
                 }
                 let pool = self.effect_pool.as_ref().unwrap();
@@ -29720,10 +35559,8 @@ impl VisionaryApp {
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<_> = self.live_effect_rule_union();
-            self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<_> = self.live_effect_control_rule_union();
-            self.game_link.send_effect_control_rules(&all_controls);
+            self.publish_effect_rules();
+            self.publish_effect_control_rules();
         }
     }
 
@@ -30077,7 +35914,7 @@ impl VisionaryApp {
         // NOTE: aliases are SENT further down, after the authored-edit clones have added
         // theirs. Sending here would ship a list missing every authored redirect (the plugin
         // does a full-list replace, so a partial list silently disables them).
-        const LIVE_CARRIER_REL: &str = "effect/assist/bomberman/ef_bomberman.eff";
+        const LIVE_CARRIER_REL: &str = crate::eff_editor::CARRIER_BASE_REL;
         // EVERY transplant of the carrier fighter rides the carrier, including one sourced from
         // that fighter's own eff.
         //
@@ -30181,6 +36018,13 @@ impl VisionaryApp {
             roots.push(d.clone());
         }
         roots.extend(self.extra_roots.iter().cloned());
+        // The vanilla dump goes LAST: it is where the carrier base comes from, and a fighter eff
+        // a mod also ships must still resolve to the mod's copy, which is what the user edits.
+        if let Some(vanilla) = &self.eff_editor.vanilla_root {
+            if !roots.contains(vanilla) {
+                roots.push(vanilla.clone());
+            }
+        }
         let mut carrier_authored: Vec<crate::eff_export::CarrierAuthored> = Vec::new();
         let mut authored_aliases: Vec<(String, String)> = Vec::new();
         let mut carrier_name_conflicts: Vec<String> = Vec::new();
@@ -30539,12 +36383,15 @@ impl VisionaryApp {
         // Textures the build would not delete because something still samples them.
         let mut carrier_textures_in_use: Vec<String> = Vec::new();
         if carrier_needed {
-            // Sources may legitimately live under DIFFERENT roots: the carrier is an assist
-            // eff from the vanilla dump, while a modded fighter's own eff is under a mod
-            // root. Requiring one root that holds everything silently skipped the carrier in
-            // that case (logged only as CARRIER ROOT MISS). Resolve per file instead, and
-            // only fall back to the all-in-one-root requirement for the builder's `donor_root`
-            // argument, which still takes a single base.
+            // Sources legitimately live under DIFFERENT roots: the carrier is an assist eff from
+            // the vanilla dump, while a modded fighter's own eff (a `c40` costume eff, say) exists
+            // only under the mod's romfs. Every file — the carrier and each donor — is resolved
+            // on its own, and the builder is handed the same resolver.
+            //
+            // The builder used to take ONE donor root, chosen as "the root holding the carrier".
+            // For a modded fighter that root never holds the fighter's eff, so every authored
+            // edit failed as "donor unreadable": no carrier bytes, no spec, and the plugin sat at
+            // state 0 while the editor waited for a swap that was never requested.
             let resolve = |rel: &str| -> Option<std::path::PathBuf> {
                 let rel = rel.to_lowercase();
                 roots.iter().map(|r| r.join(&rel)).find(|p| p.is_file())
@@ -30555,31 +36402,19 @@ impl VisionaryApp {
                 .filter(|op| resolve(&op.src_file_rel).is_none())
                 .map(|op| op.src_file_rel.clone())
                 .collect();
-            // The builder resolves donors relative to ONE root, so prefer a root that holds
-            // every source; otherwise fall back to the root holding the carrier itself and
-            // let the builder report precisely what it could not read.
-            let shared_root = roots
-                .iter()
-                .find(|root| {
-                    root.join(live_carrier_rel).is_file()
-                        && carrier_ops
-                            .iter()
-                            .all(|op| root.join(op.src_file_rel.to_lowercase()).is_file())
-                })
-                .or_else(|| {
-                    missing
-                        .is_empty()
-                        .then(|| roots.iter().find(|r| r.join(live_carrier_rel).is_file()))
-                        .flatten()
-                });
-            if shared_root.is_none() && carrier_path.is_some() && !missing.is_empty() {
+            if carrier_path.is_none() {
+                carrier_error = Some(format!(
+                    "the carrier base {live_carrier_rel} was not found — set \"Vanilla dump\" in \
+                     the Eff Editor to your vanilla ArcExplorer export"
+                ));
+            } else if !missing.is_empty() {
                 carrier_error = Some(format!(
                     "carrier sources not found under any effect root: {}",
                     missing.join(", ")
                 ));
             }
-            if let Some(root) = shared_root {
-                match std::fs::read(root.join(live_carrier_rel)) {
+            if let Some(carrier_file) = carrier_path.as_ref().filter(|_| missing.is_empty()) {
+                match std::fs::read(carrier_file) {
                     Ok(carrier_base) => {
                         // Names the carrier must hold VERBATIM: an authored clone is a copy
                         // of the fighter's OWN entry, so storing it under the donor name would
@@ -30611,11 +36446,11 @@ impl VisionaryApp {
                                 .collect();
                         let mut warnings: Vec<String> = Vec::new();
                         let carrier_bytes =
-                            crate::eff_export::rebuild_runtime_carrier_eff_bytes_with_edits(
+                            crate::eff_export::rebuild_runtime_carrier_eff_bytes_resolving(
                                 &carrier_base,
                                 live_carrier_rel,
                                 &carrier_transplants,
-                                root,
+                                &resolve,
                                 &carrier_authored,
                                 &carrier_textures,
                                 &carrier_new_textures,
@@ -30700,18 +36535,18 @@ impl VisionaryApp {
                             }
                         }
                     }
-                    Err(e) => dbg.push_str(&format!(
-                        "CARRIER BASE READ FAILED {live_carrier_rel}: {e}\n"
-                    )),
+                    Err(e) => {
+                        dbg.push_str(&format!(
+                            "CARRIER BASE READ FAILED {live_carrier_rel}: {e}\n"
+                        ));
+                        carrier_error = Some(format!("could not read {live_carrier_rel}: {e}"));
+                    }
                 }
             } else {
-                let needed = carrier_ops
-                    .iter()
-                    .map(|op| op.src_file_rel.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 dbg.push_str(&format!(
-                    "CARRIER ROOT MISS: need {live_carrier_rel} and [{needed}] under one effect root\n"
+                    "CARRIER ROOT MISS: carrier={} missing=[{}] roots={roots:?}\n",
+                    if carrier_path.is_some() { "found" } else { "missing" },
+                    missing.join(", ")
                 ));
             }
         }
@@ -30868,6 +36703,15 @@ impl VisionaryApp {
             if let Some(e) = &carrier_error {
                 self.state.status = format!("Not sent: the edit could not be built ({e})");
             }
+            // Tell the editor's send indicator directly. Without this it waited on a game that
+            // was never sent a carrier, then reported "never staged the carrier" after 25s.
+            self.eff_editor.carrier_build_error = Some(carrier_error.clone().unwrap_or_else(|| {
+                if carrier_target.is_none() {
+                    "no fighter is selected to hold the carrier".to_string()
+                } else {
+                    "the carrier was not built (see donor_send_debug.txt)".to_string()
+                }
+            }));
         }
         // Bytes first: a same-path carrier replacement must be staged before the game-thread
         // receives the new spec and creates its object. Empty is meaningful and clears old data.
@@ -31072,6 +36916,7 @@ impl VisionaryApp {
         // long as the user is editing, so a timer left running from the PREVIOUS send is already
         // past the threshold, and `live` is false on the first frame of a new send.
         self.eff_editor.carrier_state_since = None;
+        self.eff_editor.carrier_build_error = None;
         self.eff_editor.awaiting_game = Some(std::time::Instant::now());
     }
 
@@ -31079,12 +36924,11 @@ impl VisionaryApp {
     /// restores state when the game restarted between socket sessions. It sends every effect
     /// edit the editor holds, so nothing is left unsent afterwards.
     fn resend_live_state(&mut self) {
-        let spawn: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_effect_control_rules(&controls);
-        let hit: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&hit);
+        self.send_selected_fighter_to_game();
+        if let Some(agent) = &self.open_article {
+            self.game_link.send_article_probe(agent);
+        }
+        self.publish_live_rule_union();
         self.sync_eff_mods_from_editor();
         // Connecting sends like the button does, so it gets the same line and outcome. Only a
         // character with effect edits has anything to report.
@@ -31413,6 +37257,8 @@ impl VisionaryApp {
                 uses: HashMap::new(),
                 resolved_with: usize::MAX,
                 edited_sig: 0,
+                project: HashMap::new(),
+                project_stamp: None,
             };
             self.eff_editor.set_effect_uses(HashMap::new(), false);
         }
@@ -31429,6 +37275,32 @@ impl VisionaryApp {
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
+        }
+        // The linked moveset's own scripts play effects too, and the effects it adds (Shy
+        // Guy's `carrot_pull`) are played by nothing else. A moveset installed only on chosen
+        // costumes plays them only from those costumes' files, not the fighter's own.
+        let slot_file = rel
+            .rsplit('/')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|file| file.starts_with(&format!("ef_{}_c", index.fighter)));
+        let project = self.acmd_src.as_ref().filter(|source| {
+            slot_file || !source.costume_gated.contains(&index.fighter.to_ascii_lowercase())
+        });
+        // Each rebuild of the index makes new `consts`, so its address tells one build from
+        // the next without reading the scripts again on every frame.
+        let stamp = project.map(|source| std::sync::Arc::as_ptr(&source.consts) as usize);
+        if index.project_stamp != Some(stamp) {
+            index.project_stamp = Some(stamp);
+            index.project = project
+                .map(|source| {
+                    crate::effect_uses::project_uses(
+                        &index.fighter,
+                        &source.fighter_script_bodies(&index.fighter),
+                    )
+                })
+                .unwrap_or_default();
+            changed = true;
         }
         // Spawns the project added or pointed at another effect count too: a borrowed effect
         // redirected into three moves is used by them, though no game script names it.
@@ -31491,8 +37363,16 @@ impl VisionaryApp {
         if changed || index.resolved_with != moves_known || index.edited_sig != edited_sig {
             index.resolved_with = moves_known;
             index.edited_sig = edited_sig;
-            let mut resolved: HashMap<u64, Vec<crate::eff_editor::MoveUse>> = index
-                .uses
+            let mut all = index.uses.clone();
+            for (hash, uses) in &index.project {
+                let list = all.entry(*hash).or_default();
+                for found in uses {
+                    if !list.contains(found) {
+                        list.push(found.clone());
+                    }
+                }
+            }
+            let mut resolved: HashMap<u64, Vec<crate::eff_editor::MoveUse>> = all
                 .iter()
                 .map(|(hash, uses)| {
                     let moves = uses
@@ -31841,8 +37721,7 @@ impl VisionaryApp {
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&all);
+        self.publish_effect_rules();
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
         // match the export (a fresh copy is content-identical to its donor).
@@ -32432,10 +38311,8 @@ impl VisionaryApp {
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_effect_control_rules(&all_controls);
+        self.publish_effect_rules();
+        self.publish_effect_control_rules();
         if unsupported_flip_axis {
             self.state.status =
                 "This flip-axis/control token is preserved for source/export, but live preview \
@@ -32884,7 +38761,7 @@ impl VisionaryApp {
             new_hash,
             // An addition has no authored original whose captured arguments are the truth, so
             // the panel's own tail is what the export will write and what live must play.
-            donor_hash.is_none(),
+            donor_hash.is_none() || donor.is_none(),
         )?;
         Some(crate::game_link::SpawnInjectWire {
             frame: Self::script_to_motion_frame(ec.active_start),
@@ -33954,7 +39831,7 @@ impl eframe::App for VisionaryApp {
                             self.select_move(move_entry);
                         } else {
                             self.state.status = format!(
-                                "Loaded {count} moves, but {fighter_name}'s saved move {move_name} is not in this data root."
+                                "Loaded {count} moves, but {fighter_name}'s saved move {move_name} is not in this game dump."
                             );
                         }
                     }
@@ -33988,7 +39865,10 @@ impl eframe::App for VisionaryApp {
             let (send, receive) = std::sync::mpsc::channel();
             let dir = model_dir.clone();
             std::thread::spawn(move || {
-                let _ = send.send(ssbh_wgpu::ModelFolder::load_folder(dir));
+                // The files ARCropolis would load for this costume: the folder's own, its
+                // config.json shares, and the game's files for a vanilla slot.
+                let costume = crate::costume_files::CostumeFolder::resolve(&dir);
+                let _ = send.send(ssbh_wgpu::ModelFolder::load_files(costume.model_files()));
             });
             self.model_folder_load = Some((model_dir, receive));
         }
@@ -34167,6 +40047,18 @@ impl eframe::App for VisionaryApp {
             self.perf.end("acmd_source_window", t);
         }
 
+        if self.show_motion_list {
+            self.draw_motion_list_window(&ctx);
+        }
+
+        if self.article_settings.is_some() {
+            self.draw_article_settings_window(&ctx);
+        }
+        self.settle_object_baseline();
+        if self.pending_leave.is_some() {
+            self.draw_object_leave_prompt(&ctx);
+        }
+
         if self.show_capture_debug {
             let t = self.perf.start();
             self.draw_capture_debug_window(&ctx);
@@ -34339,10 +40231,8 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Game files folder").on_hover_text("The extracted game folder with fighter/, effect/ and ui/").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.set_data_root(path);
-                        }
+                    if ui.button("Sources…").on_hover_text("Your game dump, reference mods, this project's files and moveset code").clicked() {
+                        self.open_sources(SourceRow::Dump);
                         ui.close();
                     }
                     if ui
@@ -34411,6 +40301,12 @@ impl eframe::App for VisionaryApp {
                         self.focus_transplant = true;
                         toggled = true;
                     }
+                    toggled |= ui
+                        .checkbox(&mut self.show_motion_list, "Motion list")
+                        .on_hover_text(
+                            "Edit the selected fighter's motion_list.yml or motion_list.bin: motion kinds, scripts, animations, flags, and cancel and intangibility frames",
+                        )
+                        .changed();
                     let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
                     ui.add_enabled_ui(has_log, |ui| {
                         toggled |= ui
@@ -34469,6 +40365,19 @@ impl eframe::App for VisionaryApp {
                 });
                 link_menu.0.on_hover_text(link_view.hover());
                 crate::game_link::link_action(ui, &self.game_link, &link_view);
+                ui.separator();
+                // Settings live in their own window, as SSBH Editor keeps its preferences and
+                // render settings: they are rarely changed, so the button sits at the far end
+                // of the menu bar rather than among the move controls.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(self.settings_open, "⚙")
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
+                        self.settings_open = !self.settings_open;
+                    }
+                });
             });
         });
         self.perf.end("menu_bar", t_menu);
@@ -34509,22 +40418,27 @@ impl eframe::App for VisionaryApp {
                     if status.clicked() {
                         ui.ctx().copy_text(self.state.status.clone());
                     }
-                    if !self.state.acmd_source.is_empty() {
+                    if !self.state.acmd_source.is_none() {
                         ui.separator();
-                        let source = match self.state.acmd_source.as_str() {
-                            "GitHub" => "the game's scripts",
-                            other => other,
+                        let hover = match &self.acmd_source_note {
+                            Some(note) => format!("{note}
+
+Click to see the code, or link your own project"),
+                            None => "Click to see the code, or link your own project".to_string(),
                         };
                         if ui
                             .add(
                                 egui::Label::new(
-                                    RichText::new(format!("Loaded from {source}"))
-                                        .small()
-                                        .color(Color32::GRAY),
+                                    RichText::new(format!(
+                                        "Loaded from {}",
+                                        self.state.acmd_source.label()
+                                    ))
+                                    .small()
+                                    .color(Color32::GRAY),
                                 )
                                 .sense(egui::Sense::click()),
                             )
-                            .on_hover_text("Click to see the code, or link your own project")
+                            .on_hover_text(hover)
                             .clicked()
                         {
                             self.show_acmd_src = true;
@@ -34746,25 +40660,31 @@ impl eframe::App for VisionaryApp {
         if let Some(name) = self.eff_editor.open_effect_request.take() {
             self.open_effect_for_editing(&name);
         }
-        // The Effects page's own character and move pickers: every fighter and the characters
-        // made on it, each opening its own effect file.
-        let made_count = self.roster.project.authored.len();
-        if self.eff_editor.fighter_choices.len() != self.state.fighters.len() + made_count
-            || !self
-                .eff_editor
-                .fighter_choices
-                .iter()
-                .filter(|(name, _)| !name.contains('#'))
-                .map(|(name, _)| name)
-                .eq(self.state.fighters.iter().map(|f| &f.name))
-        {
-            let (_, keys) = self.character_picks();
-            self.eff_editor.fighter_choices = keys
-                .iter()
-                .map(|key| (key.as_str().to_owned(), self.character_name(key)))
-                .collect();
+        // The Effects page's own character and move pickers: every fighter (including mod
+        // slot-character rows like Shy Guy on Pac-Man) and every Visionary-made character,
+        // each opening its own effect file.
+        let mut expected_choices: Vec<(String, String)> =
+            Vec::with_capacity(self.state.fighters.len() + self.roster.project.authored.len());
+        for f in &self.state.fighters {
+            expected_choices.push((fighter_pick_key(f), f.display_name.clone()));
+            if f.custom_name.is_none() {
+                for entry in crate::character::made_on(&f.name, &self.roster.project) {
+                    let key = crate::character::CharacterKey::made(entry.key.clone());
+                    expected_choices.push((key.as_str().to_owned(), self.character_name(&key)));
+                }
+            }
         }
-        self.eff_editor.open_fighter = self.active_key().map(|key| key.as_str().to_owned());
+        if self.eff_editor.fighter_choices != expected_choices {
+            self.eff_editor.fighter_choices = expected_choices;
+        }
+        self.eff_editor.open_fighter = match self.active_key() {
+            Some(key) if key.is_made() => Some(key.as_str().to_owned()),
+            _ => self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(fighter_pick_key),
+        };
         if !self
             .eff_editor
             .move_choices
@@ -34776,17 +40696,28 @@ impl eframe::App for VisionaryApp {
         if let Some(name) = self.eff_editor.fighter_request.take() {
             // Each character's open move is kept for the session and opens again with it:
             // back on a character through its Edited chip, Move read None.
-            if let Some(left) = self.active_key() {
+            // The picker's own key: a slot character's row and its base fighter share a name.
+            let left = self.eff_editor.open_fighter.clone();
+            if let Some(left) = left.clone() {
                 let open = self.state.selected_move.as_ref().map(|m| m.name.clone());
                 match open {
-                    Some(name) => self
-                        .effects_moves_picked
-                        .insert(left.as_str().to_owned(), name),
-                    None => self.effects_moves_picked.remove(left.as_str()),
+                    Some(name) => self.effects_moves_picked.insert(left, name),
+                    None => self.effects_moves_picked.remove(&left),
                 };
             }
-            let key = crate::character::CharacterKey::parse(&name);
-            let switched = self.active_key().as_ref() != Some(&key) && self.select_character(key);
+            let parsed = crate::character::CharacterKey::parse(&name);
+            match self
+                .state
+                .fighters
+                .iter()
+                .position(|f| !parsed.is_made() && fighter_pick_key(f) == name)
+            {
+                Some(i) => self.select_fighter(i),
+                None => {
+                    self.select_character(parsed);
+                }
+            }
+            let switched = left.as_deref() != Some(name.as_str());
             if let Some(motion) = self
                 .effects_moves_picked
                 .get(&name)
@@ -34971,10 +40902,18 @@ impl eframe::App for VisionaryApp {
             // Nothing is coming, so stop waiting now instead of sitting out the silence
             // timeout and blaming the match for it.
             let rejected = self.game_link.take_carrier_error();
-            if live || silent || stalled || rejected.is_some() {
-                use crate::eff_editor::SendOutcome;
+            use crate::eff_editor::SendOutcome;
+            // The edit could not be built, so the game was never asked for it.
+            let not_built = if self.eff_editor.carrier_expected {
+                self.eff_editor.carrier_build_error.take()
+            } else {
+                None
+            };
+            if live || silent || stalled || rejected.is_some() || not_built.is_some() {
                 self.eff_editor.awaiting_game = None;
-                let outcome = if live && self.eff_editor.carrier_expected {
+                let outcome = if not_built.is_some() {
+                    SendOutcome::NotBuilt
+                } else if live && self.eff_editor.carrier_expected {
                     SendOutcome::InGame
                 } else if live {
                     SendOutcome::Restored
@@ -34988,7 +40927,9 @@ impl eframe::App for VisionaryApp {
                 // One plain outcome on the Send row, in the In game panel and on the status
                 // line. The game's numbers and the likely cause go in the row's hover: they are
                 // what settles a stall, and they mean nothing to someone making an effect.
-                let why = if live {
+                let why = if let Some(reason) = &not_built {
+                    format!("\n{reason}")
+                } else if live {
                     String::new()
                 } else if let Some(reason) = &rejected {
                     format!(
@@ -35156,6 +41097,7 @@ impl eframe::App for VisionaryApp {
         self.draw_source_mismatch_modal(&ctx);
         // Project Hub (cold start + mid-session) and its guards.
         self.draw_project_hub(&ctx);
+        self.draw_sources_window(&ctx);
         self.draw_hub_pending_modal(&ctx);
         self.draw_import_report(&ctx);
         self.draw_workspace_panel(&ctx);
@@ -35353,6 +41295,8 @@ impl eframe::App for VisionaryApp {
             egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
             self.perf.end("central_viewport", t_central);
         }
+        // Over whichever page is open, like the other tool windows.
+        self.draw_settings_window(&ctx, frame);
 
         if self.perf.enabled {
             // Profiling wants a continuous frame stream to average over; normal runs stay
@@ -35531,6 +41475,7 @@ mod effect_placement_tests {
         let bones = crate::renderer::compute_bone_world_matrices(
             &skel,
             Some(&anim),
+            None,
             &[],
             super::animation_frame_for_game_frame(ec.active_start),
         );
@@ -35714,6 +41659,37 @@ fn hurtbox_condition_palette(condition: &crate::data::HurtboxCondition) -> Optio
     }
 }
 
+fn apply_source_hurtbox_overrides(
+    volumes: &mut Vec<crate::data::HurtboxVolume>,
+    overrides: &[crate::fighter_hurtboxes::SourceHurtbox],
+    skeleton_bones: &[String],
+) {
+    for ov in overrides {
+        let bone_name = skeleton_bones
+            .iter()
+            .find(|b| b.eq_ignore_ascii_case(&ov.bone_name))
+            .cloned()
+            .unwrap_or_else(|| ov.bone_name.clone());
+        let bone_hash = hash40::hash40(&ov.bone_name.to_ascii_lowercase()).0;
+        let replacement = crate::data::HurtboxVolume {
+            index: ov.index,
+            bone_name,
+            bone_hash,
+            endpoint1: ov.endpoint1,
+            endpoint2: ov.endpoint2,
+            radius: ov.radius,
+            default_status: crate::data::HurtboxStatus::Normal,
+            shape: crate::data::HurtboxShape::Capsule,
+        };
+        if let Some(existing) = volumes.iter_mut().find(|v| v.index == ov.index) {
+            *existing = replacement;
+        } else {
+            volumes.push(replacement);
+        }
+    }
+    volumes.sort_by_key(|v| v.index);
+}
+
 fn hurtbox_render_descriptors(
     volumes: &[crate::data::HurtboxVolume],
     events: &[crate::data::HurtboxEvent],
@@ -35726,12 +41702,42 @@ fn hurtbox_render_descriptors(
     volumes
         .iter()
         .enumerate()
-        .filter(|(_, volume)| matches!(volume.shape, crate::data::HurtboxShape::Capsule))
+        .filter(|(_, volume)| {
+            matches!(volume.shape, crate::data::HurtboxShape::Capsule) && volume.radius > 0.0
+        })
         .filter_map(|(index, volume)| {
             let status = crate::data::effective_hurtbox_status(volume, events, frame);
             (status != crate::data::HurtboxStatus::Off).then_some((index, status))
         })
         .collect()
+}
+
+/// Where a bone-placed collision box sits: `(start, capsule end, radius)` in world space.
+///
+/// `bone_mat` already carries the fighter's `model_scale`, so it moves the box's bone. The box's
+/// own offset and radius take `collision_scale` instead (`AttackModule::set_attack_scale` or
+/// `GrabModule::set_size_mul`); with all scales equal, the box scales with the model. A system
+/// bone (`top`, `trans`, ...) gives only its position, as its offsets are in world axes.
+fn collision_world_placement(
+    bone_mat: glam::Mat4,
+    hb: &crate::data::Hitbox,
+    model_scale: f32,
+    collision_scale: f32,
+) -> (glam::Vec3, Option<glam::Vec3>, f32) {
+    let bone_mat = if is_system_bone(&hb.bone_name) {
+        glam::Mat4::from_translation(bone_mat.col(3).truncate())
+            * glam::Mat4::from_scale(glam::Vec3::splat(model_scale))
+    } else {
+        bone_mat
+    };
+    let offset_scale = collision_scale / model_scale;
+    let place =
+        |[x, y, z]: [f32; 3]| bone_mat.transform_point3(glam::Vec3::new(x, y, z) * offset_scale);
+    (
+        place([hb.offset_x, hb.offset_y, hb.offset_z]),
+        hb.capsule_end.map(place),
+        hb.size * collision_scale,
+    )
 }
 
 fn hurtbox_world_endpoints(
@@ -35934,6 +41940,16 @@ mod hurtbox_viewport_tests {
                 default_status: crate::data::HurtboxStatus::Off,
                 shape: crate::data::HurtboxShape::Capsule,
             },
+            crate::data::HurtboxVolume {
+                index: 2,
+                bone_name: "legl".into(),
+                bone_hash: hash40::hash40("legl").0,
+                endpoint1: [0.0, -0.7, 0.0],
+                endpoint2: [0.0, 1.8, 0.0],
+                radius: 0.0,
+                default_status: crate::data::HurtboxStatus::Normal,
+                shape: crate::data::HurtboxShape::Capsule,
+            },
         ];
         assert!(hurtbox_render_descriptors(&volumes, &[], 1, false).is_empty());
         let descriptors = hurtbox_render_descriptors(&volumes, &[], 1, true);
@@ -35941,14 +41957,63 @@ mod hurtbox_viewport_tests {
     }
 
     #[test]
+    fn source_hurtbox_overrides_replace_waist_and_preserve_canonical_bone_casing() {
+        let mut volumes = vec![crate::data::HurtboxVolume {
+            index: 4,
+            bone_name: "Waist".into(),
+            bone_hash: hash40::hash40("waist").0,
+            endpoint1: [0.0; 3],
+            endpoint2: [0.0; 3],
+            radius: 4.5,
+            default_status: crate::data::HurtboxStatus::Normal,
+            shape: crate::data::HurtboxShape::Capsule,
+        }];
+        let overrides = vec![crate::fighter_hurtboxes::SourceHurtbox {
+            index: 4,
+            bone_name: "waist".into(),
+            endpoint1: [0.0, 0.0, 0.0],
+            endpoint2: [4.2, 0.0, 0.0],
+            radius: 4.7,
+            file: PathBuf::from("frame.rs"),
+            line: 209,
+        }];
+        apply_source_hurtbox_overrides(&mut volumes, &overrides, &["Waist".to_string()]);
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].bone_name, "Waist");
+        assert_eq!(volumes[0].endpoint1, [0.0, 0.0, 0.0]);
+        assert_eq!(volumes[0].endpoint2, [4.2, 0.0, 0.0]);
+        assert_eq!(volumes[0].radius, 4.7);
+    }
+
+    #[test]
     fn hurtbox_visibility_config_is_versioned_and_defaults_off_safely() {
-        assert_eq!(encode_hurtbox_visibility(false), "v1,0");
-        assert_eq!(encode_hurtbox_visibility(true), "v1,1");
-        assert!(!parse_hurtbox_visibility(""));
-        assert!(!parse_hurtbox_visibility("v2,1"));
-        assert!(!parse_hurtbox_visibility("v1,yes"));
-        assert!(!parse_hurtbox_visibility("v1,1,extra"));
-        assert!(parse_hurtbox_visibility("v1,1\n"));
+        assert_eq!(encode_viewport_flag(false), "v1,0");
+        assert_eq!(encode_viewport_flag(true), "v1,1");
+        assert!(!parse_viewport_flag(""));
+        assert!(!parse_viewport_flag("v2,1"));
+        assert!(!parse_viewport_flag("v1,yes"));
+        assert!(!parse_viewport_flag("v1,1,extra"));
+        assert!(parse_viewport_flag("v1,1\n"));
+    }
+
+    #[test]
+    fn forgotten_row_keys_scope_slot_characters_independently_from_base_fighter() {
+        assert_eq!(forgotten_row_key("PacMan", None), "pacman");
+        assert_eq!(
+            forgotten_row_key("pacman", Some("Shy Guy")),
+            "pacman::shy guy"
+        );
+        assert_eq!(forgotten_row_key("pacman", Some("Wario")), "pacman::wario");
+        assert_ne!(
+            forgotten_row_key("pacman", Some("Shy Guy")),
+            forgotten_row_key("pacman", Some("Wario"))
+        );
+        assert_ne!(
+            forgotten_row_key("pacman", None),
+            forgotten_row_key("pacman", Some("Shy Guy"))
+        );
+        assert_eq!(forgotten_key_base_fighter("pacman"), "pacman");
+        assert_eq!(forgotten_key_base_fighter("pacman::shy guy"), "pacman");
     }
 }
 
@@ -35960,17 +42025,13 @@ mod hurtbox_viewport_tests {
 /// 398 animations against ~460 moves, so the old shape was heading for ~180,000 directory
 /// entries walked on the load thread. Indexing once makes it linear, and the widened list now
 /// loads faster than the filtered one did.
-fn index_nuanmb(motion_dir: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(motion_dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("nuanmb"))
-        .filter_map(|p| {
-            let stem = p.file_stem()?.to_str()?.to_lowercase();
-            Some((stem, p))
+/// `(lowercase stem, path)` of every animation the game loads from one motion folder.
+fn index_nuanmb(motion_files: &crate::costume_files::CostumeFolder) -> Vec<(String, PathBuf)> {
+    motion_files
+        .with_extension("nuanmb")
+        .filter_map(|(name, path)| {
+            let stem = Path::new(name).file_stem()?.to_str()?.to_lowercase();
+            Some((stem, path.to_path_buf()))
         })
         .collect()
 }
@@ -35982,15 +42043,9 @@ fn index_nuanmb(motion_dir: &Path) -> Vec<(String, PathBuf)> {
 /// Linux, and inspect only this one directory so a missing cNN asset never falls back to a
 /// different costume.
 fn find_default_eyelid_nuanmb(motion_dir: &Path) -> Option<PathBuf> {
-    const DEFAULT_EYELID: &str = "a00defaulteyelid.nuanmb";
-    let entries = std::fs::read_dir(motion_dir).ok()?;
-    entries.flatten().map(|entry| entry.path()).find(|path| {
-        path.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(DEFAULT_EYELID))
-    })
+    crate::costume_files::CostumeFolder::resolve(motion_dir)
+        .get("a00defaulteyelid.nuanmb")
+        .map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -36034,15 +42089,7 @@ mod default_eyelid_tests {
 fn index_fighter_nuanmb(fighter_dir: &Path, slot: u8) -> HashMap<u64, PathBuf> {
     let motion_root = fighter_dir.join("motion");
     let slot_name = format!("c{slot:02}");
-    let Ok(entries) = std::fs::read_dir(&motion_root) else {
-        return HashMap::new();
-    };
-
-    let mut parts: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
+    let mut parts = crate::costume_files::sibling_dirs(&motion_root);
     parts.sort_by_key(|path| {
         (
             path.file_name().and_then(|name| name.to_str()) != Some("body"),
@@ -36052,20 +42099,10 @@ fn index_fighter_nuanmb(fighter_dir: &Path, slot: u8) -> HashMap<u64, PathBuf> {
 
     let mut files = HashMap::new();
     for part in parts {
-        let slot_dir = part.join(&slot_name);
-        let Ok(entries) = std::fs::read_dir(slot_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("nuanmb") {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
+        let slot_files = crate::costume_files::CostumeFolder::resolve(&part.join(&slot_name));
+        for (name, path) in slot_files.with_extension("nuanmb") {
             let hash = hash40::hash40(&name.to_lowercase()).0;
-            files.entry(hash).or_insert(path);
+            files.entry(hash).or_insert_with(|| path.to_path_buf());
         }
     }
     files
@@ -36075,7 +42112,6 @@ fn index_fighter_nuanmb(fighter_dir: &Path, slot: u8) -> HashMap<u64, PathBuf> {
 fn find_motion_nuanmb(
     animation_hashes: &[u64],
     animation_files: &HashMap<u64, PathBuf>,
-    motion_dir: &Path,
     index: &[(String, PathBuf)],
     label: &str,
     hash: u64,
@@ -36083,18 +42119,19 @@ fn find_motion_nuanmb(
     animation_hashes
         .iter()
         .find_map(|hash| animation_files.get(hash).cloned())
-        .or_else(|| find_nuanmb(motion_dir, index, label, hash))
+        .or_else(|| find_nuanmb(index, label, hash))
 }
 
-fn find_nuanmb(
-    motion_dir: &Path,
-    index: &[(String, PathBuf)],
-    label: &str,
-    hash: u64,
-) -> Option<PathBuf> {
-    let p = motion_dir.join(format!("{}.nuanmb", label));
-    if p.exists() {
-        return Some(p);
+/// `index` is [`index_nuanmb`] of the motion folder, so every lookup sees shared files too.
+fn find_nuanmb(index: &[(String, PathBuf)], label: &str, hash: u64) -> Option<PathBuf> {
+    let by_stem = |stem: &str| {
+        index
+            .iter()
+            .find(|(indexed, _)| *indexed == stem)
+            .map(|(_, path)| path.clone())
+    };
+    if let Some(path) = by_stem(&label.to_lowercase()) {
+        return Some(path);
     }
 
     // Same rule as before: animation files carry a slot prefix (`a00wait1.nuanmb`), so the match
@@ -36104,11 +42141,7 @@ fn find_nuanmb(
         return Some(path.clone());
     }
 
-    let p = motion_dir.join(format!("{:#018x}.nuanmb", hash));
-    if p.exists() {
-        return Some(p);
-    }
-    None
+    by_stem(&format!("{:#018x}", hash))
 }
 
 fn move_node_live_definitions(
@@ -36255,6 +42288,7 @@ fn rebuild_script_from_hitboxes(
                 | ExcuteStmt::StartCutIn
                 | ExcuteStmt::CaptureCutCommon
                 | ExcuteStmt::ArticleLifecycle(_)
+                | ExcuteStmt::Article(_)
                 | ExcuteStmt::GimmickEvent { .. }
                 | ExcuteStmt::GimmickChartEvent { .. }
                 | ExcuteStmt::GimmickChartEventValues { .. }
@@ -36933,7 +42967,7 @@ fn clear_move_state(state: &mut crate::data::AppState) {
     state
         .expression_motion_module_set_frame_partial_pristine
         .clear();
-    state.acmd_source = String::new();
+    state.acmd_source = crate::data::ScriptOrigin::None;
     state.loaded_body.clear();
 }
 
@@ -38039,6 +44073,15 @@ fn unswitchable_uses(
     out
 }
 
+/// The Effects page's key for one fighter row: its name, plus the mod character it is when it
+/// is one, since that row shares the fighter's name.
+fn fighter_pick_key(fighter: &crate::data::FighterEntry) -> String {
+    match &fighter.custom_name {
+        Some(character) => format!("{}/{character}", fighter.name),
+        None => fighter.name.clone(),
+    }
+}
+
 /// A spawn the borrow question offers, in plain words: "Up throw, frame 17".
 fn redirect_label(move_key: &str, call: &crate::data::EffectCall) -> String {
     let motion = crate::character::split_move_key(move_key).map_or(move_key, |(_, motion)| motion);
@@ -38065,6 +44108,11 @@ struct EffectUseIndex {
     resolved_with: usize,
     /// The project's own spawns of the fighter's effects when the uses were last named.
     edited_sig: u64,
+    /// The uses the linked moveset's own scripts add (`effect_uses::project_uses`).
+    project: crate::effect_uses::Uses,
+    /// Which build of the linked source `project` was read from (`None` before the first
+    /// read, `Some(None)` with no source to read).
+    project_stamp: Option<Option<usize>>,
 }
 
 /// A use as the Effects page lists it: the move in plain words, and the motion that opens it.
@@ -38356,6 +44404,18 @@ fn run_export_preverified(
     let mut costume_effects: Vec<String> = Vec::new();
     for (fighter, fm) in &project.fighters {
         match &fm.eff {
+            Some(eff)
+                if !eff.is_empty() && !crate::mod_project::is_mod_relative(&eff.source_rel) =>
+            {
+                // `mod_dir.join` of an absolute path IS that path: this once rebuilt the eff
+                // straight over the user's own source file. Write nothing outside the mod.
+                errors.push(format!(
+                    "{fighter} eff: not exported — its source \"{}\" is not a game path \
+                     (effect/fighter/{fighter}/ef_{fighter}.eff). Reopen the eff from the dump \
+                     or from a mod's effect/ folder and export again.",
+                    eff.source_rel
+                ));
+            }
             Some(eff) if !eff.is_empty() => {
                 let src_path = eff_sources
                     .get(fighter)
@@ -38687,7 +44747,7 @@ fn save_hurtbox_visibility(visible: bool) {
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(dest, encode_hurtbox_visibility(visible));
+    let _ = std::fs::write(dest, encode_viewport_flag(visible));
 }
 
 fn load_hurtbox_visibility() -> bool {
@@ -38696,14 +44756,217 @@ fn load_hurtbox_visibility() -> bool {
     };
     std::fs::read_to_string(dest)
         .ok()
-        .is_some_and(|body| parse_hurtbox_visibility(&body))
+        .is_some_and(|body| parse_viewport_flag(&body))
 }
 
-fn encode_hurtbox_visibility(visible: bool) -> String {
+/// Which fighter the viewport shows being thrown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThrownVictimPref {
+    enabled: bool,
+    fighter: String,
+    slot: u8,
+}
+
+impl Default for ThrownVictimPref {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fighter: "mario".to_string(),
+            slot: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VictimFighter {
+    name: String,
+    display: String,
+    fighter_dir: PathBuf,
+    slots: Vec<u8>,
+}
+
+/// One of [`ViewportScales`], with where it came from for the toolbar's tooltip.
+#[derive(Debug, Clone, PartialEq)]
+struct ScaleValue {
+    value: f32,
+    source: String,
+}
+
+impl Default for ScaleValue {
+    fn default() -> Self {
+        Self {
+            value: 1.0,
+            source: "default".to_string(),
+        }
+    }
+}
+
+/// The scales the viewport draws a fighter at. Each is set by its own call in game, so a moveset
+/// can change one and not the others.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ViewportScales {
+    /// `ModelModule::set_scale`: the mesh and skeleton, so every bone-placed box moves with it.
+    model: ScaleValue,
+    /// `AttackModule::set_attack_scale`: hitbox radius and offset.
+    attack: ScaleValue,
+    /// `GrabModule::set_size_mul`: grab box radius and offset.
+    grab: ScaleValue,
+}
+
+impl ViewportScales {
+    /// The radius and offset multiplier for a box of `category` (see [`crate::data::Hitbox`]).
+    /// Wind areas and search boxes aren't attacks or grabs and keep their size.
+    fn collision(&self, category: u8) -> f32 {
+        match category {
+            0 => self.attack.value,
+            1 => self.grab.value,
+            _ => 1.0,
+        }
+    }
+}
+
+struct VictimCache {
+    key: (String, u8),
+    /// The victim costume's body model folder.
+    model_dir: PathBuf,
+    /// The victim costume's body motion folder, for the capture animations grabs hold it in.
+    motion_dir: PathBuf,
+    model_files: Vec<(String, PathBuf)>,
+    /// `(motion name, animation)` of every thrown motion in the victim's motion list, by name.
+    motions: Vec<(String, PathBuf)>,
+}
+
+fn encode_thrown_victim(pref: &ThrownVictimPref) -> String {
+    format!("v1,{},{},{}", u8::from(pref.enabled), pref.fighter, pref.slot)
+}
+
+fn parse_thrown_victim(body: &str) -> Option<ThrownVictimPref> {
+    let mut fields = body.trim().split(',');
+    if fields.next() != Some("v1") {
+        return None;
+    }
+    let enabled = match fields.next()? {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    let fighter = fields.next().filter(|name| !name.is_empty())?.to_string();
+    let slot = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some(ThrownVictimPref {
+        enabled,
+        fighter,
+        slot,
+    })
+}
+
+fn save_thrown_victim(pref: &ThrownVictimPref) {
+    let Some(dest) = config_path("editor_thrown_victim") else {
+        return;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(dest, encode_thrown_victim(pref));
+}
+
+fn load_thrown_victim() -> ThrownVictimPref {
+    config_path("editor_thrown_victim")
+        .and_then(|dest| std::fs::read_to_string(dest).ok())
+        .and_then(|body| parse_thrown_victim(&body))
+        .unwrap_or_default()
+}
+
+/// The victim motion a throw plays, from `motions` (sorted names): the attacker's own thrown
+/// set when the victim has one (`shizue_special_s_thrown_f` for Isabelle's side special),
+/// otherwise the generic one for the throw's direction (`throw_f` → `thrown_f`). Only the
+/// plain variant: the `_dx`, `_big` and `_girl` sets depend on the thrower in ways not read
+/// here.
+fn auto_thrown_motion(attacker: &str, move_name: &str, motions: &[(String, PathBuf)]) -> Option<usize> {
+    let is_variant = |name: &str| {
+        ["_dx", "_big", "_girl"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    };
+    let position = |wanted: &str| motions.iter().position(|(name, _)| name == wanted);
+    if let Some(direction) = move_name.strip_prefix("throw_") {
+        return position(&format!("thrown_{direction}"));
+    }
+    // A special that throws: the victim's `<attacker>_<move>_thrown*`, else any of the
+    // attacker's own thrown motions.
+    let own = format!("{attacker}_{move_name}");
+    motions
+        .iter()
+        .position(|(name, _)| name.starts_with(&own) && !is_variant(name))
+        .or_else(|| {
+            motions.iter().position(|(name, _)| {
+                name.starts_with(&format!("{attacker}_")) && !is_variant(name)
+            })
+        })
+}
+
+/// Every `(fighter, slot)` whose body model the workspace overlay (`romfs/`) holds files for.
+fn workspace_model_costumes(overlay: &Path) -> Vec<(String, u8)> {
+    let subdirs = |dir: &Path| -> Vec<(String, std::path::PathBuf)> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| Some((entry.file_name().to_str()?.to_string(), entry.path())))
+            .collect()
+    };
+    let mut costumes = Vec::new();
+    for (fighter, fighter_dir) in subdirs(&overlay.join("fighter")) {
+        for (slot_name, _) in subdirs(&fighter_dir.join("model").join("body")) {
+            if let Some(slot) = crate::data::parse_costume_dir(&slot_name) {
+                costumes.push((fighter.clone(), slot));
+            }
+        }
+    }
+    costumes.sort();
+    costumes
+}
+
+/// [`crate::model_checks`] of one Project Files costume.
+#[allow(dead_code)]
+struct CostumeModelReport {
+    fighter: String,
+    slot: u8,
+    report: crate::model_checks::ModelReport,
+}
+
+/// One viewport folder whose files are not all its own, as the toolbar reports it.
+struct ViewportFileSource {
+    /// `Model` or `Motion`.
+    label: &'static str,
+    /// [`crate::costume_files::CostumeFolder::summary`].
+    summary: String,
+    /// [`crate::costume_files::CostumeFolder::detail`], for the hover.
+    detail: String,
+}
+
+/// Helper bone constraints default on, matching the game, so only a saved "off" disables them.
+fn save_helper_bones(enabled: bool) {
+    let Some(dest) = config_path("editor_viewport_helper_bones") else {
+        return;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(dest, encode_viewport_flag(enabled));
+}
+
+fn load_helper_bones() -> bool {
+    config_path("editor_viewport_helper_bones")
+        .and_then(|dest| std::fs::read_to_string(dest).ok())
+        .map_or(true, |body| parse_viewport_flag(&body))
+}
+
+fn encode_viewport_flag(visible: bool) -> String {
     format!("v1,{}", u8::from(visible))
 }
 
-fn parse_hurtbox_visibility(body: &str) -> bool {
+fn parse_viewport_flag(body: &str) -> bool {
     let mut fields = body.trim().split(',');
     if fields.next() != Some("v1") {
         return false;
@@ -38733,11 +44996,26 @@ fn legacy_config_path(key: &str) -> Option<std::path::PathBuf> {
 /// folder the app happened to be launched from.
 pub(crate) const EFF_ROOT_CONFIG_KEY: &str = "eff_root";
 
+/// Config key for the VANILLA effect dump (an ArcExplorer export holding `effect/assist/…`).
+/// Kept apart from [`EFF_ROOT_CONFIG_KEY`] because the live carrier is built on a vanilla
+/// assist eff that a mod's romfs never contains: pointing the eff root at the mod you are
+/// editing used to make every send fail with "carrier base not found".
+pub(crate) const VANILLA_ROOT_CONFIG_KEY: &str = "vanilla_root";
+
 /// Config key for the emulator's SD root — the folder holding `ultimate/`, which is where live
 /// edits are staged for the plugin to read. Left unset, `scratch_dirs::emulator_sd_root` probes
 /// the standard Eden / yuzu / Ryujinx locations for the host platform; set it when the emulator
 /// is a portable install that lives somewhere else entirely.
 pub(crate) const SD_ROOT_CONFIG_KEY: &str = "sd_root";
+
+/// A row of the Sources window, so other panels can send the user to the one they need.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceRow {
+    Dump,
+    ReferenceMods,
+    ProjectFiles,
+    MovesetCode,
+}
 
 /// Config key for the user's own ACMD source project — the smashline crate that builds their
 /// plugin. When set, its scripts are read in preference to the dumped-script mirror.
@@ -38966,7 +45244,21 @@ fn saved_mod_root_lines() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Fighters hidden from the sidebar, one canonical lowercase fighter name per line.
+/// Persistence key for one forgotten fighter row in `forgotten_fighters`.
+/// Base fighter rows keep the plain lowercase fighter name (`"pacman"`) for compatibility
+/// with existing saved files; slot-character rows are scoped (`"pacman::shy guy"`).
+fn forgotten_row_key(name: &str, character: Option<&str>) -> String {
+    match character {
+        Some(ch) => format!("{}::{}", name.to_ascii_lowercase(), ch.to_ascii_lowercase()),
+        None => name.to_ascii_lowercase(),
+    }
+}
+
+fn forgotten_key_base_fighter(key: &str) -> &str {
+    key.split("::").next().unwrap_or(key)
+}
+
+/// Fighters hidden from the sidebar, one canonical lowercase fighter/row key per line.
 fn load_forgotten_fighters() -> BTreeSet<String> {
     let Some(dest) = config_path("forgotten_fighters") else {
         return BTreeSet::new();
@@ -38991,7 +45283,7 @@ fn save_forgotten_fighters(fighters: &BTreeSet<String>) {
     }
 }
 
-fn load_config_path(key: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn load_config_path(key: &str) -> Option<std::path::PathBuf> {
     let dest = config_path(key)?;
     let dest = if dest.exists() {
         dest
@@ -39145,11 +45437,10 @@ mod carrier_send_state_tests {
 
 #[cfg(test)]
 mod motion_animation_tests {
-    use super::{find_motion_nuanmb, index_fighter_nuanmb};
+    use super::{find_motion_nuanmb, index_fighter_nuanmb, index_nuanmb};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
     use std::fs::File;
-    use std::path::Path;
 
     #[test]
     fn motion_part_index_hashes_the_complete_animation_filename() {
@@ -39190,7 +45481,6 @@ mod motion_animation_tests {
         let selected = find_motion_nuanmb(
             &[hash40::hash40("cloudd00specialn.nuanmb").0],
             &files,
-            Path::new(&root.path().join("motion/body/c00")),
             &[],
             "cloud_special_n",
             hash40::hash40("cloud_special_n").0,
@@ -39206,11 +45496,13 @@ mod motion_animation_tests {
         File::create(&body).unwrap();
 
         let files = index_fighter_nuanmb(root.path(), 0);
+        let index = index_nuanmb(&crate::costume_files::CostumeFolder::resolve(
+            &root.path().join("motion/body/c00"),
+        ));
         let selected = find_motion_nuanmb(
             &[],
             &files,
-            Path::new(&root.path().join("motion/body/c00")),
-            &[],
+            &index,
             "attack11",
             hash40::hash40("attack11").0,
         );
@@ -39220,7 +45512,7 @@ mod motion_animation_tests {
 
 #[cfg(test)]
 mod fighter_forget_key_tests {
-    use super::{fighter_key_matches, path_is_fighter_eff};
+    use super::{fighter_eff_path, fighter_key_matches, path_is_fighter_eff};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
     use std::path::Path;
@@ -39247,6 +45539,38 @@ mod fighter_forget_key_tests {
             Path::new("effect/fighter/mariod/ef_mariod.eff"),
             "mario"
         ));
+    }
+
+    /// Shy Guy plays on Pac-Man's c40: his effects exist only in the project's
+    /// `ef_pacman_c40.eff`, while the dump has Pac-Man's own `ef_pacman.eff`.
+    #[test]
+    fn a_slot_character_plays_its_slot_file_before_the_fighters_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let romfs = tmp.path().join("romfs/effect/fighter/pacman");
+        let dump = tmp.path().join("dump/effect/fighter/pacman");
+        std::fs::create_dir_all(&romfs).unwrap();
+        std::fs::create_dir_all(&dump).unwrap();
+        std::fs::write(romfs.join("ef_pacman_c40.eff"), b"").unwrap();
+        std::fs::write(dump.join("ef_pacman.eff"), b"").unwrap();
+        let dirs = [romfs.clone(), dump.clone()];
+        assert_eq!(
+            fighter_eff_path("pacman", 40, &dirs),
+            Some(romfs.join("ef_pacman_c40.eff"))
+        );
+        // Pac-Man himself has no slot file and keeps the dump's.
+        assert_eq!(
+            fighter_eff_path("pacman", 0, &dirs),
+            Some(dump.join("ef_pacman.eff"))
+        );
+        // A slot file anywhere beats the fighter's own file in an earlier folder.
+        std::fs::write(romfs.join("ef_pacman.eff"), b"").unwrap();
+        std::fs::remove_file(romfs.join("ef_pacman_c40.eff")).unwrap();
+        std::fs::write(dump.join("ef_pacman_c40.eff"), b"").unwrap();
+        assert_eq!(
+            fighter_eff_path("pacman", 40, &dirs),
+            Some(dump.join("ef_pacman_c40.eff"))
+        );
+        assert_eq!(fighter_eff_path("mario", 0, &dirs), None);
     }
 }
 
@@ -40739,7 +47063,7 @@ mod live_effect_capture_tests {
             sound_script: script.clone(),
             sounds: script.to_sound_events(),
             sounds_pristine: script.to_sound_events(),
-            acmd_source: "Live capture".into(),
+            acmd_source: crate::data::ScriptOrigin::LiveCapture,
             loaded_body: "previous move source".into(),
             ..Default::default()
         };
@@ -40799,7 +47123,7 @@ mod live_effect_capture_tests {
                 .is_empty(),
             "ft_start_adjust_motion_frame_pristine"
         );
-        assert!(state.acmd_source.is_empty(), "acmd_source");
+        assert!(state.acmd_source.is_none(), "acmd_source");
         assert!(state.loaded_body.is_empty(), "loaded_body");
 
         // The fighter's own data is untouched — this is not `AppState::default()`.
@@ -42479,6 +48803,7 @@ mod live_effect_capture_tests {
             slots: (0..16).collect(),
             fighter_dir: PathBuf::new(),
             source: crate::data::FighterSource::DataRoot,
+            custom_name: None,
         };
         AppState {
             fighters: vec![fighter("mario", "Mario"), fighter("luigi", "Luigi")],
@@ -42497,6 +48822,7 @@ mod live_effect_capture_tests {
                 hash: hash40::hash40("attack11").0,
                 frame_count: 20,
                 anim_path: None,
+                cancel_frame: 0,
             },
         );
         let script = crate::acmd::parse_acmd_script(MARIO_GAME_ATTACK11);
@@ -43395,20 +49721,21 @@ mod live_effect_capture_tests {
     }
 }
         "#;
+        use crate::data::ScriptOrigin;
         assert!(!VisionaryApp::live_capture_can_replace_script(
             false,
-            "GitHub",
+            &ScriptOrigin::Vanilla,
             effect_only
         ));
-        assert!(VisionaryApp::live_capture_can_replace_script(false, "", ""));
+        assert!(VisionaryApp::live_capture_can_replace_script(false, &ScriptOrigin::None, ""));
         assert!(!VisionaryApp::live_capture_can_replace_script(
             false,
-            "Live capture",
+            &ScriptOrigin::LiveCapture,
             effect_only
         ));
         assert!(!VisionaryApp::live_capture_can_replace_script(
             true,
-            "GitHub",
+            &ScriptOrigin::Vanilla,
             effect_only
         ));
     }
@@ -43442,7 +49769,11 @@ mod live_effect_capture_tests {
         assert_eq!(typed.to_hurtboxes().0.len(), 1);
         assert_eq!(typed.to_work_flag_events().len(), 0);
         assert!(
-            !VisionaryApp::live_capture_can_replace_script(false, "GitHub", "effect body"),
+            !VisionaryApp::live_capture_can_replace_script(
+                false,
+                &crate::data::ScriptOrigin::Vanilla,
+                "effect body"
+            ),
             "the unscoped direct-module policy remains in force"
         );
 
@@ -45987,12 +52318,13 @@ mod live_effect_capture_tests {
             body: PROJECT_GAME.to_string(),
             covers: vec!["game_"],
             blocked: Vec::new(),
+            notes: Vec::new(),
         };
 
         let (body, label) = merge_fetched_body(Some(project.clone()), Err("offline".into()));
         let body = body.expect("a failed fetch must not surface as an error over a project");
         assert!(body.contains("fn game_x"), "{body}");
-        assert_eq!(label, "Project source");
+        assert_eq!(label, crate::data::ScriptOrigin::MovesetSource);
 
         // With the mirror in hand, the category the project left out arrives — and the one it
         // did not leave out is still the project's.
@@ -46011,7 +52343,7 @@ mod live_effect_capture_tests {
         // With no project, the fetch's own error is the answer.
         let (body, label) = merge_fetched_body(None, Err("offline".into()));
         assert!(body.is_err());
-        assert_eq!(label, "GitHub");
+        assert_eq!(label, crate::data::ScriptOrigin::Vanilla);
     }
 
     /// Dragging a hitbox rebuilds the whole script, and a runtime branch has to come through
@@ -47451,10 +53783,56 @@ mod live_effect_capture_tests {
         assert_eq!(args[7], A::Num(3.0));
         assert_eq!(args[8], A::Num(-2.0));
 
-        let end = VisionaryApp::collision_end_injection(&grab).unwrap();
+        // A grab's end is a move-level clear, not one carried by the box.
+        assert!(VisionaryApp::collision_end_injection(&grab).is_none());
+        let (rules, cut_short) = VisionaryApp::grab_clear_rules(0x1234, &[], &[grab]);
+        assert!(!cut_short);
+        assert_eq!(rules.len(), 1);
+        let end = rules[0].inject.as_ref().unwrap();
         assert_eq!(end.command.as_deref(), Some("GRAB_CLEAR_ALL"));
         assert_eq!(end.frame, VisionaryApp::script_to_motion_frame(6));
         assert!(end.args.is_empty());
+    }
+
+    fn grab_spanning(start: u32, end: u32) -> Hitbox {
+        Hitbox { category: 1, active_start: start, active_end: end, ..Default::default() }
+    }
+
+    #[test]
+    fn lengthening_a_grab_moves_the_scripts_clear_in_game() {
+        let (rules, cut_short) = VisionaryApp::grab_clear_rules(
+            0x1234,
+            &[grab_spanning(7, 8)],
+            &[grab_spanning(7, 12)],
+        );
+        assert!(!cut_short);
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        let suppress = rules.iter().find(|r| r.suppress).unwrap();
+        assert_eq!(suppress.category, crate::game_link::CAT_GRAB_CLEAR);
+        assert_eq!(suppress.hitbox_id, Some(0));
+        let at_9 = VisionaryApp::script_to_motion_frame(9);
+        assert!(suppress.frame_start.unwrap() <= at_9 && at_9 <= suppress.frame_end.unwrap());
+        let inject = rules.iter().find_map(|r| r.inject.as_ref()).unwrap();
+        assert_eq!(inject.command.as_deref(), Some("GRAB_CLEAR_ALL"));
+        assert_eq!(inject.frame, VisionaryApp::script_to_motion_frame(13));
+    }
+
+    #[test]
+    fn an_unchanged_grab_end_sends_no_clear_rules() {
+        let grab = grab_spanning(7, 8);
+        let (rules, _) =
+            VisionaryApp::grab_clear_rules(0x1234, &[grab.clone()], &[grab]);
+        assert!(rules.is_empty(), "{rules:?}");
+    }
+
+    #[test]
+    fn a_grab_still_out_past_another_ones_clear_is_flagged() {
+        let (_, cut_short) = VisionaryApp::grab_clear_rules(
+            0x1234,
+            &[grab_spanning(7, 8), grab_spanning(7, 8)],
+            &[grab_spanning(7, 8), grab_spanning(7, 12)],
+        );
+        assert!(cut_short);
     }
 
     #[test]
@@ -48709,6 +55087,88 @@ mod blocked_export_writes_nothing_tests {
              the refusal tests"
         );
     }
+
+    /// An eff source with no game path must not be written anywhere: `mod_dir.join` of an
+    /// absolute path is that path, and this once rebuilt the eff over the user's own file.
+    #[test]
+    fn an_absolute_eff_source_is_refused_and_left_untouched() {
+        let dest = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src_eff = outside.path().join("custom.eff");
+        std::fs::write(&src_eff, b"the user's own eff").unwrap();
+
+        let mut project = project(AcmdScript::default());
+        project.fighters.get_mut("mario").unwrap().eff = Some(EffMod {
+            source_rel: src_eff.to_string_lossy().into_owned(),
+            textures_removed: vec!["_visionary_no_such_texture".into()],
+            ..Default::default()
+        });
+        let mut inputs = inputs(dest.path(), source.path());
+        inputs.eff_sources.insert("mario".into(), src_eff.clone());
+
+        let outcome = run_export(&project, &inputs).expect("the rest of the project exports");
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("mario eff") && e.contains("not a game path")),
+            "the refusal has to say which eff and why: {:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            std::fs::read(&src_eff).unwrap(),
+            b"the user's own eff",
+            "export wrote over the eff it was given as a source"
+        );
+        assert!(
+            !dest.path().join("effect").exists(),
+            "a refused eff still wrote effect files: {:?}",
+            entries(dest.path())
+        );
+    }
+
+    /// The fix end to end: an eff opened from outside the dump records its game path, exports
+    /// into the mod folder at that path, and the file it was opened from is not touched.
+    #[test]
+    fn an_externally_opened_eff_exports_into_the_mod_folder() {
+        let Some(root) = corpus_root() else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let vanilla = std::fs::read(root.join("effect/fighter/mario/ef_mario.eff"))
+            .expect("mario's eff is missing from the corpus");
+        let outside = tempfile::tempdir().unwrap();
+        let src_eff = outside
+            .path()
+            .join("some_mod/effect/fighter/mario/ef_mario.eff");
+        std::fs::create_dir_all(src_eff.parent().unwrap()).unwrap();
+        std::fs::write(&src_eff, &vanilla).unwrap();
+
+        let source_rel = crate::mod_project::eff_game_rel(&src_eff, Some(&root));
+        assert_eq!(source_rel, "effect/fighter/mario/ef_mario.eff");
+
+        let dest = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let mut project = project(AcmdScript::default());
+        project.fighters.get_mut("mario").unwrap().eff = Some(EffMod {
+            source_rel: source_rel.clone(),
+            textures_removed: vec!["_visionary_no_such_texture".into()],
+            ..Default::default()
+        });
+        let mut inputs = inputs(dest.path(), source.path());
+        inputs.eff_sources.insert("mario".into(), src_eff.clone());
+        inputs.eff_export_root = root.clone();
+
+        let outcome = run_export(&project, &inputs).expect("nothing here should refuse");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(dest.path().join(&source_rel).exists());
+        assert_eq!(
+            std::fs::read(&src_eff).unwrap(),
+            vanilla,
+            "export wrote over the eff it was opened from"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -49189,6 +55649,7 @@ mod live_motion_hash_tests {
             hash: motion_hash,
             frame_count: 0,
             anim_path: None,
+            cancel_frame: 0,
         };
 
         assert_eq!(VisionaryApp::live_motion_hash(&entry), motion_hash);
@@ -49294,6 +55755,104 @@ mod donor_capture_tests {
             chosen.is_empty(),
             "replay must not borrow another move's live run"
         );
+    }
+}
+
+#[cfg(test)]
+mod saved_effect_tests {
+    use super::*;
+    use crate::data::{EffectCall, EffectCallEdit, EffectCallOp};
+
+    fn call(name: &str, frame: u32) -> EffectCall {
+        let mut call = crate::acmd::parse_effect_script(&format!(
+            "unsafe extern \"C\" fn effect_x(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, {frame}.0);\n    if macros::is_excute(agent) {{\n        macros::EFFECT(agent, Hash40::new(\"{name}\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);\n    }}\n}}\n"
+        ))
+        .to_effect_calls()
+        .remove(0);
+        call.normalize_timing();
+        call
+    }
+
+    /// Shy Guy's forward smash as the saved project held it: a one-call list from the vanilla
+    /// script it was first opened against (a raw-hash `sys_smash_flash` on frame 43), and an
+    /// edit removing the flash that both scripts open with.
+    #[test]
+    fn a_full_list_saved_against_another_script_is_not_shown_over_this_one() {
+        let pristine = vec![
+            call("sys_smash_flash", 1),
+            call("shyguy_mace_arc_wind", 17),
+            call("sys_attack_impact", 21),
+        ];
+        let stale = vec![{
+            let mut c = call("sys_smash_flash", 43);
+            c.effect_name = format!("{:#x}", hash40::hash40("sys_smash_flash").0);
+            c
+        }];
+        let edits = vec![EffectCallEdit {
+            index: 0,
+            op: EffectCallOp::Remove,
+            pristine: Some(call("sys_smash_flash", 1)),
+        }];
+        let (calls, kept, report) = reconcile_saved_effects(&pristine, Some(&stale), Some(&edits));
+        assert!(report.stale_full);
+        assert_eq!(calls.len(), 3, "the script's effects come back");
+        assert!(calls[0].disabled, "the removal still applies to the call it was made for");
+        assert_eq!(calls[1].effect_name, "shyguy_mace_arc_wind");
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn a_current_full_list_is_used_as_saved() {
+        let pristine = vec![call("a", 1), call("b", 5)];
+        let mut moved = call("b", 5);
+        moved.offset = [1.0, 2.0, 3.0];
+        let full = vec![
+            // Same call spelled as its hash: still the same call.
+            {
+                let mut c = call("a", 1);
+                c.effect_name = format!("{:#x}", hash40::hash40("a").0);
+                c
+            },
+            moved.clone(),
+            call("added", 9),
+        ];
+        let edits = vec![
+            EffectCallEdit { index: 1, op: EffectCallOp::Modify(moved), pristine: Some(call("b", 5)) },
+            EffectCallEdit { index: 2, op: EffectCallOp::Add(call("added", 9)), pristine: None },
+        ];
+        let (calls, _, report) = reconcile_saved_effects(&pristine, Some(&full), Some(&edits));
+        assert_eq!(report, SavedEffectsReconcile::default());
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1].offset, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn an_edit_follows_its_call_when_the_script_moves_it_and_is_dropped_when_it_is_gone() {
+        let pristine = vec![call("new", 1), call("a", 3)];
+        let mut tuned = call("a", 3);
+        tuned.scale = 2.0;
+        let edits = vec![
+            EffectCallEdit { index: 0, op: EffectCallOp::Modify(tuned), pristine: Some(call("a", 3)) },
+            EffectCallEdit { index: 1, op: EffectCallOp::Remove, pristine: Some(call("gone", 8)) },
+        ];
+        let (calls, kept, report) = reconcile_saved_effects(&pristine, None, Some(&edits));
+        assert_eq!((report.reanchored_edits, report.dropped_edits), (1, 1));
+        assert_eq!(calls[0].effect_name, "new");
+        assert_eq!(calls[1].scale, 2.0);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].index, 1);
+    }
+
+    #[test]
+    fn raw_hash_names_are_spelled_out_when_known() {
+        let mut calls = vec![call("x", 1), call("y", 1)];
+        calls[0].effect_name = format!("{:#x}", hash40::hash40("sys_smash_flash").0);
+        calls[1].effect_name = "0xdeadbeef".into();
+        let names: HashMap<u64, String> =
+            [(hash40::hash40("sys_smash_flash").0, "sys_smash_flash".to_string())].into();
+        resolve_raw_effect_names(&mut calls, &names);
+        assert_eq!(calls[0].effect_name, "sys_smash_flash");
+        assert_eq!(calls[1].effect_name, "0xdeadbeef", "an unknown hash stays a hash");
     }
 }
 
@@ -49415,6 +55974,60 @@ mod collapsing_id_tests {
             });
         }
         assert!(opened);
+    }
+}
+
+#[cfg(test)]
+mod thrown_victim_tests {
+    use super::{auto_thrown_motion, encode_thrown_victim, parse_thrown_victim, ThrownVictimPref};
+    use std::path::PathBuf;
+
+    fn motions(names: &[&str]) -> Vec<(String, PathBuf)> {
+        let mut list: Vec<_> = names
+            .iter()
+            .map(|name| (name.to_string(), PathBuf::from(format!("{name}.nuanmb"))))
+            .collect();
+        list.sort();
+        list
+    }
+
+    fn pick<'a>(list: &'a [(String, PathBuf)], attacker: &str, move_name: &str) -> Option<&'a str> {
+        auto_thrown_motion(attacker, move_name, list).map(|i| list[i].0.as_str())
+    }
+
+    #[test]
+    fn a_throw_picks_the_victims_motion_for_its_direction() {
+        let list = motions(&["thrown_b", "thrown_f", "thrown_f_dx", "thrown_hi", "thrown_lw"]);
+        assert_eq!(pick(&list, "mario", "throw_f"), Some("thrown_f"));
+        assert_eq!(pick(&list, "mario", "throw_lw"), Some("thrown_lw"));
+        assert_eq!(pick(&motions(&["thrown_f_dx"]), "mario", "throw_f"), None);
+    }
+
+    #[test]
+    fn a_throwing_special_picks_the_attackers_own_set_without_variants() {
+        let list = motions(&[
+            "shizue_special_s_thrown_f",
+            "shizue_special_s_thrown_f_big",
+            "gaogaen_thrown_01_dx",
+            "gaogaen_thrown_01",
+            "thrown_f",
+        ]);
+        assert_eq!(pick(&list, "shizue", "special_s_throw"), Some("shizue_special_s_thrown_f"));
+        assert_eq!(pick(&list, "gaogaen", "special_lw_throw"), Some("gaogaen_thrown_01"));
+        assert_eq!(pick(&list, "mario", "special_s_throw"), None);
+    }
+
+    #[test]
+    fn the_victim_preference_is_versioned() {
+        let pref = ThrownVictimPref {
+            enabled: true,
+            fighter: "pikachu".to_string(),
+            slot: 3,
+        };
+        assert_eq!(parse_thrown_victim(&encode_thrown_victim(&pref)), Some(pref));
+        assert_eq!(parse_thrown_victim("v2,1,mario,0"), None);
+        assert_eq!(parse_thrown_victim("v1,1,,0"), None);
+        assert_eq!(parse_thrown_victim("v1,1,mario,0,extra"), None);
     }
 }
 

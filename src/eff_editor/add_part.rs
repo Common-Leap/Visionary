@@ -1370,7 +1370,7 @@ mod tests {
         let slot = &rosters[0].slots[1];
         assert_eq!(
             (slot.source_set.as_str(), slot.source_file.as_str()),
-            ("P_B", "/fx/ef_test.eff")
+            ("P_B", "effect/fighter/test/ef_test.eff")
         );
         assert_eq!((slot.source_name.as_str(), slot.source_idx), ("b0", 0));
         assert_eq!(slot.name, "b0");

@@ -724,6 +724,12 @@ pub struct EffEditor {
     /// Whether that final reading was a success — colours the persisted readout so a failed
     /// send is not a grey line that reads like a status message.
     pub carrier_ok: bool,
+    /// Set by the app when it could not BUILD the carrier for a send that needed one. Nothing
+    /// was sent to the game, so waiting for it would only time out and blame the plugin.
+    pub carrier_build_error: Option<String>,
+    /// The vanilla effect dump, always searched when building the live carrier. Independent of
+    /// `export_root`, which is usually the mod being edited and never holds the carrier base.
+    pub vanilla_root: Option<PathBuf>,
     /// The carrier rebuild is synchronous on the UI thread, so servicing the request in the
     /// same frame as the click would block before the spinner ever painted. Hold the request
     /// for one frame so the "sending" state is visible.
@@ -840,6 +846,8 @@ impl Default for EffEditor {
             last_carrier_detail: None,
             carrier_needs_new_bytes: true,
             carrier_ok: false,
+            carrier_build_error: None,
+            vanilla_root: crate::app::load_config_path(crate::app::VANILLA_ROOT_CONFIG_KEY),
             deploy_defer: false,
             last_sent_note: None,
             history: EffHistory::default(),
@@ -1356,6 +1364,9 @@ struct WholeEffect {
 
 /// The attributes the emitter panel puts above the group tree, in this order. These are the ones
 /// an effect edit almost always starts from; every one of them is also in its own group below.
+/// The vanilla assist eff the live carrier is built on. Only a vanilla dump holds it.
+pub const CARRIER_BASE_REL: &str = "effect/assist/bomberman/ef_bomberman.eff";
+
 const BASIC_ATTRS: &[&str] = &[
     "emitter_static.color_scale",
     "render_state.blend_type",
@@ -2605,19 +2616,26 @@ impl EffEditor {
 
     // ── Project integration ───────────────────────────────────────────────────
 
-    /// Loaded eff path relative to the export root (project `source_rel`).
+    /// The loaded eff's game path (project `source_rel`), wherever the file was opened from.
+    /// See [`crate::mod_project::eff_game_rel`].
     pub fn loaded_rel(&self) -> Option<String> {
         Some(self.game_path_of(self.loaded_path.as_ref()?))
     }
 
-    /// The game path a file on disk stands for: its name inside the game folder, or the one
-    /// it was given when opened from a project or a folder the author picked.
+    /// The file on disk the editor has open, when it is the eff recorded as `source_rel`.
+    pub fn loaded_path_for(&self, source_rel: &str) -> Option<&Path> {
+        self.loaded_rel()
+            .filter(|rel| rel.eq_ignore_ascii_case(source_rel))
+            .and(self.loaded_path.as_deref())
+    }
+
+    /// The game path a file on disk stands for: the one it was given when opened from a project
+    /// or a folder the author picked, or its inferred game path via [`crate::mod_project::eff_game_rel`].
     fn game_path_of(&self, path: &Path) -> String {
         if let Some(rel) = self.game_paths.get(path) {
             return rel.clone();
         }
-        let rel = path.strip_prefix(&self.export_root).unwrap_or(path);
-        rel.to_string_lossy().replace('\\', "/")
+        crate::mod_project::eff_game_rel(path, Some(&self.export_root))
     }
 
     /// Open `path` as the game's `rel` (e.g. `effect/fighter/pickel/ef_pickel.eff`), so edits
@@ -2659,10 +2677,25 @@ impl EffEditor {
     }
 
     pub fn set_export_root(&mut self, root: PathBuf) {
+        // A folder that holds the carrier base IS a vanilla dump: remember it as such, so that
+        // later pointing the eff root at a mod's romfs does not lose the carrier base with it.
+        self.remember_vanilla_root(&root);
         if self.export_root != root {
             self.export_root = root;
             self.rescan();
         }
+    }
+
+    /// Record `dir` as the vanilla dump if it holds the carrier base. Returns whether it did.
+    pub fn remember_vanilla_root(&mut self, dir: &Path) -> bool {
+        if !dir.join(CARRIER_BASE_REL).is_file() {
+            return false;
+        }
+        if self.vanilla_root.as_deref() != Some(dir) {
+            self.vanilla_root = Some(dir.to_path_buf());
+            crate::app::save_config_path(crate::app::VANILLA_ROOT_CONFIG_KEY, dir);
+        }
+        true
     }
 
     /// Queue authored edits to apply after the next queued eff loads (project load path).
@@ -2671,9 +2704,10 @@ impl EffEditor {
         self.pending_edits_push_live = true;
     }
 
-    /// The file a queued load is about to open (relative to the export root) when nothing has
-    /// queued its edits yet. The app answers with [`Self::queue_carried_edits`], so a file
-    /// switched away from and back to opens with its edits instead of pristine.
+    /// The file a queued load is about to open (its game path, as [`Self::loaded_rel`] records
+    /// it) when nothing has queued its edits yet. The app answers with
+    /// [`Self::queue_carried_edits`], so a file switched away from and back to opens with its
+    /// edits instead of pristine.
     pub fn load_needing_edits(&self) -> Option<String> {
         if self.pending_edits.is_some() || self.pending_structure.is_some() {
             return None;
@@ -4916,6 +4950,31 @@ impl EffEditor {
             }
             if ui.button("Look for files again").clicked() {
                 self.rescan();
+            }
+            ui.separator();
+            let vanilla_label = match &self.vanilla_root {
+                Some(dir) => format!("Vanilla game files: {}", dir.display()),
+                None => "Vanilla game files: not set".to_string(),
+            };
+            ui.label(egui::RichText::new(vanilla_label).small()).on_hover_text(
+                "The unmodded ArcExplorer export. Live edits ride a carrier built on a vanilla \
+                 assist effect file, which a mod's romfs does not contain, so this stays set even \
+                 when the folder above points at your mod.",
+            );
+            if ui.button("Change vanilla folder").clicked() {
+                let mut dialog =
+                    rfd::FileDialog::new().set_title("Select the vanilla ArcExplorer export");
+                if let Some(dir) = self.vanilla_root.as_ref().filter(|d| d.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(dir) = dialog.pick_folder() {
+                    if !self.remember_vanilla_root(&dir) {
+                        self.set_sent_note(format!(
+                            "{} has no {CARRIER_BASE_REL}: pick the folder that contains effect/",
+                            dir.display()
+                        ));
+                    }
+                }
             }
         });
         if let Some(err) = &self.scan_error {
@@ -8200,6 +8259,8 @@ pub(crate) enum SendOutcome {
     Restored,
     /// The game could not read the file it was pointed at.
     Unreadable,
+    /// The edit could not be built, so nothing was sent.
+    NotBuilt,
     /// No match is reporting; the staged files load when one starts.
     NoMatch,
     /// The match did not take it; the staged files load at the next match.
@@ -8212,6 +8273,7 @@ impl SendOutcome {
             Self::InGame => "In the game",
             Self::Restored => "The game plays its own effects again",
             Self::Unreadable => "The game could not read the edit",
+            Self::NotBuilt => "Not sent: the edit could not be built",
             Self::NoMatch => "Saved for the next match",
             Self::NextMatch => "Not in this match: it loads at the next match",
         }
@@ -8221,7 +8283,7 @@ impl SendOutcome {
     pub(crate) fn status_prefix(self) -> &'static str {
         match self {
             Self::InGame | Self::Restored => "In the game",
-            Self::Unreadable => "Not sent",
+            Self::Unreadable | Self::NotBuilt => "Not sent",
             Self::NoMatch | Self::NextMatch => "Saved for the next match",
         }
     }
@@ -8292,6 +8354,7 @@ mod tests {
             SendOutcome::InGame,
             SendOutcome::Restored,
             SendOutcome::Unreadable,
+            SendOutcome::NotBuilt,
             SendOutcome::NoMatch,
             SendOutcome::NextMatch,
         ];
@@ -10634,5 +10697,23 @@ mod tests {
         }]);
         assert!(editor.pending_edits.is_some());
         assert!(editor.pending_edits_push_live);
+    }
+    /// File → Open Effect File… on a mod's eff: the project records the game path, and the
+    /// open file (not the dump's copy) is what that path resolves to while it is open.
+    #[test]
+    fn an_eff_opened_outside_the_root_records_its_game_path() {
+        let opened = PathBuf::from("C:/Users/me/mods/x/effect/fighter/mario/ef_mario.eff");
+        let editor = EffEditor {
+            export_root: PathBuf::from("C:/dump"),
+            loaded_path: Some(opened.clone()),
+            ..Default::default()
+        };
+        let rel = editor.loaded_rel().unwrap();
+        assert_eq!(rel, "effect/fighter/mario/ef_mario.eff");
+        assert_eq!(editor.loaded_path_for(&rel), Some(opened.as_path()));
+        assert_eq!(
+            editor.loaded_path_for("effect/fighter/link/ef_link.eff"),
+            None
+        );
     }
 }

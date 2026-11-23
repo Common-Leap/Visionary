@@ -40,6 +40,7 @@ pub mod frame_context;
 pub mod gimmicks;
 #[cfg(not(feature = "mod_plugin"))]
 pub mod hitbox_viewer;
+pub mod loader;
 pub mod main_smash;
 pub mod math;
 #[cfg(not(feature = "mod_plugin"))]

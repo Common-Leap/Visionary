@@ -61,6 +61,20 @@ impl Default for Flight {
     }
 }
 
+/// Status names that represent impact, landing, explosion, death, or idle states rather than
+/// initial flight. Their `set_speed(0.0)` / braking calls must not erase the projectile's launch
+/// speed in the 3D preview.
+fn is_terminal_status(status: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    const TERMINAL: &[&str] = &[
+        "ground", "explode", "burst", "hit", "vanish", "dead", "die", "death", "stop", "finish",
+        "end", "bound", "landing", "cliff", "shield", "reflect", "wait", "break", "drown",
+    ];
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| TERMINAL.contains(&tok))
+}
+
 impl Flight {
     /// Offset from the spawn point after `frames`, as (forward, up). The ground is at
     /// `-start_height`, so a bouncing object turns back up there.
@@ -123,10 +137,230 @@ impl Flight {
         let next = if outward { speed } else { -speed };
         (distance + next * part).max(0.0)
     }
+
+    /// Overlay resolved status settings on top of the params-derived flight.
+    ///
+    /// `Literal`, `Const` (with a known value) and `Param` settings replace the
+    /// params-derived fields; `Computed` values leave them as they are. Per
+    /// design ruling R3, only fields `Flight` simulates are mapped (`speed`,
+    /// `angle`, `accel`, `gravity`, `max_speed`, `life`); `Brake`, `SpeedMul`
+    /// and unmodelled kinetic calls stay on the Settings card without altering
+    /// the flight path.
+    pub fn with_settings(
+        self,
+        settings: &[crate::articles::settings::Setting],
+        params: &crate::articles::params::ParamBlock,
+    ) -> Self {
+        self.with_settings_and_blocks(settings, params, &HashMap::new())
+    }
+
+    /// Like [`Flight::with_settings`], also resolving `SettingValue::Param` entries that read
+    /// from another block (e.g. `param_common` or another article's block) when present in
+    /// `other_blocks`.
+    pub fn with_settings_and_blocks(
+        mut self,
+        settings: &[crate::articles::settings::Setting],
+        params: &crate::articles::params::ParamBlock,
+        other_blocks: &HashMap<String, crate::articles::params::ParamBlock>,
+    ) -> Self {
+        use crate::articles::settings::SettingField;
+
+        let mut vx: Option<f32> = None;
+        let mut vy: Option<f32> = None;
+
+        for setting in settings {
+            if is_terminal_status(&setting.status) {
+                continue;
+            }
+            let Some(value) = resolve_setting_number(&setting.value, params, other_blocks) else {
+                continue;
+            };
+            match setting.field {
+                SettingField::SpeedX => {
+                    // The 3D preview faces right (+1.0), so both signed and facing-multiplied
+                    // speeds keep their value.
+                    vx = Some(value);
+                }
+                SettingField::SpeedY => {
+                    vy = Some(value);
+                }
+                SettingField::AccelX => {
+                    if value > 0.0 {
+                        self.accel = value;
+                    }
+                }
+                SettingField::Gravity => {
+                    self.gravity = value.abs();
+                }
+                SettingField::AccelY => {
+                    if value < 0.0 {
+                        self.gravity = value.abs();
+                    }
+                }
+                SettingField::MaxSpeedX => {
+                    if value.abs() > 0.0 {
+                        self.max_speed = Some(value.abs());
+                    }
+                }
+                SettingField::StableSpeedX => {
+                    if self.max_speed.is_none() && value.abs() > 0.0 {
+                        self.max_speed = Some(value.abs());
+                    }
+                }
+                SettingField::Life => {
+                    if value > 0.0 {
+                        self.life = value;
+                    }
+                }
+                SettingField::Scale
+                | SettingField::StableSpeedY
+                | SettingField::MaxSpeedY
+                | SettingField::BrakeX
+                | SettingField::BrakeY
+                | SettingField::SpeedMul
+                | SettingField::PowerMul
+                | SettingField::OtherMovement => {}
+            }
+        }
+
+        match (vx, vy) {
+            (Some(x), Some(y)) => {
+                self.speed = x.hypot(y);
+                self.angle = y.atan2(x).to_degrees();
+            }
+            (Some(x), None) => {
+                self.speed = x.abs();
+                if x < 0.0 {
+                    self.angle = 180.0;
+                }
+            }
+            (None, Some(y)) => {
+                let x = self.speed * self.angle.to_radians().cos();
+                self.speed = x.hypot(y);
+                self.angle = y.atan2(x).to_degrees();
+            }
+            (None, None) => {}
+        }
+
+        self
+    }
+}
+
+fn resolve_setting_number(
+    value: &crate::articles::settings::SettingValue,
+    params: &crate::articles::params::ParamBlock,
+    other_blocks: &HashMap<String, crate::articles::params::ParamBlock>,
+) -> Option<f32> {
+    use crate::articles::params::ParamValue;
+    use crate::articles::settings::SettingValue;
+
+    let num = match value {
+        SettingValue::Literal(v) => Some(*v as f32),
+        SettingValue::Const { value: Some(v), .. } => Some(*v as f32),
+        SettingValue::Const { value: None, .. } => None,
+        SettingValue::Param { block, field } => {
+            let source = other_blocks.get(block).unwrap_or(params);
+            let entry = source
+                .fields
+                .get(field)
+                .or_else(|| source.fields.get(field.trim_end_matches('_')));
+            match entry.map(|(v, _)| v) {
+                Some(ParamValue::Float(v)) => Some(*v),
+                Some(ParamValue::Int(v)) => Some(*v as f32),
+                _ => None,
+            }
+        }
+        SettingValue::Computed(_) => None,
+    }?;
+    num.is_finite().then_some(num)
+}
+
+/// Filter a multi-use carrier's status `settings` down to those belonging to `motion` (or its
+/// ACMD handler function name, e.g. `motion = "carrot"` matching
+/// `WEAPON_PACMAN_BIGPACMAN_STATUS_KIND_CARROT`, or `motion = "fly"` with
+/// `handler_fn = Some("game_fireball_fly")` matching `WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_FIREBALL`).
+/// Returns an empty vec when no status specifically matches so callers can fall back to the
+/// article's default flight.
+pub fn settings_for_motion(
+    settings: &[crate::articles::settings::Setting],
+    motion: &str,
+    handler_fn: Option<&str>,
+) -> Vec<crate::articles::settings::Setting> {
+    let mut tokens: Vec<String> = Vec::new();
+    let add_tokens = |raw: &str, out: &mut Vec<String>| {
+        let lower = raw.to_ascii_lowercase();
+        let compact = lower.replace('_', "");
+        if compact.len() >= 3 && !out.contains(&compact) {
+            out.push(compact);
+        }
+        for part in lower.split('_') {
+            if part.len() >= 4
+                && !matches!(
+                    part,
+                    "game" | "effect" | "sound" | "expression" | "special" | "attack" | "main"
+                )
+                && !out.iter().any(|t| t == part)
+            {
+                out.push(part.to_owned());
+            }
+        }
+    };
+    add_tokens(motion, &mut tokens);
+    if let Some(handler) = handler_fn {
+        add_tokens(handler, &mut tokens);
+    }
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    settings
+        .iter()
+        .filter(|s| {
+            let status_lower = s.status.to_ascii_lowercase();
+            let status_compact = status_lower.replace('_', "");
+            // Match against the status suffix after `_STATUS_KIND_` when present.
+            let suffix = status_lower
+                .split_once("_status_kind_")
+                .map(|(_, tail)| tail.replace('_', ""))
+                .unwrap_or(status_compact);
+            tokens
+                .iter()
+                .any(|tok| suffix == *tok || suffix.contains(tok) || tok.contains(&suffix))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Uniform scale resolved from an article's status settings (`ModelModule::set_scale` /
+/// `PostureModule::set_scale`). `Computed` and non-positive values fall back to `1.0`.
+pub fn scale_from_settings(
+    settings: &[crate::articles::settings::Setting],
+    params: &crate::articles::params::ParamBlock,
+) -> f32 {
+    scale_from_settings_and_blocks(settings, params, &HashMap::new())
+}
+
+/// Like [`scale_from_settings`], also resolving `SettingValue::Param` entries against
+/// `other_blocks`.
+pub fn scale_from_settings_and_blocks(
+    settings: &[crate::articles::settings::Setting],
+    params: &crate::articles::params::ParamBlock,
+    other_blocks: &HashMap<String, crate::articles::params::ParamBlock>,
+) -> f32 {
+    let mut scale = 1.0f32;
+    for setting in settings {
+        if setting.field == crate::articles::settings::SettingField::Scale {
+            if let Some(v) = resolve_setting_number(&setting.value, params, other_blocks) {
+                if v > 0.0 {
+                    scale = v;
+                }
+            }
+        }
+    }
+    scale
 }
 
 /// Everything needed to show one kind of object.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ObjectKind {
     /// "fireball", from `FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL`.
     pub name: String,
@@ -139,6 +373,8 @@ pub struct ObjectKind {
     /// Effects from the object's own script; for many projectiles they are all you see.
     pub effects: Vec<ObjectEffect>,
     pub flight: Flight,
+    /// Uniform visual scale applied on top of the object's world placement (default `1.0`).
+    pub scale: f32,
     /// Every motion of the object that has an animation, by hash40 of the motion kind. A move
     /// picks one with `ArticleModule::change_motion`: Samus's grab beam plays `catch` alongside
     /// her grab.
@@ -146,6 +382,23 @@ pub struct ObjectKind {
     /// The animation is one of those motions, made in step with the fighter's and in the
     /// fighter's space, so the object rides the fighter's `top` rather than a hand.
     pub synced: bool,
+}
+
+impl Default for ObjectKind {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            model_dir: None,
+            skel: None,
+            anim: None,
+            hitboxes: Vec::new(),
+            effects: Vec::new(),
+            flight: Flight::default(),
+            scale: 1.0,
+            motions: Vec::new(),
+            synced: false,
+        }
+    }
 }
 
 /// An effect an object's script shows, on one of its bones.
@@ -165,7 +418,7 @@ pub struct ObjectEffect {
 /// The effects in an object's script. Objects often pick an effect by facing, which the
 /// effect parser leaves out, so this reads the effect lines themselves and keeps the first of
 /// each pair.
-fn object_effects(body: &str) -> Vec<ObjectEffect> {
+pub fn object_effects(body: &str) -> Vec<ObjectEffect> {
     // The preview faces right, so the script's left-facing choice is swapped for its pair.
     let mut effects = object_effects_as_written(body);
     for effect in &mut effects {
@@ -273,6 +526,7 @@ fn object_effects_as_written(body: &str) -> Vec<ObjectEffect> {
 }
 
 /// One object out at the current frame, placed in the world.
+#[derive(Clone)]
 pub struct PlacedObject {
     pub kind: Arc<ObjectKind>,
     /// The frame it was spawned on and the one it is removed on, to place it at earlier ages.
@@ -297,9 +551,8 @@ pub fn article_name(symbol: &str) -> Option<String> {
 
 /// Reads one object's flight from its parameter block, `param_<name>`.
 pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, String>) -> Flight {
-    let mut flight = Flight::default();
     let Ok(param) = prc::open(param_path) else {
-        return flight;
+        return Flight::default();
     };
     let wanted = format!("param_{name}");
     let block = param.0.iter().find_map(|(hash, value)| {
@@ -310,9 +563,9 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
         Some(prc::ParamKind::Struct(fields)) => fields,
         Some(prc::ParamKind::List(list)) => match list.0.first() {
             Some(prc::ParamKind::Struct(fields)) => fields,
-            _ => return flight,
+            _ => return Flight::default(),
         },
-        _ => return flight,
+        _ => return Flight::default(),
     };
     let listed: Vec<(&str, f32)> = fields
         .0
@@ -332,6 +585,33 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
             Some((label.trim_end_matches('_'), number))
         })
         .collect();
+    flight_from_listed(&listed)
+}
+
+/// Reads one object's flight from a merged [`crate::articles::params::ParamBlock`]
+/// (dump + reference mods + moveset `vl.prc`/`vl.prcxml` + `param_config` overrides).
+pub fn flight_from_param_block(params: &crate::articles::params::ParamBlock) -> Flight {
+    use crate::articles::params::ParamValue;
+    if !params.present {
+        return Flight::default();
+    }
+    let listed: Vec<(&str, f32)> = params
+        .fields
+        .iter()
+        .filter_map(|(label, (value, _))| {
+            let number = match value {
+                ParamValue::Float(v) => *v,
+                ParamValue::Int(v) => *v as f32,
+                ParamValue::Other(_) => return None,
+            };
+            Some((label.trim_end_matches('_'), number))
+        })
+        .collect();
+    flight_from_listed(&listed)
+}
+
+fn flight_from_listed(listed: &[(&str, f32)]) -> Flight {
+    let mut flight = Flight::default();
     let mut values: HashMap<String, f32> = listed
         .iter()
         .map(|(label, number)| ((*label).to_owned(), *number))
@@ -479,8 +759,62 @@ fn split_variant(label: &str) -> Option<(String, String)> {
         })
 }
 
+/// Read an article script from the linked moveset `SourceIndex` first, falling back to `dump`
+/// (e.g. `acmd::fetch_object_script`) only when the source does not define it.
+pub fn script_from_index_or_dump(
+    index: Option<&crate::acmd_src::SourceIndex>,
+    agent: &str,
+    script_name: &str,
+    dump: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if let Some(index) = index {
+        let lower = script_name.to_ascii_lowercase();
+        let snake = pascal_to_snake(script_name);
+        for candidate in [lower.as_str(), snake.as_str()] {
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some(project) = index.script_source(agent, candidate) {
+                if !project.body.trim().is_empty() {
+                    return Some(project.body);
+                }
+            }
+        }
+    }
+    dump(script_name)
+}
+
+fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 && !out.ends_with('_') {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Optional moveset-resolved overrides for [`load_kind_resolved`].
+#[derive(Default)]
+pub struct ResolvedArticleInputs<'a> {
+    /// Additional `fighter/<owner>` directories searched before `fighter_dir` (for example the
+    /// moveset's `romfs/fighter/<owner>` so custom/cloned models and motions load).
+    pub extra_fighter_dirs: &'a [PathBuf],
+    /// Extra candidate script names (such as a clone's `source_scripts`) probed if
+    /// `motion_list.bin` is absent or yields nothing.
+    pub extra_scripts: &'a [String],
+    /// Merged `ParamBlock` for this article (the new owner's `param_<new_name>` for clones).
+    pub params: Option<&'a crate::articles::params::ParamBlock>,
+    /// Any other param blocks referenced by `settings` (`param_common`, another article's block).
+    pub other_blocks: Option<&'a HashMap<String, crate::articles::params::ParamBlock>>,
+    /// Resolved status settings from `crate::articles::settings_for`.
+    pub settings: &'a [crate::articles::settings::Setting],
+}
+
 /// Loads an object's model, skeleton, animation, hitboxes and flight. `script` gives the body of
 /// one of the object's game scripts by name ("Regular"), or nothing.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_kind(
     fighter_dir: &Path,
     param_path: &Path,
@@ -489,14 +823,46 @@ pub fn load_kind(
     labels: &HashMap<u64, String>,
     script: &dyn Fn(&str) -> Option<String>,
 ) -> Option<ObjectKind> {
-    let skel_path =
-        crate::data::find_part_skel(&fighter_dir.join("model").join(model_folder(name)), slot);
+    load_kind_resolved(
+        fighter_dir,
+        param_path,
+        slot,
+        name,
+        labels,
+        &ResolvedArticleInputs::default(),
+        script,
+    )
+}
+
+/// Like [`load_kind`], overlaying a moveset's resolved `ParamBlock`, status `Setting`s, extra
+/// script candidates, and extra `fighter/<owner>` roots (such as `romfs/`).
+pub fn load_kind_resolved(
+    fighter_dir: &Path,
+    param_path: &Path,
+    slot: u8,
+    name: &str,
+    labels: &HashMap<u64, String>,
+    inputs: &ResolvedArticleInputs<'_>,
+    script: &dyn Fn(&str) -> Option<String>,
+) -> Option<ObjectKind> {
+    let search_dirs: Vec<&Path> = inputs
+        .extra_fighter_dirs
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(fighter_dir))
+        .collect();
+    let model_name = model_folder(name);
+    let skel_path = search_dirs.iter().find_map(|dir| {
+        crate::data::find_part_skel(&dir.join("model").join(model_name), slot)
+    });
     let model_dir = skel_path
         .as_ref()
         .and_then(|path| path.parent())
         .map(Path::to_path_buf);
     let skel = skel_path.and_then(|path| SkelData::from_file(path).ok());
-    let motion_dir = costume_dir(&fighter_dir.join("motion").join(name), slot);
+    let motion_dir = search_dirs
+        .iter()
+        .find_map(|dir| costume_dir(&dir.join("motion").join(name), slot));
     // The object plays the first motion in its list that has a script, "regular" first.
     let mut motions: Vec<(String, Option<PathBuf>)> = Vec::new();
     let mut by_kind: Vec<(u64, PathBuf)> = Vec::new();
@@ -536,8 +902,20 @@ pub fn load_kind(
             );
         }
     }
-    motions.sort_by_key(|(label, _)| label != "regular");
-    let mut chosen = motions.first().cloned();
+    // Always include "regular" and any caller-supplied source script names as fallback candidates
+    // so clones or articles without a local motion_list.bin still load their source hitboxes.
+    for fallback in std::iter::once("regular").chain(inputs.extra_scripts.iter().map(String::as_str))
+    {
+        if !fallback.is_empty() && !motions.iter().any(|(label, _)| label == fallback) {
+            motions.push((fallback.to_owned(), None));
+        }
+    }
+    motions.sort_by_key(|(label, anim)| (label != "regular", anim.is_none()));
+    let mut chosen = motions
+        .iter()
+        .find(|(_, anim)| anim.is_some())
+        .or_else(|| motions.first())
+        .cloned();
     let mut hitboxes = Vec::new();
     let mut effects = Vec::new();
     for (label, anim) in &motions {
@@ -552,7 +930,9 @@ pub fn load_kind(
         if !found.is_empty() || !shown.is_empty() {
             hitboxes = found;
             effects = shown;
-            chosen = Some((label.clone(), anim.clone()));
+            if anim.is_some() || chosen.as_ref().and_then(|(_, p)| p.as_ref()).is_none() {
+                chosen = Some((label.clone(), anim.clone()));
+            }
             if !hitboxes.is_empty() {
                 break;
             }
@@ -578,7 +958,24 @@ pub fn load_kind(
             Some((kind, anim))
         })
         .collect();
-    let flight = flight_from_params(param_path, name, labels);
+    let base_flight = match inputs.params {
+        Some(params) if params.present => flight_from_param_block(params),
+        _ => flight_from_params(param_path, name, labels),
+    };
+    let empty_params = crate::articles::params::ParamBlock::default();
+    let params_ref = inputs.params.unwrap_or(&empty_params);
+    let flight = match inputs.other_blocks {
+        Some(others) if !others.is_empty() => {
+            base_flight.with_settings_and_blocks(inputs.settings, params_ref, others)
+        }
+        _ => base_flight.with_settings(inputs.settings, params_ref),
+    };
+    let scale = match inputs.other_blocks {
+        Some(others) if !others.is_empty() => {
+            scale_from_settings_and_blocks(inputs.settings, params_ref, others)
+        }
+        _ => scale_from_settings(inputs.settings, params_ref),
+    };
     if skel.is_none() && hitboxes.is_empty() && effects.is_empty() && flight.speed == 0.0 {
         return None;
     }
@@ -590,6 +987,7 @@ pub fn load_kind(
         hitboxes,
         effects,
         flight,
+        scale,
         motions,
         synced: false,
     })
@@ -776,6 +1174,471 @@ pub struct Spawn {
 /// The hands an object can leave from.
 pub const HANDS: [&str; 4] = ["havel", "haver", "handl", "handr"];
 
+/// Planned lifecycle for one spawned copy of an article, built from typed
+/// [`crate::data::ArticleCall`]s while honoring `ArticleTarget::All`, `First`, and `Last`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnPlan {
+    pub name: String,
+    pub spawned: u32,
+    pub removed: Option<u32>,
+    pub shot: Option<u32>,
+    pub shown: Vec<(u32, bool)>,
+    pub motion: Option<String>,
+}
+
+fn target_live_indices(
+    plans: &[SpawnPlan],
+    name: &str,
+    frame: u32,
+    target: crate::data::ArticleTarget,
+) -> Vec<usize> {
+    use crate::data::ArticleTarget;
+    let live: Vec<usize> = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.name == name && p.spawned <= frame && p.removed.is_none_or(|r| frame < r))
+        .map(|(i, _)| i)
+        .collect();
+    match target {
+        ArticleTarget::All | ArticleTarget::Unspecified => live,
+        ArticleTarget::First => live.first().copied().into_iter().collect(),
+        ArticleTarget::Last | ArticleTarget::Term => live.last().copied().into_iter().collect(),
+        ArticleTarget::None => Vec::new(),
+    }
+}
+
+fn parse_bool_arg(args: &[String], index: usize) -> Option<bool> {
+    match args.get(index).map(|s| s.trim()) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_quoted_motion(arg: &str) -> Option<String> {
+    let (_, rest) = arg.split_once('"')?;
+    let (motion, _) = rest.split_once('"')?;
+    (!motion.is_empty()).then(|| motion.to_owned())
+}
+
+/// Turn a move's `(frame, ArticleCall)` stream into per-copy spawn plans, applying
+/// `Remove`, `Shoot`, `SetVisibility*`, and `ChangeMotion` to `All`, `First`, or `Last`
+/// live copies of each article.
+pub fn plan_spawns_from_calls(
+    calls: &[(u32, &crate::data::ArticleCall)],
+    resolve_name: &dyn Fn(&crate::data::ArticleCall) -> Option<String>,
+) -> Vec<SpawnPlan> {
+    use crate::data::ArticleOp;
+
+    let mut ordered: Vec<(usize, u32, &crate::data::ArticleCall)> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (frame, call))| (i, *frame, *call))
+        .collect();
+    ordered.sort_by_key(|(i, frame, _)| (*frame, *i));
+
+    let mut plans: Vec<SpawnPlan> = Vec::new();
+    for (_, frame, call) in ordered {
+        let Some(name) = resolve_name(call) else {
+            continue;
+        };
+        match call.op {
+            ArticleOp::Generate | ArticleOp::GenerateEnable => {
+                plans.push(SpawnPlan {
+                    name,
+                    spawned: frame,
+                    removed: None,
+                    shot: None,
+                    shown: Vec::new(),
+                    motion: None,
+                });
+            }
+            ArticleOp::Remove | ArticleOp::RemoveExist => {
+                for idx in target_live_indices(&plans, &name, frame, call.target) {
+                    plans[idx].removed = Some(frame);
+                }
+            }
+            ArticleOp::Shoot | ArticleOp::ShootExist => {
+                for idx in target_live_indices(&plans, &name, frame, call.target) {
+                    if plans[idx].shot.is_none() {
+                        plans[idx].shot = Some(frame);
+                    }
+                }
+            }
+            ArticleOp::SetVisibilityWhole => {
+                if let Some(visible) = parse_bool_arg(&call.args, 0) {
+                    for idx in target_live_indices(&plans, &name, frame, call.target) {
+                        plans[idx].shown.push((frame, visible));
+                    }
+                }
+            }
+            ArticleOp::SetVisibility => {
+                if let Some(visible) = parse_bool_arg(&call.args, 1) {
+                    for idx in target_live_indices(&plans, &name, frame, call.target) {
+                        plans[idx].shown.push((frame, visible));
+                    }
+                }
+            }
+            ArticleOp::ChangeMotion => {
+                if let Some(motion) = call.args.first().and_then(|arg| parse_quoted_motion(arg)) {
+                    for idx in target_live_indices(&plans, &name, frame, call.target) {
+                        if plans[idx].motion.is_none() {
+                            plans[idx].motion = Some(motion.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    plans
+}
+
+/// Inspect a fighter move script for project-defined article spawn wrappers such as
+/// `generate_sceptile_article(boma, ArticleKind::LeafStorm)` or
+/// `generate_stacked_article(boma, ArticleKind::Pellet)` so the 3D preview can spawn their
+/// catalog articles even when the moveset wraps `ArticleModule::generate_article` in a helper.
+pub fn plan_wrapper_spawns_from_script(
+    script: &crate::data::AcmdScript,
+    catalog: &crate::articles::ArticleCatalog,
+    index: Option<&crate::acmd_src::SourceIndex>,
+) -> Vec<SpawnPlan> {
+    let mut plans = Vec::new();
+    collect_wrapper_spawns(&script.stmts, 0.0, catalog, index, &mut plans);
+    plans
+}
+
+fn collect_wrapper_spawns(
+    stmts: &[crate::data::AcmdStmt],
+    start_frame: f32,
+    catalog: &crate::articles::ArticleCatalog,
+    index: Option<&crate::acmd_src::SourceIndex>,
+    out: &mut Vec<SpawnPlan>,
+) -> f32 {
+    use crate::data::{AcmdStmt, ExcuteStmt};
+    let mut frame = start_frame;
+    for stmt in stmts {
+        match stmt {
+            AcmdStmt::Frame(f) => frame = *f,
+            AcmdStmt::Wait(w) => frame += *w,
+            AcmdStmt::Raw(line) => {
+                if let Some(plan) =
+                    wrapper_spawn_from_line(line, frame.max(1.0).round() as u32, catalog, index)
+                {
+                    out.push(plan);
+                }
+            }
+            AcmdStmt::Excute(inner) => {
+                let at = frame.max(1.0).round() as u32;
+                for s in inner {
+                    if let ExcuteStmt::Raw(line) = s {
+                        if let Some(plan) = wrapper_spawn_from_line(line, at, catalog, index) {
+                            out.push(plan);
+                        }
+                    }
+                }
+            }
+            AcmdStmt::Bare(inner) => {
+                if let ExcuteStmt::Raw(line) = inner.as_ref() {
+                    if let Some(plan) = wrapper_spawn_from_line(
+                        line,
+                        frame.max(1.0).round() as u32,
+                        catalog,
+                        index,
+                    ) {
+                        out.push(plan);
+                    }
+                }
+            }
+            AcmdStmt::RawBlock { header, body, .. } => {
+                if let Some(plan) = wrapper_spawn_from_line(
+                    header,
+                    frame.max(1.0).round() as u32,
+                    catalog,
+                    index,
+                ) {
+                    out.push(plan);
+                }
+                frame = collect_wrapper_spawns(body, frame, catalog, index, out);
+            }
+            AcmdStmt::Loop { count, body, .. } => {
+                for _ in 0..(*count).min(16) {
+                    frame = collect_wrapper_spawns(body, frame, catalog, index, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    frame
+}
+
+fn wrapper_spawn_from_line(
+    line: &str,
+    frame: u32,
+    catalog: &crate::articles::ArticleCatalog,
+    index: Option<&crate::acmd_src::SourceIndex>,
+) -> Option<SpawnPlan> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("//")
+        || trimmed.starts_with("println!")
+        || trimmed.starts_with("eprintln!")
+        || trimmed.contains("ArticleModule::")
+    {
+        return None;
+    }
+    // Look for a helper call whose name suggests generating/spawning an article, e.g.
+    // `generate_sceptile_article(..., ArticleKind::LeafStorm)` or
+    // `generate_stacked_article(..., ArticleKind::Pellet)` or `generate_autobomb_article(...)`.
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.contains("generate_") || lower.contains("spawn_")) {
+        return None;
+    }
+    // 1. Prefer an explicit `ArticleKind::<Variant>` argument.
+    let mut hint: Option<String> = None;
+    if let Some(pos) = trimmed.find("ArticleKind::") {
+        let rest = &trimmed[pos + "ArticleKind::".len()..];
+        let variant: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !variant.is_empty() {
+            hint = Some(variant.to_ascii_lowercase());
+        }
+    }
+    // 2. Otherwise inspect the helper function name itself (`generate_autobomb_article` → `autobomb`).
+    if hint.is_none() {
+        for prefix in ["generate_", "spawn_"] {
+            if let Some(pos) = lower.find(prefix) {
+                let ident: String = lower[pos + prefix.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let stem = ident
+                    .trim_end_matches("_article")
+                    .trim_start_matches("shot_")
+                    .trim_start_matches("stacked_");
+                if !stem.is_empty() && stem != "article" {
+                    hint = Some(stem.replace('_', ""));
+                    break;
+                }
+            }
+        }
+    }
+    let hint = hint?;
+    let hint_compact = hint.replace('_', "");
+    // Direct match against a catalog article's own name (e.g. Sceptile's `leafstorm`, `bulletseed`).
+    if let Some(article) = catalog
+        .articles
+        .iter()
+        .find(|a| a.name == hint || a.name.replace('_', "") == hint_compact)
+    {
+        return Some(SpawnPlan {
+            name: article.name.clone(),
+            spawned: frame,
+            removed: None,
+            shot: None,
+            shown: Vec::new(),
+            motion: None,
+        });
+    }
+    // Carrier match: prefer `game_` scripts over `effect_`/`sound_` ones so hitbox scripts win.
+    // Match either the registered script name (`game_pellet_shoot`) or the Rust handler function
+    // name in `SourceIndex` (`game_fireball_fly` registered as `"game_fly"`).
+    for want_game in [true, false] {
+        for article in &catalog.articles {
+            let fighter_scripts = index.and_then(|idx| idx.fighters.get(&article.agent));
+            let matched_script = article.source_scripts.iter().find_map(|raw| {
+                let is_game = raw.starts_with("game_");
+                if is_game != want_game {
+                    return None;
+                }
+                let stripped = raw
+                    .strip_prefix("game_")
+                    .or_else(|| raw.strip_prefix("effect_"))
+                    .or_else(|| raw.strip_prefix("sound_"))
+                    .or_else(|| raw.strip_prefix("expression_"))
+                    .unwrap_or(raw);
+                let compact = stripped.replace('_', "");
+                let fn_matches = fighter_scripts
+                    .and_then(|fs| fs.scripts.get(raw))
+                    .is_some_and(|site| {
+                        site.function
+                            .to_ascii_lowercase()
+                            .replace('_', "")
+                            .contains(&hint_compact)
+                    });
+                (compact.contains(&hint_compact) || fn_matches).then(|| stripped.to_owned())
+            });
+            if let Some(motion) = matched_script {
+                return Some(SpawnPlan {
+                    name: article.name.clone(),
+                    spawned: frame,
+                    removed: None,
+                    shot: None,
+                    shown: Vec::new(),
+                    motion: Some(motion),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Inspect a fighter status function body (and any same-file `fastshift` / `main_shift` /
+/// `main_shift_status` loop function it hands off to, when `file_text` is provided) for direct
+/// `ArticleModule::generate_article` or project-defined wrapper spawn calls (such as Shy Guy's
+/// `special_n` spawning `ArticleKind::Fireball` or Sceptile's `final_smash` spawning
+/// `ArticleKind::Sceptilem`).
+pub fn plan_spawns_from_status_body(
+    body: &str,
+    file_text: Option<&str>,
+    catalog: &crate::articles::ArticleCatalog,
+    index: Option<&crate::acmd_src::SourceIndex>,
+) -> Vec<SpawnPlan> {
+    let mut plans: Vec<SpawnPlan> = Vec::new();
+    scan_status_body_spawns(body, catalog, index, &mut plans);
+    if let Some(full) = file_text {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier: Vec<String> = same_file_callees(body, full);
+        for _depth in 0..4 {
+            let mut next = Vec::new();
+            for callee in frontier {
+                if !visited.insert(callee.clone()) {
+                    continue;
+                }
+                if let Some(span) = crate::acmd_src::function_item(full, &callee) {
+                    let sub = &full[span];
+                    scan_status_body_spawns(sub, catalog, index, &mut plans);
+                    next.extend(same_file_callees(sub, full));
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+    }
+    plans
+}
+
+/// Same-file function names referenced by `body` either as a `fastshift` / `main_shift` target
+/// or as a direct `helper_name(...)` call, filtered to functions actually defined in `file_text`.
+fn same_file_callees(body: &str, file_text: &str) -> Vec<String> {
+    let mut out = shifted_status_callees(body);
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_lowercase() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &body[start..i];
+            // Skip method calls (`.foo(`), module-qualified calls (`::foo(`), and keywords.
+            let prev = body[..start].trim_end().as_bytes().last().copied();
+            let next = body[i..].trim_start().as_bytes().first().copied();
+            if next == Some(b'(')
+                && !matches!(prev, Some(b'.' | b':'))
+                && !matches!(
+                    ident,
+                    "if" | "while" | "for" | "match" | "return" | "let" | "unsafe" | "fn" | "Some" | "None"
+                )
+                && !out.iter().any(|s| s == ident)
+                && crate::acmd_src::function_item(file_text, ident).is_some()
+            {
+                out.push(ident.to_owned());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn shifted_status_callees(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for marker in [
+        "main_shift_status(",
+        "main_shift(",
+        "fastshift(",
+        "subshift(",
+    ] {
+        let mut rest = body;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            let end = after.find(')').unwrap_or(after.len());
+            let inner = &after[..end];
+            // Handles both `main_shift_status(special_n_loop)` and
+            // `fastshift(L2CValue::Ptr(special_n_loop as *const () as _))`.
+            let candidate = inner
+                .rsplit('(')
+                .next()
+                .unwrap_or(inner)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            if !candidate.is_empty()
+                && candidate
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && !out.iter().any(|s| s == candidate)
+            {
+                out.push(candidate.to_owned());
+            }
+            rest = &after[end..];
+        }
+    }
+    out
+}
+
+fn scan_status_body_spawns(
+    body: &str,
+    catalog: &crate::articles::ArticleCatalog,
+    index: Option<&crate::acmd_src::SourceIndex>,
+    plans: &mut Vec<SpawnPlan>,
+) {
+    let empty_locals = HashMap::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let candidate = if let Some(call) = crate::data::ArticleCall::parse(trimmed) {
+            if matches!(
+                call.op,
+                crate::data::ArticleOp::Generate | crate::data::ArticleOp::GenerateEnable
+            ) {
+                catalog
+                    .resolve_id(&call.article, &empty_locals)
+                    .map(|a| a.name.clone())
+                    .or_else(|| article_name(&call.article))
+                    .map(|name| SpawnPlan {
+                        name,
+                        spawned: 1,
+                        removed: None,
+                        shot: None,
+                        shown: Vec::new(),
+                        motion: None,
+                    })
+            } else {
+                None
+            }
+        } else {
+            wrapper_spawn_from_line(trimmed, 1, catalog, index)
+        };
+        if let Some(plan) = candidate {
+            if !plans
+                .iter()
+                .any(|p| p.name == plan.name && p.motion == plan.motion)
+            {
+                plans.push(plan);
+            }
+        }
+    }
+}
+
 /// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
 /// matrices at a game frame.
 pub fn place(
@@ -805,6 +1668,12 @@ pub fn place(
         if hidden {
             continue;
         }
+        let scale = if kind.scale.is_finite() && kind.scale > 0.0 {
+            kind.scale
+        } else {
+            1.0
+        };
+        let scale_mat = glam::Mat4::from_scale(glam::Vec3::splat(scale));
         let flies = !(kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0);
         // Something that doesn't fly rides the fighter until the move removes it; something
         // thrown later is held in the hand until it is.
@@ -827,7 +1696,7 @@ pub fn place(
                 glam::Mat4::from_rotation_translation(rotation, position)
             } else {
                 ride_bone(&bones, &kind.name)
-            };
+            } * scale_mat;
             placed.push(PlacedObject {
                 kind: kind.clone(),
                 spawned: *spawned,
@@ -861,7 +1730,7 @@ pub fn place(
             shot: *shot,
             hand: hand.clone(),
             age,
-            placement: glam::Mat4::from_rotation_translation(rotation, position),
+            placement: glam::Mat4::from_rotation_translation(rotation, position) * scale_mat,
         });
     }
     placed
@@ -884,7 +1753,7 @@ pub fn plays_in_fighter_space(skel: &SkelData, anim: &AnimData) -> bool {
         .collect();
     let last = anim.final_frame_index.max(0.0);
     [0.0, last * 0.5, last].iter().any(|&frame| {
-        let bones = crate::renderer::compute_bone_world_matrices(skel, Some(anim), &[], frame);
+        let bones = crate::renderer::compute_bone_world_matrices(skel, Some(anim), None, &[], frame);
         top.iter().any(|name| {
             bones
                 .get(*name)
@@ -898,7 +1767,7 @@ pub fn object_bones(object: &PlacedObject) -> HashMap<String, glam::Mat4> {
     let Some(skel) = &object.kind.skel else {
         return HashMap::from([("top".to_owned(), object.placement)]);
     };
-    crate::renderer::compute_bone_world_matrices(skel, object.kind.anim.as_deref(), &[], object.age)
+    crate::renderer::compute_bone_world_matrices(skel, object.kind.anim.as_deref(), None, &[], object.age)
         .into_iter()
         .map(|(name, matrix)| (name, object.placement * matrix))
         .collect()
@@ -913,6 +1782,7 @@ pub fn placement_layer(object: &PlacedObject) -> Option<AnimData> {
     let local = crate::renderer::compute_bone_world_matrices(
         skel,
         object.kind.anim.as_deref(),
+        None,
         &[],
         object.age,
     )
@@ -1415,5 +2285,643 @@ mod object_effect_rotation_tests {
         let effects = super::object_effects_as_written(body);
         assert_eq!(effects[0].rotation, [-4.0, 80.0, 96.0]);
         assert_eq!(effects[0].offset, [0.0, 1.0, 2.0]);
+    }
+}
+
+#[cfg(test)]
+mod resolved_settings_preview_tests {
+    use super::*;
+    use crate::articles::params::{ParamBlock, ParamValue};
+    use crate::articles::settings::{Setting, SettingField, SettingValue};
+    use crate::data::{ArticleCall, ArticleOp, ArticleOrigin, ArticleTarget};
+
+    fn make_setting(field: SettingField, value: SettingValue, facing_factor: bool) -> Setting {
+        Setting {
+            field,
+            value,
+            status: "STATUS_FLY".into(),
+            phase: "Main".into(),
+            file: PathBuf::from("status.rs"),
+            span: 0..1,
+            facing_factor,
+            referenced_params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn settings_override_params() {
+        let mut params = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        params
+            .fields
+            .insert("speed".into(), (ParamValue::Float(1.0), PathBuf::from("vl.prc")));
+        let base = flight_from_param_block(&params);
+        assert_eq!(base.speed, 1.0);
+
+        let settings = vec![
+            make_setting(
+                SettingField::SpeedX,
+                SettingValue::Const {
+                    name: "SHOT_SPEED".into(),
+                    value: Some(2.0),
+                },
+                true,
+            ),
+            make_setting(SettingField::Life, SettingValue::Literal(45.0), false),
+            make_setting(SettingField::Gravity, SettingValue::Literal(0.08), false),
+        ];
+        let resolved = base.with_settings(&settings, &params);
+        assert_eq!(resolved.speed, 2.0);
+        assert_eq!(resolved.life, 45.0);
+        assert!((resolved.gravity - 0.08).abs() < 1e-6);
+    }
+
+    #[test]
+    fn computed_keeps_params() {
+        let mut params = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        params
+            .fields
+            .insert("speed".into(), (ParamValue::Float(1.0), PathBuf::from("vl.prc")));
+        let base = flight_from_param_block(&params);
+        let settings = vec![make_setting(
+            SettingField::SpeedX,
+            SettingValue::Computed("lerp(1.0, 3.0, charge)".into()),
+            true,
+        )];
+        let resolved = base.with_settings(&settings, &params);
+        assert_eq!(resolved.speed, 1.0);
+    }
+
+    #[test]
+    fn scale_applies_to_placement() {
+        let scale_setting = Setting {
+            field: SettingField::Scale,
+            value: SettingValue::Literal(2.0),
+            facing_factor: false,
+            status: "regular".into(),
+            phase: "main".into(),
+            file: PathBuf::from("status.rs"),
+            span: 0..3,
+            referenced_params: Vec::new(),
+        };
+        let resolved_scale = scale_from_settings(&[scale_setting], &ParamBlock::default());
+        assert!((resolved_scale - 2.0).abs() < 1e-5);
+        let kind = Arc::new(ObjectKind {
+            scale: resolved_scale,
+            flight: Flight {
+                speed: 1.0,
+                life: 30.0,
+                ..Flight::default()
+            },
+            ..ObjectKind::default()
+        });
+        let spawn = Spawn {
+            kind,
+            spawned: 1,
+            ..Spawn::default()
+        };
+        let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]);
+        let placed = place(&[spawn], 5.0, &bones);
+        assert_eq!(placed.len(), 1);
+        let bx = placed[0].placement.x_axis.truncate().length();
+        let by = placed[0].placement.y_axis.truncate().length();
+        let bz = placed[0].placement.z_axis.truncate().length();
+        assert!((bx - 2.0).abs() < 1e-5, "expected x basis length 2.0, got {bx}");
+        assert!((by - 2.0).abs() < 1e-5, "expected y basis length 2.0, got {by}");
+        assert!((bz - 2.0).abs() < 1e-5, "expected z basis length 2.0, got {bz}");
+    }
+
+    #[test]
+    fn source_script_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"latios\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            r#"
+unsafe extern "C" fn game_regular(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 14.0, 361, 80, 0, 40, 4.5, 0.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, true, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_elec"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_ELEC, *ATTACK_REGION_ENERGY);
+    }
+}
+
+pub fn install() {
+    smashline::Agent::new("samus_lativolt")
+        .game_acmd("game_regular", game_regular, smashline::Priority::Default)
+        .install();
+}
+"#,
+        )
+        .unwrap();
+        let index = crate::acmd_src::SourceIndex::build(root).expect("build index");
+        let dump_called = std::cell::Cell::new(false);
+        let dump_body = r#"unsafe extern "C" fn game_regular(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 5.0, 361, 50, 0, 20, 2.0, 0.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, true, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_fire"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_FIRE, *ATTACK_REGION_NONE);
+    }
+}"#;
+        let kind = load_kind(
+            &root.join("fighter/samus"),
+            &root.join("fighter/samus/param/vl.prc"),
+            0,
+            "lativolt",
+            &HashMap::new(),
+            &|script_name| {
+                script_from_index_or_dump(
+                    Some(&index),
+                    "samus_lativolt",
+                    script_name,
+                    &|_| {
+                        dump_called.set(true);
+                        Some(dump_body.to_string())
+                    },
+                )
+            },
+        )
+        .expect("load_kind should build from source index script");
+        assert!(
+            !dump_called.get(),
+            "dump fallback must not be used when SourceIndex defines samus_lativolt game_regular"
+        );
+        assert_eq!(kind.hitboxes.len(), 1);
+        assert_eq!(kind.hitboxes[0].damage, 14.0);
+    }
+
+    #[test]
+    fn remove_all_removes_every_copy() {
+        let mk = |op: ArticleOp, target: ArticleTarget| ArticleCall {
+            op,
+            article: "*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL".into(),
+            args: Vec::new(),
+            target,
+            source: String::new(),
+            edited: false,
+            origin: ArticleOrigin::Script,
+        };
+        let c1 = mk(ArticleOp::Generate, ArticleTarget::None);
+        let c2 = mk(ArticleOp::Generate, ArticleTarget::None);
+        let rm = mk(ArticleOp::Remove, ArticleTarget::All);
+        let plans = plan_spawns_from_calls(
+            &[(5, &c1), (12, &c2), (20, &rm)],
+            &|call| article_name(&call.article),
+        );
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].spawned, 5);
+        assert_eq!(plans[0].removed, Some(20));
+        assert_eq!(plans[1].spawned, 12);
+        assert_eq!(plans[1].removed, Some(20));
+
+        // Also check Last vs First targeting.
+        let rm_last = mk(ArticleOp::Remove, ArticleTarget::Last);
+        let last_plans = plan_spawns_from_calls(
+            &[(5, &c1), (12, &c2), (20, &rm_last)],
+            &|call| article_name(&call.article),
+        );
+        assert_eq!(last_plans[0].removed, None);
+        assert_eq!(last_plans[1].removed, Some(20));
+
+        let rm_first = mk(ArticleOp::Remove, ArticleTarget::First);
+        let first_plans = plan_spawns_from_calls(
+            &[(5, &c1), (12, &c2), (20, &rm_first)],
+            &|call| article_name(&call.article),
+        );
+        assert_eq!(first_plans[0].removed, Some(20));
+        assert_eq!(first_plans[1].removed, None);
+    }
+
+    #[test]
+    fn terminal_status_speed_zero_does_not_stop_flight() {
+        let params = ParamBlock::default();
+        let base = Flight {
+            speed: 2.5,
+            life: 60.0,
+            ..Flight::default()
+        };
+        let explode_stop = Setting {
+            field: SettingField::SpeedX,
+            value: SettingValue::Literal(0.0),
+            facing_factor: false,
+            status: "WEAPON_SAMUS_LATIVOLT_STATUS_KIND_GROUND".into(),
+            phase: "main".into(),
+            file: PathBuf::from("lati_speciallw/mod.rs"),
+            span: 0..3,
+            referenced_params: Vec::new(),
+        };
+        let result = base.with_settings(&[explode_stop], &params);
+        assert!(
+            (result.speed - 2.5).abs() < 1e-5,
+            "impact/ground status speed 0.0 must not zero out flight speed, got {}",
+            result.speed
+        );
+    }
+
+    #[test]
+    fn wrapper_spawn_calls_resolve_clones_and_carriers() {
+        use crate::articles::{Article, ArticleCatalog, ArticleOrigin};
+        // Sceptile-style clone article spawned through a wrapper helper.
+        let sceptile_catalog = ArticleCatalog {
+            articles: vec![Article {
+                agent: "mario_leafstorm".into(),
+                owner: "mario".into(),
+                name: "leafstorm".into(),
+                origin: ArticleOrigin::Rewritten,
+                id_symbols: Vec::new(),
+                source_scripts: vec!["game_fly".into()],
+                conflicts: Vec::new(),
+                id_note: None,
+                also_declared: Vec::new(),
+                clone_conflicts: Vec::new(),
+            }],
+            unresolved_clones: Vec::new(),
+        };
+        let sceptile_script = crate::acmd::parse_acmd_script(
+            r#"
+unsafe extern "C" fn game_special_n_shoot(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 18.0);
+    if macros::is_excute(agent) {
+        if generate_sceptile_article(agent.module_accessor, ArticleKind::LeafStorm) {
+            macros::QUAKE(agent, *CAMERA_QUAKE_KIND_M);
+        }
+    }
+}
+"#,
+        );
+        let plans = plan_wrapper_spawns_from_script(&sceptile_script, &sceptile_catalog, None);
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        assert_eq!(plans[0].name, "leafstorm");
+        assert_eq!(plans[0].spawned, 18);
+
+        // Shy Guy-style carrier article spawned via `ArticleKind::Pellet`.
+        let shyguy_catalog = ArticleCatalog {
+            articles: vec![Article {
+                agent: "pacman_trampoline".into(),
+                owner: "pacman".into(),
+                name: "trampoline".into(),
+                origin: ArticleOrigin::Rewritten,
+                id_symbols: Vec::new(),
+                source_scripts: vec!["game_pellet_shoot".into(), "game_fireball_fly".into()],
+                conflicts: Vec::new(),
+                id_note: None,
+                also_declared: Vec::new(),
+                clone_conflicts: Vec::new(),
+            }],
+            unresolved_clones: Vec::new(),
+        };
+        let shyguy_script = crate::acmd::parse_acmd_script(
+            r#"
+unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 6.0);
+    if macros::is_excute(agent) {
+        generate_stacked_article(agent.module_accessor, ArticleKind::Pellet);
+    }
+}
+"#,
+        );
+        let plans = plan_wrapper_spawns_from_script(&shyguy_script, &shyguy_catalog, None);
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        assert_eq!(plans[0].name, "trampoline");
+        assert_eq!(plans[0].spawned, 6);
+        assert_eq!(plans[0].motion.as_deref(), Some("pellet_shoot"));
+    }
+
+    #[test]
+    #[ignore = "reads real moveset folders under C:\\Users\\notja\\Documents\\Coding\\SSBU Modding\\Movesets"]
+    fn real_movesets_latios_sceptile_shyguy_load_for_preview() {
+        let base = Path::new(r"C:\Users\notja\Documents\Coding\SSBU Modding\Movesets");
+        if std::fs::read_dir(base.join("Latios-Moveset/src")).is_err() {
+            return;
+        }
+        let names: Vec<String> = [
+            "samus", "mario", "luigi", "link", "koopajr", "pacman", "ridley", "simon", "rockman",
+            "palutena", "krool", "lucario",
+        ]
+        .map(String::from)
+        .to_vec();
+        let labels = HashMap::new();
+
+        // 1. Latios (samus c32): lativolt, latisnow, latihado
+        let latios = base.join("Latios-Moveset");
+        if std::fs::read_dir(latios.join("src")).is_ok() {
+            let index = crate::acmd_src::SourceIndex::build(&latios).expect("latios index");
+            let fighter_dir = latios.join("romfs/fighter/samus");
+            let param_path = fighter_dir.join("param/vl.prc");
+            let catalog = crate::articles::catalog_for("samus", &index, &names, &fighter_dir);
+            let lativolt = catalog.get("samus_lativolt").expect("lativolt in catalog");
+            let extra: Vec<String> = lativolt
+                .source_scripts
+                .iter()
+                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .collect();
+            let settings = crate::articles::settings_for(&index, "samus_lativolt");
+            let params = crate::articles::params::param_block(&[param_path.clone()], &[], "lativolt", &labels);
+            let kind = load_kind_resolved(
+                &fighter_dir,
+                &param_path,
+                32,
+                "lativolt",
+                &labels,
+                &ResolvedArticleInputs {
+                    extra_fighter_dirs: std::slice::from_ref(&fighter_dir),
+                    extra_scripts: &extra,
+                    params: Some(&params),
+                    other_blocks: None,
+                    settings: &settings,
+                },
+                &|s| script_from_index_or_dump(Some(&index), "samus_lativolt", s, &|_| None),
+            )
+            .expect("lativolt must load");
+            assert!(kind.skel.is_some(), "lativolt c32 skel should load");
+            assert!(!kind.hitboxes.is_empty(), "lativolt hitboxes should load from source");
+            assert!(!kind.effects.is_empty(), "lativolt effects should load from source");
+        }
+
+        // 2. Sceptile (mario c40, nested plugin/ crate with ../romfs)
+        let sceptile = base.join("Sceptile-Moveset");
+        let sceptile_plugin = sceptile.join("plugin");
+        if std::fs::read_dir(sceptile_plugin.join("src")).is_ok() {
+            let index = crate::acmd_src::SourceIndex::build(&sceptile_plugin).expect("sceptile index");
+            let fighter_dir = sceptile.join("romfs/fighter/mario");
+            let param_path = fighter_dir.join("param/vl.prc");
+            let catalog = crate::articles::catalog_for("mario", &index, &names, &fighter_dir);
+            let bulletseed = catalog.get("mario_bulletseed").expect("bulletseed in catalog");
+            let extra: Vec<String> = bulletseed
+                .source_scripts
+                .iter()
+                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .collect();
+            let settings = crate::articles::settings_for(&index, "mario_bulletseed");
+            let params = crate::articles::params::param_block(&[param_path.clone()], &[], "bulletseed", &labels);
+            let kind = load_kind_resolved(
+                &fighter_dir,
+                &param_path,
+                40,
+                "bulletseed",
+                &labels,
+                &ResolvedArticleInputs {
+                    extra_fighter_dirs: std::slice::from_ref(&fighter_dir),
+                    extra_scripts: &extra,
+                    params: Some(&params),
+                    other_blocks: None,
+                    settings: &settings,
+                },
+                &|s| script_from_index_or_dump(Some(&index), "mario_bulletseed", s, &|_| None),
+            )
+            .expect("bulletseed must load");
+            assert!(kind.model_dir.is_some() && kind.skel.is_some(), "bulletseed c40 model must load");
+            // Sceptile's stick has an ACMD game_throw hitbox + c40 model.
+            let stick = catalog.get("mario_stick").expect("stick in catalog");
+            let stick_extra: Vec<String> = stick
+                .source_scripts
+                .iter()
+                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .collect();
+            let stick_kind = load_kind_resolved(
+                &fighter_dir,
+                &param_path,
+                40,
+                "stick",
+                &labels,
+                &ResolvedArticleInputs {
+                    extra_fighter_dirs: std::slice::from_ref(&fighter_dir),
+                    extra_scripts: &stick_extra,
+                    params: None,
+                    other_blocks: None,
+                    settings: &[],
+                },
+                &|s| script_from_index_or_dump(Some(&index), "mario_stick", s, &|_| None),
+            )
+            .expect("stick must load");
+            assert!(stick_kind.model_dir.is_some() && stick_kind.skel.is_some(), "stick c40 model must load");
+            assert!(!stick_kind.hitboxes.is_empty(), "stick game_throw hitboxes should load");
+            // Check wrapper spawn in special_n_shoot
+            let special_n_shoot = index.script_source("mario", "special_n_shoot").expect("special_n_shoot");
+            let parsed = crate::acmd::parse_acmd_script(&special_n_shoot.body);
+            let plans = plan_wrapper_spawns_from_script(&parsed, &catalog, Some(&index));
+            assert!(
+                plans.iter().any(|p| p.name == "leafstorm"),
+                "special_n_shoot should spawn leafstorm: {plans:?}"
+            );
+            // Check status spawns (final_smash spawns sceptilem, throw spawns bulletseed)
+            let status_spawns: Vec<SpawnPlan> = index
+                .status_bodies("mario")
+                .into_iter()
+                .flat_map(|(site, body)| {
+                    let file_text = std::fs::read_to_string(&site.file).ok();
+                    plan_spawns_from_status_body(&body, file_text.as_deref(), &catalog, Some(&index))
+                })
+                .collect();
+            assert!(
+                status_spawns
+                    .iter()
+                    .any(|p| p.name == "sceptilem" || p.name == "bulletseed"),
+                "sceptile statuses should spawn sceptilem or bulletseed: {status_spawns:?}"
+            );
+        }
+
+        // 3. Shy Guy (pacman c40, nested plugin/ crate with ../romfs)
+        let shyguy = base.join("Shy-Guy-Moveset");
+        let shyguy_plugin = shyguy.join("plugin");
+        if std::fs::read_dir(shyguy_plugin.join("src")).is_ok() {
+            let index = crate::acmd_src::SourceIndex::build(&shyguy_plugin).expect("shyguy index");
+            let fighter_dir = shyguy.join("romfs/fighter/pacman");
+            let param_path = fighter_dir.join("param/vl.prcxml");
+            let catalog = crate::articles::catalog_for("pacman", &index, &names, &fighter_dir);
+            let trampoline = catalog.get("pacman_trampoline").expect("trampoline in catalog");
+            let extra: Vec<String> = trampoline
+                .source_scripts
+                .iter()
+                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .collect();
+            let settings = crate::articles::settings_for(&index, "pacman_trampoline");
+            let params = crate::articles::params::param_block(&[param_path.clone()], &[], "trampoline", &labels);
+            let kind = load_kind_resolved(
+                &fighter_dir,
+                &param_path,
+                40,
+                "trampoline",
+                &labels,
+                &ResolvedArticleInputs {
+                    extra_fighter_dirs: std::slice::from_ref(&fighter_dir),
+                    extra_scripts: &extra,
+                    params: Some(&params),
+                    other_blocks: None,
+                    settings: &settings,
+                },
+                &|s| script_from_index_or_dump(Some(&index), "pacman_trampoline", s, &|_| None),
+            )
+            .expect("trampoline must load");
+            assert!(kind.model_dir.is_some() && kind.skel.is_some(), "trampoline c40 model must load");
+            assert!(!kind.hitboxes.is_empty(), "trampoline hitboxes should load");
+            // Check status spawn for fireball on special_n (via main_shift_status / fastshift)
+            let status_spawns: Vec<(String, SpawnPlan)> = index
+                .status_bodies("pacman")
+                .into_iter()
+                .flat_map(|(site, body)| {
+                    let s = site.kind_expr.clone();
+                    let file_text = std::fs::read_to_string(&site.file).ok();
+                    plan_spawns_from_status_body(&body, file_text.as_deref(), &catalog, Some(&index))
+                        .into_iter()
+                        .map(move |p| (s.clone(), p))
+                })
+                .collect();
+            assert!(
+                status_spawns
+                    .iter()
+                    .any(|(s, p)| crate::articles::view::status_matches_move(s, "special_n")
+                        && p.name == "trampoline"),
+                "shyguy special_n status should spawn trampoline fireball: {status_spawns:?}"
+            );
+            // Check Shy Guy down tilt spawns carrot (bigpacman) with its real parabolic arc
+            // (LAUNCH_VX = 0.5, LAUNCH_VY = 3.1, ARC_GRAVITY = 0.12, LIFETIME_FRAMES = 250).
+            let dtilt = index.script_source("pacman", "attack_lw3").expect("shyguy attack_lw3");
+            let dtilt_plans = plan_wrapper_spawns_from_script(
+                &crate::acmd::parse_acmd_script(&dtilt.body),
+                &catalog,
+                Some(&index),
+            );
+            assert!(
+                dtilt_plans
+                    .iter()
+                    .any(|p| p.name == "bigpacman" && p.motion.as_deref() == Some("carrot")),
+                "shyguy attack_lw3 should spawn bigpacman@carrot: {dtilt_plans:?}"
+            );
+            let bigpac_settings = crate::articles::settings_for(&index, "pacman_bigpacman");
+            let carrot_settings = settings_for_motion(&bigpac_settings, "carrot", Some("game_carrot"));
+            assert!(!carrot_settings.is_empty(), "carrot status settings must be found");
+            let carrot_flight = Flight::default().with_settings(&carrot_settings, &ParamBlock::default());
+            assert!(
+                (carrot_flight.gravity - 0.12).abs() < 1e-4,
+                "carrot gravity should be 0.12, got {:?}",
+                carrot_flight
+            );
+            assert!(
+                carrot_flight.angle > 75.0 && carrot_flight.speed > 3.0,
+                "carrot should launch upward in a steep arc, got {:?}",
+                carrot_flight
+            );
+            let (_, y_mid) = carrot_flight.offset(25.0, 6.0);
+            let (_, y_late) = carrot_flight.offset(50.0, 6.0);
+            assert!(
+                y_mid > 30.0 && y_late < y_mid,
+                "carrot should arc upward then fall back down: y(25)={y_mid}, y(50)={y_late}"
+            );
+
+            // Verify Shy Guy's carrot_trail (EP03 SuperStripe ribbon) parses and sweeps vertices.
+            let carrot_src = index
+                .script_source("pacman_bigpacman", "carrot")
+                .expect("carrot src");
+            let carrot_effs = object_effects(&carrot_src.body);
+            assert!(
+                carrot_effs.iter().any(|e| e.name == "carrot_trail"),
+                "carrot should expose carrot_trail effect: {carrot_effs:?}"
+            );
+            let eff_dir = shyguy.join("romfs/effect/fighter/pacman");
+            let eff_bytes = std::fs::read(eff_dir.join("ef_pacman_c40.eff")).unwrap();
+            let eff_file = effect_library::NamcoEffectFile::load(&eff_bytes).unwrap();
+            let handles = crate::effects::entry_set_handles(&eff_file);
+            let set_idx = *handles.get("carrot_trail").expect("CARROT_TRAIL in ef_pacman_c40.eff")
+                as usize;
+            let ptcl_file = eff_file.ptcl_file.as_ref().expect("ptcl");
+            let raw_sets = eff_wgpu::ptcl::emitter_sets(&ptcl_file.base_bytes);
+            let tail_em = &ptcl_file.emitter_list.emitter_sets[set_idx].emitters[0];
+            let tail_raw = &raw_sets[set_idx].emitters[0];
+            let tail_fixed = eff_wgpu::static_block::fixed_emitter_data(tail_raw, &|_| None, None);
+            let stripe_cfg = crate::vfx_preview::StripeConfig::from_emitter(tail_em, &tail_fixed)
+                .expect("CARROT_TRAIL tail_wind must parse as EP03 stripe");
+            assert_eq!(stripe_cfg.history_count, 24);
+            let placements: Vec<glam::Mat4> = (0..25)
+                .map(|f| {
+                    let (x, y) = carrot_flight.offset(f as f32, 0.0);
+                    glam::Mat4::from_translation(glam::Vec3::new(0.0, y + 3.0, x))
+                })
+                .collect();
+            let stripe_verts = crate::vfx_preview::build_stripe_vertices(
+                &placements,
+                stripe_cfg.local,
+                tail_em.data.emission.start.max(0) as usize,
+                None,
+                &stripe_cfg,
+                glam::Vec3::new(50.0, 15.0, 0.0),
+                [1.0; 4],
+            );
+            assert!(
+                stripe_verts.len() >= 60,
+                "CARROT_TRAIL stripe should emit ribbon geometry along the carrot arc, got {} verts",
+                stripe_verts.len()
+            );
+
+            // Verify Shy Guy's aerial down special (and ledge variant) expand stilt_trails_on +
+            // unroll `for shoe in ["stiltshoel", "stiltshoer"]` and resolve trail_c40 textures.
+            for (move_name, expected_span) in [
+                ("special_air_lw", (14, 23)),
+                ("special_air_lw_ledge", (1, 8)),
+            ] {
+                let src = index
+                    .script_source("pacman", move_name)
+                    .unwrap_or_else(|| panic!("{move_name} src"));
+                let effs = crate::acmd::parse_effect_script(&src.body).to_effect_calls();
+                assert_eq!(
+                    effs.len(),
+                    2,
+                    "{move_name} should expand both stilt trails: {effs:?}"
+                );
+                assert_eq!(effs[0].bone_name, "stiltshoel");
+                assert_eq!(effs[1].bone_name, "stiltshoer");
+                assert_eq!((effs[0].active_start, effs[0].active_end), expected_span);
+                let spec = effs[0]
+                    .raw_line
+                    .as_deref()
+                    .and_then(crate::preview_trail::parse)
+                    .expect("preview_trail::parse");
+                assert!(
+                    crate::preview_trail::texture_path_for_slot(
+                        std::slice::from_ref(&eff_dir),
+                        Some(40),
+                        None,
+                        &spec.texture
+                    )
+                    .is_some(),
+                    "trail_c40/{}.nutexb must resolve",
+                    spec.texture
+                );
+                assert!(
+                    crate::preview_trail::texture_path_for_slot(
+                        std::slice::from_ref(&eff_dir),
+                        Some(40),
+                        None,
+                        &spec.fade
+                    )
+                    .is_some(),
+                    "trail_c40/{}.nutexb must resolve",
+                    spec.fade
+                );
+            }
+
+            // Shy Guy's frame.rs overrides Pac-Man's hurtboxes on entry/reset, elongating
+            // the Waist capsule upward ([0,0,0] -> [4.2,0,0], radius 4.7) and zeroing the legs.
+            let shyguy_hurtboxes = index
+                .hurtboxes
+                .get("pacman")
+                .expect("Shy Guy hurtbox overrides must be indexed on pacman");
+            assert_eq!(shyguy_hurtboxes.len(), 7, "{shyguy_hurtboxes:?}");
+            let waist = shyguy_hurtboxes
+                .iter()
+                .find(|h| h.bone_name.eq_ignore_ascii_case("waist"))
+                .expect("waist hurtbox override");
+            assert_eq!(waist.index, 4);
+            assert_eq!(waist.endpoint1, [0.0, 0.0, 0.0]);
+            assert_eq!(waist.endpoint2, [4.2, 0.0, 0.0]);
+            assert_eq!(waist.radius, 4.7);
+        }
     }
 }
