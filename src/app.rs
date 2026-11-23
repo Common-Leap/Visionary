@@ -5318,11 +5318,6 @@ pub struct VisionaryApp {
     /// Why the open move shows vanilla even though a moveset source is linked.
     acmd_source_note: Option<String>,
     show_acmd_src: bool,
-    /// The Motion List window, and the open list when it has been opened.
-    show_motion_list: bool,
-    motion_list_editor: Option<crate::motion_list_editor::MotionListEditor>,
-    /// `.nuanmb` names in the open list's costume folder, for its animation picker.
-    motion_list_anims: Vec<String>,
     /// The script currently open in the source editor window.
     acmd_src_buffer: Option<SourceBuffer>,
     acmd_src_view: SourceView,
@@ -5921,9 +5916,6 @@ impl VisionaryApp {
             acmd_src_problem: None,
             acmd_source_note: None,
             show_acmd_src: false,
-            show_motion_list: false,
-            motion_list_editor: None,
-            motion_list_anims: Vec::new(),
             acmd_src_buffer: None,
             acmd_src_view: SourceView::Source,
             eff_editor: crate::eff_editor::EffEditor::default(),
@@ -7134,8 +7126,8 @@ impl VisionaryApp {
         self.state.status = "Loading moves...".to_string();
 
         std::thread::spawn(move || {
-            // The binary or the YAML, whichever was written last, so an edit made in the Motion
-            // List window (or by hand in the YAML) shows before the next build converts it.
+            // The binary or the YAML, whichever was written last, so an edit to the YAML shows
+            // before the next build converts it.
             let Some(mlist) = crate::motion_list::load_current_in(&motion_dir) else {
                 return;
             };
@@ -9808,127 +9800,6 @@ impl VisionaryApp {
                 plan.nro_name,
                 path.display()
             );
-        }
-    }
-
-    /// The Motion List window. It follows the selected fighter's costume folder, unless the open
-    /// list has unsaved edits, which keep it open until they are saved or discarded.
-    fn draw_motion_list_window(&mut self, ctx: &egui::Context) {
-        let motion_dir = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|fighter| fighter.motion_dir.clone());
-        let wanted = motion_dir
-            .as_deref()
-            .and_then(crate::motion_list::editable_in);
-        let stale = match (&self.motion_list_editor, &wanted) {
-            (None, Some(_)) => true,
-            (Some(editor), Some(path)) => editor.file.path != *path && !editor.file.changed,
-            _ => false,
-        };
-        if stale {
-            if let (Some(path), Some(dir)) = (wanted.as_ref(), motion_dir.as_ref()) {
-                self.open_motion_list(path, dir);
-            }
-        }
-        let Some(editor) = self.motion_list_editor.as_mut() else {
-            let mut open = true;
-            egui::Window::new("Motion List")
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(match motion_dir {
-                        Some(dir) => {
-                            format!("No motion_list.yml or motion_list.bin in {}", dir.display())
-                        }
-                        None => "Select a fighter to edit its motion list.".to_string(),
-                    });
-                });
-            self.show_motion_list = open;
-            return;
-        };
-        let response = editor.show(ctx, &self.motion_list_anims);
-        self.show_motion_list = response.open;
-        if let Some(path) = &response.saved {
-            self.state.status = format!("Saved {}", path.display());
-        }
-        if response.changed {
-            self.apply_motion_list_to_moves();
-        }
-    }
-
-    fn open_motion_list(&mut self, path: &Path, dir: &Path) {
-        crate::motion_list::add_known_labels(self.state.labels.iter());
-        match crate::motion_list::MotionListFile::open(path) {
-            Ok(file) => {
-                let mut anims: Vec<String> = std::fs::read_dir(dir)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-                    .filter(|name| name.to_ascii_lowercase().ends_with(".nuanmb"))
-                    .collect();
-                anims.sort_unstable_by_key(|name| name.to_ascii_lowercase());
-                crate::motion_list::add_derived_labels(
-                    &file.mlist,
-                    anims.iter().map(String::as_str),
-                );
-                let mut editor = crate::motion_list_editor::MotionListEditor::new(file);
-                let selected = self
-                    .state
-                    .selected_move
-                    .as_ref()
-                    .map(|entry| crate::motion_list::Hash40(entry.hash))
-                    .filter(|hash| editor.file.mlist.list.contains_key(hash));
-                if let Some(hash) = selected {
-                    editor.select(hash);
-                }
-                self.motion_list_editor = Some(editor);
-                self.motion_list_anims = anims;
-            }
-            Err(error) => {
-                self.motion_list_editor = None;
-                self.state.status = format!("Could not open {}: {error:#}", path.display());
-            }
-        }
-    }
-
-    /// Carry the open list's cancel frames into the move list, so frame data follows an edit
-    /// at once. Only when the list is the selected fighter's own.
-    fn apply_motion_list_to_moves(&mut self) {
-        let Some(editor) = &self.motion_list_editor else {
-            return;
-        };
-        let current = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .is_some_and(|fighter| editor.file.path.parent() == Some(fighter.motion_dir.as_path()));
-        if !current {
-            return;
-        }
-        let cancel_of = |hash: u64| {
-            editor
-                .file
-                .mlist
-                .list
-                .get(&crate::motion_list::Hash40(hash))
-                .map(|motion| {
-                    motion
-                        .extra
-                        .as_ref()
-                        .map_or(0, |extra| u32::from(extra.cancel_frame))
-                })
-        };
-        for entry in &mut self.move_list {
-            if let Some(cancel) = cancel_of(entry.hash) {
-                entry.cancel_frame = cancel;
-            }
-        }
-        if let Some(entry) = self.state.selected_move.as_mut() {
-            if let Some(cancel) = cancel_of(entry.hash) {
-                entry.cancel_frame = cancel;
-            }
         }
     }
 
@@ -40354,10 +40225,6 @@ impl eframe::App for VisionaryApp {
             self.perf.end("acmd_source_window", t);
         }
 
-        if self.show_motion_list {
-            self.draw_motion_list_window(&ctx);
-        }
-
         if self.article_settings.is_some() {
             self.draw_article_settings_window(&ctx);
         }
@@ -40608,12 +40475,6 @@ impl eframe::App for VisionaryApp {
                         self.focus_transplant = true;
                         toggled = true;
                     }
-                    toggled |= ui
-                        .checkbox(&mut self.show_motion_list, "Motion list")
-                        .on_hover_text(
-                            "Edit the selected fighter's motion_list.yml or motion_list.bin: motion kinds, scripts, animations, flags, and cancel and intangibility frames",
-                        )
-                        .changed();
                     let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
                     ui.add_enabled_ui(has_log, |ui| {
                         toggled |= ui
