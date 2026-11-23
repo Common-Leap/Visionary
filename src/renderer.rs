@@ -235,8 +235,9 @@ pub struct HitboxRenderState {
     cached_default_anim: Option<(std::path::PathBuf, Option<ssbh_data::anim_data::AnimData>)>,
     /// Cached skeleton data — reloaded only when the path changes
     cached_skel: Option<(std::path::PathBuf, ssbh_data::skel_data::SkelData)>,
-    /// The loaded model's `model.nuhlpb`. Applied to the mesh and to the overlay's bone
-    /// matrices while [`Self::helper_bones`] is on, as the game applies it every frame.
+    /// The loaded model's `model.nuhlpb`, which bends the mesh while [`Self::helper_bones`] is
+    /// on. Not the overlay's bone matrices: the game's `ModelModule` joints, which hitboxes and
+    /// effects sit on, leave helper bones as the animation has them.
     model_hlpb: Option<ssbh_data::hlpb_data::HlpbData>,
     /// The loaded model's `model.numatb`, which material tracks in a move's `.nuanmb` animate.
     model_matl: Option<ssbh_data::matl_data::MatlData>,
@@ -247,8 +248,8 @@ pub struct HitboxRenderState {
     /// the moveset's frame callback sets. Applied at the skeleton's root, so the mesh and every
     /// bone the overlay reads grow together. Set through [`Self::set_model_scale`].
     model_scale: f32,
-    /// The bone matrices of frames asked for before, while the animation, skeletons, helper
-    /// bones and scale they were evaluated with stand ([`Self::forget_poses`]).
+    /// The bone matrices of frames asked for before, while the animation, skeletons and scale
+    /// they were evaluated with stand.
     poses: PoseCache,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
     /// attach_bone_name is the character bone the weapon root attaches to (e.g. "haver")
@@ -581,7 +582,6 @@ impl HitboxRenderState {
 
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
         let skel = self.cached_skel.as_ref().map(|(_, s)| s);
-        // Field borrows rather than `active_hlpb()`: the loop below borrows `render_models`.
         let hlpb = self.model_hlpb.as_ref().filter(|_| self.helper_bones);
         let matl = self.model_matl.as_ref();
 
@@ -910,11 +910,10 @@ impl HitboxRenderState {
         self.model_hlpb.is_some()
     }
 
-    /// Turn helper bone constraints on or off for both the mesh and the overlay.
+    /// Turn helper bone constraints on or off.
     pub fn set_helper_bones(&mut self, enabled: bool) {
         if self.helper_bones != enabled {
             self.helper_bones = enabled;
-            self.poses.clear();
             // Force the next prepare() to re-skin with the new constraint set.
             self.last_frame = -1.0;
         }
@@ -939,10 +938,6 @@ impl HitboxRenderState {
         self.model_scale
     }
 
-    fn active_hlpb(&self) -> Option<&ssbh_data::hlpb_data::HlpbData> {
-        self.model_hlpb.as_ref().filter(|_| self.helper_bones)
-    }
-
     /// Eagerly load skeleton data so bone_world_matrices_at() returns valid results
     /// immediately, without waiting for the first prepare() call.
     pub fn load_skeleton(&mut self, skel_path: &Path) {
@@ -964,9 +959,8 @@ impl HitboxRenderState {
         };
         self.poses.at(frame, true, || {
             let anim = self.cached_anim.as_ref().map(|(_, a)| a);
-            let hlpb = self.active_hlpb();
             let mut matrices =
-                compute_bone_world_matrices(skel, anim, hlpb, &self.weapon_skels, frame);
+                compute_bone_world_matrices(skel, anim, None, &self.weapon_skels, frame);
             // The same as scaling the root bone, which is what the mesh gets: in game every
             // joint sits at exactly the model scale times its unscaled place.
             let scale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale));
@@ -1463,6 +1457,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Helper bones bend the mesh only. The game's joints leave them as the animation has them
+    /// (Wolf's `h_elbowr` in wait: 0.4 degrees from the animation's turn, 53 from the helper's),
+    /// so nothing the view draws on a bone may turn with them.
+    #[test]
+    fn helper_bones_leave_the_overlays_bones_alone() {
+        use glam::{Quat, Vec3};
+        use ssbh_data::hlpb_data::{HlpbData, OrientConstraintData};
+        let Some((device, queue)) = crate::preview_trail::tests::gpu() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let skel = ssbh_data::skel_data::SkelData {
+            major_version: 1,
+            minor_version: 0,
+            bones: vec![
+                bone("ShoulderR", None, Vec3::ZERO),
+                bone("ArmR", Some(0), Vec3::X),
+                bone("H_ElbowR", Some(0), Vec3::X),
+            ],
+        };
+        let anim = ssbh_data::anim_data::AnimData {
+            major_version: 2,
+            minor_version: 0,
+            final_frame_index: 0.0,
+            groups: vec![ssbh_data::anim_data::GroupData {
+                group_type: ssbh_data::anim_data::GroupType::Transform,
+                nodes: vec![transform_track(
+                    "ArmR",
+                    vec![(Vec3::X, Quat::from_rotation_z(1.0))],
+                )],
+            }],
+        };
+        let hlpb = HlpbData {
+            major_version: 1,
+            minor_version: 1,
+            aim_constraints: Vec::new(),
+            orient_constraints: vec![OrientConstraintData {
+                name: "elbow".into(),
+                parent_bone_name1: "ShoulderR".into(),
+                parent_bone_name2: "ShoulderR".into(),
+                source_bone_name: "ArmR".into(),
+                target_bone_name: "H_ElbowR".into(),
+                unk_type: 1,
+                constraint_axes: Vec3::splat(0.5),
+                quat1: Quat::IDENTITY,
+                quat2: Quat::IDENTITY,
+                range_min: Vec3::splat(-180.0),
+                range_max: Vec3::splat(180.0),
+            }],
+        };
+        let evaluate =
+            |hlpb| super::compute_bone_world_matrices(&skel, Some(&anim), hlpb, &[], 0.0);
+        let plain = evaluate(None);
+        let bent = evaluate(Some(&hlpb));
+        assert!(!bent["H_ElbowR"].abs_diff_eq(plain["H_ElbowR"], 0.1));
+        let mut state =
+            super::HitboxRenderState::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        state.cached_skel = Some((Default::default(), skel.clone()));
+        state.cached_anim = Some((Default::default(), anim.clone()));
+        state.model_hlpb = Some(hlpb.clone());
+        state.set_helper_bones(true);
+        let drawn = state.bone_world_matrices_at(0.0);
+        assert!(drawn["H_ElbowR"].abs_diff_eq(plain["H_ElbowR"], 1e-5));
     }
 
     /// Against real data: a fighter's helper bones move once their constraints apply, and the

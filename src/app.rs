@@ -19303,8 +19303,8 @@ impl VisionaryApp {
                 }
                 response
                     .on_hover_text(
-                        "Bend the model's helper bones (elbows, knees) as the game does. Moves \
-                         the mesh and whatever sits on those bones (model.nuhlpb).",
+                        "Bend the model's elbows, knees and other joints the way its helper \
+                         bones say to (model.nuhlpb)",
                     )
                     .on_disabled_hover_text("This model has no helper bones (model.nuhlpb)");
 
