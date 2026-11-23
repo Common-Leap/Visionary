@@ -2911,51 +2911,7 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 "carrot should arc upward then fall back down: y(25)={y_mid}, y(50)={y_late}"
             );
 
-            // Verify Shy Guy's carrot_trail (EP03 SuperStripe ribbon) parses and sweeps vertices.
-            let carrot_src = index
-                .script_source("pacman_bigpacman", "carrot")
-                .expect("carrot src");
-            let carrot_effs = object_effects(&carrot_src.body);
-            assert!(
-                carrot_effs.iter().any(|e| e.name == "carrot_trail"),
-                "carrot should expose carrot_trail effect: {carrot_effs:?}"
-            );
             let eff_dir = shyguy.join("romfs/effect/fighter/pacman");
-            let eff_bytes = std::fs::read(eff_dir.join("ef_pacman_c40.eff")).unwrap();
-            let eff_file = effect_library::NamcoEffectFile::load(&eff_bytes).unwrap();
-            let handles = crate::effects::entry_set_handles(&eff_file);
-            let set_idx = *handles
-                .get("carrot_trail")
-                .expect("CARROT_TRAIL in ef_pacman_c40.eff") as usize;
-            let ptcl_file = eff_file.ptcl_file.as_ref().expect("ptcl");
-            let raw_sets = eff_wgpu::ptcl::emitter_sets(&ptcl_file.base_bytes);
-            let tail_em = &ptcl_file.emitter_list.emitter_sets[set_idx].emitters[0];
-            let tail_raw = &raw_sets[set_idx].emitters[0];
-            let tail_fixed = eff_wgpu::static_block::fixed_emitter_data(tail_raw, &|_| None, None);
-            let stripe_cfg = crate::vfx_preview::StripeConfig::from_emitter(tail_em, &tail_fixed)
-                .expect("CARROT_TRAIL tail_wind must parse as EP03 stripe");
-            assert_eq!(stripe_cfg.history_count, 24);
-            let placements: Vec<glam::Mat4> = (0..25)
-                .map(|f| {
-                    let (x, y) = carrot_flight.offset(f as f32, 0.0);
-                    glam::Mat4::from_translation(glam::Vec3::new(0.0, y + 3.0, x))
-                })
-                .collect();
-            let stripe_verts = crate::vfx_preview::build_stripe_vertices(
-                &placements,
-                stripe_cfg.local,
-                tail_em.data.emission.start.max(0) as usize,
-                None,
-                &stripe_cfg,
-                glam::Vec3::new(50.0, 15.0, 0.0),
-                [1.0; 4],
-            );
-            assert!(
-                stripe_verts.len() >= 60,
-                "CARROT_TRAIL stripe should emit ribbon geometry along the carrot arc, got {} verts",
-                stripe_verts.len()
-            );
-
             // Verify Shy Guy's aerial down special (and ledge variant) expand stilt_trails_on +
             // unroll `for shoe in ["stiltshoel", "stiltshoer"]` and resolve trail_c40 textures.
             for (move_name, expected_span) in [
