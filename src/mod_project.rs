@@ -51,7 +51,8 @@ pub struct ModProjectFile {
     #[serde(default)]
     pub fighters: HashMap<String, FighterMod>,
     /// Characters made in Visionary, by roster key ("mario#c08") → that character's own move
-    /// edits. A made character is its own character: these never apply to its donor's costumes,
+    /// edits. A costume's own effect file no made character owns keeps its effect edits here too,
+    /// under the costume's key ("pacman#c40"). A made character is its own character: these never apply to its donor's costumes,
     /// and the donor's edits in `fighters` never apply to its costumes. `fighters` holds engine
     /// fighters only. Left out of the file when empty, so a project with no made characters is
     /// written exactly as before.

@@ -3669,6 +3669,44 @@ fn project_owner_mod<'a>(
     }
 }
 
+/// Put the effect edits kept under `owner` in a project being built.
+fn store_effect_edits(
+    project: &mut crate::mod_project::ModProjectFile,
+    roster: &crate::mod_project::RosterMod,
+    owner: &str,
+    eff: &crate::mod_project::EffMod,
+) {
+    let key = crate::character::CharacterKey::parse(owner);
+    let store = match key.costume_file(roster) {
+        // A costume's own effect file keeps its edits under the costume.
+        Some(_) => Some(
+            project
+                .characters
+                .entry(key.roster_key().clone())
+                .or_default(),
+        ),
+        None => project_owner_mod(project, roster, owner),
+    };
+    if let Some(fm) = store {
+        fm.eff = Some(eff.clone());
+    }
+}
+
+/// The key effect edits a project stores under `stored` are kept under: older builds kept a
+/// costume's own effect file under its fighter.
+fn loaded_effect_owner(
+    stored: &str,
+    source_rel: &str,
+    roster: &crate::mod_project::RosterMod,
+) -> String {
+    let own = crate::character::effect_owner(source_rel, roster);
+    if own.contains('#') && !stored.contains('#') {
+        own
+    } else {
+        stored.to_owned()
+    }
+}
+
 /// A gimmick saved while the game ran one per fighter, limited to exactly a made character's
 /// costumes, was that character's. Move it to the character, unchanged, unless the character
 /// already has one of its own.
@@ -3754,9 +3792,7 @@ fn made_effect_lookup(
     let rel = rel.replace('\\', "/");
     let owner =
         crate::character::CharacterKey::parse(&crate::character::effect_owner(&rel, roster));
-    if !owner.is_made() {
-        return None;
-    }
+    owner.authored(roster)?;
     let own = made_root(owner.roster_key())
         .map(|root| root.join(&rel))
         .filter(|path| path.is_file());
@@ -4022,6 +4058,74 @@ fn effect_off_kind_flags(ui: &mut egui::Ui, fade: &mut bool, detach: &mut bool) 
             .changed();
     });
     changed
+}
+
+/// The costumes an effect edit kept under `owner` reaches in the game: a made character's own;
+/// those that play a costume's own effect file; a fighter's own when other characters play on
+/// some of its costumes, since they keep theirs; else every costume (empty). `own_file` says
+/// whether a costume of the fighter's has an effect file of its own.
+fn effect_costumes(
+    owner: &str,
+    fighters: &[crate::data::FighterEntry],
+    roster: &crate::mod_project::RosterMod,
+    own_file: &dyn Fn(u8) -> bool,
+) -> Vec<u8> {
+    let key = crate::character::CharacterKey::parse(owner);
+    let fighter = key.engine_fighter();
+    let rows: Vec<&crate::data::FighterEntry> = fighters
+        .iter()
+        .filter(|row| row.name.eq_ignore_ascii_case(fighter))
+        .collect();
+    if let Some(slot) = key.costume_file(roster) {
+        // A mod's character shares one file between its costumes: all but those with another.
+        let row = rows
+            .iter()
+            .find(|row| row.custom_name.is_some() && row.slots.contains(&slot));
+        return row.map_or(vec![slot], |row| {
+            let shares = |other: &u8| *other == slot || !own_file(*other);
+            row.slots.iter().copied().filter(shares).collect()
+        });
+    }
+    if key.is_made() {
+        return key.made_slots(roster);
+    }
+    // A mod's character with an effect file of its own doesn't play the fighter's.
+    let taken: Vec<u8> = rows
+        .iter()
+        .filter(|row| row.custom_name.is_some() && row.slots.iter().any(|slot| own_file(*slot)))
+        .flat_map(|row| row.slots.iter().copied())
+        .collect();
+    if taken.is_empty() && crate::character::made_on(fighter, roster).next().is_none() {
+        return Vec::new();
+    }
+    let mut slots: Vec<u8> = match rows.is_empty() {
+        true => crate::data::default_slots(),
+        false => rows.iter().flat_map(|row| row.slots.clone()).collect(),
+    };
+    slots.retain(|slot| !taken.contains(slot));
+    crate::character::base_costumes(fighter, &slots, roster)
+}
+
+/// The effect file `rel` (a game path) under the first of `roots` that has it.
+pub(crate) fn find_effect_file(roots: &[PathBuf], rel: &str) -> Option<PathBuf> {
+    roots
+        .iter()
+        .map(|root| root.join(rel))
+        .find(|path| path.is_file())
+}
+
+/// The fighter's own row in `fighters`, or failing that any row that plays as it.
+fn own_row_index(fighters: &[crate::data::FighterEntry], fighter: &str) -> Option<usize> {
+    let mut rows = fighters
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.name.eq_ignore_ascii_case(fighter));
+    let first = rows.next()?;
+    std::iter::once(first)
+        .chain(rows)
+        .find(|(_, row)| row.custom_name.is_none())
+        .or(Some(first))
+        .map(|(index, _)| index)
 }
 
 /// Put the viewport camera back on the default side view.
@@ -4968,6 +5072,12 @@ pub struct VisionaryApp {
     frame_params_cache: Option<(String, String, crate::frame_data::FrameParams)>,
     /// [`Self::viewport_scales`], keyed by everything it reads.
     viewport_scales_cache: Option<(String, ViewportScales)>,
+    /// Counts re-indexes of the fighter list.
+    index_rev: u64,
+    /// [`Self::found_project_romfs`]: the folder, the re-index it was looked up at, its answer.
+    romfs_found: std::cell::RefCell<Option<(PathBuf, u64, bool)>>,
+    /// The fighters and characters [`Self::sync_effect_fighter_choices`] last listed.
+    effect_choices_key: Option<u64>,
     timeline_filters: TimelineFilters,
     /// The selected source command for the non-collision tabs.  The command site is stable for a
     /// source statement, including loop repetitions; the current frame still identifies which
@@ -5744,6 +5854,9 @@ impl VisionaryApp {
             primary_tab: PrimaryEditorTab::Collisions,
             frame_params_cache: None,
             viewport_scales_cache: None,
+            index_rev: 0,
+            romfs_found: Default::default(),
+            effect_choices_key: None,
             gimmicks_editor: crate::gimmicks::editor::GimmicksEditor::default(),
             node_editor: Default::default(),
             node_workspace: false,
@@ -6086,19 +6199,28 @@ impl VisionaryApp {
         if let Some(found) = self.project_eff_source(source_rel) {
             return found;
         }
-        let primary = self.eff_editor.export_root().join(source_rel);
-        if primary.exists() {
-            return primary;
-        }
-        let mut roots = self.shared_roots();
-        if let Some(d) = &self.export_dir {
-            roots.push(d.clone());
-        }
+        find_effect_file(&self.effect_roots(), source_rel)
+            .unwrap_or_else(|| self.eff_editor.export_root().join(source_rel))
+    }
+
+    /// Every folder effect files are read from, in order: the project's own files and the linked
+    /// moveset's, the effect editor's folder, the dump, the installed mods, then the folders only
+    /// ever searched for what none of those hold. A modded character's own file, its donors and
+    /// the carrier base each come from whichever has it.
+    fn effect_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        roots.extend(self.project_romfs());
+        roots.extend(self.acmd_romfs_roots());
+        roots.push(self.eff_editor.export_root().to_path_buf());
+        roots.extend(self.shared_roots());
+        roots.extend(self.export_dir.clone());
+        roots.extend(self.effect_pool.as_ref().map(|p| p.root().to_path_buf()));
+        // The vanilla dump last: it is where the carrier base comes from, and a fighter eff a
+        // mod also ships must still be the mod's copy, which is what the user edits.
+        roots.extend(self.eff_editor.vanilla_root.clone());
+        let mut seen = HashSet::new();
+        roots.retain(|root| seen.insert(root.clone()));
         roots
-            .iter()
-            .map(|r| r.join(source_rel))
-            .find(|p| p.exists())
-            .unwrap_or(primary)
     }
 
     /// Every root fighters and their costume slots are discovered from: the game-data root
@@ -6107,10 +6229,24 @@ impl VisionaryApp {
     /// has a file for an indexed fighter, `reindex_fighters` points the entry at it.
     fn all_roots(&self) -> Vec<PathBuf> {
         let mut roots = self.shared_roots();
-        if let Some(romfs) = self.project_romfs().filter(|romfs| romfs.is_dir()) {
-            roots.push(romfs);
-        }
+        roots.extend(self.found_project_romfs());
         roots
+    }
+
+    /// The open project's `romfs/`, when it has one. Asked on every paint, so whether it is there
+    /// is looked up once per project and re-index.
+    fn found_project_romfs(&self) -> Option<PathBuf> {
+        let romfs = self.project_romfs()?;
+        let mut known = self.romfs_found.borrow_mut();
+        let there = match &*known {
+            Some((path, rev, there)) if *path == romfs && *rev == self.index_rev => *there,
+            _ => {
+                let there = romfs.is_dir();
+                *known = Some((romfs.clone(), self.index_rev, there));
+                there
+            }
+        };
+        there.then_some(romfs)
     }
 
     /// [`Self::all_roots`] without the open project's `romfs/`: the dump and the Mod Library,
@@ -6167,6 +6303,21 @@ impl VisionaryApp {
             costume_gated: &self.acmd_src_costume_gated,
         };
         crate::project_scope::script_owners(fighter, &self.state.fighters, &inputs)
+    }
+
+    /// The project rows an edit kept under `owner` belongs to: a costume's own effect file is its
+    /// character's, anything else the fighter's scripts' owners'.
+    fn edit_rows(&self, owner: &str) -> Vec<crate::mod_project::ProjectFighter> {
+        let key = crate::character::CharacterKey::parse(owner);
+        let Some(slot) = key.costume_file(&self.roster.project) else {
+            return self.script_owner_rows(owner);
+        };
+        vec![crate::mod_project::ProjectFighter {
+            name: key.engine_fighter().to_owned(),
+            character: self
+                .slot_row(key.engine_fighter(), slot)
+                .and_then(|row| row.custom_name.clone()),
+        }]
     }
 
     fn project_fighter_key(&self, idx: usize) -> Option<crate::mod_project::ProjectFighter> {
@@ -6378,6 +6529,7 @@ impl VisionaryApp {
     /// Rebuild the fighter list from the data root plus every mod root. Idempotent — called
     /// on data-root change and whenever the mod-root set changes.
     fn reindex_fighters(&mut self) {
+        self.index_rev = self.index_rev.wrapping_add(1);
         // Source actors are independent of select-screen slots: partners and Pokémon forms
         // have their own moves, models and parameters. Filter only exact manager/boss names;
         // a custom source named e.g. "nanaex" or "masterhand_custom" is not an alias.
@@ -6700,6 +6852,41 @@ impl VisionaryApp {
             .iter()
             .enumerate()
             .any(|(i, other)| i != index && other.name.eq_ignore_ascii_case(&fighter));
+        // The effect files that are this row's alone: a mod's character's costumes', or the
+        // fighter's costumes no such character plays on.
+        let own_files: Vec<String> = self
+            .eff_mods
+            .keys()
+            .filter(|owner| {
+                let key = crate::character::CharacterKey::parse(owner);
+                let slot = key.costume_file(&self.roster.project);
+                key.engine_fighter().eq_ignore_ascii_case(&fighter)
+                    && slot.is_some_and(|slot| match &custom_name {
+                        Some(_) => self.state.fighters[index].slots.contains(&slot),
+                        None => self.slot_row(&fighter, slot).is_none(),
+                    })
+            })
+            .cloned()
+            .collect();
+        for owner in own_files {
+            let Some(eff) = self.eff_mods.get_mut(&owner) else {
+                continue;
+            };
+            // With no edits left, the game is given the file as it is on disk.
+            *eff = crate::mod_project::EffMod {
+                source_rel: eff.source_rel.clone(),
+                ..Default::default()
+            };
+            if self.live_eff_deployed.contains(&owner) {
+                self.deploy_live_eff(&owner);
+            }
+            self.eff_mods.remove(&owner);
+            let open = self.eff_editor.loaded_rel();
+            if open.is_some_and(|rel| self.eff_owner(&rel) == owner) {
+                self.eff_editor.forget_fighter(&fighter);
+            }
+            self.push_effect_aliases();
+        }
         // A slot character shares the base fighter's internal id (`pacman`). Only wipe shared
         // fighter-level edits, captures, and script caches when forgetting the base fighter row
         // itself or when no sibling row for that fighter remains in the list.
@@ -10726,7 +10913,9 @@ impl VisionaryApp {
 
                     // Fighter-wide discard (hitbox log only keeps its own remove API). A made
                     // character's discard takes every edit it owns.
-                    let made_group = crate::character::CharacterKey::parse(fighter_name).is_made();
+                    let made_group = crate::character::CharacterKey::parse(fighter_name)
+                        .authored(&self.roster.project)
+                        .is_some();
                     if move_names.len() > 1 || made_group {
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
@@ -12798,8 +12987,8 @@ impl VisionaryApp {
             crate::mod_project::eff_game_rel(own, Some(self.eff_editor.export_root()))
                 .eq_ignore_ascii_case(&rel)
         };
-        let path = match (&self.current_eff_path, self.active_key()) {
-            (Some(own), Some(active)) if active.as_str() == owner && same_file(own) => own.clone(),
+        let path = match (&self.current_eff_path, self.active_effect_owner()) {
+            (Some(own), Some(active)) if active == owner && same_file(own) => own.clone(),
             _ => self.eff_editor.loaded_path()?.to_path_buf(),
         };
         Some((owner, path))
@@ -12858,12 +13047,13 @@ impl VisionaryApp {
             return;
         };
         let source = self.resolve_eff_source(&eff.source_rel);
-        let root = self.eff_editor.export_root().to_path_buf();
+        let roots = self.effect_roots();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
+            let donor = |rel: &str| find_effect_file(&roots, rel);
             let rebuilt = std::fs::read(&source)
                 .map_err(anyhow::Error::from)
-                .and_then(|src| crate::eff_export::rebuild_eff_bytes(&src, &eff, Some(&root)));
+                .and_then(|src| crate::eff_export::rebuild_eff_bytes_resolving(&src, &eff, &donor));
             if std::env::var_os("VFX_TIMING").is_some() {
                 match &rebuilt {
                     Ok(bytes) => eprintln!(
@@ -21595,10 +21785,7 @@ impl VisionaryApp {
                         .map(|f| f.name.clone())
                         .unwrap_or_default();
                     let own = !fighter.is_empty() && name.starts_with(&format!("{fighter}_"));
-                    let owner = self
-                        .active_key()
-                        .map(|key| key.as_str().to_owned())
-                        .unwrap_or_default();
+                    let owner = self.active_effect_owner().unwrap_or_default();
                     let is_baked_copy = self
                         .eff_mods
                         .get(&owner)
@@ -21635,7 +21822,7 @@ impl VisionaryApp {
                                     {
                                         self.transplant_sel = Some((rel, name.clone()));
                                         self.transplant_new_name = format!("{name}{}", crate::mod_project::TRANSPLANT_SUFFIX);
-                                        self.transplant_target = Some(fighter.clone());
+                                        self.transplant_target = Some(owner.clone());
                                         self.show_transplant = true;
                                         self.focus_transplant = true;
                                     }
@@ -23119,12 +23306,7 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return false;
         }
-        let Some(index) = self
-            .state
-            .fighters
-            .iter()
-            .position(|entry| entry.name.eq_ignore_ascii_case(key.engine_fighter()))
-        else {
+        let Some(index) = own_row_index(&self.state.fighters, key.engine_fighter()) else {
             self.state.status = format!("{} is not in the fighter list.", key.engine_fighter());
             return false;
         };
@@ -23287,12 +23469,17 @@ impl VisionaryApp {
             effect_call_moves: self.character_effect_moves(key).len(),
             ..Default::default()
         };
-        // Each character's effect file edits are kept under its own key.
-        if let Some(eff) = self.eff_mods.get(key.as_str()) {
-            counts.authored_effects =
+        // Each character's effect file edits are kept under its own key, and a fighter's costumes
+        // with an effect file of their own count with the fighter.
+        for (_, eff) in self
+            .eff_mods
+            .iter()
+            .filter(|(owner, _)| self.moves_owner(owner) == key.as_str())
+        {
+            counts.authored_effects +=
                 eff.authored.len() + eff.rosters.len() + eff.entry_edits.len();
-            counts.borrowed_effects = eff.transplants.len();
-            counts.textures =
+            counts.borrowed_effects += eff.transplants.len();
+            counts.textures +=
                 eff.textures.len() + eff.textures_added.len() + eff.textures_removed.len();
         }
         // Each character's gimmick and meters are its own; values are the fighter's.
@@ -23707,11 +23894,7 @@ impl VisionaryApp {
         let slots = if key.is_made() {
             key.made_slots(&self.roster.project)
         } else {
-            let fighter = self
-                .state
-                .fighters
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(key.engine_fighter()))?;
+            let fighter = self.fighter_row(key.engine_fighter())?;
             crate::character::base_costumes(&fighter.name, &fighter.slots, &self.roster.project)
         };
         let name = self.character_name(&key);
@@ -23751,12 +23934,31 @@ impl VisionaryApp {
     /// The name a character is shown by in titles and status lines.
     pub(crate) fn character_name(&self, key: &crate::character::CharacterKey) -> String {
         let display = self
-            .state
-            .fighters
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(key.engine_fighter()))
-            .map(|entry| entry.display_name.as_str());
-        key.display_name(&self.roster.project, display)
+            .fighter_row(key.engine_fighter())
+            .map(|row| row.display_name.as_str());
+        let Some(slot) = key.costume_file(&self.roster.project) else {
+            return key.display_name(&self.roster.project, display);
+        };
+        // A costume's own effect file: the mod's character on it, or the fighter's costume.
+        match self.slot_row(key.engine_fighter(), slot) {
+            Some(row) => row.display_name.clone(),
+            None => format!("{} c{slot:02}", display.unwrap_or(key.engine_fighter())),
+        }
+    }
+
+    /// The fighter's own row in the fighter list. A mod's character on its costumes has a row
+    /// under the same name, which stands in when the fighter has none of its own.
+    fn fighter_row(&self, fighter: &str) -> Option<&crate::data::FighterEntry> {
+        own_row_index(&self.state.fighters, fighter).map(|index| &self.state.fighters[index])
+    }
+
+    /// The row of a mod's character that plays on costume `slot` of `fighter`.
+    fn slot_row(&self, fighter: &str, slot: u8) -> Option<&crate::data::FighterEntry> {
+        self.state.fighters.iter().find(|row| {
+            row.custom_name.is_some()
+                && row.name.eq_ignore_ascii_case(fighter)
+                && row.slots.contains(&slot)
+        })
     }
 
     /// The active character's name, for status lines.
@@ -23772,28 +23974,80 @@ impl VisionaryApp {
         crate::character::effect_owner(rel, &self.roster.project)
     }
 
-    /// The costumes an effect edit kept under `owner` reaches in the game: a made character's
-    /// own; a fighter's own when characters are made on it, since they keep theirs; else every
-    /// costume (empty).
+    /// [`effect_costumes`] with the files on disk.
     fn eff_costumes(&self, owner: &str) -> Vec<u8> {
+        let fighter = crate::character::CharacterKey::parse(owner);
+        let fighter = fighter.engine_fighter();
+        effect_costumes(owner, &self.state.fighters, &self.roster.project, &|slot| {
+            let rel = crate::roster::scaffold::effect_file(fighter, slot);
+            self.resolve_eff_source(&rel).is_file()
+        })
+    }
+
+    /// Whose moves play the effects kept under `owner`: a costume's own effect file is played by
+    /// the fighter's moves, which every costume shares; any other owner's are its own.
+    fn moves_owner(&self, owner: &str) -> String {
         let key = crate::character::CharacterKey::parse(owner);
+        match key.costume_file(&self.roster.project) {
+            Some(_) => key.engine_fighter().to_owned(),
+            None => owner.to_owned(),
+        }
+    }
+
+    /// The edits store of the effect file open on the Effects page, for changes to the file as a
+    /// whole (its textures). With none open, the open character's.
+    fn open_eff_mod(&mut self) -> Option<(String, &mut crate::mod_project::EffMod)> {
+        let rel = self.eff_editor.loaded_rel();
+        let owner = rel
+            .as_deref()
+            .map(|rel| self.eff_owner(rel))
+            .or_else(|| self.active_effect_owner())?;
+        let source_rel = rel.unwrap_or_else(|| {
+            crate::character::CharacterKey::parse(&owner).effect_rel(&self.roster.project)
+        });
+        let entry = self.eff_mods.entry(owner.clone()).or_default();
+        if entry.source_rel.is_empty() {
+            entry.source_rel = source_rel;
+        }
+        let name = self.character_name(&crate::character::CharacterKey::parse(&owner));
+        self.eff_mods.get_mut(&owner).map(|entry| (name, entry))
+    }
+
+    /// Keep the Effects page's character list in step with the fighter list and the roster.
+    fn sync_effect_fighter_choices(&mut self) {
+        let key = effect_choices_key(&self.state.fighters, &self.roster.project);
+        if self.effect_choices_key == Some(key) {
+            return;
+        }
+        let mut choices: Vec<(String, String)> = Vec::new();
+        for row in &self.state.fighters {
+            choices.push((fighter_pick_key(row), row.display_name.clone()));
+            if row.custom_name.is_none() {
+                for entry in crate::character::made_on(&row.name, &self.roster.project) {
+                    let key = crate::character::CharacterKey::made(entry.key.clone());
+                    choices.push((key.as_str().to_owned(), self.character_name(&key)));
+                }
+            }
+        }
+        self.eff_editor.fighter_choices = choices;
+        self.effect_choices_key = Some(key);
+    }
+
+    /// The key the open character's effect edits are kept under: its own costume file's when
+    /// the open row plays one (a mod's character), else [`Self::active_key`]'s.
+    fn active_effect_owner(&self) -> Option<String> {
+        let key = self.active_key()?;
         if key.is_made() {
-            return key.made_slots(&self.roster.project);
+            return Some(key.as_str().to_owned());
         }
-        let fighter = key.engine_fighter();
-        if crate::character::made_on(fighter, &self.roster.project)
-            .next()
-            .is_none()
-        {
-            return Vec::new();
-        }
-        let slots = self
-            .state
-            .fighters
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(fighter))
-            .map_or_else(crate::data::default_slots, |entry| entry.slots.clone());
-        crate::character::base_costumes(fighter, &slots, &self.roster.project)
+        let own = self
+            .current_eff_path
+            .as_deref()
+            .map(|path| self.eff_owner(&self.eff_editor.game_path_of(path)))
+            .filter(|own| {
+                crate::character::CharacterKey::parse(own).engine_fighter() == key.engine_fighter()
+            });
+        Some(own.unwrap_or_else(|| key.as_str().to_owned()))
     }
 
     /// Open `key`'s own effect file in the effect editor, which the move preview draws from too:
@@ -24717,12 +24971,7 @@ impl VisionaryApp {
                 continue;
             };
             let fighter = owner.engine_fighter();
-            let Some(fighter_index) = self
-                .state
-                .fighters
-                .iter()
-                .position(|entry| entry.name.eq_ignore_ascii_case(fighter))
-            else {
+            let Some(fighter_index) = own_row_index(&self.state.fighters, fighter) else {
                 report.missing_fighter.insert(fighter.to_string());
                 continue;
             };
@@ -25517,9 +25766,7 @@ impl VisionaryApp {
             if eff.is_empty() {
                 continue;
             }
-            if let Some(fm) = project_owner_mod(&mut project, &roster, owner) {
-                fm.eff = Some(eff.clone());
-            }
+            store_effect_edits(&mut project, &roster, owner, eff);
         }
         // User-set live color×/speed multipliers → LiveTweaks, attached to every fighter
         // whose spawn lists use the effect (falls back to the selected fighter).
@@ -25607,7 +25854,7 @@ impl VisionaryApp {
         let edited_now = crate::project_scope::edited_fighters(&project);
         let owners: HashMap<String, Vec<crate::mod_project::ProjectFighter>> = edited_now
             .difference(&self.edited_fighters)
-            .map(|name| (name.clone(), self.script_owner_rows(name)))
+            .map(|name| (name.clone(), self.edit_rows(name)))
             .collect();
         self.edited_fighters = crate::project_scope::absorb_edited_fighters(
             &mut self.project_fighters,
@@ -27523,7 +27770,7 @@ impl VisionaryApp {
             project_name: self.project_name.clone(),
             slug: slug.clone(),
             eff_sources,
-            eff_export_root: self.eff_editor.export_root().to_path_buf(),
+            eff_roots: self.effect_roots(),
             source_root: if developer {
                 dest.join("acmd_source")
             } else {
@@ -28168,7 +28415,8 @@ impl VisionaryApp {
                     + eff.textures_removed.len()
                     + eff.rosters.len()
                     + eff.entry_edits.len();
-                self.eff_mods.insert(fighter.clone(), eff);
+                let owner = loaded_effect_owner(&fighter, &eff.source_rel, &self.roster.project);
+                self.eff_mods.entry(owner).or_insert(eff);
             }
             // Live color/speed tweaks: restore into the override store and re-send.
             for t in fm.live_tweaks {
@@ -28236,13 +28484,8 @@ impl VisionaryApp {
         // and previews are available together with the staged merged files.
         self.flush_effect_aliases();
         self.game_link.send_live_eff_reload();
-        if let Some(fighter) = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|f| f.name.clone())
-        {
-            if let Some(eff) = self.eff_mods.get(&fighter).cloned() {
+        if let Some(owner) = self.active_effect_owner() {
+            if let Some(eff) = self.eff_mods.get(&owner).cloned() {
                 let src = self.resolve_eff_source(&eff.source_rel);
                 if src.exists() {
                     // Always start a loaded project from the canonical base EFF. Applying a new
@@ -34641,16 +34884,38 @@ impl VisionaryApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
 
-        // The open character: a made character borrows into its own effect file.
-        let selected_fighter = self.active_key().map(|key| key.as_str().to_owned());
-        let fighter_names: Vec<(String, String)> = self
+        // The open character: a made character, or a mod's character on a costume, borrows
+        // into its own effect file.
+        let selected_fighter = self.active_effect_owner();
+        let mut fighter_names: Vec<(String, String)> = self
             .state
             .fighters
             .iter()
+            .filter(|f| f.custom_name.is_none())
             .map(|f| (f.name.clone(), f.display_name.clone()))
             .collect();
         // Import into ANY character — the picker defaults to the selected fighter.
-        let target = self.transplant_target.clone().or(selected_fighter);
+        let target = self
+            .transplant_target
+            .clone()
+            .or_else(|| selected_fighter.clone());
+        for owner in [&selected_fighter, &target].into_iter().flatten() {
+            let key = crate::character::CharacterKey::parse(owner);
+            if key.costume_file(&self.roster.project).is_some()
+                && !fighter_names.iter().any(|(known, _)| known == owner)
+            {
+                fighter_names.push((owner.clone(), self.character_name(&key)));
+            }
+        }
+        // A costume's own effect file is for that costume alone: there is nothing to pick.
+        let one_costume = target.as_deref().is_some_and(|name| {
+            crate::character::CharacterKey::parse(name)
+                .costume_file(&self.roster.project)
+                .is_some()
+        });
+        if one_costume {
+            self.one_slot_slots.clear();
+        }
         let target_name = target
             .as_deref()
             .map(|name| self.character_name(&crate::character::CharacterKey::parse(name)));
@@ -34669,7 +34934,7 @@ impl VisionaryApp {
                 self.state
                     .fighters
                     .iter()
-                    .filter(|f| f.name == *name)
+                    .filter(|f| f.name == *name && f.custom_name.is_none())
                     .collect()
             })
             .unwrap_or_default();
@@ -34891,6 +35156,7 @@ impl VisionaryApp {
                     });
                 }
                 ui.separator();
+                if !one_costume {
                 ui.horizontal(|ui| {
                     ui.label("Skins:");
                     if ui
@@ -34980,6 +35246,7 @@ impl VisionaryApp {
                         "It is saved in an effect file of their own (ef_<fighter>_cXX.eff), \
                          which the game only loads with per-skin effect file support.",
                     );
+                }
                 }
                 let Some(target) = &target else {
                     ui.colored_label(egui::Color32::GRAY, "No fighter picked")
@@ -35506,7 +35773,7 @@ impl VisionaryApp {
         let mut by_fighter: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
         for (fighter, name) in removed {
             by_fighter
-                .entry(fighter.to_lowercase())
+                .entry(self.moves_owner(fighter).to_lowercase())
                 .or_default()
                 .insert(name.to_lowercase());
         }
@@ -35690,7 +35957,9 @@ impl VisionaryApp {
                 return None;
             }
         };
-        match crate::eff_export::rebuild_eff_bytes(&src_bytes, &eff, Some(&root)) {
+        let roots = self.effect_roots();
+        let donor = |rel: &str| find_effect_file(&roots, rel);
+        match crate::eff_export::rebuild_eff_bytes_resolving(&src_bytes, &eff, &donor) {
             Ok(merged) => {
                 // Publish only a complete new preview. A failed/partial write must never leave
                 // the editor pointed at the previous donor's bytes.
@@ -35851,8 +36120,8 @@ impl VisionaryApp {
         // `carrier_owner` is whose edits ride it: the character open in the editor, a made
         // character's own when it is one. `carrier_fighter` is the fighter the game runs for it.
         let carrier_owner: Option<String> = self
-            .active_key()
-            .map(|key| key.as_str().to_lowercase())
+            .active_effect_owner()
+            .map(|owner| owner.to_lowercase())
             .or_else(|| {
                 // No selection yet: fall back to the fighter whose eff the editor has open,
                 // so an "Apply to game" straight from the eff editor still lands.
@@ -36002,33 +36271,10 @@ impl VisionaryApp {
             .filter(|(owner, _)| Some(owner.to_lowercase()) == carrier_owner)
             .flat_map(|(_, eff)| eff.textures_removed.iter().cloned())
             .collect();
-        // Where donor and fighter effs may live: the effect pool's root, the eff editor's export
-        // root, the data root, plus mod roots (a modded character's own eff lives there, not in
-        // the vanilla dump). An assist eff under a different root than the fighter data was the
-        // silent-skip bug, so every lookup tries all of them.
-        //
-        // Built HERE rather than at the donor-stripping loop below because the texture-import
-        // pass needs to read the fighter's own eff, and that has to happen before the aliases
-        // are sent a few lines down.
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(p) = self.effect_pool.as_ref() {
-            roots.push(p.root().to_path_buf());
-        }
-        roots.push(self.eff_editor.export_root().to_path_buf());
-        if let Some(d) = &self.export_dir {
-            roots.push(d.clone());
-        }
-        if let Some(d) = &self.state.data_root {
-            roots.push(d.clone());
-        }
-        roots.extend(self.extra_roots.iter().cloned());
-        // The vanilla dump goes LAST: it is where the carrier base comes from, and a fighter eff
-        // a mod also ships must still resolve to the mod's copy, which is what the user edits.
-        if let Some(vanilla) = &self.eff_editor.vanilla_root {
-            if !roots.contains(vanilla) {
-                roots.push(vanilla.clone());
-            }
-        }
+        // Where donor and fighter effs may live. Built HERE rather than at the donor-stripping
+        // loop below because the texture-import pass needs to read the fighter's own eff, and
+        // that has to happen before the aliases are sent a few lines down.
+        let roots = self.effect_roots();
         let mut carrier_authored: Vec<crate::eff_export::CarrierAuthored> = Vec::new();
         let mut authored_aliases: Vec<(String, String)> = Vec::new();
         let mut carrier_name_conflicts: Vec<String> = Vec::new();
@@ -36189,11 +36435,7 @@ impl VisionaryApp {
                     .filter(|eff| !eff.source_rel.is_empty())
                     .map(|eff| eff.source_rel.to_lowercase())
                     .unwrap_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff"));
-                let bytes = roots
-                    .iter()
-                    .map(|r| r.join(&src_rel))
-                    .find(|p| p.is_file())
-                    .and_then(|p| std::fs::read(p).ok());
+                let bytes = find_effect_file(&roots, &src_rel).and_then(|p| std::fs::read(p).ok());
                 let parsed = bytes.and_then(|b| effect_library::NamcoEffectFile::load(&b).ok());
                 if let Some(file) = parsed {
                     for import in &carrier_textures {
@@ -36396,10 +36638,7 @@ impl VisionaryApp {
             // For a modded fighter that root never holds the fighter's eff, so every authored
             // edit failed as "donor unreadable": no carrier bytes, no spec, and the plugin sat at
             // state 0 while the editor waited for a swap that was never requested.
-            let resolve = |rel: &str| -> Option<std::path::PathBuf> {
-                let rel = rel.to_lowercase();
-                roots.iter().map(|r| r.join(&rel)).find(|p| p.is_file())
-            };
+            let resolve = |rel: &str| find_effect_file(&roots, &rel.to_lowercase());
             let carrier_path = resolve(live_carrier_rel);
             let missing: Vec<String> = carrier_ops
                 .iter()
@@ -36407,15 +36646,13 @@ impl VisionaryApp {
                 .map(|op| op.src_file_rel.clone())
                 .collect();
             if carrier_path.is_none() {
-                carrier_error = Some(format!(
-                    "the carrier base {live_carrier_rel} was not found — set \"Vanilla dump\" in \
-                     the Eff Editor to your vanilla ArcExplorer export"
-                ));
+                carrier_error = Some(
+                    "the unmodded game files were not found: set them under Game files on the \
+                     Effects page"
+                        .to_owned(),
+                );
             } else if !missing.is_empty() {
-                carrier_error = Some(format!(
-                    "carrier sources not found under any effect root: {}",
-                    missing.join(", ")
-                ));
+                carrier_error = Some(format!("not found: {}", missing.join(", ")));
             }
             if let Some(carrier_file) = carrier_path.as_ref().filter(|_| missing.is_empty()) {
                 match std::fs::read(carrier_file) {
@@ -36716,9 +36953,9 @@ impl VisionaryApp {
             self.eff_editor.carrier_build_error =
                 Some(carrier_error.clone().unwrap_or_else(|| {
                     if carrier_target.is_none() {
-                        "no fighter is selected to hold the carrier".to_string()
+                        "no character is open".to_string()
                     } else {
-                        "the carrier was not built (see donor_send_debug.txt)".to_string()
+                        "see donor_send_debug.txt".to_string()
                     }
                 }));
         }
@@ -36806,13 +37043,14 @@ impl VisionaryApp {
         // An edit-free EffMod is intentional after the last transplant is removed: serving
         // the pristine source bytes replaces the previously merged resident file and makes
         // removal take effect immediately instead of leaving the old live payload staged.
-        let root = self.eff_editor.export_root().to_path_buf();
+        let roots = self.effect_roots();
+        let donor = |rel: &str| find_effect_file(&roots, rel);
         let src = self.resolve_eff_source(&eff.source_rel);
         let Ok(bytes) = std::fs::read(&src) else {
             self.state.status = format!("Live deploy: source eff missing ({})", src.display());
             return false;
         };
-        let merged = match crate::eff_export::rebuild_eff_bytes(&bytes, &eff, Some(&root)) {
+        let merged = match crate::eff_export::rebuild_eff_bytes_resolving(&bytes, &eff, &donor) {
             Ok(m) => m,
             Err(e) => {
                 self.state.status = format!("Live deploy failed to merge: {e}");
@@ -36821,7 +37059,7 @@ impl VisionaryApp {
         };
         // A made character's file stands for each of its costumes' files.
         let character = crate::character::CharacterKey::parse(fighter);
-        if character.is_made() {
+        if character.authored(&self.roster.project).is_some() {
             let engine = character.engine_fighter().to_owned();
             let mut served = false;
             for slot in character.made_slots(&self.roster.project) {
@@ -37065,7 +37303,9 @@ impl VisionaryApp {
         let cross_fighter = rel
             .strip_prefix("effect/fighter/")
             .and_then(|r| r.split('/').next())
-            .is_some_and(|df| df != fighter);
+            .is_some_and(|df| {
+                df != crate::character::CharacterKey::parse(fighter).engine_fighter()
+            });
         let live_note = if cross_fighter {
             "not sent to the game yet — press Send to game; a cross-fighter donor also needs a \
              match re-entry to load"
@@ -37129,7 +37369,7 @@ impl VisionaryApp {
                 let Some(name) = motion_name.get(&m) else {
                     continue;
                 };
-                let key = Self::move_key(&self.owner_spelling(fighter), name);
+                let key = Self::move_key(&self.owner_spelling(&self.moves_owner(fighter)), name);
                 if self.state.effect_call_full.contains_key(&key) {
                     continue;
                 }
@@ -37145,6 +37385,7 @@ impl VisionaryApp {
         self.preview_transplant_result(fighter);
 
         // Gather every known use of the donor effect for the redirect picker.
+        let fighter = self.moves_owner(fighter);
         let donor_hash = effect_name_hash(donor);
         let mut uses: Vec<RedirectUse> = Vec::new();
         for (key, calls) in &self.state.effect_call_full {
@@ -37192,7 +37433,7 @@ impl VisionaryApp {
         // measured ~236 ms each, so a cold cache cost roughly two minutes. Now: resolve
         // everything already on disk first (no network at all, ~5 ms for a whole fighter),
         // then pull only the misses over a shared pooled client from a small thread pool.
-        let rx = spawn_move_effect_scan(fighter);
+        let rx = spawn_move_effect_scan(&fighter);
         self.use_scan = Some(UseScan {
             rx,
             fighter: fighter.to_string(),
@@ -40536,6 +40777,7 @@ Click to see the code, or link your own project"
                 .iter()
                 .filter(|(f, e)| {
                     !e.transplants.is_empty()
+                        && !f.contains('#')
                         && !self.merged_build_failed.contains(*f)
                         && !root
                             .join(&e.source_rel)
@@ -40574,15 +40816,20 @@ Click to see the code, or link your own project"
                                 .join(format!("ef_{f}.eff"))
                         })
                         .filter(|p| *p != base);
-                    let merged = if e.transplants.is_empty() {
+                    let merged = if e.transplants.is_empty() || f.contains('#') {
                         None
                     } else {
                         base.parent()
                             .map(|d| d.join(crate::scratch_dirs::TRANSPLANT_PREVIEW_FILE))
                             .filter(|p| p.exists())
                     };
+                    let key = crate::character::CharacterKey::parse(f);
+                    let row = key
+                        .costume_file(&self.roster.project)
+                        .and_then(|slot| self.slot_row(key.engine_fighter(), slot));
                     crate::eff_editor::EditSource {
                         fighter: f.clone(),
+                        pick: row.map_or_else(|| f.clone(), fighter_pick_key),
                         label: if f == "common" {
                             "Shared effects".to_owned()
                         } else {
@@ -40667,20 +40914,7 @@ Click to see the code, or link your own project"
         // The Effects page's own character and move pickers: every fighter (including mod
         // slot-character rows like Shy Guy on Pac-Man) and every Visionary-made character,
         // each opening its own effect file.
-        let mut expected_choices: Vec<(String, String)> =
-            Vec::with_capacity(self.state.fighters.len() + self.roster.project.authored.len());
-        for f in &self.state.fighters {
-            expected_choices.push((fighter_pick_key(f), f.display_name.clone()));
-            if f.custom_name.is_none() {
-                for entry in crate::character::made_on(&f.name, &self.roster.project) {
-                    let key = crate::character::CharacterKey::made(entry.key.clone());
-                    expected_choices.push((key.as_str().to_owned(), self.character_name(&key)));
-                }
-            }
-        }
-        if self.eff_editor.fighter_choices != expected_choices {
-            self.eff_editor.fighter_choices = expected_choices;
-        }
+        self.sync_effect_fighter_choices();
         self.eff_editor.open_fighter = match self.active_key() {
             Some(key) if key.is_made() => Some(key.as_str().to_owned()),
             _ => self
@@ -40738,6 +40972,9 @@ Click to see the code, or link your own project"
             }
         }
         self.carry_eff_edits_across_load();
+        if self.eff_editor.load_queued() {
+            self.eff_editor.effect_roots = self.effect_roots();
+        }
         self.eff_editor.update(&ctx, &self.game_link);
         // A bar picked on the timeline stays picked only while its effect is the open one:
         // opening another from the list left the old bar outlined beside the new one.
@@ -41129,16 +41366,13 @@ Click to see the code, or link your own project"
         // dropped rather than recorded, so a restored texture leaves no trace in the project.
         let texture_imports = self.eff_editor.take_texture_imports();
         if !texture_imports.is_empty() {
-            if let Some(fighter) = current_fighter.clone() {
-                let entry = self.eff_mods.entry(fighter.clone()).or_default();
-                if entry.source_rel.is_empty() {
-                    entry.source_rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
-                }
+            if let Some((fighter, entry)) = self.open_eff_mod() {
+                let mut status = String::new();
                 for import in texture_imports {
                     entry
                         .textures
                         .retain(|t| t.texture_name != import.texture_name);
-                    self.state.status = if import.png_path.is_empty() {
+                    status = if import.png_path.is_empty() {
                         format!("Texture '{}' restored for {fighter}", import.texture_name)
                     } else {
                         let msg =
@@ -41147,6 +41381,7 @@ Click to see the code, or link your own project"
                         msg
                     };
                 }
+                self.state.status = status;
                 // Like a transplant, this previews in-app and sends nothing until asked.
                 self.eff_editor.mark_unsent();
             } else {
@@ -41163,14 +41398,10 @@ Click to see the code, or link your own project"
         let texture_additions = self.eff_editor.take_texture_additions();
         let texture_removals = self.eff_editor.take_texture_removals();
         if !texture_additions.is_empty() || !texture_removals.is_empty() {
-            if let Some(fighter) = current_fighter.clone() {
-                let entry = self.eff_mods.entry(fighter.clone()).or_default();
-                if entry.source_rel.is_empty() {
-                    entry.source_rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
-                }
+            if let Some((fighter, entry)) = self.open_eff_mod() {
+                let mut status = String::new();
                 for add in texture_additions {
-                    self.state.status =
-                        format!("Texture '{}' added for {fighter}", add.texture_name);
+                    status = format!("Texture '{}' added for {fighter}", add.texture_name);
                     entry
                         .textures_added
                         .retain(|t| t.texture_name != add.texture_name);
@@ -41186,8 +41417,9 @@ Click to see the code, or link your own project"
                     if !was_ours && !entry.textures_removed.contains(&name) {
                         entry.textures_removed.push(name.clone());
                     }
-                    self.state.status = format!("Texture '{name}' removed for {fighter}");
+                    status = format!("Texture '{name}' removed for {fighter}");
                 }
+                self.state.status = status;
                 // Like a transplant, this previews in-app and sends nothing until asked.
                 self.eff_editor.mark_unsent();
             } else {
@@ -44077,6 +44309,24 @@ fn unswitchable_uses(
     out
 }
 
+/// What the Effects page's character list is made from, as one number, so a paint can see
+/// whether it changed without building it.
+fn effect_choices_key(
+    fighters: &[crate::data::FighterEntry],
+    roster: &crate::mod_project::RosterMod,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for row in fighters {
+        (&row.name, &row.custom_name, &row.display_name).hash(&mut hasher);
+    }
+    for made in &roster.authored {
+        (&made.key, &made.donor, &made.display_name).hash(&mut hasher);
+        roster.names.get(&made.key).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// The Effects page's key for one fighter row: its name, plus the mod character it is when it
 /// is one, since that row shares the fighter's name.
 fn fighter_pick_key(fighter: &crate::data::FighterEntry) -> String {
@@ -44286,8 +44536,8 @@ struct ExportInputs {
     slug: String,
     /// fighter → the source `.eff` to rebuild from, already resolved against the app's roots.
     eff_sources: std::collections::HashMap<String, std::path::PathBuf>,
-    /// The dump root a transplant's donor emitters are read from.
-    eff_export_root: std::path::PathBuf,
+    /// The folders a borrowed effect or an added part is read from (`effect_roots`).
+    eff_roots: Vec<std::path::PathBuf>,
     /// Where the generated Rust project goes: inside `dest` for a developer export, a scratch
     /// directory otherwise, since a mod folder ships the built `.nro` rather than the source.
     source_root: std::path::PathBuf,
@@ -44375,7 +44625,7 @@ fn run_export_preverified(
         project_name,
         slug,
         eff_sources,
-        eff_export_root,
+        eff_roots,
         source_root,
         rule_pack: _,
     } = inputs;
@@ -44406,6 +44656,17 @@ fn run_export_preverified(
         .any(|fighter| fighter.eff.as_ref().is_some_and(|eff| !eff.is_empty()));
     // A costume's own effect file loads only when the costume's directory entry lists it.
     let mut costume_effects: Vec<String> = Vec::new();
+    let effect_file = |rel: &str| find_effect_file(eff_roots, rel);
+    let source_of = |owner: &str, rel: &str| {
+        let found = eff_sources.get(owner).cloned().or_else(|| effect_file(rel));
+        found.unwrap_or_else(|| rel.into())
+    };
+    // Borrowed effects limited to a costume whose own effect file this project also edits: that
+    // file is written below with both, rather than one over the other.
+    let mut into_costume_files: std::collections::BTreeMap<
+        crate::roster::RosterKey,
+        Vec<crate::mod_project::TransplantOp>,
+    > = Default::default();
     for (fighter, fm) in &project.fighters {
         match &fm.eff {
             Some(eff)
@@ -44421,10 +44682,7 @@ fn run_export_preverified(
                 ));
             }
             Some(eff) if !eff.is_empty() => {
-                let src_path = eff_sources
-                    .get(fighter)
-                    .cloned()
-                    .unwrap_or_else(|| eff_export_root.join(&eff.source_rel));
+                let src_path = source_of(fighter, &eff.source_rel);
                 let rel_for = |slot: Option<u8>| match slot {
                     None => eff.source_rel.clone(),
                     Some(s) => {
@@ -44442,7 +44700,7 @@ fn run_export_preverified(
                     let rebuilt = crate::eff_export::rebuild_eff_bytes_for_slot(
                         &bytes,
                         eff,
-                        Some(eff_export_root),
+                        &effect_file,
                         slot,
                     )?;
                     let rel = rel_for(slot);
@@ -44471,6 +44729,23 @@ fn run_export_preverified(
                     .collect();
                 slots.sort();
                 slots.dedup();
+                slots.retain(|slot| {
+                    let key = crate::roster::RosterKey::slot(fighter, *slot);
+                    let own = crate::character::CharacterKey::made(key.clone());
+                    let edited = own.costume_file(&project.roster).is_some()
+                        && project
+                            .characters
+                            .get(&key)
+                            .is_some_and(|fm| fm.eff.as_ref().is_some_and(|eff| !eff.is_empty()));
+                    if edited {
+                        let ops = eff
+                            .transplants
+                            .iter()
+                            .filter(|op| op.one_slot_slots.contains(slot));
+                        into_costume_files.insert(key, ops.cloned().collect());
+                    }
+                    !edited
+                });
                 for s in &slots {
                     match write_variant(Some(*s)) {
                         Ok(()) => costume_effects.push(rel_for(Some(*s))),
@@ -44505,25 +44780,28 @@ fn run_export_preverified(
             )),
         }
     }
-    if !costume_effects.is_empty() {
-        if let Err(error) = declare_costume_effects(&mod_dir, &costume_effects) {
-            errors.push(format!("config.json: {error}"));
-        }
-    }
     // A made character's effects: its own file rebuilt with its edits, written as the file of
-    // each of its costumes, which the game loads with the One-Slot Effects plugin.
+    // each of its costumes, which the game loads with the One-Slot Effects plugin. A costume's
+    // own effect file is that costume's.
     for (key, fm) in &project.characters {
         let Some(eff) = fm.eff.as_ref().filter(|eff| !eff.is_empty()) else {
             continue;
         };
         let character = crate::character::CharacterKey::made(key.clone());
         let donor = character.engine_fighter();
-        let slots = character.made_slots(&project.roster);
-        let name = character.display_name(&project.roster, None);
-        let src_path = eff_sources
-            .get(key.as_str())
-            .cloned()
-            .unwrap_or_else(|| eff_export_root.join(&eff.source_rel));
+        let costume = character.costume_file(&project.roster);
+        let slots = match costume {
+            Some(slot) => vec![slot],
+            None => character.made_slots(&project.roster),
+        };
+        let name = match costume {
+            Some(slot) => format!("{} c{slot:02}", crate::data::fighter_display_name(donor)),
+            None => character.display_name(&project.roster, None),
+        };
+        let mut eff = eff.clone();
+        eff.transplants
+            .extend(into_costume_files.remove(key).unwrap_or_default());
+        let src_path = source_of(key.as_str(), &eff.source_rel);
         let source = match std::fs::read(&src_path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -44538,8 +44816,8 @@ fn run_export_preverified(
         for slot in &slots {
             let result = crate::eff_export::rebuild_eff_bytes_for_slot(
                 &source,
-                eff,
-                Some(eff_export_root),
+                &eff,
+                &effect_file,
                 Some(*slot),
             )
             .and_then(|bytes| {
@@ -44551,7 +44829,12 @@ fn run_export_preverified(
                 Ok(())
             });
             match result {
-                Ok(()) => written.push(*slot),
+                Ok(()) => {
+                    written.push(*slot);
+                    if costume.is_some() {
+                        costume_effects.push(crate::roster::scaffold::effect_file(donor, *slot));
+                    }
+                }
                 Err(error) => errors.push(format!("{name} effects c{slot:02}: {error:#}")),
             }
         }
@@ -44561,6 +44844,11 @@ fn run_export_preverified(
                 eff.authored.len() + eff.rosters.len() + eff.entry_edits.len(),
                 eff.transplants.len()
             ));
+        }
+    }
+    if !costume_effects.is_empty() {
+        if let Err(error) = declare_costume_effects(&mod_dir, &costume_effects) {
+            errors.push(format!("config.json: {error}"));
         }
     }
 
@@ -54634,7 +54922,7 @@ mod blocked_export_writes_nothing_tests {
             project_name: "test mod".into(),
             slug: "test_mod".into(),
             eff_sources: Default::default(),
-            eff_export_root: dest.join("_no_dump_root"),
+            eff_roots: Vec::new(),
             source_root: source_root.to_path_buf(),
             rule_pack: false,
         }
@@ -54732,7 +55020,7 @@ mod blocked_export_writes_nothing_tests {
         });
         let dest = dir.path().join("mod");
         let mut input = inputs(&dest, &dir.path().join("source"));
-        input.eff_export_root = root;
+        input.eff_roots = vec![root];
         let outcome =
             run_export_preverified(&project, &input, None, false, None, Vec::new()).unwrap();
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -54751,6 +55039,238 @@ mod blocked_export_writes_nothing_tests {
             crate::roster::costume_config::undeclared_costume_effects(&dest),
             [costume]
         );
+    }
+
+    /// A mod's character on a costume (Shy Guy on Pac-Man c40) and the fighter it is on each
+    /// export their own edits into their own file, the costume's is listed for it, and a borrow
+    /// the fighter limits to that costume joins the costume's file instead of overwriting it.
+    /// The costume's file, and a donor only the mod has, are read from the mod's folder.
+    #[test]
+    fn a_mods_character_and_its_fighter_export_their_own_effect_files() {
+        let Some(root) = corpus_root() else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the folder holding effect/");
+            return;
+        };
+        let (base, costume) = (
+            "effect/fighter/pacman/ef_pacman.eff",
+            "effect/fighter/pacman/ef_pacman_c40.eff",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mod_root = dir.path().join("mod_romfs");
+        std::fs::create_dir_all(mod_root.join(costume).parent().unwrap()).unwrap();
+        std::fs::copy(root.join(base), mod_root.join(costume)).unwrap();
+        let names = |path: &std::path::Path| {
+            effect_library::NamcoEffectFile::load(&std::fs::read(path).unwrap())
+                .unwrap()
+                .entry_names
+        };
+        let donor = names(&root.join(base))
+            .into_iter()
+            .find(|name| !name.is_empty())
+            .unwrap();
+        let op = |name: &str, from: &str, slots: &[u8]| crate::mod_project::TransplantOp {
+            new_entry_name: name.into(),
+            src_file_rel: from.into(),
+            src_set_name: donor.to_lowercase(),
+            src_set_idx: 0,
+            one_slot_slots: slots.to_vec(),
+            replace_entry: None,
+        };
+        let mut project = ModProjectFile::default();
+        project.fighters.entry("pacman".into()).or_default().eff = Some(EffMod {
+            source_rel: base.into(),
+            transplants: vec![
+                // Borrowed from the file only the mod has.
+                op("from_shy_guy", costume, &[]),
+                op("only_on_c40", "", &[40]),
+                op("only_on_c01", "", &[1]),
+            ],
+            ..Default::default()
+        });
+        let key = crate::roster::RosterKey::slot("pacman", 40);
+        project.characters.entry(key).or_default().eff = Some(EffMod {
+            source_rel: costume.into(),
+            transplants: vec![op("shy_guys_own", "", &[])],
+            ..Default::default()
+        });
+        let plan = crate::mod_export::plan_normal_export(&project, None).unwrap();
+        assert!(
+            !plan.has_acmd_source,
+            "a costume's effect edits are no script to export"
+        );
+        let dest = dir.path().join("mod");
+        let mut input = inputs(&dest, &dir.path().join("source"));
+        input.eff_roots = vec![mod_root, root];
+        let outcome =
+            run_export_preverified(&project, &input, None, false, None, Vec::new()).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let mine = |rel: &str| {
+            let mut mine: Vec<String> = names(&dest.join(rel))
+                .into_iter()
+                .filter(|name| name.contains("shy_guy") || name.contains("only_on"))
+                .collect();
+            mine.sort();
+            mine
+        };
+        assert_eq!(mine(base), ["from_shy_guy"]);
+        assert_eq!(mine(costume), ["only_on_c40", "shy_guys_own"]);
+        assert_eq!(
+            mine("effect/fighter/pacman/ef_pacman_c01.eff"),
+            ["from_shy_guy", "only_on_c01"]
+        );
+        assert!(!dest
+            .join("effect/fighter/pacman/ef_pacman_c40_c40.eff")
+            .exists());
+        assert!(crate::roster::costume_config::undeclared_costume_effects(&dest).is_empty());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dest.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["new-dir-files"]["fighter/pacman/c40"],
+            serde_json::json!([costume])
+        );
+    }
+
+    /// A costume file's edits and the fighter's are saved and loaded apart, and a project saved
+    /// when the costume's file shared the fighter's key opens with them under the costume.
+    #[test]
+    fn a_costume_files_edits_are_saved_apart_from_the_fighters() {
+        let roster = crate::mod_project::RosterMod::default();
+        let edits = |rel: &str, name: &str| EffMod {
+            source_rel: rel.into(),
+            textures_removed: vec![name.into()],
+            ..Default::default()
+        };
+        let stores = [
+            (
+                "pacman",
+                edits("effect/fighter/pacman/ef_pacman.eff", "his"),
+            ),
+            (
+                "pacman#c40",
+                edits("effect/fighter/pacman/ef_pacman_c40.eff", "hers"),
+            ),
+        ];
+        let mut project = ModProjectFile::default();
+        for (owner, eff) in &stores {
+            store_effect_edits(&mut project, &roster, owner, eff);
+        }
+        let json = serde_json::to_string(&project).unwrap();
+        let loaded: ModProjectFile = serde_json::from_str(&json).unwrap();
+        let mut back: Vec<(String, Vec<String>)> = loaded
+            .fighters
+            .into_iter()
+            .chain(
+                loaded
+                    .characters
+                    .into_iter()
+                    .map(|(key, fm)| (key.as_str().to_owned(), fm)),
+            )
+            .filter_map(|(stored, fm)| {
+                let eff = fm.eff?;
+                let owner = loaded_effect_owner(&stored, &eff.source_rel, &roster);
+                Some((owner, eff.textures_removed))
+            })
+            .collect();
+        back.sort();
+        assert_eq!(
+            back,
+            [
+                ("pacman".to_owned(), vec!["his".to_owned()]),
+                ("pacman#c40".to_owned(), vec!["hers".to_owned()]),
+            ]
+        );
+        // As an older build saved it: the costume's file under the fighter.
+        assert_eq!(
+            loaded_effect_owner("pacman", "effect/fighter/pacman/ef_pacman_c40.eff", &roster),
+            "pacman#c40"
+        );
+        // Anything else stays where it is.
+        for (stored, rel) in [
+            ("pacman", "effect/fighter/pacman/ef_pacman.eff"),
+            ("common", "effect/system/common/ef_common.eff"),
+            ("mario#c08", "effect/fighter/mario/ef_mario_c08.eff"),
+        ] {
+            assert_eq!(loaded_effect_owner(stored, rel, &roster), stored);
+        }
+    }
+
+    fn row(name: &str, custom: Option<&str>, slots: &[u8]) -> crate::data::FighterEntry {
+        crate::data::FighterEntry {
+            name: name.into(),
+            display_name: custom.unwrap_or(name).into(),
+            param_path: Default::default(),
+            motion_dir: Default::default(),
+            model_dir: Default::default(),
+            effect_dir: None,
+            slots: slots.to_vec(),
+            fighter_dir: Default::default(),
+            source: crate::data::FighterSource::DataRoot,
+            custom_name: custom.map(str::to_owned),
+        }
+    }
+
+    /// An effect edit reaches the costumes that play its file and no others.
+    #[test]
+    fn effect_edits_reach_the_costumes_that_play_their_file() {
+        let roster = crate::mod_project::RosterMod::default();
+        let rows = [
+            row("falco", Some("Empoleon"), &[32, 33]),
+            row("falco", None, &[0, 1]),
+            row("pacman", None, &[0, 1, 2]),
+            row("pacman", Some("Shy Guy"), &[40, 41, 42]),
+        ];
+        let reach = |owner: &str, own: &[u8]| {
+            effect_costumes(owner, &rows, &roster, &|slot| own.contains(&slot))
+        };
+        // Shy Guy's c40 file is c41's too; c42 has one of its own.
+        assert_eq!(reach("pacman#c40", &[40, 42]), [40, 41]);
+        assert_eq!(reach("pacman#c42", &[40, 42]), [41, 42]);
+        // Pac-Man's reach his own costumes only.
+        assert_eq!(reach("pacman", &[40, 42]), [0, 1, 2]);
+        // Empoleon has no effect file, so plays Falco's.
+        assert_eq!(reach("falco", &[]), Vec::<u8>::new());
+        // A costume of the fighter's own with an effect file.
+        assert_eq!(reach("falco#c01", &[1]), [1]);
+        // The fighter's own row, though a mod's character sorts before it.
+        assert_eq!(own_row_index(&rows, "Falco"), Some(1));
+        assert_eq!(own_row_index(&rows[..1], "falco"), Some(0));
+        assert_eq!(own_row_index(&rows, "mario"), None);
+    }
+
+    /// The Effects page's character list is rebuilt when a row or a made character changes, and
+    /// only then.
+    #[test]
+    fn the_effect_character_list_key_follows_the_fighter_list() {
+        let mut roster = crate::mod_project::RosterMod::default();
+        let mut rows = vec![
+            row("pacman", None, &[0]),
+            row("pacman", Some("Shy Guy"), &[40]),
+        ];
+        let first = effect_choices_key(&rows, &roster);
+        assert_eq!(effect_choices_key(&rows.clone(), &roster), first);
+        // Two rows named pacman are not one another.
+        rows.swap(0, 1);
+        assert_ne!(effect_choices_key(&rows, &roster), first);
+        rows.swap(0, 1);
+        rows[1].display_name = "Fly Guy".into();
+        let renamed = effect_choices_key(&rows, &roster);
+        assert_ne!(renamed, first);
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("pacman", 8),
+            donor: "pacman".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let made = effect_choices_key(&rows, &roster);
+        assert_ne!(made, renamed);
+        roster
+            .names
+            .insert(roster.authored[0].key.clone(), "Clyde".into());
+        assert_ne!(effect_choices_key(&rows, &roster), made);
     }
 
     fn selected_chart_project() -> (ModProjectFile, crate::mod_export::SelectedGimmickRuntime) {
@@ -54954,7 +55474,7 @@ mod blocked_export_writes_nothing_tests {
         let eff_inputs = |dest: &std::path::Path, source: &std::path::Path| {
             let mut inputs = inputs(dest, source);
             inputs.eff_sources.insert("mario".into(), src_eff.clone());
-            inputs.eff_export_root = root.clone();
+            inputs.eff_roots = vec![root.clone()];
             inputs
         };
 
@@ -55052,7 +55572,7 @@ mod blocked_export_writes_nothing_tests {
             let source = tempfile::tempdir().unwrap();
             let mut inputs = inputs(dest.path(), source.path());
             inputs.eff_sources.insert("mario#c08".into(), own.clone());
-            inputs.eff_export_root = root.clone();
+            inputs.eff_roots = vec![root.clone()];
             let outcome = run_export(project, &inputs).expect("must export");
             assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
             (dest, outcome)
@@ -55177,7 +55697,7 @@ mod blocked_export_writes_nothing_tests {
         });
         let mut inputs = inputs(dest.path(), source.path());
         inputs.eff_sources.insert("mario".into(), src_eff.clone());
-        inputs.eff_export_root = root.clone();
+        inputs.eff_roots = vec![root.clone()];
 
         let outcome = run_export(&project, &inputs).expect("nothing here should refuse");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);

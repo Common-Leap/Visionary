@@ -56,9 +56,22 @@ impl CharacterKey {
             .map_or(spelling, |(donor, _)| donor)
     }
 
-    /// True for a character made in Visionary.
+    /// True for a character made in Visionary, and for a costume effect file's key (see
+    /// [`Self::costume_file`]): neither is the fighter itself.
     pub fn is_made(&self) -> bool {
         self.0.as_str().contains('#')
+    }
+
+    /// The costume whose own effect file this key's effect edits are for, when no character
+    /// made in Visionary owns that costume: a mod's character on the slot (Shy Guy on Pac-Man
+    /// c40, "pacman#c40"), or a costume of the fighter's with effects of its own. Such a key
+    /// keeps effect edits only.
+    pub fn costume_file(&self, roster: &crate::mod_project::RosterMod) -> Option<u8> {
+        let (_, slot) = self.as_str().split_once('#')?;
+        match self.authored(roster) {
+            Some(_) => None,
+            None => slot.strip_prefix('c')?.parse().ok(),
+        }
     }
 
     /// The made character's entry in the project, when it is one.
@@ -101,12 +114,13 @@ impl CharacterKey {
     }
 
     /// The effect file this character's effects are edited in, by the game path it stands for:
-    /// a fighter's own file, or a made character's costume file (its first costume's), which
-    /// export writes for every one of its costumes.
+    /// a fighter's own file, a costume's own, or a made character's costume file (its first
+    /// costume's), which export writes for every one of its costumes.
     pub fn effect_rel(&self, roster: &crate::mod_project::RosterMod) -> String {
         let fighter = self.engine_fighter();
-        match self.made_slots(roster).first() {
-            Some(slot) => crate::roster::scaffold::effect_file(fighter, *slot),
+        let slot = self.made_slots(roster).first().copied();
+        match slot.or_else(|| self.costume_file(roster)) {
+            Some(slot) => crate::roster::scaffold::effect_file(fighter, slot),
             None => format!("effect/fighter/{fighter}/ef_{fighter}.eff"),
         }
     }
@@ -239,8 +253,10 @@ pub fn made_on<'a>(
         .filter(move |entry| entry.donor.eq_ignore_ascii_case(fighter))
 }
 
-/// The key an effect file's edits are kept under: the made character whose own costume file it
-/// is (`ef_mario_c08.eff` while Vision owns c08), else the fighter (or file) it is for.
+/// The key an effect file's edits are kept under: a costume's own file under the made character
+/// that owns the costume (`ef_mario_c08.eff` while Vision owns c08), else under the costume
+/// itself ("pacman#c40", see [`CharacterKey::costume_file`]), so it never shares a store with
+/// the fighter's own file; any other file under the fighter (or file) it is for.
 pub fn effect_owner(rel: &str, roster: &crate::mod_project::RosterMod) -> String {
     let fighter = crate::mod_project::fighter_from_source_rel(rel);
     let costume = std::path::Path::new(rel)
@@ -248,10 +264,14 @@ pub fn effect_owner(rel: &str, roster: &crate::mod_project::RosterMod) -> String
         .and_then(|stem| stem.to_str())
         .and_then(|stem| stem.strip_prefix(&format!("ef_{fighter}_c")))
         .and_then(|number| number.parse::<u8>().ok());
-    let owner = costume
-        .and_then(|slot| made_on(&fighter, roster).find(|entry| entry.all_slots().contains(&slot)))
-        .map(|entry| entry.key.as_str().to_owned());
-    owner.unwrap_or(fighter)
+    let Some(slot) = costume else {
+        return fighter;
+    };
+    let made = made_on(&fighter, roster).find(|entry| entry.all_slots().contains(&slot));
+    made.map_or_else(
+        || RosterKey::slot(&fighter, slot).as_str().to_owned(),
+        |entry| entry.key.as_str().to_owned(),
+    )
 }
 
 /// A page a character can be opened on.
@@ -454,20 +474,58 @@ mod tests {
             ),
             "mario#c08"
         );
-        // The fighter's own file, and a costume file no made character owns, stay the fighter's.
+        // The fighter's own file is the fighter's.
         let mario = CharacterKey::base("mario");
         assert_eq!(
             mario.effect_rel(&roster),
             "effect/fighter/mario/ef_mario.eff"
         );
         assert_eq!(effect_owner(&mario.effect_rel(&roster), &roster), "mario");
+    }
+
+    /// A costume's own effect file that no made character owns is its own file: kept under the
+    /// fighter, opening Shy Guy's `ef_pacman_c40.eff` wrote over Pac-Man's edits.
+    #[test]
+    fn a_costume_effect_file_never_shares_the_fighters_key() {
+        let roster = roster_with_vision();
+        for (rel, owner, fighter, slot) in [
+            (
+                "effect/fighter/pacman/ef_pacman_c40.eff",
+                "pacman#c40",
+                "pacman",
+                40,
+            ),
+            (
+                "effect/fighter/mario/ef_mario_c03.eff",
+                "mario#c03",
+                "mario",
+                3,
+            ),
+            (
+                "effect/fighter/luigi/ef_luigi_c08.eff",
+                "luigi#c08",
+                "luigi",
+                8,
+            ),
+            (
+                "effect/fighter/samus/ef_samus_c113.eff",
+                "samus#c113",
+                "samus",
+                113,
+            ),
+        ] {
+            assert_eq!(effect_owner(rel, &roster), owner);
+            let key = CharacterKey::parse(owner);
+            assert_eq!(key.engine_fighter(), fighter);
+            assert_eq!(key.costume_file(&roster), Some(slot));
+            assert_eq!(key.effect_rel(&roster), rel);
+        }
+        // A made character's key and a fighter's are not costume files.
+        assert_eq!(CharacterKey::parse("mario#c08").costume_file(&roster), None);
+        assert_eq!(CharacterKey::base("mario").costume_file(&roster), None);
         assert_eq!(
-            effect_owner("effect/fighter/mario/ef_mario_c03.eff", &roster),
-            "mario"
-        );
-        assert_eq!(
-            effect_owner("effect/fighter/luigi/ef_luigi_c08.eff", &roster),
-            "luigi"
+            effect_owner("effect/fighter/pacman/ef_pacman.eff", &roster),
+            "pacman"
         );
     }
 

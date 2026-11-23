@@ -1612,6 +1612,12 @@ pub fn merge_romfs_overlay(overlay: &Path, dest: &Path) -> anyhow::Result<(usize
                 if same_file_contents(&path, &out) {
                     continue;
                 }
+                // Both describe the mod's files to the game: the export's own costumes, and what
+                // the project's files say of theirs.
+                if rel == Path::new("config.json") && combine_configs(&path, &out)? {
+                    copied += 1;
+                    continue;
+                }
                 skipped.push(
                     rel.components()
                         .map(|c| c.as_os_str().to_string_lossy())
@@ -1630,6 +1636,19 @@ pub fn merge_romfs_overlay(overlay: &Path, dest: &Path) -> anyhow::Result<(usize
     skipped.sort();
     skipped.dedup();
     Ok((copied, skipped))
+}
+
+/// Add what the config at `from` describes to the one at `into`. False when either is not JSON.
+fn combine_configs(from: &Path, into: &Path) -> anyhow::Result<bool> {
+    let read = |path: &Path| -> Option<serde_json::Value> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    };
+    let (Some(mut config), Some(other)) = (read(into), read(from)) else {
+        return Ok(false);
+    };
+    crate::roster::costume_config::combine(&mut config, other);
+    std::fs::write(into, serde_json::to_vec_pretty(&config)?)?;
+    Ok(true)
 }
 
 /// How an edit kind is handled by the tool.
@@ -2034,6 +2053,42 @@ mod tests {
     }
 
     /// A file the mod already has with the same bytes is no conflict.
+    /// The project's own config.json (a mod's costume shares) joins the one the export wrote for
+    /// a costume's effect file: kept out as a conflict, the mod's costumes lost every file they
+    /// share.
+    #[test]
+    fn the_projects_config_joins_the_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let (overlay, dest) = (dir.path().join("romfs"), dir.path().join("mod"));
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let effect = "effect/fighter/pacman/ef_pacman_c40.eff";
+        std::fs::write(
+            dest.join("config.json"),
+            serde_json::json!({"new-dir-files": {"fighter/pacman/c40": [effect]}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            overlay.join("config.json"),
+            serde_json::json!({"share-to-vanilla": {"a": ["b"]}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            merge_romfs_overlay(&overlay, &dest).unwrap(),
+            (1, Vec::new())
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dest.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["share-to-vanilla"]["a"][0], "b");
+        assert_eq!(config["new-dir-files"]["fighter/pacman/c40"][0], effect);
+        // One that is not JSON is still reported rather than dropped in silence.
+        std::fs::write(overlay.join("config.json"), "not json").unwrap();
+        assert_eq!(
+            merge_romfs_overlay(&overlay, &dest).unwrap(),
+            (0, vec!["config.json".to_owned()])
+        );
+    }
+
     #[test]
     fn romfs_overlay_does_not_report_a_file_the_mod_already_has_unchanged() {
         let dir = tempfile::tempdir().unwrap();

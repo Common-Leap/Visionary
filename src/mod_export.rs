@@ -586,6 +586,12 @@ fn render_ordinary_source_with(
     for (key, edits) in &project.characters {
         let character = crate::character::CharacterKey::made(key.clone());
         let Some(entry) = character.authored(&project.roster) else {
+            // A costume's own effect file: no scripts to export (see `costume_file`).
+            let mut scripts = edits.clone();
+            scripts.eff = None;
+            if !scripts.has_edits() {
+                continue;
+            }
             bail!(
                 "{key} has move edits but is not one of this project's characters any more, so the costumes they belong to are unknown"
             );

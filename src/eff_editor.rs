@@ -401,6 +401,8 @@ fn effect_entries(index: &crate::effects::EffIndex, sets: usize) -> Vec<EffEntry
 pub struct EditSource {
     /// The key the project keeps these edits under: a fighter, or a made character's key.
     pub fighter: String,
+    /// The character list's key that opens it.
+    pub pick: String,
     /// The name it is shown by.
     pub label: String,
     pub base: PathBuf,
@@ -730,6 +732,9 @@ pub struct EffEditor {
     /// The vanilla effect dump, always searched when building the live carrier. Independent of
     /// `export_root`, which is usually the mod being edited and never holds the carrier base.
     pub vanilla_root: Option<PathBuf>,
+    /// Every folder effect files are read from, in order, as the app's `effect_roots` was when a
+    /// file was last loaded.
+    pub effect_roots: Vec<PathBuf>,
     /// The carrier rebuild is synchronous on the UI thread, so servicing the request in the
     /// same frame as the click would block before the spinner ever painted. Hold the request
     /// for one frame so the "sending" state is visible.
@@ -848,6 +853,7 @@ impl Default for EffEditor {
             carrier_ok: false,
             carrier_build_error: None,
             vanilla_root: crate::app::load_config_path(crate::app::VANILLA_ROOT_CONFIG_KEY),
+            effect_roots: Vec::new(),
             deploy_defer: false,
             last_sent_note: None,
             history: EffHistory::default(),
@@ -1362,11 +1368,11 @@ struct WholeEffect {
     written: Vec<WholeFields>,
 }
 
-/// The attributes the emitter panel puts above the group tree, in this order. These are the ones
-/// an effect edit almost always starts from; every one of them is also in its own group below.
 /// The vanilla assist eff the live carrier is built on. Only a vanilla dump holds it.
 pub const CARRIER_BASE_REL: &str = "effect/assist/bomberman/ef_bomberman.eff";
 
+/// The attributes the emitter panel puts above the group tree, in this order. These are the ones
+/// an effect edit almost always starts from; every one of them is also in its own group below.
 const BASIC_ATTRS: &[&str] = &[
     "emitter_static.color_scale",
     "render_state.blend_type",
@@ -2631,7 +2637,7 @@ impl EffEditor {
 
     /// The game path a file on disk stands for: the one it was given when opened from a project
     /// or a folder the author picked, or its inferred game path via [`crate::mod_project::eff_game_rel`].
-    fn game_path_of(&self, path: &Path) -> String {
+    pub fn game_path_of(&self, path: &Path) -> String {
         if let Some(rel) = self.game_paths.get(path) {
             return rel.clone();
         }
@@ -2702,6 +2708,11 @@ impl EffEditor {
     pub fn queue_edits(&mut self, edits: Vec<AuthoredEdit>) {
         self.pending_edits = Some(edits);
         self.pending_edits_push_live = true;
+    }
+
+    /// Whether a file is about to be opened.
+    pub fn load_queued(&self) -> bool {
+        self.pending_load.is_some()
     }
 
     /// The file a queued load is about to open (its game path, as [`Self::loaded_rel`] records
@@ -3556,6 +3567,7 @@ impl EffEditor {
                         ui.visuals().text_color()
                     }))
                     .height(360.0)
+                    .truncate()
                     .show_ui(ui, |ui| {
                         for found in &uses {
                             let here = showing_move
@@ -4953,25 +4965,24 @@ impl EffEditor {
             }
             ui.separator();
             let vanilla_label = match &self.vanilla_root {
-                Some(dir) => format!("Vanilla game files: {}", dir.display()),
-                None => "Vanilla game files: not set".to_string(),
+                Some(dir) => format!("Unmodded: {}", dir.display()),
+                None => "Unmodded: not set".to_string(),
             };
             ui.label(egui::RichText::new(vanilla_label).small())
                 .on_hover_text(
-                "The unmodded ArcExplorer export. Live edits ride a carrier built on a vanilla \
-                 assist effect file, which a mod's romfs does not contain, so this stays set even \
-                 when the folder above points at your mod.",
+                "Your dump of the game without mods. Sending effects to a running match needs a \
+                 file only it has, so it stays set when the folder above is a mod's.",
             );
-            if ui.button("Change vanilla folder").clicked() {
+            if ui.button("Change unmodded folder").clicked() {
                 let mut dialog =
-                    rfd::FileDialog::new().set_title("Select the vanilla ArcExplorer export");
+                    rfd::FileDialog::new().set_title("Choose your dump of the unmodded game");
                 if let Some(dir) = self.vanilla_root.as_ref().filter(|d| d.is_dir()) {
                     dialog = dialog.set_directory(dir);
                 }
                 if let Some(dir) = dialog.pick_folder() {
                     if !self.remember_vanilla_root(&dir) {
                         self.set_sent_note(format!(
-                            "{} has no {CARRIER_BASE_REL}: pick the folder that contains effect/",
+                            "{} is not a whole dump: it has no {CARRIER_BASE_REL}",
                             dir.display()
                         ));
                     }
@@ -5057,9 +5068,9 @@ impl EffEditor {
         let known = self
             .fighter_choices
             .iter()
-            .any(|(name, _)| *name == src.fighter);
-        if known && self.open_fighter.as_deref() != Some(src.fighter.as_str()) {
-            self.fighter_request = Some(src.fighter.clone());
+            .any(|(name, _)| *name == src.pick);
+        if known && self.open_fighter.as_deref() != Some(src.pick.as_str()) {
+            self.fighter_request = Some(src.pick.clone());
             self.only_open_move = false;
         } else {
             self.pending_load = Some(src.base.clone());
@@ -10033,6 +10044,7 @@ mod tests {
     #[test]
     fn the_edited_chip_opens_its_character() {
         let source = EditSource {
+            pick: "bayonetta".into(),
             fighter: "bayonetta".into(),
             label: "Bayonetta".into(),
             base: PathBuf::from("/fx/ef_bayonetta.eff"),
