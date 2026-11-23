@@ -762,6 +762,7 @@ enum PendingLeave {
     Script(Option<String>, MoveEntry),
     /// Kept by name, not row: the list can be re-indexed while the prompt is open.
     Fighter(crate::mod_project::ProjectFighter),
+    Character(crate::character::CharacterKey),
     ForgetFighter(crate::mod_project::ProjectFighter),
     Hub(crate::project_hub::HubAction),
     LoadProject(PathBuf),
@@ -780,6 +781,7 @@ impl PendingLeave {
         match self {
             Self::Script(..) => "open another script",
             Self::Fighter(_) => "choose another fighter",
+            Self::Character(_) => "choose another character",
             Self::ForgetFighter(_) => "remove this fighter from the list",
             Self::Hub(_) | Self::LoadProject(_) => "open another project",
             Self::NewProject(_) => "start a new project",
@@ -884,6 +886,7 @@ mod object_leave_tests {
                 name: "samus".into(),
                 character: None,
             }),
+            PendingLeave::Character(crate::character::CharacterKey::base("samus")),
             PendingLeave::ForgetFighter(crate::mod_project::ProjectFighter::fighter("samus")),
             PendingLeave::Hub(crate::project_hub::HubAction::BrowseWithoutProject),
             PendingLeave::LoadProject(PathBuf::from("p.json")),
@@ -901,6 +904,24 @@ mod object_leave_tests {
         assert!(words.len() >= 10, "{words:?}");
         // The gate is the same for all of them.
         assert!(object_leave_needs_prompt(Some("samus_lativolt"), true));
+    }
+
+    /// Switching between the characters of one fighter (Mario and one made on him) cleared an
+    /// object script's unsynced changes without asking, and reopened it as a fighter move.
+    #[test]
+    fn another_character_of_the_same_fighter_asks_first() {
+        let switch = include_str!("app.rs")
+            .split("fn select_character(&mut self")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("select_character");
+        let gate = switch
+            .find("self.leave_gate(|| PendingLeave::Character(")
+            .expect("the prompt");
+        let commit = switch.find("self.commit_current_edits();").expect("commit");
+        let cleared = switch.find("clear_move_state(").expect("clear");
+        assert!(gate < commit && commit < cleared);
+        assert!(switch.contains("entry.filter(|_| !object)"));
     }
 
     #[test]
@@ -23403,6 +23424,9 @@ impl VisionaryApp {
                     }
                 }
             }
+            PendingLeave::Character(key) => {
+                self.select_character(key);
+            }
             PendingLeave::ForgetFighter(target) => {
                 if self.state.fighters.iter().any(|f| {
                     f.name.eq_ignore_ascii_case(&target.name) && f.custom_name == target.character
@@ -23539,13 +23563,20 @@ impl VisionaryApp {
         if same_fighter && self.active_key().as_ref() == Some(&key) {
             return true;
         }
+        if self.leave_gate(|| PendingLeave::Character(key.clone())) {
+            return false;
+        }
         // Save the open move under the character it was opened for, then close it before the
         // switch, so nothing of one character is ever saved as the other's.
         self.commit_current_edits();
         let reopen = if same_fighter {
             let entry = self.state.selected_move.take();
             clear_move_state(&mut self.state);
-            entry
+            // An object's script is closed: its name is not one of the fighter's moves.
+            let object = self.open_article.take().is_some();
+            self.object_baseline = None;
+            self.open_article_in_source = false;
+            entry.filter(|_| !object)
         } else {
             None
         };
