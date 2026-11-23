@@ -247,6 +247,9 @@ pub struct HitboxRenderState {
     /// the moveset's frame callback sets. Applied at the skeleton's root, so the mesh and every
     /// bone the overlay reads grow together. Set through [`Self::set_model_scale`].
     model_scale: f32,
+    /// The bone matrices of frames asked for before, while the animation, skeletons, helper
+    /// bones and scale they were evaluated with stand ([`Self::forget_poses`]).
+    poses: PoseCache,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
     /// attach_bone_name is the character bone the weapon root attaches to (e.g. "haver")
     weapon_skels: Vec<(String, ssbh_data::skel_data::SkelData, String)>,
@@ -334,6 +337,7 @@ impl HitboxRenderState {
             model_matl: None,
             helper_bones: true,
             model_scale: 1.0,
+            poses: PoseCache::default(),
             weapon_skels: Vec::new(),
             last_frame: -1.0,
             last_anim_path: None,
@@ -452,6 +456,7 @@ impl HitboxRenderState {
         self.set_hidden.clear();
         self.object_dirs.clear();
         self.weapon_skels.clear();
+        self.poses.clear();
         // `folder` holds the files ARCropolis would load here (see `read_costume_model`).
         if folder.meshes.is_empty() && folder.skels.is_empty() {
             eprintln!("[MODEL] no model files for {:?}", model_dir);
@@ -532,6 +537,7 @@ impl HitboxRenderState {
             self.cached_anim = None;
             self.cached_default_anim = None;
             self.cached_vis_meshes = meshes_key;
+            self.poses.clear();
         }
         self.update_default_animation(default_anim_path, &meshes);
 
@@ -543,6 +549,7 @@ impl HitboxRenderState {
                 .map(|(p, _)| p != path)
                 .unwrap_or(true);
             if needs_load {
+                self.poses.clear();
                 self.cached_anim =
                     ssbh_data::anim_data::AnimData::from_file(path)
                         .ok()
@@ -551,8 +558,8 @@ impl HitboxRenderState {
                             (path.to_path_buf(), a)
                         });
             }
-        } else {
-            self.cached_anim = None;
+        } else if self.cached_anim.take().is_some() {
+            self.poses.clear();
         }
 
         // Reload skel only when path changes
@@ -563,12 +570,13 @@ impl HitboxRenderState {
                 .map(|(p, _)| p != path)
                 .unwrap_or(true);
             if needs_load {
+                self.poses.clear();
                 self.cached_skel = ssbh_data::skel_data::SkelData::from_file(path)
                     .ok()
                     .map(|s| (path.to_path_buf(), s));
             }
-        } else {
-            self.cached_skel = None;
+        } else if self.cached_skel.take().is_some() {
+            self.poses.clear();
         }
 
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
@@ -906,6 +914,7 @@ impl HitboxRenderState {
     pub fn set_helper_bones(&mut self, enabled: bool) {
         if self.helper_bones != enabled {
             self.helper_bones = enabled;
+            self.poses.clear();
             // Force the next prepare() to re-skin with the new constraint set.
             self.last_frame = -1.0;
         }
@@ -920,8 +929,14 @@ impl HitboxRenderState {
         };
         if self.model_scale != scale {
             self.model_scale = scale;
+            self.poses.clear();
             self.last_frame = -1.0;
         }
+    }
+
+    /// The scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
+    pub fn model_scale(&self) -> f32 {
+        self.model_scale
     }
 
     fn active_hlpb(&self) -> Option<&ssbh_data::hlpb_data::HlpbData> {
@@ -931,6 +946,7 @@ impl HitboxRenderState {
     /// Eagerly load skeleton data so bone_world_matrices_at() returns valid results
     /// immediately, without waiting for the first prepare() call.
     pub fn load_skeleton(&mut self, skel_path: &Path) {
+        self.poses.clear();
         self.cached_skel = ssbh_data::skel_data::SkelData::from_file(skel_path)
             .ok()
             .map(|s| (skel_path.to_path_buf(), s));
@@ -939,35 +955,81 @@ impl HitboxRenderState {
     /// Bone name -> world matrix (body and weapon skeletons) at an explicit `frame`.
     /// The offset from ACMD should be transformed by this matrix (not just added). Use this from the simulation code so bone
     /// positions are correct on the very first frame (no 1-frame delay).
-    pub fn bone_world_matrices_at(
-        &self,
-        frame: f32,
-    ) -> std::collections::HashMap<String, glam::Mat4> {
-        let skel = match self.cached_skel.as_ref() {
-            Some((_, s)) => s,
-            None => {
-                if crate::debug_enabled() {
-                    eprintln!("[BONE] cached_skel is NONE — returning empty map");
-                }
-                return std::collections::HashMap::new();
+    pub fn bone_world_matrices_at(&self, frame: f32) -> Pose {
+        let Some((_, skel)) = self.cached_skel.as_ref() else {
+            if crate::debug_enabled() {
+                eprintln!("[BONE] cached_skel is NONE — returning empty map");
             }
+            return Default::default();
         };
-        let anim = self.cached_anim.as_ref().map(|(_, a)| a);
-        let mut matrices =
-            compute_bone_world_matrices(skel, anim, self.active_hlpb(), &self.weapon_skels, frame);
-        if self.model_scale != 1.0 {
-            // The same as scaling the root bone, which is what the mesh gets.
+        self.poses.at(frame, true, || {
+            let anim = self.cached_anim.as_ref().map(|(_, a)| a);
+            let hlpb = self.active_hlpb();
+            let mut matrices =
+                compute_bone_world_matrices(skel, anim, hlpb, &self.weapon_skels, frame);
+            // The same as scaling the root bone, which is what the mesh gets: in game every
+            // joint sits at exactly the model scale times its unscaled place.
             let scale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale));
             for matrix in matrices.values_mut() {
                 *matrix = scale * *matrix;
             }
-        }
-        matrices
+            matrices
+        })
     }
 
-    /// The model scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
-    pub fn model_scale(&self) -> f32 {
-        self.model_scale
+    /// [`Self::bone_world_matrices_at`] with every axis at its unscaled length: where the scaled
+    /// fighter's bones are, for what is placed on them without taking its scale.
+    pub fn joint_matrices_at(&self, frame: f32) -> Pose {
+        let scaled = self.bone_world_matrices_at(frame);
+        if self.model_scale == 1.0 {
+            return scaled;
+        }
+        self.poses.at(frame, false, || {
+            let unscale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale.recip()));
+            let joint = |(name, matrix): (&String, &glam::Mat4)| (name.clone(), *matrix * unscale);
+            scaled.iter().map(joint).collect()
+        })
+    }
+}
+
+/// Bone matrices by frame. Evaluating a skeleton sorts its bones and builds a map of their
+/// names, and one paint asks for the same frames many times over: the overlays for the open
+/// one, and a weapon trail for a dozen samples of each frame it covers.
+#[derive(Default)]
+struct PoseCache {
+    poses: std::sync::Mutex<Poses>,
+}
+
+/// A frame's bone matrices by name.
+pub type Pose = std::sync::Arc<std::collections::HashMap<String, glam::Mat4>>;
+/// By frame, and whether the axes carry the fighter's scale.
+type Poses = std::collections::HashMap<(u32, bool), Pose>;
+
+impl PoseCache {
+    /// Enough for every sample of a long trail and the frames around it.
+    const MOST: usize = 512;
+
+    fn at(
+        &self,
+        frame: f32,
+        scaled: bool,
+        evaluate: impl FnOnce() -> std::collections::HashMap<String, glam::Mat4>,
+    ) -> Pose {
+        let key = (frame.to_bits(), scaled);
+        if let Some(pose) = self.poses.lock().unwrap().get(&key) {
+            return pose.clone();
+        }
+        let pose = Pose::new(evaluate());
+        let mut poses = self.poses.lock().unwrap();
+        if poses.len() >= Self::MOST {
+            poses.clear();
+        }
+        poses.insert(key, pose.clone());
+        pose
+    }
+
+    fn clear(&mut self) {
+        self.poses.get_mut().unwrap().clear();
     }
 }
 
@@ -1288,6 +1350,48 @@ mod tests {
         state.apply_preferences(&queue, &Default::default());
         assert!(!state.axis_lines.any());
         assert_eq!(state.floor_color, [r, g, b, 1.0]);
+    }
+
+    /// A frame's bones are evaluated once, however often a paint asks for them, and again after
+    /// anything they depend on changes.
+    #[test]
+    fn a_frames_bones_are_evaluated_once() {
+        let evaluated = std::cell::Cell::new(0);
+        let mut poses = super::PoseCache::default();
+        // One paint of an eight frame trail: the overlays at the open frame, twelve samples of
+        // each trail frame for the ribbon and three for its outline. Sixty paints of it.
+        let paint = |poses: &super::PoseCache| {
+            let ask = |frame: f32| {
+                poses.at(frame, true, || {
+                    evaluated.set(evaluated.get() + 1);
+                    std::collections::HashMap::from([(
+                        "top".to_owned(),
+                        glam::Mat4::from_translation(glam::Vec3::splat(frame)),
+                    )])
+                })
+            };
+            for _ in 0..4 {
+                assert_eq!(ask(8.0)["top"].w_axis.x, 8.0);
+            }
+            for i in 0..=8 * 12 {
+                ask(i as f32 / 12.0);
+            }
+            for i in 0..=8 * 3 {
+                ask(i as f32 * 4.0 / 12.0);
+            }
+        };
+        for _ in 0..60 {
+            paint(&poses);
+        }
+        assert_eq!(evaluated.get(), 97);
+        poses.clear();
+        paint(&poses);
+        assert_eq!(evaluated.get(), 2 * 97);
+        // It never grows past its limit.
+        for i in 0..5000 {
+            poses.at(i as f32, true, Default::default);
+        }
+        assert!(poses.poses.lock().unwrap().len() <= super::PoseCache::MOST);
     }
 
     /// Bone positions are evaluated through the hierarchy, whatever order the skeleton lists

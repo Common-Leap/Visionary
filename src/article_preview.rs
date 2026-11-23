@@ -1649,7 +1649,7 @@ fn scan_status_body_spawns(
 pub fn place(
     spawns: &[Spawn],
     frame: f32,
-    bones_at: &dyn Fn(f32) -> HashMap<String, glam::Mat4>,
+    bones_at: &dyn Fn(f32) -> crate::renderer::Pose,
 ) -> Vec<PlacedObject> {
     let mut placed = Vec::new();
     for Spawn {
@@ -1898,6 +1898,7 @@ mod tests {
                 ("havel".to_owned(), glam::Mat4::from_translation(left)),
                 ("haver".to_owned(), glam::Mat4::from_translation(right)),
             ])
+            .into()
         };
         let start = |hand: Option<&str>| {
             let spawn = Spawn {
@@ -2057,7 +2058,8 @@ mod tests {
                         return false;
                     };
                     let kind = Arc::new(kind);
-                    let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]);
+                    let bones =
+                        |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]).into();
                     for frame in [0.0, 5.5, 30.0, 200.0] {
                         let spawn = Spawn {
                             kind: kind.clone(),
@@ -2192,6 +2194,7 @@ mod thrown_object_tests {
                 ("top".to_owned(), glam::Mat4::IDENTITY),
                 ("haver".to_owned(), glam::Mat4::from_translation(hand)),
             ])
+            .into()
         };
         let spawn = Spawn {
             kind,
@@ -2399,7 +2402,7 @@ mod resolved_settings_preview_tests {
             spawned: 1,
             ..Spawn::default()
         };
-        let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]);
+        let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]).into();
         let placed = place(&[spawn], 5.0, &bones);
         assert_eq!(placed.len(), 1);
         let bx = placed[0].placement.x_axis.truncate().length();

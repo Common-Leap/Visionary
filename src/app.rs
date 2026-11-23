@@ -4295,7 +4295,7 @@ fn draw_trail_preview(
         if frame == frame_num as f32 {
             edges_in(current_matrices)
         } else {
-            edges_in(&rs.bone_world_matrices_at(crate::trail_preview::motion_frame(frame)))
+            edges_in(&rs.joint_matrices_at(crate::trail_preview::motion_frame(frame)))
         }
     };
     let span = crate::trail_preview::visible_span(
@@ -5050,15 +5050,22 @@ pub struct VisionaryApp {
     /// beside the others rather than a second panel competing for the same width.
     primary_tab: PrimaryEditorTab,
     /// Params frame data needs for one `(fighter, move kind)`, read once rather than per frame.
-    frame_params_cache: Option<(String, String, crate::frame_data::FrameParams)>,
-    /// [`Self::viewport_scales`], keyed by everything it reads.
-    viewport_scales_cache: Option<(String, ViewportScales)>,
-    /// Counts re-indexes of the fighter list.
+    frame_params_cache: Option<(
+        ViewFiles,
+        String,
+        crate::frame_data::MoveKind,
+        crate::frame_data::FrameParams,
+    )>,
+    /// [`Self::viewport_scales`] of a fighter, while the files it was read from stand.
+    viewport_scales_cache: Option<(ViewFiles, String, ViewportScales)>,
+    /// Counts re-indexes of the fighter list, for [`ViewFiles`].
     index_rev: u64,
     /// [`Self::found_project_romfs`]: the folder, the re-index it was looked up at, its answer.
     romfs_found: std::cell::RefCell<Option<(PathBuf, u64, bool)>>,
     /// The fighters and characters [`Self::sync_effect_fighter_choices`] last listed.
     effect_choices_key: Option<u64>,
+    /// Where the open row's trail textures are, while the files they were found in stand.
+    trail_textures: std::cell::RefCell<Option<TrailTextures>>,
     timeline_filters: TimelineFilters,
     /// The selected source command for the non-collision tabs.  The command site is stable for a
     /// source statement, including loop repetitions; the current frame still identifies which
@@ -5840,6 +5847,7 @@ impl VisionaryApp {
             index_rev: 0,
             romfs_found: Default::default(),
             effect_choices_key: None,
+            trail_textures: Default::default(),
             gimmicks_editor: crate::gimmicks::editor::GimmicksEditor::default(),
             node_editor: Default::default(),
             node_workspace: false,
@@ -11747,38 +11755,34 @@ impl VisionaryApp {
     /// The selected move's frame data, from the hitboxes as currently edited.
     fn current_frame_data(&mut self) -> Option<crate::frame_data::FrameData> {
         let move_entry = self.state.selected_move.as_ref()?;
-        let fighter = self
+        let fighter = &self
             .state
             .selected_fighter
             .and_then(|index| self.state.fighters.get(index))?
-            .name
-            .clone();
+            .name;
         let kind = crate::frame_data::MoveKind::of(&move_entry.name);
-        let roots: Vec<PathBuf> = self
-            .all_roots()
-            .iter()
-            .map(|root| root.join("fighter"))
-            .collect();
-        let overrides = self
-            .acmd_src
-            .as_ref()
-            .filter(|index| index.has_fighter(&fighter))
-            .map(|index| index.param_overrides.clone())
-            .unwrap_or_default();
         // Everything the params depend on, so a new data root, a reordered mod or an edited
         // `params.rs` re-reads them instead of showing stale numbers.
-        let mut sorted_overrides: Vec<_> = overrides.iter().collect();
-        sorted_overrides.sort_by(|a, b| a.0.cmp(b.0));
-        let kind_key = format!("{kind:?}|{roots:?}|{sorted_overrides:?}");
         let cached = self
             .frame_params_cache
             .as_ref()
-            .is_some_and(|(f, k, _)| *f == fighter && *k == kind_key);
+            .is_some_and(|(files, f, k, _)| f == fighter && *k == kind && files.stands(self));
         if !cached {
-            let params = crate::frame_data::load_params(&roots, &fighter, kind, &overrides);
-            self.frame_params_cache = Some((fighter, kind_key, params));
+            let roots: Vec<PathBuf> = self
+                .all_roots()
+                .iter()
+                .map(|root| root.join("fighter"))
+                .collect();
+            let overrides = self
+                .acmd_src
+                .as_ref()
+                .filter(|index| index.has_fighter(fighter))
+                .map(|index| index.param_overrides.clone())
+                .unwrap_or_default();
+            let params = crate::frame_data::load_params(&roots, fighter, kind, &overrides);
+            self.frame_params_cache = Some((ViewFiles::of(self), fighter.clone(), kind, params));
         }
-        let params = &self.frame_params_cache.as_ref()?.2;
+        let params = &self.frame_params_cache.as_ref()?.3;
         let move_entry = self.state.selected_move.as_ref()?;
         Some(crate::frame_data::compute(&crate::frame_data::Inputs {
             motion: &move_entry.name,
@@ -11791,16 +11795,22 @@ impl VisionaryApp {
     }
 
     /// The scales the viewport draws the selected fighter at: what its frame callback sets, over
-    /// its `fighter_param` `scale` (or the moveset's `param_config` override of it).
+    /// its `fighter_param` `scale` (or the moveset's `param_config` override of it) for the
+    /// model. The game scales hitboxes and grab boxes only when a moveset asks for it.
     fn viewport_scales(&mut self) -> ViewportScales {
         let Some(fighter) = self
             .state
             .selected_fighter
             .and_then(|index| self.state.fighters.get(index))
-            .map(|entry| entry.name.clone())
         else {
             return ViewportScales::default();
         };
+        if let Some((files, name, scales)) = &self.viewport_scales_cache {
+            if *name == fighter.name && files.stands(self) {
+                return scales.clone();
+            }
+        }
+        let fighter = fighter.name.clone();
         let roots: Vec<PathBuf> = self
             .all_roots()
             .iter()
@@ -11811,64 +11821,39 @@ impl VisionaryApp {
             .as_ref()
             .filter(|index| index.has_fighter(&fighter));
         let source = index.and_then(|index| {
-            let scales = index
-                .scales
-                .get(&fighter)
+            index.scales.get(&fighter).or_else(|| {
                 // A project that never names its fighter keeps its scripts under "".
-                .or_else(|| {
-                    (index.scales.len() == 1)
-                        .then(|| index.scales.values().next())
-                        .flatten()
-                })?;
-            Some((index.root.clone(), scales.clone()))
+                (index.scales.len() == 1)
+                    .then(|| index.scales.values().next())
+                    .flatten()
+            })
         });
-        let override_scale = index.and_then(|index| index.param_scale);
-        let key = format!("{fighter}|{roots:?}|{source:?}|{override_scale:?}");
-        if let Some((cached, scales)) = &self.viewport_scales_cache {
-            if *cached == key {
-                return scales.clone();
-            }
-        }
-        let base = match override_scale {
-            Some(value) => ScaleValue {
-                value,
-                source: "the moveset's param_config override of fighter_param scale".to_string(),
-            },
-            None => match crate::frame_data::fighter_param_scale(&roots, &fighter) {
-                Some(value) => ScaleValue {
-                    value,
-                    source: "fighter_param.prc scale".to_string(),
-                },
-                None => ScaleValue {
-                    value: 1.0,
-                    source: "default (no fighter_param scale found)".to_string(),
-                },
-            },
-        };
-        let from_call = |call: Option<&crate::fighter_scale::ScaleCall>, root: &Path| {
-            call.map(|call| ScaleValue {
-                value: call.value,
-                source: format!(
-                    "{}:{}",
-                    call.file.strip_prefix(root).unwrap_or(&call.file).display(),
-                    call.line
-                ),
+        let call = |call: Option<&crate::fighter_scale::ScaleCall>| {
+            call.zip(index).map(|(call, index)| {
+                let file = call.file.strip_prefix(&index.root).unwrap_or(&call.file);
+                ScaleValue {
+                    value: call.value,
+                    set_by: Some(format!("{}:{}", file.display(), call.line)),
+                }
             })
         };
-        let (model, attack, grab) = match &source {
-            Some((root, scales)) => (
-                from_call(scales.model.as_ref(), root),
-                from_call(scales.attack.as_ref(), root),
-                from_call(scales.grab.as_ref(), root),
-            ),
-            None => (None, None, None),
+        let from_params = || match index.and_then(|index| index.param_scale) {
+            Some(value) => ScaleValue {
+                value,
+                set_by: Some("the moveset's param_config".to_owned()),
+            },
+            None => ScaleValue {
+                value: crate::frame_data::fighter_param_scale(&roots, &fighter).unwrap_or(1.0),
+                set_by: None,
+            },
         };
         let scales = ViewportScales {
-            model: model.unwrap_or_else(|| base.clone()),
-            attack: attack.unwrap_or_else(|| base.clone()),
-            grab: grab.unwrap_or(base),
+            model: call(source.and_then(|s| s.model.as_ref())).unwrap_or_else(from_params),
+            attack: call(source.and_then(|s| s.attack.as_ref())).unwrap_or_default(),
+            grab: call(source.and_then(|s| s.grab.as_ref())).unwrap_or_default(),
         };
-        self.viewport_scales_cache = Some((key, scales.clone()));
+        let files = ViewFiles::of(self);
+        self.viewport_scales_cache = Some((files, fighter, scales.clone()));
         scales
     }
 
@@ -12235,11 +12220,11 @@ impl VisionaryApp {
         };
         let mut placed =
             crate::article_preview::place(&spawns, self.state.current_frame as f32, &|at| {
-                rs.bone_world_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
+                rs.joint_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
             });
         if !stowed.is_empty() {
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
-            let bones = rs.bone_world_matrices_at(animation_frame);
+            let bones = rs.joint_matrices_at(animation_frame);
             for kind in stowed {
                 let bone = format!("{}b", kind.name);
                 if let Some(at) = bones.get(&bone) {
@@ -12274,7 +12259,7 @@ impl VisionaryApp {
         // An item move's item, in the right hand by its grip.
         if let Some(kind) = held_item {
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
-            let bones = rs.bone_world_matrices_at(animation_frame);
+            let bones = rs.joint_matrices_at(animation_frame);
             if let Some(hand) = bones.get("haver") {
                 let grip = kind
                     .skel
@@ -12304,7 +12289,7 @@ impl VisionaryApp {
         // A grab or throw holds the opponent on the thrower's throw bone.
         if let Some(kind) = opponent {
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
-            let bones = rs.bone_world_matrices_at(animation_frame);
+            let bones = rs.joint_matrices_at(animation_frame);
             if let Some(throw) = bones.get("Throw").or_else(|| bones.get("throw")) {
                 let hip = kind
                     .skel
@@ -12355,20 +12340,6 @@ impl VisionaryApp {
             .state
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i));
-        let mut effect_dirs: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = self.current_eff_path.as_ref().and_then(|p| p.parent()) {
-            effect_dirs.push(dir.to_path_buf());
-        }
-        if let Some(fighter) = selected_fighter {
-            for dir in self.fighter_effect_dirs(fighter) {
-                if !effect_dirs.contains(&dir) {
-                    effect_dirs.push(dir);
-                }
-            }
-        }
-        if effect_dirs.is_empty() {
-            return Vec::new();
-        }
         let slot = selected_fighter
             .map(|fighter| self.active_article_slot(fighter))
             .or_else(|| {
@@ -12397,15 +12368,9 @@ impl VisionaryApp {
             if newest <= oldest {
                 continue;
             }
-            let root = self.state.data_root.as_deref();
             let (Some(texture), Some(fade)) = (
-                crate::preview_trail::texture_path_for_slot(
-                    &effect_dirs,
-                    slot,
-                    root,
-                    &spec.texture,
-                ),
-                crate::preview_trail::texture_path_for_slot(&effect_dirs, slot, root, &spec.fade),
+                self.trail_texture(slot, &spec.texture),
+                self.trail_texture(slot, &spec.fade),
             ) else {
                 continue;
             };
@@ -12425,7 +12390,7 @@ impl VisionaryApp {
             let edges: Vec<[glam::Vec3; 2]> = (0..=steps)
                 .filter_map(|i| {
                     let at = oldest + (newest - oldest) * i as f32 / steps as f32;
-                    let bones = rs.bone_world_matrices_at((at - 1.0).max(0.0));
+                    let bones = rs.joint_matrices_at((at - 1.0).max(0.0));
                     let point = |bone: &str, p: glam::Vec3| {
                         bones
                             .get(bone)
@@ -12442,6 +12407,43 @@ impl VisionaryApp {
             });
         }
         out
+    }
+
+    /// Where the open row's trail texture `name` is, looked up on disk once while [`ViewFiles`],
+    /// the row and its costume stand.
+    fn trail_texture(&self, slot: Option<u8>, name: &str) -> Option<PathBuf> {
+        let row = self.state.selected_fighter;
+        let mut textures = self.trail_textures.borrow_mut();
+        let stands = textures.as_ref().is_some_and(|known| {
+            known.row == row
+                && known.slot == slot
+                && known.eff == self.current_eff_path
+                && known.files.stands(self)
+        });
+        if !stands {
+            let own = self.current_eff_path.as_ref().and_then(|p| p.parent());
+            let mut dirs: Vec<PathBuf> = own.map(Path::to_path_buf).into_iter().collect();
+            if let Some(fighter) = row.and_then(|i| self.state.fighters.get(i)) {
+                for dir in self.fighter_effect_dirs(fighter) {
+                    if !dirs.contains(&dir) {
+                        dirs.push(dir);
+                    }
+                }
+            }
+            *textures = Some(TrailTextures {
+                files: ViewFiles::of(self),
+                row,
+                slot,
+                eff: self.current_eff_path.clone(),
+                dirs,
+                found: HashMap::new(),
+            });
+        }
+        let root = self.state.data_root.as_deref();
+        textures.as_mut()?.texture(name, |dirs| {
+            let known = !dirs.is_empty();
+            known.then(|| crate::preview_trail::texture_path_for_slot(dirs, slot, root, name))?
+        })
     }
 
     /// Candidate `effect/fighter/<fighter>` directories for `.eff` and `trail`/`trail_cNN`
@@ -13345,9 +13347,13 @@ impl VisionaryApp {
         let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() else {
             return Vec::new();
         };
+        let model_scale = if self.open_article.is_some() {
+            1.0
+        } else {
+            rs.model_scale()
+        };
         // Bone matrices by game frame, computed once each for this paint.
-        let cache: std::cell::RefCell<HashMap<u32, std::rc::Rc<HashMap<String, glam::Mat4>>>> =
-            Default::default();
+        let cache: std::cell::RefCell<HashMap<u32, crate::renderer::Pose>> = Default::default();
         let bones_at = |game_frame: u32| {
             cache
                 .borrow_mut()
@@ -13361,11 +13367,9 @@ impl VisionaryApp {
                         } else {
                             HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)])
                         };
-                        std::rc::Rc::new(map)
+                        crate::renderer::Pose::new(map)
                     } else {
-                        std::rc::Rc::new(
-                            rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame)),
-                        )
+                        rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame))
                     }
                 })
                 .clone()
@@ -13446,7 +13450,7 @@ impl VisionaryApp {
                     .get(&ec.bone_name)
                     .or_else(|| bones.get(&ec.bone_name.to_lowercase()))
                     .copied()?;
-                Some(effect_placement(ec, bone, offset, euler))
+                Some(effect_placement(ec, bone, model_scale, offset, euler))
             };
             // A following effect rides its bone every frame; any other stays where it was
             // spawned, as the game places it once.
@@ -13493,7 +13497,7 @@ impl VisionaryApp {
                         hand: object.hand.clone(),
                     }],
                     at as f32,
-                    &|f| (*bones_at(f.max(1.0) as u32)).clone(),
+                    &|f| bones_at(f.max(1.0) as u32),
                 )
                 .into_iter()
                 .next()
@@ -13941,22 +13945,18 @@ impl VisionaryApp {
                             .unwrap_or_else(|| {
                                 HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)])
                             })
+                            .into()
                     } else {
                         rs.bone_world_matrices_at(animation_frame)
                     };
                     self.perf.end("bone_matrices", t);
-                    // Keep a positions map for debug display
-                    let bone_positions: std::collections::HashMap<String, glam::Vec3> =
-                        bone_matrices
-                            .iter()
-                            .map(|(k, m)| (k.clone(), m.col(3).truncate()))
-                            .collect();
                     // What Home frames, and Period when no hitbox is selected.
-                    self.fighter_sphere = bounding_sphere(bone_positions.values().copied());
+                    self.fighter_sphere =
+                        bounding_sphere(bone_matrices.values().map(|m| m.w_axis.truncate()));
                     self.selection_sphere = None;
 
                     if self.show_debug {
-                        let mut names: Vec<&String> = bone_positions.keys().collect();
+                        let mut names: Vec<&String> = bone_matrices.keys().collect();
                         names.sort();
                         for (i, name) in names.iter().take(30).enumerate() {
                             ui.painter().text(
@@ -13978,8 +13978,8 @@ impl VisionaryApp {
                                 egui::Color32::LIGHT_BLUE,
                             );
                         }
-                        for (name, pos) in &bone_positions {
-                            if let Some(sp) = rs.world_to_screen(*pos, rect) {
+                        for (name, matrix) in bone_matrices.iter() {
+                            if let Some(sp) = rs.world_to_screen(matrix.w_axis.truncate(), rect) {
                                 ui.painter().circle_filled(
                                     sp,
                                     3.0,
@@ -14315,29 +14315,17 @@ impl VisionaryApp {
                             .copied()
                             .unwrap_or(glam::Mat4::IDENTITY);
 
-                        let (hitbox_model_scale, hitbox_collision_scale) =
-                            if self.open_article.is_some() {
-                                let s = objects
-                                    .first()
-                                    .map(|o| {
-                                        if o.kind.scale.is_finite() && o.kind.scale > 0.0 {
-                                            o.kind.scale
-                                        } else {
-                                            1.0
-                                        }
-                                    })
-                                    .unwrap_or(1.0);
-                                (s, s)
-                            } else {
-                                (rs.model_scale(), viewport_scales.collision(hb.category))
-                            };
+                        let collision_scale = if self.open_article.is_some() {
+                            objects
+                                .first()
+                                .map(|object| object.kind.scale)
+                                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                                .unwrap_or(1.0)
+                        } else {
+                            viewport_scales.collision(hb.category)
+                        };
                         let (world_pos, capsule_world_end, world_radius) =
-                            collision_world_placement(
-                                bone_mat,
-                                hb,
-                                hitbox_model_scale,
-                                hitbox_collision_scale,
-                            );
+                            collision_world_placement(bone_mat, hb, collision_scale);
                         let launch_center = capsule_world_end
                             .map(|world_end| (world_pos + world_end) * 0.5)
                             .unwrap_or(world_pos);
@@ -14440,7 +14428,6 @@ impl VisionaryApp {
                                 let (start, end, radius) = collision_world_placement(
                                     bone_mat,
                                     hb,
-                                    rs.model_scale(),
                                     viewport_scales.collision(hb.category),
                                 );
                                 let center = end.map(|end| (start + end) * 0.5).unwrap_or(start);
@@ -14512,6 +14499,12 @@ impl VisionaryApp {
                         }
                     }
 
+                    // Trails and objects ride the bones without the fighter's scale in their axes.
+                    let joints = if self.open_article.is_some() {
+                        bone_matrices.clone()
+                    } else {
+                        rs.joint_matrices_at(animation_frame)
+                    };
                     // Effect spawn markers: blue circles at bone position + script offset.
                     let mut best_pick: Option<(usize, f32)> = None;
                     for (i, ec) in self.state.effects.iter().enumerate() {
@@ -14529,7 +14522,7 @@ impl VisionaryApp {
                                     ui.painter(),
                                     rs,
                                     rect,
-                                    &bone_matrices,
+                                    &joints,
                                     ec,
                                     &geometry,
                                     frame_num,
@@ -14558,9 +14551,10 @@ impl VisionaryApp {
                         else {
                             continue;
                         };
-                        let world_pos = effect_placement(ec, bone_mat, ec.offset, [0.0; 3])
-                            .w_axis
-                            .truncate();
+                        let world_pos =
+                            effect_placement(ec, bone_mat, rs.model_scale(), ec.offset, [0.0; 3])
+                                .w_axis
+                                .truncate();
                         let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
                             continue;
                         };
@@ -19639,8 +19633,7 @@ impl VisionaryApp {
             ("grab", &scales.grab),
         ]
         .into_iter()
-        .filter(|(_, scale)| (scale.value - 1.0).abs() > 1e-4)
-        .map(|(name, scale)| (name, scale, &scale.source))
+        .filter_map(|(name, scale)| Some((name, scale, scale.set_by.as_ref()?)))
         .collect();
         let throw = self.selected_move_is_throw();
         if !camera_moved && scaled.is_empty() && !throw && self.viewport_file_sources.is_empty() {
@@ -41556,9 +41549,15 @@ fn placement_offset(ec: &crate::data::EffectCall, offset: [f32; 3]) -> [f32; 3] 
 /// Whether an effect call's offset is in the fighter's facing axes rather than its bone's (see
 /// [`placement_offset`]).
 fn offset_in_facing_space(ec: &crate::data::EffectCall) -> bool {
+    keeps_its_own_size(ec) && is_system_bone(&ec.bone_name)
+}
+
+/// Whether a spawn (not a following one) is flagged `false`, which the game then gives neither
+/// the fighter's scale nor, on a root bone, its axes: Sonic's (0.95) up smash impact is the
+/// script's size 2, his down smash's, flagged `true`, 0.95 times its 1.5.
+fn keeps_its_own_size(ec: &crate::data::EffectCall) -> bool {
     let follows = ec.spawn_func.contains("FOLLOW") || ec.spawn_func.contains("FLW");
     !follows
-        && is_system_bone(&ec.bone_name)
         && ec
             .extra_args
             .as_ref()
@@ -41583,12 +41582,21 @@ fn follows_position_only(ec: &crate::data::EffectCall) -> bool {
 /// "throw" (turned 180) came out flipped. On "top" the preview's bone has no turn, and the
 /// fighter's facing is the preview's own. An offset in the fighter's facing axes (see
 /// [`placement_offset`]) is not turned by the bone.
+///
+/// `bone` carries the fighter's scale, `model_scale`, and so do the offset and the size of what
+/// is spawned on it, as in game, but for a spawn that [`keeps_its_own_size`].
 fn effect_placement(
     ec: &crate::data::EffectCall,
     bone: glam::Mat4,
+    model_scale: f32,
     offset: [f32; 3],
     euler: [f32; 3],
 ) -> glam::Mat4 {
+    let bone = if keeps_its_own_size(ec) {
+        bone * glam::Mat4::from_scale(glam::Vec3::splat(model_scale.recip()))
+    } else {
+        bone
+    };
     let turn = glam::Mat4::from_scale_rotation_translation(
         glam::Vec3::splat(ec.scale.max(0.01)),
         effect_rotation(euler),
@@ -41694,7 +41702,7 @@ mod effect_placement_tests {
             "the body faces back at the spawn: {}",
             forward(rot)
         );
-        let placed = super::effect_placement(ec, rot, ec.offset, super::script_rotation(ec));
+        let placed = super::effect_placement(ec, rot, 1.0, ec.offset, super::script_rotation(ec));
         assert!(
             forward(placed).dot(forward(rot)) > 0.999,
             "the shell faces {} and the body {}",
@@ -41922,25 +41930,29 @@ fn hurtbox_render_descriptors(
 
 /// Where a bone-placed collision box sits: `(start, capsule end, radius)` in world space.
 ///
-/// `bone_mat` already carries the fighter's `model_scale`, so it moves the box's bone. The box's
-/// own offset and radius take `collision_scale` instead (`AttackModule::set_attack_scale` or
-/// `GrabModule::set_size_mul`); with all scales equal, the box scales with the model. A system
-/// bone (`top`, `trans`, ...) gives only its position, as its offsets are in world axes.
+/// The box sits its offset away from its bone along the bone's axes, at full length: neither
+/// the fighter's scale nor the bone's own animated one changes it (Sonic's forward smash grows
+/// the fist but not the offset of its hitbox). `collision_scale` does
+/// (`AttackModule::set_attack_scale` or `GrabModule::set_size_mul`, 1 unless the moveset calls
+/// it). A system bone (`top`, `trans`, ...) gives only its position, as its offsets are in world
+/// axes.
 fn collision_world_placement(
     bone_mat: glam::Mat4,
     hb: &crate::data::Hitbox,
-    model_scale: f32,
     collision_scale: f32,
 ) -> (glam::Vec3, Option<glam::Vec3>, f32) {
-    let bone_mat = if is_system_bone(&hb.bone_name) {
-        glam::Mat4::from_translation(bone_mat.col(3).truncate())
-            * glam::Mat4::from_scale(glam::Vec3::splat(model_scale))
+    let at = bone_mat.w_axis.truncate();
+    let axes = if is_system_bone(&hb.bone_name) {
+        glam::Mat3::IDENTITY
     } else {
-        bone_mat
+        let axis = |column: glam::Vec4| column.truncate().normalize_or_zero();
+        glam::Mat3::from_cols(
+            axis(bone_mat.x_axis),
+            axis(bone_mat.y_axis),
+            axis(bone_mat.z_axis),
+        )
     };
-    let offset_scale = collision_scale / model_scale;
-    let place =
-        |[x, y, z]: [f32; 3]| bone_mat.transform_point3(glam::Vec3::new(x, y, z) * offset_scale);
+    let place = |offset: [f32; 3]| at + axes * glam::Vec3::from(offset) * collision_scale;
     (
         place([hb.offset_x, hb.offset_y, hb.offset_z]),
         hb.capsule_end.map(place),
@@ -45049,18 +45061,96 @@ struct VictimFighter {
     slots: Vec<u8>,
 }
 
-/// One of [`ViewportScales`], with where it came from for the toolbar's tooltip.
+/// What the files the view reads besides the open move's own are found by: the data folder, the
+/// mods, the project and the linked source. While it stands they are not looked up again; a
+/// re-index (File > Refresh skins and mods among them) ends it. Asking is comparing, with no
+/// disk access and nothing allocated, so a paint can.
+#[derive(Debug, Clone, PartialEq)]
+struct ViewFiles {
+    data_root: Option<PathBuf>,
+    extra_roots: Vec<PathBuf>,
+    project: Option<PathBuf>,
+    source: u64,
+    index: u64,
+}
+
+impl ViewFiles {
+    fn of(app: &VisionaryApp) -> Self {
+        Self {
+            data_root: app.state.data_root.clone(),
+            extra_roots: app.extra_roots.clone(),
+            project: app.project_path.clone(),
+            source: app.acmd_src_generation,
+            index: app.index_rev,
+        }
+    }
+
+    fn stands(&self, app: &VisionaryApp) -> bool {
+        self.matches(
+            &app.state.data_root,
+            &app.extra_roots,
+            &app.project_path,
+            app.acmd_src_generation,
+            app.index_rev,
+        )
+    }
+
+    fn matches(
+        &self,
+        data_root: &Option<PathBuf>,
+        extra_roots: &[PathBuf],
+        project: &Option<PathBuf>,
+        source: u64,
+        index: u64,
+    ) -> bool {
+        self.source == source
+            && self.index == index
+            && self.data_root == *data_root
+            && self.extra_roots == extra_roots
+            && self.project == *project
+    }
+}
+
+/// The trail textures found for one fighter row's costume, by texture name.
+struct TrailTextures {
+    files: ViewFiles,
+    row: Option<usize>,
+    slot: Option<u8>,
+    eff: Option<PathBuf>,
+    /// The folders they are looked for in.
+    dirs: Vec<PathBuf>,
+    found: HashMap<String, Option<PathBuf>>,
+}
+
+impl TrailTextures {
+    /// Where texture `name` is, asking `look_up` the first time only, found or not.
+    fn texture(
+        &mut self,
+        name: &str,
+        look_up: impl FnOnce(&[PathBuf]) -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        if let Some(found) = self.found.get(name) {
+            return found.clone();
+        }
+        let found = look_up(&self.dirs);
+        self.found.insert(name.to_owned(), found.clone());
+        found
+    }
+}
+
+/// One of [`ViewportScales`].
 #[derive(Debug, Clone, PartialEq)]
 struct ScaleValue {
     value: f32,
-    source: String,
+    /// What in the moveset sets it, when that is not the game's own value.
+    set_by: Option<String>,
 }
 
 impl Default for ScaleValue {
     fn default() -> Self {
         Self {
             value: 1.0,
-            source: "default".to_string(),
+            set_by: None,
         }
     }
 }
@@ -45071,9 +45161,9 @@ impl Default for ScaleValue {
 struct ViewportScales {
     /// `ModelModule::set_scale`: the mesh and skeleton, so every bone-placed box moves with it.
     model: ScaleValue,
-    /// `AttackModule::set_attack_scale`: hitbox radius and offset.
+    /// `AttackModule::set_attack_scale`: hitbox radius and offset. 1 unless called.
     attack: ScaleValue,
-    /// `GrabModule::set_size_mul`: grab box radius and offset.
+    /// `GrabModule::set_size_mul`: grab box radius and offset. 1 unless called.
     grab: ScaleValue,
 }
 
@@ -52179,6 +52269,92 @@ mod live_effect_capture_tests {
         assert_eq!(EFFECT_ROTATION_AXIS_LABELS, ["X", "Y", "Z"]);
     }
 
+    /// Effects as a match placed them (the emitter matrices of nn::vfx), on Sonic, whose model
+    /// scale is 0.95: what is spawned takes it in its offset and size, unless the spawn is
+    /// flagged `false`.
+    #[test]
+    fn effects_take_the_fighters_scale_unless_told_not_to() {
+        let placed = |source: &str| {
+            let source = format!(
+                "unsafe extern \"C\" fn effect_x(agent: &mut L2CAgentBase) {{\n\
+                 frame(agent.lua_state_agent, 3.0);\n\
+                 if macros::is_excute(agent) {{\n{source}\n}}\n}}\n"
+            );
+            let calls = crate::acmd::parse_effect_script(&source).to_effect_calls();
+            let top = glam::Mat4::from_scale(glam::Vec3::splat(0.95));
+            let placed = effect_placement(&calls[0], top, 0.95, calls[0].offset, [0.0; 3]);
+            let (scale, _, at) = placed.to_scale_rotation_translation();
+            // The game's axes: forward is the preview's Z, and Z its -X.
+            ([at.z, at.y, -at.x], scale.x)
+        };
+        let close = |((at, size), (want, want_size)): (([f32; 3], f32), ([f32; 3], f32))| {
+            let near = |a: f32, b: f32| (a - b).abs() < 2e-3;
+            assert!(
+                near(size, want_size) && (0..3).all(|i| near(at[i], want[i])),
+                "{at:?} size {size}, in game {want:?} size {want_size}"
+            );
+        };
+        // His jab's line, up smash's flash and down smash's impact.
+        close((
+            placed("macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new(\"sys_attack_line\"), Hash40::new(\"sys_attack_line\"), Hash40::new(\"top\"), 1, 7.8, -2, 0, 0, 0, 0.9, true, *EF_FLIP_YZ);"),
+            ([-1.9, 7.41, -0.95], 0.855),
+        ));
+        close((
+            placed("macros::EFFECT(agent, Hash40::new(\"sys_smash_flash\"), Hash40::new(\"top\"), 0, 13, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);"),
+            ([1.9, 12.35, 0.0], 0.95),
+        ));
+        close((
+            placed("macros::EFFECT(agent, Hash40::new(\"sys_attack_impact\"), Hash40::new(\"top\"), 0, 2.5, 17, 0, 0, 0, 1.5, 0, 0, 0, 0, 0, 360, true);"),
+            ([16.15, 2.375, 0.0], 1.425),
+        ));
+        // His forward smash's impact, flagged `false`.
+        close((
+            placed("macros::EFFECT(agent, Hash40::new(\"sys_attack_impact\"), Hash40::new(\"top\"), 18, 6.5, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 360, false);"),
+            ([18.0, 6.5, 1.0], 1.0),
+        ));
+    }
+
+    /// A hitbox's centre as `AttackModule::center_pos` gave it in a match, against the joint it
+    /// is on: Sonic (model scale 0.95) on frame 17 of his forward smash, whose hand is 2.39
+    /// times its size. The offset keeps its length whatever the fighter's or the bone's scale.
+    #[test]
+    fn hitbox_offsets_keep_their_length_on_scaled_bones() {
+        let hitbox = |bone: &str, offset: [f32; 3]| crate::data::Hitbox {
+            bone_name: bone.into(),
+            offset_x: offset[0],
+            offset_y: offset[1],
+            offset_z: offset[2],
+            size: 4.5,
+            ..Default::default()
+        };
+        let joint = glam::Vec3::new(-14.9012, 7.6329, 0.9244);
+        let along = (glam::Vec3::new(-11.538, 6.9512, -1.1309) - joint).normalize();
+        let turn = glam::Quat::from_rotation_arc(glam::Vec3::X, along);
+        let hand = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(0.95 * 2.39),
+            turn,
+            joint,
+        );
+        let (centre, end, radius) =
+            collision_world_placement(hand, &hitbox("handr", [4.0, 0.0, 0.0]), 1.0);
+        let game = glam::Vec3::new(-11.538, 6.9512, -1.1309);
+        assert!(centre.abs_diff_eq(game, 2e-3), "{centre} not {game}");
+        assert_eq!((end, radius), (None, 4.5));
+        // His up smash's, on `top`: 15 up and 5.5 ahead, not 0.95 of that.
+        let top = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(0.95),
+            glam::Quat::from_rotation_y(0.4),
+            glam::Vec3::new(0.0, 0.01, -30.0),
+        );
+        let (centre, ..) = collision_world_placement(top, &hitbox("top", [0.0, 15.0, 5.5]), 1.0);
+        assert!(centre.abs_diff_eq(glam::Vec3::new(0.0, 15.01, -24.5), 1e-4));
+        // A moveset's own hitbox scale moves and grows it.
+        let (centre, _, radius) =
+            collision_world_placement(top, &hitbox("top", [0.0, 15.0, 5.5]), 2.0);
+        assert!(centre.abs_diff_eq(glam::Vec3::new(0.0, 30.01, -19.0), 1e-4));
+        assert_eq!(radius, 9.0);
+    }
+
     #[test]
     fn wind_coordinates_use_the_same_gameplay_plane_as_top_bone_offsets() {
         let root = glam::Mat4::from_translation(glam::Vec3::new(2.0, 3.0, 4.0));
@@ -55207,6 +55383,50 @@ mod blocked_export_writes_nothing_tests {
         assert_eq!(own_row_index(&rows, "Falco"), Some(1));
         assert_eq!(own_row_index(&rows[..1], "falco"), Some(0));
         assert_eq!(own_row_index(&rows, "mario"), None);
+    }
+
+    /// What the view looked up on disk is kept until something it was found by changes: any one
+    /// of them ends it, and a paint that changes none looks nothing up, a missing file included.
+    #[test]
+    fn the_views_files_are_looked_up_once_until_what_they_hang_on_changes() {
+        let path = |p: &str| Some(std::path::PathBuf::from(p));
+        let mods = [std::path::PathBuf::from("/mods/a")];
+        let files = ViewFiles {
+            data_root: path("/dump"),
+            extra_roots: mods.to_vec(),
+            project: path("/p/modproject.json"),
+            source: 3,
+            index: 7,
+        };
+        let dump = path("/dump");
+        let project = path("/p/modproject.json");
+        assert!(files.matches(&dump, &mods, &project, 3, 7));
+        assert!(!files.matches(&path("/other"), &mods, &project, 3, 7));
+        assert!(!files.matches(&dump, &[], &project, 3, 7));
+        assert!(!files.matches(&dump, &mods, &None, 3, 7));
+        assert!(!files.matches(&dump, &mods, &project, 4, 7));
+        assert!(!files.matches(&dump, &mods, &project, 3, 8));
+
+        let looked = std::cell::Cell::new(0);
+        let mut textures = TrailTextures {
+            files,
+            row: Some(0),
+            slot: Some(40),
+            eff: None,
+            dirs: vec!["/mods/a/effect".into()],
+            found: HashMap::new(),
+        };
+        for _paint in 0..60 {
+            let mut ask = |name: &str, there: bool| {
+                textures.texture(name, |dirs| {
+                    looked.set(looked.get() + 1);
+                    there.then(|| dirs[0].join(name))
+                })
+            };
+            assert_eq!(ask("tex_sword", true), path("/mods/a/effect/tex_sword"));
+            assert_eq!(ask("tex_missing", false), None);
+        }
+        assert_eq!(looked.get(), 2);
     }
 
     /// The Effects page's character list is rebuilt when a row or a made character changes, and
