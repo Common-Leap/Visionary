@@ -42613,26 +42613,48 @@ fn rebuild_script_from_hitboxes(
             .collect()
     }
 
-    /// Expand the source's finite control flow into timestamped non-collision statements.
+    /// Expand the source's finite control flow into timestamped non-collision statements, each
+    /// before or after the collisions of its frame as the source has it: what changes a hitbox
+    /// (`AttackModule::set_add_reaction_frame`) does nothing ahead of its `ATTACK`.
     fn retain_non_collisions(
         stmts: &[AcmdStmt],
         start_frame: f32,
-        out: &mut Vec<(f32, AcmdStmt)>,
+        collided: &mut Option<u32>,
+        out: &mut Vec<(f32, bool, AcmdStmt)>,
     ) -> f32 {
         let mut frame = start_frame;
         for stmt in stmts {
+            // A collision ahead of the first `frame` call is out on frame 1.
+            let follows = *collided == Some(crate::data::script_frame(frame));
+            let at = if follows {
+                crate::data::script_frame(frame) as f32
+            } else {
+                frame
+            };
             match stmt {
                 AcmdStmt::Frame(value) => frame = *value,
                 AcmdStmt::Wait(value) => frame += *value,
                 AcmdStmt::Excute(inner) => {
-                    let retained = retain_non_collisions_in_block(inner);
+                    let first = inner.iter().position(|one| {
+                        retain_non_collisions_in_block(std::slice::from_ref(one)).is_empty()
+                    });
+                    let (before, after) = inner.split_at(first.unwrap_or(inner.len()));
+                    let retained = retain_non_collisions_in_block(before);
                     if !retained.is_empty() {
-                        out.push((frame, AcmdStmt::Excute(retained)));
+                        out.push((at, follows, AcmdStmt::Excute(retained)));
+                    }
+                    let retained = retain_non_collisions_in_block(after);
+                    if !retained.is_empty() {
+                        let at = crate::data::script_frame(frame) as f32;
+                        out.push((at, true, AcmdStmt::Excute(retained)));
+                    }
+                    if first.is_some() {
+                        *collided = Some(crate::data::script_frame(frame));
                     }
                 }
                 AcmdStmt::Loop { count, body, .. } => {
                     for _ in 0..*count {
-                        frame = retain_non_collisions(body, frame, out);
+                        frame = retain_non_collisions(body, frame, collided, out);
                     }
                 }
                 // Kept whole and in place. The frame clock does not advance across it: whether
@@ -42640,7 +42662,8 @@ fn rebuild_script_from_hitboxes(
                 // editor does not model.
                 AcmdStmt::RawBlock { header, body } => {
                     out.push((
-                        frame,
+                        at,
+                        follows,
                         AcmdStmt::RawBlock {
                             header: header.clone(),
                             body: retain_inside_raw_block(body),
@@ -42648,10 +42671,10 @@ fn rebuild_script_from_hitboxes(
                     ));
                 }
                 AcmdStmt::Bare(inner) => {
-                    if let Some(kept) =
-                        retain_non_collisions_in_block(std::slice::from_ref(inner.as_ref())).pop()
+                    match retain_non_collisions_in_block(std::slice::from_ref(inner.as_ref())).pop()
                     {
-                        out.push((frame, AcmdStmt::Bare(Box::new(kept))));
+                        Some(kept) => out.push((at, follows, AcmdStmt::Bare(Box::new(kept)))),
+                        None => *collided = Some(crate::data::script_frame(frame)),
                     }
                 }
                 // A rate call is a timing statement, not a collision, so it survives a rebuild
@@ -42662,11 +42685,49 @@ fn rebuild_script_from_hitboxes(
                 | AcmdStmt::WaitLoopClear
                 | AcmdStmt::MotionRate(_)
                 | AcmdStmt::Raw(_) => {
-                    out.push((frame, stmt.clone()));
+                    out.push((at, follows, stmt.clone()));
                 }
             }
         }
         frame
+    }
+
+    /// The frames `stmt`, written after the collisions of `frame`, belongs on: where the hitboxes
+    /// it changes now come out.
+    fn frames_of_modifier(
+        stmt: &ExcuteStmt,
+        frame: u32,
+        pristine: &[Hitbox],
+        hitboxes: &[Hitbox],
+    ) -> Vec<u32> {
+        let line = crate::acmd::emit_excute_stmts(std::slice::from_ref(stmt), "").join("\n");
+        let Some(modifier) = crate::source_timing::modifiers(&line, 0..line.len()).pop() else {
+            return vec![frame];
+        };
+        let mut frames: Vec<u32> = pristine
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| crate::data::is_attack_category(h.category))
+            .filter(|(_, h)| h.active_start == frame && modifier.changes(h.id))
+            .filter_map(|(p, before)| {
+                let same = |h: &&Hitbox| (h.category, h.id) == (before.category, before.id);
+                // The same place in the list, unless hitboxes were added or removed.
+                let mut left = hitboxes.iter().filter(same);
+                hitboxes
+                    .get(p)
+                    .filter(|_| hitboxes.len() == pristine.len())
+                    .filter(same)
+                    .or_else(|| left.clone().find(|h| h.active_start == frame))
+                    .or_else(|| left.next().filter(|_| left.next().is_none()))
+                    .map(|now| now.active_start.max(FIRST_GAME_FRAME))
+            })
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        if frames.is_empty() {
+            frames.push(frame);
+        }
+        frames
     }
 
     // End events run before spawns at the same frame. This matters when an id is reused: clear the
@@ -42755,8 +42816,32 @@ fn rebuild_script_from_hitboxes(
         }
     }
 
-    let mut timed = Vec::new();
-    retain_non_collisions(&original.stmts, 0.0, &mut timed);
+    let mut retained = Vec::new();
+    retain_non_collisions(&original.stmts, 0.0, &mut None, &mut retained);
+    // What changes a hitbox goes where the hitbox went.
+    let pristine = original.to_hitboxes();
+    let mut timed: Vec<(f32, u8, AcmdStmt)> = Vec::new();
+    for (at, follows, stmt) in retained {
+        let AcmdStmt::Excute(inner) = &stmt else {
+            timed.push((at, if follows { 2 } else { 0 }, stmt));
+            continue;
+        };
+        if !follows {
+            timed.push((at, 0, stmt));
+            continue;
+        }
+        let mut by_frame: BTreeMap<u32, Vec<ExcuteStmt>> = BTreeMap::new();
+        for one in inner {
+            for frame in frames_of_modifier(one, at as u32, &pristine, hitboxes) {
+                by_frame.entry(frame).or_default().push(one.clone());
+            }
+        }
+        timed.extend(
+            by_frame
+                .into_iter()
+                .map(|(frame, inner)| (frame as f32, 2, AcmdStmt::Excute(inner))),
+        );
+    }
     let mut event_frames: Vec<u32> = ends.keys().chain(spawns.keys()).copied().collect();
     event_frames.sort_unstable();
     event_frames.dedup();
@@ -42764,16 +42849,15 @@ fn rebuild_script_from_hitboxes(
         let mut events = ends.remove(&frame).unwrap_or_default();
         events.extend(spawns.remove(&frame).unwrap_or_default());
         if !events.is_empty() {
-            timed.push((frame as f32, AcmdStmt::Excute(events)));
+            timed.push((frame as f32, 1, AcmdStmt::Excute(events)));
         }
     }
-    // `sort_by` is stable, so retained source statements stay ahead of regenerated collisions at
-    // the same frame. This preserves setup calls that originally preceded ATTACK in an excute.
-    timed.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    // Around the collisions of a frame, what preceded them in the source and what followed.
+    timed.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
 
     let mut stmts = Vec::new();
     let mut frame = 0.0_f32;
-    for (at, stmt) in timed {
+    for (at, _, stmt) in timed {
         if at > 0.0 && at != frame {
             stmts.push(AcmdStmt::Frame(at));
             frame = at;
@@ -53623,6 +53707,82 @@ mod live_effect_capture_tests {
         assert_eq!((states[0].active_start, states[0].active_end), (3, 7));
         assert_eq!(pris.len(), 1, "so did the collision priority");
         assert_eq!((pris[0].pri, pris[0].active_end), (200, 7));
+    }
+
+    /// Donkey Kong's down tilt, as the game has it: three hitboxes, then what changes each and
+    /// what changes them all. An edit writes them after the hitboxes still, and a retime takes
+    /// each along with its hitbox.
+    #[test]
+    fn what_changes_a_hitbox_stays_after_it_and_moves_with_it() {
+        let original = crate::acmd::parse_acmd_script(crate::source_timing::tests::DK_DTILT);
+        let pristine = original.to_hitboxes();
+        assert_eq!(pristine.len(), 3);
+        // Each line's call and hitbox id, by frame.
+        let written = |hitboxes: &[Hitbox]| -> Vec<(f32, Vec<String>)> {
+            let script = rebuild_script_from_hitboxes(&original, hitboxes);
+            // Saved and edited again, it is the same.
+            let again = rebuild_script_from_hitboxes(&script, hitboxes);
+            assert_eq!(
+                serde_json::to_value(&again).unwrap(),
+                serde_json::to_value(&script).unwrap()
+            );
+            let mut out: Vec<(f32, Vec<String>)> = Vec::new();
+            let mut frame = 0.0;
+            for stmt in &script.stmts {
+                match stmt {
+                    crate::data::AcmdStmt::Frame(at) => frame = *at,
+                    crate::data::AcmdStmt::Excute(inner) => {
+                        let lines = crate::acmd::emit_excute_stmts(inner, "");
+                        let short = lines.iter().map(|line| {
+                            let name = line.split('(').next().unwrap().rsplit("::").next().unwrap();
+                            let id = line.split(',').nth(1).unwrap_or("").trim();
+                            format!("{name} {id}")
+                        });
+                        match out.last_mut().filter(|(at, _)| *at == frame) {
+                            Some((_, lines)) => lines.extend(short),
+                            None => out.push((frame, short.collect())),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        };
+        let attacks = ["ATTACK 0", "ATTACK 1", "ATTACK 2"];
+        let height = "set_attack_height_all AttackHeight(*ATTACK_HEIGHT_LOW)";
+        let reaction = |id: u32| format!("set_add_reaction_frame {id}");
+
+        let mut hitboxes = pristine.clone();
+        hitboxes[0].damage = 9.0;
+        let mut expected: Vec<String> = attacks.map(String::from).to_vec();
+        expected.push(height.into());
+        expected.extend([0, 1, 2].map(reaction));
+        let frames = written(&hitboxes);
+        assert_eq!(frames[1], (6.0, expected), "{frames:?}");
+
+        // One hitbox a frame later: its own line goes with it, and the shared one is for both.
+        let mut hitboxes = pristine.clone();
+        hitboxes[2].active_start = 7;
+        let frames = written(&hitboxes);
+        assert_eq!(
+            frames[1].1,
+            ["ATTACK 0", "ATTACK 1", height, &reaction(0), &reaction(1)],
+            "{frames:?}"
+        );
+        assert_eq!(
+            frames[2].1,
+            ["ATTACK 2", height, &reaction(2)],
+            "{frames:?}"
+        );
+        assert_eq!(frames[2].0, 7.0);
+
+        // All of them sooner: nothing is left behind.
+        let mut hitboxes = pristine;
+        hitboxes.iter_mut().for_each(|h| h.active_start = 3);
+        let frames = written(&hitboxes);
+        assert_eq!(frames[0].0, 3.0);
+        assert_eq!(frames[0].1.len(), 7, "{frames:?}");
+        assert!(frames.iter().all(|(at, _)| *at != 6.0), "{frames:?}");
     }
 
     #[test]

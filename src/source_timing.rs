@@ -17,7 +17,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use crate::acmd_src::{format_float, matching_brace, opens_is_excute, skip_trivia, statement_end};
+use crate::acmd_src::{
+    format_float, matching_brace, opens_is_excute, scan_macro_sites_unscoped, skip_trivia,
+    split_call_args, statement_end,
+};
 use crate::data::{is_attack_category, script_frame, Hitbox};
 
 /// A hitbox the editor retimed, and where its call is.
@@ -393,6 +396,8 @@ struct Request {
     frame: u32,
     /// A clear goes before anything else on its frame; a call after.
     clear: bool,
+    /// A line that changes several hitboxes goes after their calls (0), in the order it was.
+    after: usize,
     line: String,
 }
 
@@ -614,6 +619,153 @@ fn span_label(start: u32, end: u32) -> String {
     }
 }
 
+/// `lines` without the indentation of their first, for writing at another one.
+fn dedented(lines: &str) -> String {
+    let lines: Vec<&str> = lines.trim_end().lines().collect();
+    let lead = lines.first().map_or(0, |l| l.len() - l.trim_start().len());
+    lines
+        .iter()
+        .map(|line| match line.get(..lead) {
+            Some(indent) if indent.trim().is_empty() => &line[lead..],
+            _ => line.trim_start(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A statement that changes a hitbox already out: `AttackModule::set_add_reaction_frame(…, 0, …)`,
+/// `ATK_SET_SHIELD_SETOFF_MUL(agent, 0, …)`.
+pub(crate) struct Modifier {
+    call: Range<usize>,
+    /// What it calls, to name it by.
+    name: String,
+    /// The hitbox ids it names; none changes every hitbox out.
+    ids: Vec<u32>,
+}
+
+impl Modifier {
+    pub(crate) fn changes(&self, id: u32) -> bool {
+        self.ids.is_empty() || self.ids.contains(&id)
+    }
+}
+
+/// The modifiers written in `range`, in order.
+pub(crate) fn modifiers(text: &str, range: Range<usize>) -> Vec<Modifier> {
+    const MODULE: &str = "AttackModule::";
+    // Every id has to be read, or the call may change any hitbox.
+    let ids = |args: Option<&[Range<usize>]>| -> Vec<u32> {
+        let id = |arg: &Range<usize>| {
+            let arg = text[arg.clone()].trim();
+            arg.parse().ok().or_else(|| {
+                let value = crate::project_consts::resolve_in_scope(arg)?;
+                (value.fract() == 0.0 && value >= 0.0).then_some(value as u32)
+            })
+        };
+        let read: Option<Vec<u32>> = args.unwrap_or_default().iter().map(id).collect();
+        read.unwrap_or_default()
+    };
+    let mut out: Vec<Modifier> = scan_macro_sites_unscoped(text, range.clone())
+        .into_iter()
+        .filter(|site| {
+            // `ATK_SET_SHIELD_SETOFF_MUL_arg4(agent, 0, 1, 8.0)` names several.
+            site.name.starts_with("ATK_SET_SHIELD_SETOFF_MUL")
+                || matches!(site.name.as_str(), "ATK_POWER" | "ATK_LERP_RATIO")
+        })
+        .map(|site| Modifier {
+            ids: ids(site.args.get(1..site.args.len().saturating_sub(1))),
+            name: site.name,
+            call: site.span,
+        })
+        .collect();
+    let mut i = range.start;
+    while i < range.end {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if !text.is_char_boundary(i) || !text[i..].starts_with(MODULE) {
+            i += 1;
+            continue;
+        }
+        let start = text[..i]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map_or(0, |n| n + 1);
+        i += MODULE.len();
+        let Some(open) = text[i..range.end].find('(').map(|n| i + n) else {
+            break;
+        };
+        let method = text[i..open].trim();
+        let Some((args, close)) = split_call_args(text, open + 1, range.end) else {
+            continue;
+        };
+        let sets = ["set_", "add_", "enable_", "disable_", "init_"];
+        if sets.iter().any(|verb| method.starts_with(verb)) {
+            out.push(Modifier {
+                call: start..close + 1,
+                name: format!("{MODULE}{method}"),
+                ids: ids(match method {
+                    "set_lerp" => args.get(1..),
+                    _ => args.get(1..2),
+                }),
+            });
+        }
+        i = close;
+    }
+    out.sort_by_key(|modifier| modifier.call.start);
+    out
+}
+
+/// What changes hitbox `id`, or every hitbox, after its call ending at `call_end` and on the same
+/// frame: the whole lines of each. A modifier in a condition cannot be moved with the call, and
+/// one after another call with the id is that call's.
+fn modifiers_of(
+    text: &str,
+    timeline: &Timeline,
+    item: usize,
+    call_end: usize,
+    id: u32,
+) -> Result<Vec<(Modifier, Range<usize>)>, String> {
+    let blocks: Vec<(usize, usize)> = timeline.items[item..]
+        .iter()
+        .take_while(|next| next.before == timeline.items[item].before)
+        .filter_map(|next| match next.kind {
+            Kind::Excute { open, close } => Some((open, close)),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (open, close) in blocks {
+        let from = call_end.max(open);
+        let replaced = scan_macro_sites_unscoped(text, from..close)
+            .into_iter()
+            .find(|site| {
+                let named = site.args.get(1).map(|arg| text[arg.clone()].trim());
+                site.name.starts_with("ATTACK") && named.and_then(|n| n.parse().ok()) == Some(id)
+            })
+            .map(|site| site.span.start);
+        for modifier in modifiers(text, from..replaced.unwrap_or(close)) {
+            if !modifier.changes(id) {
+                continue;
+            }
+            let end =
+                statement_end(text, modifier.call.start).map_or(modifier.call.end, |semi| semi + 1);
+            let lines = own_lines(text, &(modifier.call.start..end))
+                .filter(|_| only_transparent_blocks(text, open, modifier.call.start))
+                .ok_or_else(|| {
+                    format!(
+                        "`{}` after it sits inside a condition or shares a line with other code",
+                        modifier.name
+                    )
+                })?;
+            out.push((modifier, lines));
+        }
+        if replaced.is_some() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// `text` with `removed` lines taken out and `requests` written in where they land.
 fn place(
     text: &str,
@@ -645,7 +797,7 @@ fn place(
         ordered.sort_by_key(|r| !r.clear);
         ordered
             .iter()
-            .flat_map(|r| r.line.split('\n').map(str::to_string))
+            .flat_map(|r| r.line.lines().map(str::to_string))
             .collect()
     };
 
@@ -670,7 +822,7 @@ fn place(
                     if !clears.is_empty() {
                         let text_in: String = clears
                             .iter()
-                            .flat_map(|r| r.line.split('\n'))
+                            .flat_map(|r| r.line.lines())
                             .map(|line| format!("{body_indent}{line}{nl}"))
                             .collect();
                         edits.push((line_end(text, open)..line_end(text, open), text_in));
@@ -678,7 +830,7 @@ fn place(
                     if !calls.is_empty() {
                         let text_in: String = calls
                             .iter()
-                            .flat_map(|r| r.line.split('\n'))
+                            .flat_map(|r| r.line.lines())
                             .map(|line| format!("{body_indent}{line}{nl}"))
                             .collect();
                         edits.push((close_line..close_line, text_in));
@@ -935,6 +1087,9 @@ pub(crate) fn retime_hitboxes(
     let mut removed: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut requests: BTreeSet<Request> = BTreeSet::new();
     let mut clear_alls: BTreeMap<(usize, usize), (u32, String)> = BTreeMap::new();
+    // Lines that change several hitboxes: their frame, and the frames hitboxes they changed as
+    // they came out now start on.
+    let mut shared: BTreeMap<(usize, usize), (u32, Modifier, BTreeSet<u32>)> = BTreeMap::new();
     let item_of = |at: usize| {
         timeline.items.iter().position(|item| match item.kind {
             Kind::Excute { open, close } => open < at && at < close,
@@ -963,10 +1118,31 @@ pub(crate) fn retime_hitboxes(
                 return Err(fail("its call shares a line with other code"));
             };
             removed.insert((lines.start, lines.end));
+            let mut moving = vec![dedented(&text[lines])];
+            // What changes it as it comes out goes with it.
+            let following = match family(m.before.category) {
+                Family::Attack => {
+                    modifiers_of(text, &timeline, item, m.call.end, id).map_err(|why| fail(&why))?
+                }
+                _ => Vec::new(),
+            };
+            for (modifier, lines) in following {
+                if modifier.ids == [id] {
+                    removed.insert((lines.start, lines.end));
+                    moving.push(dedented(&text[lines]));
+                } else {
+                    shared
+                        .entry((lines.start, lines.end))
+                        .or_insert((m.before.active_start, modifier, BTreeSet::new()))
+                        .2
+                        .insert(m.after.active_start);
+                }
+            }
             requests.insert(Request {
                 frame: m.after.active_start,
                 clear: false,
-                line: text[lines].trim().to_string(),
+                after: 0,
+                line: moving.join("\n"),
             });
         }
         let (old_end, new_end) = (m.before.active_end, m.after.active_end);
@@ -999,6 +1175,7 @@ pub(crate) fn retime_hitboxes(
                 requests.insert(Request {
                     frame: new_end + 1,
                     clear: true,
+                    after: 0,
                     line: style.clear(id),
                 });
             }
@@ -1014,6 +1191,7 @@ pub(crate) fn retime_hitboxes(
                 requests.insert(Request {
                     frame: new_end + 1,
                     clear: true,
+                    after: 0,
                     line,
                 });
             }
@@ -1026,6 +1204,41 @@ pub(crate) fn retime_hitboxes(
         }
         // Lengthening one the next same-id call replaces needs that call moved too; if the
         // editor did not move it, the check below says so.
+    }
+
+    // Such a line is written again after each moved call, and goes from where it was once no
+    // hitbox it changed is out there. Where it would change one it never did, nothing is written.
+    let out_on = |h: &Hitbox, frame: u32| {
+        is_attack_category(h.category) && h.active_start <= frame && frame <= h.active_end
+    };
+    for ((start, end), (frame, modifier, targets)) in shared {
+        let changed: Vec<usize> = (0..pristine.len())
+            .filter(|&p| out_on(&pristine[p], frame) && modifier.changes(pristine[p].id))
+            .collect();
+        for target in targets {
+            let caught = (0..expected.len())
+                .map(|p| (p, expected[p]))
+                .find(|(p, h)| !changed.contains(p) && out_on(h, target) && modifier.changes(h.id));
+            if let Some((_, h)) = caught {
+                return Err(format!(
+                    "`{}` changes several hitboxes, and on frame {target} it would change \
+                     hitbox {} too",
+                    modifier.name, h.id
+                ));
+            }
+            requests.insert(Request {
+                frame: target,
+                clear: false,
+                after: start,
+                line: dedented(&text[start..end]),
+            });
+        }
+        let stays = |&p: &usize| {
+            expected[p].active_start == pristine[p].active_start && out_on(expected[p], frame)
+        };
+        if !changed.iter().any(stays) {
+            removed.insert((start, end));
+        }
     }
 
     // A `clear_all` ends every hitbox open on its frame. It moves to the latest end any of them
@@ -1063,6 +1276,7 @@ pub(crate) fn retime_hitboxes(
                 requests.insert(Request {
                     frame: closes_at,
                     clear: true,
+                    after: 0,
                     line,
                 });
             }
@@ -1076,6 +1290,7 @@ pub(crate) fn retime_hitboxes(
                 requests.insert(Request {
                     frame: h.active_end + 1,
                     clear: true,
+                    after: 0,
                     line: style.clear(h.id),
                 });
             }
@@ -1108,6 +1323,7 @@ pub(crate) fn retime_hitboxes(
                 requests.insert(Request {
                     frame: end + 1,
                     clear: true,
+                    after: 0,
                     line: style.clear(h.id),
                 });
             }
@@ -1160,6 +1376,7 @@ pub(crate) fn retime_hitboxes(
         requests.insert(Request {
             frame,
             clear: true,
+            after: 0,
             line: grab_line.clone(),
         });
     }
@@ -1546,6 +1763,7 @@ pub(crate) fn retime_effects(
                     requests.insert(Request {
                         frame: m.after.active_start,
                         clear: false,
+                        after: 0,
                         line: lines.join("\n"),
                     });
                 }
@@ -1569,23 +1787,11 @@ pub(crate) fn retime_effects(
                     if whole {
                         if moved_chains.insert(chain.lines.start) {
                             removed.insert((chain.lines.start, chain.lines.end));
-                            let body: Vec<&str> = text[chain.lines.clone()].lines().collect();
-                            let lead = body.first().map_or(0, |l| l.len() - l.trim_start().len());
-                            let line = body
-                                .iter()
-                                .map(|l| {
-                                    if l.len() >= lead && l[..lead].trim().is_empty() {
-                                        &l[lead..]
-                                    } else {
-                                        l.trim_start()
-                                    }
-                                })
-                                .map(|l| l.trim_end_matches('\r'))
-                                .collect::<Vec<_>>()
-                                .join("\n");
+                            let line = dedented(&text[chain.lines.clone()]);
                             requests.insert(Request {
                                 frame: m.after.active_start,
                                 clear: false,
+                                after: 0,
                                 line,
                             });
                         }
@@ -1638,6 +1844,7 @@ pub(crate) fn retime_effects(
                         requests.insert(Request {
                             frame: m.after.active_start,
                             clear: false,
+                            after: 0,
                             line: lines.join("\n"),
                         });
                     }
@@ -1677,6 +1884,7 @@ pub(crate) fn retime_effects(
             requests.insert(Request {
                 frame: m.after.active_end,
                 clear: false,
+                after: 0,
                 line: text[range].trim().to_string(),
             });
         }
@@ -1750,6 +1958,7 @@ pub(crate) fn add_effects(text: &str, additions: &[EffectAddition]) -> Result<St
         requests.insert(Request {
             frame: addition.frame.max(1),
             clear: false,
+            after: 0,
             line,
         });
     }
@@ -1757,7 +1966,7 @@ pub(crate) fn add_effects(text: &str, additions: &[EffectAddition]) -> Result<St
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn hitboxes(source: &str) -> Vec<Hitbox> {
@@ -1832,6 +2041,169 @@ mod tests {
             .map(|h| (h.active_start, h.active_end))
             .collect();
         assert_eq!(spans, vec![(11, 12), (11, 12), (13, 21), (13, 21)]);
+    }
+
+    /// Donkey Kong's down tilt as the game has it.
+    pub(crate) const DK_DTILT: &str = r#"unsafe extern "C" fn game_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::HIT_NODE(agent, Hash40::new("arml"), *HIT_STATUS_XLU);
+        macros::HIT_NODE(agent, Hash40::new("shoulderl"), *HIT_STATUS_XLU);
+    }
+    frame(agent.lua_state_agent, 6.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("shoulderl"), 6.0, 361, 80, 0, 10, 4.4, 2.3, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.4, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 1, 0, Hash40::new("arml"), 6.0, 361, 80, 0, 10, 4.4, 1.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.4, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 2, 0, Hash40::new("arml"), 6.0, 361, 80, 0, 10, 5.5, 8.5, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.4, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_LOW), false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 5.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 1, 5.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 2, 5.0, false);
+    }
+    frame(agent.lua_state_agent, 8.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+        HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);
+    }
+}
+"#;
+
+    /// The lines of each execute block, by its frame.
+    fn blocks(source: &str) -> Vec<(u32, Vec<String>)> {
+        let timeline = parse(source).unwrap();
+        timeline
+            .items
+            .iter()
+            .filter_map(|item| match item.kind {
+                Kind::Excute { open, close } => Some((
+                    item.before as u32,
+                    source[line_end(source, open)..close]
+                        .lines()
+                        .map(|line| line.trim().to_string())
+                        .filter(|line| !line.is_empty())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn short(lines: &[String]) -> Vec<&str> {
+        lines
+            .iter()
+            .map(|line| &line[..line.find("agent.module_accessor").map_or(24, |n| n + 25)])
+            .collect()
+    }
+
+    /// Every hitbox of the move comes out sooner: what changes each goes with its call, and what
+    /// changes all of them after the calls.
+    #[test]
+    fn a_retimed_hitbox_takes_the_lines_that_change_it_along() {
+        let out = retime(DK_DTILT, |hitboxes| {
+            hitboxes.iter_mut().for_each(|h| h.active_start = 3);
+        })
+        .unwrap();
+        let written = blocks(&out);
+        assert_eq!(
+            written.iter().map(|(frame, _)| *frame).collect::<Vec<_>>(),
+            [3, 5, 8],
+            "{out}"
+        );
+        assert_eq!(
+            short(&written[0].1),
+            [
+                "macros::ATTACK(agent, 0,",
+                "AttackModule::set_add_reaction_frame(agent.module_accessor, 0,",
+                "macros::ATTACK(agent, 1,",
+                "AttackModule::set_add_reaction_frame(agent.module_accessor, 1,",
+                "macros::ATTACK(agent, 2,",
+                "AttackModule::set_add_reaction_frame(agent.module_accessor, 2,",
+                "AttackModule::set_attack_height_all(agent.module_accessor, At",
+            ],
+            "{out}"
+        );
+    }
+
+    /// One of the three moves: its own line goes, the shared one is kept for the two that stay
+    /// and written again for it. Where that would change a hitbox it never did, nothing is
+    /// written.
+    #[test]
+    fn a_line_that_changes_every_hitbox_is_kept_for_those_that_stay() {
+        let out = retime(DK_DTILT, |hitboxes| hitboxes[2].active_start = 7).unwrap();
+        let written = blocks(&out);
+        assert_eq!(short(&written[1].1).len(), 5, "{out}");
+        assert!(written[1]
+            .1
+            .iter()
+            .all(|line| !line.contains("accessor, 2,")));
+        assert_eq!(
+            short(&written[2].1),
+            [
+                "macros::ATTACK(agent, 2,",
+                "AttackModule::set_add_reaction_frame(agent.module_accessor, 2,",
+                "AttackModule::set_attack_height_all(agent.module_accessor, At",
+            ],
+            "{out}"
+        );
+
+        let call = DK_DTILT
+            .lines()
+            .find(|l| l.contains("agent, 1, 0,"))
+            .unwrap();
+        let other = call.replace("agent, 1, 0,", "agent, 3, 0,");
+        let crowded = DK_DTILT.replace(
+            "    frame(agent.lua_state_agent, 8.0);",
+            &format!("    frame(agent.lua_state_agent, 7.0);\n    if macros::is_excute(agent) {{\n{other}\n    }}\n    frame(agent.lua_state_agent, 8.0);"),
+        );
+        let error = retime(&crowded, |hitboxes| hitboxes[2].active_start = 7).unwrap_err();
+        assert!(
+            error.contains("set_attack_height_all") && error.contains("hitbox 3"),
+            "{error}"
+        );
+    }
+
+    /// Mewtwo's rapid jab finisher writes one call for hitboxes 0 and 1 (`…_arg3`): it names
+    /// both, so it moves with the one it has and is not taken for hitbox 0's alone.
+    #[test]
+    fn a_line_naming_several_hitboxes_is_not_one_hitboxs() {
+        let found = modifiers(
+            "macros::ATK_SET_SHIELD_SETOFF_MUL_arg3(agent, 0, 1, 4.0);",
+            0..57,
+        );
+        assert_eq!(found[0].ids, [0, 1]);
+        let found = modifiers("macros::ATK_POWER(agent, 2, 7);", 0..31);
+        assert_eq!(found[0].ids, [2]);
+        assert!(modifiers("AttackModule::clear(boma, 0, false);", 0..36).is_empty());
+    }
+
+    /// A modifier in a condition cannot be moved out of it.
+    #[test]
+    fn a_conditional_line_that_changes_the_hitbox_stops_the_retime() {
+        let source = DK_DTILT.replace(
+            "        AttackModule::set_add_reaction_frame(agent.module_accessor, 1, 5.0, false);",
+            "        if WorkModule::is_flag(agent.module_accessor, 1) {\n            AttackModule::set_add_reaction_frame(agent.module_accessor, 1, 5.0, false);\n        }",
+        );
+        let error = retime(&source, |hitboxes| hitboxes[1].active_start = 4).unwrap_err();
+        assert!(error.contains("inside a condition"), "{error}");
+    }
+
+    /// A call written over several lines in a file with Windows line endings.
+    #[test]
+    fn a_call_over_several_crlf_lines_keeps_its_line_endings_and_shape() {
+        let source = DK_DTILT
+            .replace("\"), 6.0,", "\"),\n            6.0,")
+            .replace("None, None, None, ", "None, None, None,\n            ")
+            .replace('\n', "\r\n");
+        let out = retime(&source, |hitboxes| {
+            hitboxes.iter_mut().for_each(|h| h.active_start = 3);
+        })
+        .unwrap();
+        assert!(!out.contains("\r\r"), "{out:?}");
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count());
+        // Nothing but the calls' place changed: every line that was there still is.
+        for line in source.lines().filter(|line| line.contains("6.0, 361")) {
+            assert_eq!(out.matches(line).count(), source.matches(line).count());
+        }
     }
 
     #[test]

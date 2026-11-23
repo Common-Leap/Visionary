@@ -464,7 +464,11 @@ fn char_literal_len(rest: &str) -> Option<usize> {
 
 /// Split a call's arguments starting just after its `(`. Returns the argument spans and the
 /// offset of the matching `)`.
-fn split_call_args(text: &str, open: usize, limit: usize) -> Option<(Vec<Range<usize>>, usize)> {
+pub(crate) fn split_call_args(
+    text: &str,
+    open: usize,
+    limit: usize,
+) -> Option<(Vec<Range<usize>>, usize)> {
     let bytes = text.as_bytes();
     let mut args = Vec::new();
     let mut depth = 0usize;
@@ -8374,7 +8378,18 @@ pub fn rewrite_attack_mods(
         if before == now {
             continue;
         }
-        let Some(site) = sites.get(now.site) else {
+        // A retimed hitbox takes its modifiers along, which can put them after another id's:
+        // counted among the calls of its own kind and id, then, not among all of them.
+        let rank = pristine
+            .iter()
+            .filter(|other| (other.kind, other.id) == (before.kind, before.id))
+            .filter(|other| other.site < before.site)
+            .count();
+        let own = |site: &&MacroSite| {
+            site.name == before.kind.macro_name()
+                && site_u32(text, site, 1).map(i64::from) == Some(before.id)
+        };
+        let Some(site) = sites.iter().filter(own).nth(rank).or(sites.get(now.site)) else {
             report.skipped.push(format!(
                 "{label}: a `{}` has no matching call in the source — it was added in the \
                  editor, and source syncing only retunes existing calls",
