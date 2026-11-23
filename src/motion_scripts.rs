@@ -186,6 +186,21 @@ pub fn motion_name(
         .or_else(|| animations.iter().find_map(|a| animation_stem(a)))
 }
 
+/// Give the entries the names `labels` has for them, when the labels arrive after the list was
+/// made: in place of a hash, or of a name [`motion_name`] could only guess from a script or an
+/// animation file (`wait` read as `wait1` from `a00wait1.nuanmb`).
+pub fn resolve_late_names(
+    entries: &mut [crate::data::MoveEntry],
+    labels: &HashMap<u64, String>,
+) -> usize {
+    for entry in entries.iter_mut() {
+        if labels.contains_key(&entry.hash) && hash40(&entry.name) != entry.hash {
+            entry.name = format!("{:#018x}", entry.hash);
+        }
+    }
+    crate::data::resolve_move_entry_names(entries, labels)
+}
+
 /// Recover a motion's exact name from one of its animation file names.
 ///
 /// Animations are named after their motion with the underscores dropped and a slot prefix
@@ -356,6 +371,40 @@ fn find_nros(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The labels can arrive after the move list is made. A name guessed without them gives way
+    /// to the motion's own, as a bare hash does: left as `wait1`, the view found no `wait` and
+    /// showed the fighter in its bind pose with no move open.
+    #[test]
+    fn a_guessed_name_gives_way_to_a_late_label() {
+        let entry = |name: &str, motion: &str| crate::data::MoveEntry {
+            name: name.into(),
+            hash: hash40(motion),
+            frame_count: 0,
+            anim_path: None,
+            cancel_frame: 0,
+        };
+        let guessed = motion_name(
+            hash40("wait"),
+            &[],
+            &[hash40("a00wait1.nuanmb")],
+            &HashMap::from([(hash40("a00wait1.nuanmb"), "a00wait1.nuanmb".to_owned())]),
+        );
+        assert_eq!(guessed.as_deref(), Some("wait1"), "no label yet");
+        let mut entries = [
+            entry("wait1", "wait"),
+            entry(&format!("{:#018x}", hash40("attack_11")), "attack_11"),
+            entry("attack_s4_s_reverse", "attack_s4_s_reverse"),
+            entry("specialnshoot", "special_n_shoot_fire"),
+        ];
+        let labels = ["wait", "attack_11"].map(|name| (hash40(name), name.to_owned()));
+        assert_eq!(resolve_late_names(&mut entries, &labels.into()), 2);
+        assert_eq!(
+            entries.each_ref().map(|entry| entry.name.as_str()),
+            ["wait", "attack_11", "attack_s4_s_reverse", "specialnshoot"],
+            "a name no label has stays"
+        );
+    }
 
     /// Shy Guy's reverse fsmash: a motion no name rule can map to its scripts.
     #[test]

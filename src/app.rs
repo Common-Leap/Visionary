@@ -13615,7 +13615,6 @@ impl VisionaryApp {
     ) {
         let drawn = egui::Area::new(egui::Id::unique("effect_view_switch"))
             .fixed_pos(at)
-            .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 let frame = egui::Frame::popup(ui.style());
                 // A long move name is cut short rather than running off a narrow view.
@@ -13673,7 +13672,6 @@ impl VisionaryApp {
         let before = self.preview_stage.clone();
         let drawn = egui::Area::new(egui::Id::unique("preview_stage_picker"))
             .fixed_pos(at)
-            .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::ComboBox::from_id_salt("preview_stage_combo")
                     .selected_text(current)
@@ -23856,13 +23854,21 @@ impl VisionaryApp {
     /// "Vision c08–c15", "Mario c00–c07": who is open and which costumes it covers.
     fn character_chip_text(&self) -> Option<String> {
         let key = self.active_key()?;
-        let slots = if key.is_made() {
+        // A mod's character on the fighter's costumes is itself, not the fighter.
+        let open = self.state.selected_fighter;
+        let own_row = open
+            .and_then(|index| self.state.fighters.get(index))
+            .filter(|row| row.custom_name.is_some() && !key.is_made());
+        let slots = if let Some(row) = own_row {
+            row.slots.clone()
+        } else if key.is_made() {
             key.made_slots(&self.roster.project)
         } else {
             let fighter = self.fighter_row(key.engine_fighter())?;
             crate::character::base_costumes(&fighter.name, &fighter.slots, &self.roster.project)
         };
-        let name = self.character_name(&key);
+        let name =
+            own_row.map_or_else(|| self.character_name(&key), |row| row.display_name.clone());
         Some(match crate::character::slot_range(&slots) {
             Some(range) => format!("{name} {range}"),
             None => name,
@@ -40020,7 +40026,7 @@ impl eframe::App for VisionaryApp {
             if let Ok(mut moves) = rx.try_recv() {
                 // The worker holds a label snapshot from when it started. Labels may have
                 // arrived while it was scanning, so resolve against the current map too.
-                crate::data::resolve_move_entry_names(&mut moves, &self.state.labels);
+                crate::motion_scripts::resolve_late_names(&mut moves, &self.state.labels);
                 let count = moves.len();
                 if let Some(kind) = self.current_fighter_kind() {
                     self.capture_motion_names.extend(
@@ -41229,12 +41235,12 @@ Click to see the code, or link your own project"
                         self.downloaded_labels = labels;
                         // A cached/downloaded label map can arrive after the motion list.
                         // Refresh placeholders in place without reloading or discarding edits.
-                        crate::data::resolve_move_entry_names(
+                        crate::motion_scripts::resolve_late_names(
                             &mut self.move_list,
                             &self.state.labels,
                         );
                         if let Some(entry) = self.state.selected_move.as_mut() {
-                            crate::data::resolve_move_entry_names(
+                            crate::motion_scripts::resolve_late_names(
                                 std::slice::from_mut(entry),
                                 &self.state.labels,
                             );
