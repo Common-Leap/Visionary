@@ -277,6 +277,18 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
     // put all 39 of Kirby's models in a carrier that referenced 2 of them, and there is no way
     // to strip a pool without rebuilding it.
 
+    // Edited emitter lists, retargeted onto the carrier's copies, before anything is pruned: a
+    // part added from another effect or file brings its textures, models and shaders with it,
+    // and the prune and compaction below must see it to keep them.
+    let absent = apply_carrier_rosters(
+        &mut carrier,
+        ops,
+        donor_root,
+        authored,
+        &mut donors,
+        warnings,
+    )?;
+
     let transplanted: Vec<&str> = plan
         .iter()
         .map(|(op, _)| op.new_entry_name.as_str())
@@ -337,17 +349,15 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
                 warnings.push(format!("edit:{}", entry.set_name));
                 continue;
             };
-            if let Some(roster) = &entry.roster {
-                let mut roster = roster.clone();
-                roster.set_name = entry.set_name.clone();
-                roster.set_idx = idx;
-                if let Err(err) = apply_roster(ptcl, &roster) {
-                    // Same rule as a missing edit target: one bad roster must not take down
-                    // every other transplant in the same snapshot.
-                    warnings.push(format!("emitters:{}: {err}", entry.set_name));
-                }
-            }
             for edit in &entry.edits {
+                // An edit of a part that is not here would fall to whichever part is at its
+                // place.
+                let gone = absent.iter().any(|(set, part)| {
+                    set.eq_ignore_ascii_case(&entry.set_name) && *part == edit.emitter_name
+                });
+                if gone {
+                    continue;
+                }
                 // Retarget the edit at the carrier's copy: the editor authored it against the
                 // FIGHTER's eff, where the set sits at a different index under its original
                 // name. `apply_authored` resolves strictly by (name, index), so both must be
@@ -366,6 +376,80 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
 
     let bytes = save_keeping_source(carrier_bytes, &mut carrier)?;
     refuse_invalid(bytes, "live carrier")
+}
+
+/// Apply each authored entry's edited emitter list to the carrier's copy of that entry.
+///
+/// A roster was authored against the fighter's own file, where the set has another index under
+/// its original name, so each is retargeted onto the carrier's set first. Its file is the file
+/// the carrier copied the entry from (the transplant op whose entry this is): parts it adds from
+/// another of that file's effects, or from another file, are read from there.
+///
+/// Returns the (set, part) names of the parts that were not found, whose edits go with them.
+fn apply_carrier_rosters(
+    carrier: &mut effect_library::NamcoEffectFile,
+    ops: &[TransplantOp],
+    donor_root: &std::path::Path,
+    authored: &[CarrierAuthored],
+    donors: &mut Vec<(String, effect_library::NamcoEffectFile)>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(String, String)>> {
+    let mut retargeted: Vec<(crate::mod_project::EmitterRoster, Option<String>)> = Vec::new();
+    for entry in authored {
+        let Some(roster) = &entry.roster else {
+            continue;
+        };
+        let Some(idx) = carrier.ptcl_file.as_ref().and_then(|ptcl| {
+            ptcl.emitter_list
+                .emitter_sets
+                .iter()
+                .position(|s| s.name.eq_ignore_ascii_case(&entry.set_name))
+        }) else {
+            // Reported with the entry's edits below.
+            continue;
+        };
+        let mut roster = roster.clone();
+        roster.set_name = entry.set_name.clone();
+        roster.set_idx = idx;
+        let home = ops
+            .iter()
+            .find(|op| {
+                op.new_entry_name.eq_ignore_ascii_case(&entry.set_name)
+                    || op.src_set_name.eq_ignore_ascii_case(&entry.set_name)
+            })
+            .map(|op| op.src_file_rel.clone());
+        retargeted.push((roster, home));
+    }
+    if retargeted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let homes: Vec<(&crate::mod_project::EmitterRoster, Option<&str>)> = retargeted
+        .iter()
+        // With no op to name its file, a home-file part has nowhere to come from: an empty
+        // name resolves nothing, and the slot is reported and dropped.
+        .map(|(roster, home)| (roster, Some(home.as_deref().unwrap_or(""))))
+        .collect();
+    let mut missing = Vec::new();
+    let foreign = graft_foreign_parts(carrier, "", &homes, Some(donor_root), donors, &mut missing)?;
+    let ptcl = carrier
+        .ptcl_file
+        .as_mut()
+        .context("carrier has no ptcl section — cannot apply emitter lists")?;
+    for ((roster, _), parts) in retargeted.iter().zip(&foreign) {
+        if let Err(err) = apply_roster(ptcl, roster, parts) {
+            // Same rule as a missing edit target: one bad roster must not take down every
+            // other transplant in the same snapshot.
+            warnings.push(format!("emitters:{}: {err}", roster.set_name));
+        }
+    }
+    Ok(missing
+        .into_iter()
+        .map(|part| {
+            let set = retargeted[part.roster].0.set_name.clone();
+            warnings.push(format!("emitters:{set}: {} was not found", part.from));
+            (set, part.name)
+        })
+        .collect())
 }
 
 /// Every texture GUID some surviving emitter samples.
@@ -1316,6 +1400,42 @@ fn rebuild_eff_bytes_filtered(
             )?;
         }
     }
+    // Emitter lists next: they decide which emitters EXIST, so they go before the authored
+    // edits that address the survivors by name and index (the other order would edit emitters
+    // the roster is about to drop and miss the copies it is about to add). And before the pools
+    // are narrowed below: a part added from another effect or file brings its textures, models
+    // and shaders in here, and the narrowing has to see it to keep them.
+    let mut warnings = Vec::new();
+    {
+        let homes: Vec<(&crate::mod_project::EmitterRoster, Option<&str>)> =
+            eff.rosters.iter().map(|roster| (roster, None)).collect();
+        let mut missing = Vec::new();
+        let foreign = graft_foreign_parts(
+            &mut namco,
+            &eff.source_rel,
+            &homes,
+            donor_root,
+            &mut Vec::new(),
+            &mut missing,
+        )?;
+        // Not left out quietly: the mod would ship without a part its author added, and the
+        // edits of that part, which name it, would land on whichever sits at its place.
+        if let Some(part) = missing.first() {
+            anyhow::bail!(
+                "part '{}' of '{}' is a copy of {}, which was not found",
+                part.name,
+                eff.rosters[part.roster].entry_name,
+                part.from
+            );
+        }
+        let ptcl = namco
+            .ptcl_file
+            .as_mut()
+            .ok_or_else(|| anyhow!("source .eff has no embedded PTCL"))?;
+        for (roster, parts) in eff.rosters.iter().zip(&foreign) {
+            apply_roster(ptcl, roster, parts)?;
+        }
+    }
     // Strip the shader library down to what this file addresses, the same way the carrier does.
     // Cross-file transplants merge in each donor's ENTIRE BNSH — Pickel ships 370 variations and
     // one transplanted effect uses twelve — so without this a single transplant makes the
@@ -1342,19 +1462,12 @@ fn rebuild_eff_bytes_filtered(
     //
     // Warnings go to stderr rather than a channel: the export UI reports the file it wrote, and
     // anything dropped here has already been surfaced by the live carrier build.
-    let mut warnings = Vec::new();
     apply_texture_additions(&mut namco, &eff.textures_added, &mut warnings)?;
     {
         let ptcl = namco
             .ptcl_file
             .as_mut()
             .ok_or_else(|| anyhow!("source .eff has no embedded PTCL"))?;
-        // Emitter lists first: they decide which emitters EXIST, and an authored edit addresses
-        // one of the survivors by name and index. The other order would apply edits to emitters
-        // the roster is about to drop, and miss the duplicates it is about to add.
-        for roster in &eff.rosters {
-            apply_roster(ptcl, roster)?;
-        }
         for edit in &eff.authored {
             apply_authored(ptcl, edit)?;
         }
@@ -1613,13 +1726,143 @@ fn apply_transplant_cross_file(
         }
     }
 
+    let emitter_lists: Vec<&[effect_library::structs::Emitter]> = donor_sets
+        .iter()
+        .map(|set| set.emitters.as_slice())
+        .collect();
+    let bases = merge_donor_resources(
+        namco,
+        donor,
+        &emitter_lists,
+        shader_strategy,
+        &op.new_entry_name,
+    )?;
+    let remap = |set: &mut effect_library::structs::EmitterSet| {
+        relocate_donor_shaders(&mut set.emitters, bases);
+    };
+    // LIVE REPLACE-IN-PLACE: replacing a single-set target with a single-set donor overwrites
+    // the target entry's OWN emitter set in place — the entry name + set index are unchanged,
+    // so `req(name)` (already registered at fighter-load) keeps resolving and a mid-match
+    // reparse rebuilds that set with the donor's content → renders LIVE with NO re-entry and
+    // no new-kind registration (the wall that makes appended `_os` entries NOT-FOUND live).
+    if let Some(target) = &op.replace_entry {
+        if donor_entry.variant_count == 0 {
+            let ti = namco
+                .entry_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(target))
+                .ok_or_else(|| anyhow!("replace target entry '{target}' not found in this eff"))?;
+            let tgt = &namco.entries[ti];
+            if tgt.variant_count == 0 {
+                let tset = (tgt.emitter_set_id as usize)
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("replace target '{target}' has no emitter set"))?;
+                let mut donor_set = donor_sets.into_iter().next().unwrap();
+                remap(&mut donor_set);
+                let dest_ptcl = namco.ptcl_file.as_mut().unwrap();
+                let sets = &mut dest_ptcl.emitter_list.emitter_sets;
+                let keep_name = sets
+                    .get(tset)
+                    .map(|s| s.name.clone())
+                    .ok_or_else(|| anyhow!("replace target set {tset} out of range"))?;
+                donor_set.name = keep_name; // keep the target set's name; only its content changes
+                sets[tset] = donor_set;
+                return Ok(());
+            }
+        }
+        // Fall through to append for multi-variant targets/donors (registration caveat applies).
+    }
+
+    // Append path (new named entry). NOTE: an APPENDED entry does NOT register as a spawnable
+    // kind mid-match (`req` NOT-FOUND) — it only becomes visible on a fresh fighter load. For
+    // live cross-fighter, prefer replace-in-place above.
+    let dest_ptcl = namco.ptcl_file.as_mut().unwrap();
+    let sets = &mut dest_ptcl.emitter_list.emitter_sets;
+    let mut new_set_ids: Vec<u32> = Vec::new();
+    for mut set in donor_sets {
+        set.name = op.new_entry_name.clone();
+        remap(&mut set);
+        sets.push(set);
+        new_set_ids.push(sets.len() as u32); // raw 1-based handle
+    }
+
+    let mut new_entry = donor_entry;
+    // External models are referenced through parallel name/flag tables. Transfer the selected
+    // row and repoint the cloned entry; retaining the donor's numeric handle would index an
+    // unrelated row in the carrier, while dropping it made model edits export-only.
+    new_entry.external_model_idx = (new_entry.external_model_idx as usize)
+        .checked_sub(1)
+        .and_then(|index| {
+            let name = donor.external_model_names.get(index)?.clone();
+            let flag = donor.effect_models.get(index).copied().unwrap_or(0);
+            let dest = namco
+                .external_model_names
+                .iter()
+                .zip(&namco.effect_models)
+                .position(|(n, f)| *n == name && *f == flag)
+                .unwrap_or_else(|| {
+                    namco.external_model_names.push(name);
+                    namco.effect_models.push(flag);
+                    namco.external_model_names.len() - 1
+                });
+            Some(dest as u32 + 1)
+        })
+        .unwrap_or(0);
+    // Non-fighter donors (assists/items — e.g. ef_alucard) commonly use type 0 in the
+    // kind u16's high byte. A FIGHTER destination needs 0x01xx: the fighter spawn path
+    // rejects type-0 entries. An assist-owned carrier needs the inverse normalization:
+    // fighter-type 0x01xx entries are not registered by the assist loader.
+    new_entry.kind = destination_entry_kind(new_entry.kind, destination_is_fighter);
+    if new_entry.variant_count == 0 {
+        new_entry.emitter_set_id = new_set_ids[primary_set_pos.unwrap_or(0)];
+    } else {
+        new_entry.emitter_set_id = primary_set_pos
+            .map(|position| new_set_ids[position])
+            .unwrap_or(0);
+        let new_start = namco.effect_variants.len() as u16 + 1; // raw 1-based
+        for ((frame, set_id), bone) in variant_frames
+            .iter()
+            .zip(&new_set_ids[variant_set_start..])
+            .zip(&variant_bones)
+        {
+            namco
+                .effect_variants
+                .push(effect_library::namco_file::EffectVariant {
+                    start_frame: *frame,
+                    emitter_set_id: *set_id as u16,
+                });
+            namco.external_bone_names.push(bone.clone());
+        }
+        new_entry.variant_start_idx = new_start;
+    }
+    finish_transplant_entry(namco, op, new_entry)
+}
+
+/// Bring into `namco` everything the donor emitters in `emitter_lists` need from `donor`: the
+/// models and textures they name by GUID, and the shader containers they index. Returns the
+/// bases the donor's standard and compute variations landed on, for
+/// [`relocate_donor_shaders`]. `label` names what is being brought in, for errors.
+///
+/// One path for every way a part reaches another file: a transplanted effect, and a single part
+/// added to an effect from another file (`graft_foreign_parts`).
+fn merge_donor_resources(
+    namco: &mut effect_library::NamcoEffectFile,
+    donor: &effect_library::NamcoEffectFile,
+    emitter_lists: &[&[effect_library::structs::Emitter]],
+    shader_strategy: ShaderStrategy,
+    label: &str,
+) -> Result<(i32, i32)> {
+    let donor_ptcl = donor
+        .ptcl_file
+        .as_ref()
+        .ok_or_else(|| anyhow!("donor eff has no embedded PTCL"))?;
     // Collect the resources the donor emitters reference.
     let mut tex_ids: Vec<u64> = Vec::new();
     let mut uses_shader = false;
     let mut uses_compute = false;
     let mut prim_ids: Vec<u64> = Vec::new();
-    for set in &donor_sets {
-        visit_emitters_ref(&set.emitters, &mut |em| {
+    for emitters in emitter_lists {
+        visit_emitters_ref(emitters, &mut |em| {
             let d = &em.data;
             append_unique_resource_ids(
                 &mut tex_ids,
@@ -1733,7 +1976,7 @@ fn apply_transplant_cross_file(
                 anyhow::bail!(
                     "transplant '{}': donor primitive model name collides with the target's \
                      (PRMA merge would desync) — not merged",
-                    op.new_entry_name
+                    label
                 );
             }
             dest_prim.binary_data = Some(merged);
@@ -1768,28 +2011,16 @@ fn apply_transplant_cross_file(
                 .binary_data
                 .as_ref()
                 .ok_or_else(|| anyhow!("donor texture section has no binary"))?;
-            // bntx extraction is file-path based — round-trip through the scratch dir.
-            let tmp = crate::scratch_dirs::app_scratch_dir("transplant-tex")?;
-            let path = tmp.path().join(format!("{name}.bntx"));
-            effect_library::bntx::export_single_texture(donor_bin, idx, &name, &path)
-                .with_context(|| format!("extracting donor texture '{name}'"))?;
-            new_blobs.push(std::fs::read(&path)?);
+            new_blobs.push(extract_pool_texture(donor_bin, idx, &name)?);
             dest_tex
                 .descriptors
                 .push(effect_library::ptcl_file::TextureDescriptor { id: *id, name });
         }
         if !new_blobs.is_empty() {
-            let mut files: Vec<Vec<u8>> = Vec::with_capacity(new_blobs.len() + 1);
-            if let Some(existing) = dest_tex.binary_data.as_ref().filter(|b| !b.is_empty()) {
-                files.push(existing.clone());
-            }
-            files.extend(new_blobs);
-            dest_tex.binary_data = Some(if files.len() == 1 {
-                files.pop().unwrap()
-            } else {
-                effect_library::bntx::merge_texture_files(&files)
-                    .context("merging donor textures into the target BNTX")?
-            });
+            dest_tex.binary_data = Some(merge_pool_textures(
+                dest_tex.binary_data.as_deref(),
+                new_blobs,
+            )?);
         }
     }
 
@@ -1851,6 +2082,9 @@ fn apply_transplant_cross_file(
                 ShaderStrategy::Merge => {
                     if dest_bin.is_empty() {
                         dest_shader.compute_binary = Some(donor_bin.clone());
+                    } else if dest_bin == *donor_bin {
+                        // The engine-global container most files ship byte for byte: the
+                        // donor's indices already address the destination's own variations.
                     } else {
                         compute_index_base = effect_library::bnsh::BnshFile::read(&dest_bin)
                             .context("reading destination compute-shader variations")?
@@ -1869,124 +2103,57 @@ fn apply_transplant_cross_file(
         }
     }
 
-    // Shader-remap the donor emitters (shaders are index-referenced; textures/primitives are
-    // GUID-referenced against the merged pools, so they need no remap).
-    let remap = |set: &mut effect_library::structs::EmitterSet| {
-        visit_emitters(&mut set.emitters, &mut 0, &mut |_, em| {
-            let s = &mut em.data.shader_references;
-            remap_shader_indices(
-                &mut s.shader_index,
-                &mut s.user_shader_index1,
-                &mut s.user_shader_index2,
-                &mut s.compute_shader_index,
-                shader_index_base,
-                compute_index_base,
-            );
-            // `custom_shader_index` is NOT an index into the BNSH variation array. Its values
-            // are small custom-shader modes (typically 0, 4, or 8) shared by emitters whose
-            // real `shader_index` spans the whole file. Relocating it by the destination's
-            // variation count makes otherwise valid effects invisible (Daisy's petals exposed
-            // this by changing mode 0 into the invalid value 38 in the Bomberman carrier).
-            em.cached_binary = None; // indices moved → cached EMTR blob is stale
-        });
-    };
+    Ok((shader_index_base, compute_index_base))
+}
 
-    // LIVE REPLACE-IN-PLACE: replacing a single-set target with a single-set donor overwrites
-    // the target entry's OWN emitter set in place — the entry name + set index are unchanged,
-    // so `req(name)` (already registered at fighter-load) keeps resolving and a mid-match
-    // reparse rebuilds that set with the donor's content → renders LIVE with NO re-entry and
-    // no new-kind registration (the wall that makes appended `_os` entries NOT-FOUND live).
-    if let Some(target) = &op.replace_entry {
-        if donor_entry.variant_count == 0 {
-            let ti = namco
-                .entry_names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(target))
-                .ok_or_else(|| anyhow!("replace target entry '{target}' not found in this eff"))?;
-            let tgt = &namco.entries[ti];
-            if tgt.variant_count == 0 {
-                let tset = (tgt.emitter_set_id as usize)
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow!("replace target '{target}' has no emitter set"))?;
-                let mut donor_set = donor_sets.into_iter().next().unwrap();
-                remap(&mut donor_set);
-                let dest_ptcl = namco.ptcl_file.as_mut().unwrap();
-                let sets = &mut dest_ptcl.emitter_list.emitter_sets;
-                let keep_name = sets
-                    .get(tset)
-                    .map(|s| s.name.clone())
-                    .ok_or_else(|| anyhow!("replace target set {tset} out of range"))?;
-                donor_set.name = keep_name; // keep the target set's name; only its content changes
-                sets[tset] = donor_set;
-                return Ok(());
-            }
-        }
-        // Fall through to append for multi-variant targets/donors (registration caveat applies).
-    }
+/// Move donor emitters' shader indices onto the bases their containers landed on. Shaders are
+/// index-referenced; textures and models are GUID-referenced against the merged pools, so they
+/// need no remap.
+fn relocate_donor_shaders(
+    emitters: &mut [effect_library::structs::Emitter],
+    (shader_index_base, compute_index_base): (i32, i32),
+) {
+    visit_emitters(emitters, &mut 0, &mut |_, em| {
+        let s = &mut em.data.shader_references;
+        remap_shader_indices(
+            &mut s.shader_index,
+            &mut s.user_shader_index1,
+            &mut s.user_shader_index2,
+            &mut s.compute_shader_index,
+            shader_index_base,
+            compute_index_base,
+        );
+        // `custom_shader_index` is NOT an index into the BNSH variation array. Its values
+        // are small custom-shader modes (typically 0, 4, or 8) shared by emitters whose
+        // real `shader_index` spans the whole file. Relocating it by the destination's
+        // variation count makes otherwise valid effects invisible (Daisy's petals exposed
+        // this by changing mode 0 into the invalid value 38 in the Bomberman carrier).
+        em.cached_binary = None; // indices moved → cached EMTR blob is stale
+    });
+}
 
-    // Append path (new named entry). NOTE: an APPENDED entry does NOT register as a spawnable
-    // kind mid-match (`req` NOT-FOUND) — it only becomes visible on a fresh fighter load. For
-    // live cross-fighter, prefer replace-in-place above.
-    let dest_ptcl = namco.ptcl_file.as_mut().unwrap();
-    let sets = &mut dest_ptcl.emitter_list.emitter_sets;
-    let mut new_set_ids: Vec<u32> = Vec::new();
-    for mut set in donor_sets {
-        set.name = op.new_entry_name.clone();
-        remap(&mut set);
-        sets.push(set);
-        new_set_ids.push(sets.len() as u32); // raw 1-based handle
-    }
+/// Texture `index` of `pool` (named `name`), alone, as a BNTX to merge into another pool.
+pub fn extract_pool_texture(pool: &[u8], index: usize, name: &str) -> Result<Vec<u8>> {
+    // bntx extraction is file-path based — round-trip through the scratch dir.
+    let tmp = crate::scratch_dirs::app_scratch_dir("transplant-tex")?;
+    let path = tmp.path().join(format!("{name}.bntx"));
+    effect_library::bntx::export_single_texture(pool, index, name, &path)
+        .with_context(|| format!("extracting donor texture '{name}'"))?;
+    Ok(std::fs::read(&path)?)
+}
 
-    let mut new_entry = donor_entry;
-    // External models are referenced through parallel name/flag tables. Transfer the selected
-    // row and repoint the cloned entry; retaining the donor's numeric handle would index an
-    // unrelated row in the carrier, while dropping it made model edits export-only.
-    new_entry.external_model_idx = (new_entry.external_model_idx as usize)
-        .checked_sub(1)
-        .and_then(|index| {
-            let name = donor.external_model_names.get(index)?.clone();
-            let flag = donor.effect_models.get(index).copied().unwrap_or(0);
-            let dest = namco
-                .external_model_names
-                .iter()
-                .zip(&namco.effect_models)
-                .position(|(n, f)| *n == name && *f == flag)
-                .unwrap_or_else(|| {
-                    namco.external_model_names.push(name);
-                    namco.effect_models.push(flag);
-                    namco.external_model_names.len() - 1
-                });
-            Some(dest as u32 + 1)
-        })
-        .unwrap_or(0);
-    // Non-fighter donors (assists/items — e.g. ef_alucard) commonly use type 0 in the
-    // kind u16's high byte. A FIGHTER destination needs 0x01xx: the fighter spawn path
-    // rejects type-0 entries. An assist-owned carrier needs the inverse normalization:
-    // fighter-type 0x01xx entries are not registered by the assist loader.
-    new_entry.kind = destination_entry_kind(new_entry.kind, destination_is_fighter);
-    if new_entry.variant_count == 0 {
-        new_entry.emitter_set_id = new_set_ids[primary_set_pos.unwrap_or(0)];
-    } else {
-        new_entry.emitter_set_id = primary_set_pos
-            .map(|position| new_set_ids[position])
-            .unwrap_or(0);
-        let new_start = namco.effect_variants.len() as u16 + 1; // raw 1-based
-        for ((frame, set_id), bone) in variant_frames
-            .iter()
-            .zip(&new_set_ids[variant_set_start..])
-            .zip(&variant_bones)
-        {
-            namco
-                .effect_variants
-                .push(effect_library::namco_file::EffectVariant {
-                    start_frame: *frame,
-                    emitter_set_id: *set_id as u16,
-                });
-            namco.external_bone_names.push(bone.clone());
-        }
-        new_entry.variant_start_idx = new_start;
+/// `pool` with the single-texture BNTXs in `blobs` appended, in order.
+pub fn merge_pool_textures(pool: Option<&[u8]>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    let mut files: Vec<Vec<u8>> = Vec::with_capacity(blobs.len() + 1);
+    if let Some(existing) = pool.filter(|b| !b.is_empty()) {
+        files.push(existing.to_vec());
     }
-    finish_transplant_entry(namco, op, new_entry)
+    files.extend(blobs);
+    if files.len() <= 1 {
+        return Ok(files.pop().unwrap_or_default());
+    }
+    effect_library::bntx::merge_texture_files(&files)
+        .context("merging donor textures into the target BNTX")
 }
 
 fn destination_entry_kind(kind: u16, destination_is_fighter: bool) -> u16 {
@@ -2304,6 +2471,177 @@ fn apply_fields(em: &mut effect_library::structs::Emitter, f: &EmitterFieldEdits
     em.cached_binary = None;
 }
 
+/// The parts each roster adds from another effect or file, made at home in `namco`: indexed like
+/// the rosters and their slots, `None` for a slot that clones from its own set or could not be
+/// found ([`MissingPart`]).
+type ForeignParts = Vec<Vec<Option<effect_library::structs::Emitter>>>;
+
+/// A part a roster adds from elsewhere that is not there to copy.
+struct MissingPart {
+    /// The roster's place in the list, and the part's name in it.
+    roster: usize,
+    name: String,
+    /// What it was and where it was looked for.
+    from: String,
+}
+
+/// Resolve every slot that copies a part from another effect or file, and bring what those parts
+/// need into `namco` — textures and models by GUID, shader containers by index — through the
+/// same merge a transplant uses.
+///
+/// A slot naming `own_rel` (the file `namco` is, in an export; empty for the carrier, which is no
+/// file a part is saved from) takes its part from `namco` itself.
+///
+/// `homes` pairs each roster with the file it was authored against: `None` when that is `namco`
+/// itself (an export of the file), `Some(rel)` when `namco` is somewhere else (the live carrier,
+/// which holds a copy of the effect). Files are read from `donor_root` once each, through
+/// `donors` (lowercase rel to parsed file), which the caller may have filled already.
+///
+/// Every source is resolved before any roster is applied, so a part copied from an effect whose
+/// own list is also being edited is the file's part, as the editor showed it.
+fn graft_foreign_parts(
+    namco: &mut effect_library::NamcoEffectFile,
+    own_rel: &str,
+    homes: &[(&crate::mod_project::EmitterRoster, Option<&str>)],
+    donor_root: Option<&std::path::Path>,
+    donors: &mut Vec<(String, effect_library::NamcoEffectFile)>,
+    missing: &mut Vec<MissingPart>,
+) -> Result<ForeignParts> {
+    let mut out: ForeignParts = homes
+        .iter()
+        .map(|(roster, _)| vec![None; roster.slots.len()])
+        .collect();
+    /// The parts taken from one file (None for `namco` itself), by (roster, slot).
+    type Taken = (
+        Option<String>,
+        Vec<(usize, usize, effect_library::structs::Emitter)>,
+    );
+    let mut taken: Vec<Taken> = Vec::new();
+    for (r, (roster, home)) in homes.iter().enumerate() {
+        for (k, slot) in roster.slots.iter().enumerate() {
+            if !slot.is_foreign() {
+                continue;
+            }
+            let own = !own_rel.is_empty()
+                && slot
+                    .source_file
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&own_rel.replace('\\', "/"));
+            let file = if own {
+                None
+            } else if slot.source_file.is_empty() {
+                home.map(str::to_owned)
+            } else {
+                Some(slot.source_file.clone())
+            };
+            let key = file.as_ref().map(|f| f.replace('\\', "/").to_lowercase());
+            let donor = match &key {
+                None => Some(&*namco),
+                Some(key) => {
+                    if !donors.iter().any(|(k, _)| k == key) {
+                        let loaded = donor_root
+                            .map(|root| root.join(file.as_deref().unwrap_or_default()))
+                            .and_then(|path| std::fs::read(path).ok())
+                            .and_then(|bytes| effect_library::NamcoEffectFile::load(&bytes).ok());
+                        if let Some(loaded) = loaded {
+                            donors.push((key.clone(), loaded));
+                        }
+                    }
+                    donors.iter().find(|(k, _)| k == key).map(|(_, d)| d)
+                }
+            };
+            let found = donor.and_then(|donor| foreign_part(donor, slot));
+            let Some(emitter) = found else {
+                missing.push(MissingPart {
+                    roster: r,
+                    name: slot.name.clone(),
+                    from: format!(
+                        "{} of {} in {}",
+                        slot.source_name,
+                        slot.source_set,
+                        file.as_deref().unwrap_or(own_rel)
+                    ),
+                });
+                continue;
+            };
+            match taken.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, parts)) => parts.push((r, k, emitter)),
+                None => taken.push((key, vec![(r, k, emitter)])),
+            }
+        }
+    }
+    for (key, parts) in taken {
+        let mut emitters: Vec<effect_library::structs::Emitter> =
+            parts.iter().map(|(_, _, em)| em.clone()).collect();
+        if let Some(key) = &key {
+            let donor = &donors
+                .iter()
+                .find(|(k, _)| k == key)
+                .expect("every donor a part was taken from was loaded")
+                .1;
+            let label = format!("parts added from '{key}'");
+            let bases = merge_donor_resources(
+                namco,
+                donor,
+                &[emitters.as_slice()],
+                ShaderStrategy::Merge,
+                &label,
+            )?;
+            relocate_donor_shaders(&mut emitters, bases);
+        }
+        for ((r, k, _), emitter) in parts.into_iter().zip(emitters) {
+            out[r][k] = Some(emitter);
+        }
+    }
+    Ok(out)
+}
+
+/// The part `slot` copies, out of `donor`: found in its set by the stored name at the stored
+/// index, then the name anywhere, then the bare index only when no name was stored. A part from
+/// another file that no longer has that name is not swapped for whatever sits at its index. It
+/// comes alone, without parts made from it.
+fn foreign_part(
+    donor: &effect_library::NamcoEffectFile,
+    slot: &crate::mod_project::EmitterSlot,
+) -> Option<effect_library::structs::Emitter> {
+    let sets = &donor.ptcl_file.as_ref()?.emitter_list.emitter_sets;
+    let set = sets
+        .iter()
+        .find(|s| s.name == slot.source_set)
+        .or_else(|| {
+            sets.iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&slot.source_set))
+        })?;
+    let mut flat: Vec<&effect_library::structs::Emitter> = Vec::new();
+    fn flatten<'a>(
+        src: &'a [effect_library::structs::Emitter],
+        out: &mut Vec<&'a effect_library::structs::Emitter>,
+    ) {
+        for em in src {
+            out.push(em);
+            flatten(&em.children, out);
+        }
+    }
+    flatten(&set.emitters, &mut flat);
+    let named = |i: usize| {
+        !slot.source_name.is_empty()
+            && flat.get(i).map(|em| em.data.display_name()) == Some(slot.source_name.clone())
+    };
+    let at = if named(slot.source_idx) {
+        slot.source_idx
+    } else {
+        (0..flat.len())
+            .find(|i| named(*i))
+            .or(
+                (slot.source_idx < flat.len() && slot.source_name.is_empty())
+                    .then_some(slot.source_idx),
+            )?
+    };
+    let mut part = flat.get(at).map(|em| (*em).clone())?;
+    part.children = Vec::new();
+    Some(part)
+}
+
 /// Rebuild one emitter set's emitter list from a roster: which emitters play, in what order,
 /// nested how.
 ///
@@ -2314,9 +2652,14 @@ fn apply_fields(em: &mut effect_library::structs::Emitter, f: &EmitterFieldEdits
 /// Children are re-parented by depth rather than kept with their original parent: the editor
 /// presents the set as a flat, parent-first list, and that is the only ordering an edit can be
 /// expressed against.
+///
+/// A slot that copies a part from another effect or file takes it from `foreign`, which
+/// [`graft_foreign_parts`] has already made at home in this file; one it could not resolve is
+/// dropped like a missing source.
 fn apply_roster(
     ptcl: &mut effect_library::PtclFile,
     roster: &crate::mod_project::EmitterRoster,
+    foreign: &[Option<effect_library::structs::Emitter>],
 ) -> Result<()> {
     let sets = &mut ptcl.emitter_list.emitter_sets;
     let set_named = |s: &effect_library::structs::EmitterSet| {
@@ -2354,7 +2697,19 @@ fn apply_roster(
     let names: Vec<String> = flat.iter().map(|em| em.data.display_name()).collect();
     let mut built: Vec<effect_library::structs::Emitter> = Vec::new();
     let mut depths: Vec<u8> = Vec::new();
-    for slot in &roster.slots {
+    for (slot_idx, slot) in roster.slots.iter().enumerate() {
+        if slot.is_foreign() {
+            // One that was not found is dropped here; its caller reported it: [`MissingPart`].
+            if let Some(mut emitter) = foreign.get(slot_idx).cloned().flatten() {
+                if !slot.name.is_empty() {
+                    set_emitter_name(&mut emitter.data, &slot.name);
+                    emitter.cached_binary = None;
+                }
+                built.push(emitter);
+                depths.push(slot.depth);
+            }
+            continue;
+        }
         // Same resolution rule as an authored edit: the stored name at the stored index wins
         // outright, then the name anywhere, then the bare index.
         let named =
@@ -4483,6 +4838,7 @@ mod tests {
             source_name: names[idx].clone(),
             name: name.to_string(),
             depth: 0,
+            ..Default::default()
         };
         let eff = crate::mod_project::EffMod {
             source_rel: SRC.to_string(),
@@ -6660,5 +7016,439 @@ mod tests {
                 "{rel}: the rebuilt file is missing a section the game ships"
             );
         }
+    }
+
+    /// The set `entry` plays in `file`, and its parts' names, flat and parent-first.
+    fn entry_set(file: &effect_library::NamcoEffectFile, entry: &str) -> (usize, Vec<String>) {
+        let at = file
+            .entry_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(entry))
+            .unwrap_or_else(|| panic!("{entry}"));
+        let set = file.entries[at].emitter_set_id as usize - 1;
+        let mut names = Vec::new();
+        super::visit_emitters_ref(
+            &file.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[set].emitters,
+            &mut |em| names.push(em.data.display_name()),
+        );
+        (set, names)
+    }
+
+    /// A roster for `entry`'s set keeping every part, plus the slots in `added` after the first.
+    fn roster_adding(
+        file: &effect_library::NamcoEffectFile,
+        entry: &str,
+        added: Vec<crate::mod_project::EmitterSlot>,
+    ) -> crate::mod_project::EmitterRoster {
+        let (set_idx, names) = entry_set(file, entry);
+        let mut slots: Vec<crate::mod_project::EmitterSlot> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| crate::mod_project::EmitterSlot {
+                source_idx: i,
+                source_name: name.clone(),
+                name: name.clone(),
+                ..Default::default()
+            })
+            .collect();
+        for (k, slot) in added.into_iter().enumerate() {
+            slots.insert(1 + k, slot);
+        }
+        crate::mod_project::EmitterRoster {
+            set_name: file.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[set_idx]
+                .name
+                .clone(),
+            entry_name: entry.into(),
+            set_idx,
+            slots,
+        }
+    }
+
+    /// The emitter named `name` in `entry`'s set, with the name of the texture it samples first
+    /// and the parent it is made from, if any.
+    fn shipped_part(
+        file: &effect_library::NamcoEffectFile,
+        set_name: &str,
+        name: &str,
+    ) -> Option<(String, Option<String>)> {
+        let ptcl = file.ptcl_file.as_ref()?;
+        let set = ptcl
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(set_name))?;
+        let texture = |em: &effect_library::structs::Emitter| {
+            let id = em.data.sampler0.as_ref().map(|s| s.texture_id)?;
+            ptcl.texture_info
+                .as_ref()?
+                .descriptors
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.name.clone())
+        };
+        for root in &set.emitters {
+            if root.data.display_name() == name {
+                return Some((texture(root).unwrap_or_default(), None));
+            }
+            for child in &root.children {
+                if child.data.display_name() == name {
+                    return Some((
+                        texture(child).unwrap_or_default(),
+                        Some(root.data.display_name()),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The program the part `name` of set `set_name` draws with, as its own file's container
+    /// holds it, and the models it names that the file has.
+    fn part_program(
+        file: &effect_library::NamcoEffectFile,
+        set_name: &str,
+        name: &str,
+    ) -> (String, Vec<u64>) {
+        let ptcl = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(set_name))
+            .unwrap_or_else(|| panic!("{set_name}"));
+        let mut found = None;
+        super::visit_emitters_ref(&set.emitters, &mut |em| {
+            if em.data.display_name() == name && found.is_none() {
+                found = Some(em.data.clone());
+            }
+        });
+        let data = found.unwrap_or_else(|| panic!("{name} in {set_name}"));
+        let bnsh = effect_library::bnsh::BnshFile::read(
+            ptcl.shader_info
+                .as_ref()
+                .unwrap()
+                .binary_data
+                .as_ref()
+                .unwrap(),
+        )
+        .expect("bnsh parses");
+        let index = data.shader_references.shader_index as usize;
+        let models = ptcl
+            .primitive_info
+            .as_ref()
+            .map(|p| p.descriptors.iter().map(|d| d.id).collect::<Vec<_>>())
+            .unwrap_or_default();
+        (
+            format!("{:?}", bnsh.variations[index].binary_program),
+            [
+                data.particle_data.primitive_id,
+                data.shape_info.primitive_index,
+            ]
+            .into_iter()
+            .filter(|id| models.contains(id))
+            .collect(),
+        )
+    }
+
+    const SHARED: &str = "effect/system/common/ef_common.eff";
+
+    /// A shared-file slot, as the editor saves a starter.
+    fn shared_slot(
+        set: &str,
+        part: &str,
+        index: usize,
+        name: &str,
+        depth: u8,
+    ) -> crate::mod_project::EmitterSlot {
+        crate::mod_project::EmitterSlot {
+            source_idx: index,
+            source_name: part.into(),
+            name: name.into(),
+            depth,
+            source_set: set.into(),
+            source_file: SHARED.into(),
+        }
+    }
+
+    /// Parts added to a fighter's effect from the shared file and from another of its own
+    /// effects export into a file that keeps every game-file rule, each with its texture, one of
+    /// them made from the first part. A slot whose source is gone refuses the export.
+    #[test]
+    fn parts_added_from_other_effects_export_with_their_textures() {
+        let Some(root) = effect_root() else {
+            return;
+        };
+        const SRC: &str = "effect/fighter/mario/ef_mario.eff";
+        let src = std::fs::read(root.join(SRC)).expect("Mario eff");
+        let file = effect_library::NamcoEffectFile::load(&src).expect("Mario parse");
+        let (_, own) = entry_set(&file, "mario_fb_shoot");
+        let (other_set, other) = entry_set(&file, "mario_fb_bound");
+        let other_set_name = file.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[other_set]
+            .name
+            .clone();
+        let had_texture = |name: &str| {
+            file.ptcl_file
+                .as_ref()
+                .unwrap()
+                .texture_info
+                .as_ref()
+                .unwrap()
+                .descriptors
+                .iter()
+                .any(|d| d.name == name)
+        };
+        // Mario's file has the glow's texture already and not the sparks'.
+        assert!(!had_texture("ef_cmn_line03") && had_texture("ef_cmn_flare01"));
+        let roster = roster_adding(
+            &file,
+            "mario_fb_shoot",
+            vec![
+                shared_slot("P_CmnMuzzleflash", "flare1", 6, "glow", 1),
+                shared_slot("P_CmnSlipSpark", "spark1", 1, "sparks", 0),
+                crate::mod_project::EmitterSlot {
+                    source_idx: 0,
+                    source_name: other[0].clone(),
+                    name: "bounce".into(),
+                    source_set: other_set_name.clone(),
+                    // Named as the editor names its own file.
+                    source_file: SRC.into(),
+                    ..Default::default()
+                },
+                shared_slot("P_CmnAttackLine", "cylinder1", 4, "tube", 0),
+            ],
+        );
+        let set_name = roster.set_name.clone();
+        let eff = crate::mod_project::EffMod {
+            source_rel: SRC.into(),
+            rosters: vec![roster],
+            ..Default::default()
+        };
+        let bytes = super::rebuild_eff_bytes(&src, &eff, Some(&root)).expect("export");
+        assert!(crate::eff_validate::problems(&bytes).is_empty());
+        let out = effect_library::NamcoEffectFile::load(&bytes).expect("re-read");
+        let (_, names) = entry_set(&out, "mario_fb_shoot");
+        assert_eq!(names.len(), own.len() + 4, "{names:?}");
+        assert_eq!(
+            shipped_part(&out, &set_name, "glow"),
+            Some(("ef_cmn_flare01".into(), Some(own[0].clone())))
+        );
+        assert_eq!(
+            shipped_part(&out, &set_name, "sparks"),
+            Some(("ef_cmn_line03".into(), None))
+        );
+        let (bounce_texture, _) = shipped_part(&out, &set_name, "bounce").expect("bounce");
+        assert!(had_texture(&bounce_texture), "{bounce_texture}");
+
+        // A part that is not where it was copied from: the export says which, and writes nothing.
+        let mut gone = eff.clone();
+        gone.rosters[0].slots[2].source_name = "no_such_part".into();
+        let error = super::rebuild_eff_bytes(&src, &gone, Some(&root)).expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("part 'sparks'")
+                && format!("{error:#}").contains("no_such_part of P_CmnSlipSpark"),
+            "{error:#}"
+        );
+        // Each draws with the program it had where it came from, the file's own parts too, and
+        // the tube's model came with it.
+        let shared =
+            effect_library::NamcoEffectFile::load(&std::fs::read(root.join(SHARED)).unwrap())
+                .expect("shared parse");
+        for (from, from_set, part, to) in [
+            (&shared, "P_CmnMuzzleflash", "flare1", "glow"),
+            (&shared, "P_CmnSlipSpark", "spark1", "sparks"),
+            (&shared, "P_CmnAttackLine", "cylinder1", "tube"),
+            (&file, other_set_name.as_str(), other[0].as_str(), "bounce"),
+            (&file, set_name.as_str(), own[0].as_str(), own[0].as_str()),
+            (&file, set_name.as_str(), own[3].as_str(), own[3].as_str()),
+        ] {
+            assert_eq!(
+                part_program(&out, &set_name, to),
+                part_program(from, from_set, part),
+                "{to}"
+            );
+        }
+        let (_, models) = part_program(&out, &set_name, "tube");
+        assert!(!models.is_empty(), "the tube is drawn on a model");
+        // A texture the file had is not brought in twice.
+        let copies = |name: &str| {
+            out.ptcl_file
+                .as_ref()
+                .unwrap()
+                .texture_info
+                .as_ref()
+                .unwrap()
+                .descriptors
+                .iter()
+                .filter(|d| d.name == name)
+                .count()
+        };
+        assert_eq!((copies("ef_cmn_flare01"), copies("ef_cmn_line03")), (1, 1));
+    }
+
+    /// Everything the Add part window lists from the shared file can be added: every part's
+    /// textures and models are there to bring, and its shaders relocate onto real ones.
+    #[test]
+    fn every_shared_part_has_what_it_needs_to_be_added() {
+        let Some(root) = effect_root() else {
+            return;
+        };
+        let load = |rel: &str| {
+            effect_library::NamcoEffectFile::load(&std::fs::read(root.join(rel)).unwrap())
+                .expect(rel)
+        };
+        let shared = load(SHARED);
+        let mut dest = load("effect/fighter/mario/ef_mario.eff");
+        let mut parts: Vec<effect_library::structs::Emitter> = Vec::new();
+        for set in &shared.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets {
+            super::visit_emitters_ref(&set.emitters, &mut |em| {
+                let mut part = em.clone();
+                part.children.clear();
+                parts.push(part);
+            });
+        }
+        assert!(parts.len() > 1000, "only {} parts", parts.len());
+        let bases = super::merge_donor_resources(
+            &mut dest,
+            &shared,
+            &[parts.as_slice()],
+            super::ShaderStrategy::Merge,
+            "every shared part",
+        )
+        .expect("every part's textures and models");
+        super::relocate_donor_shaders(&mut parts, bases);
+        let set = &mut dest.ptcl_file.as_mut().unwrap().emitter_list.emitter_sets[0];
+        set.emitters.extend(parts);
+        super::verify_shader_indices_resolve(&dest, "every shared part").expect("shaders");
+    }
+
+    /// The live send of an effect with a part added from the shared file: the carrier keeps
+    /// every game-file rule and plays the part, with its texture, in its copy of the effect.
+    #[test]
+    fn the_live_carrier_plays_a_part_added_from_the_shared_file() {
+        let Some(root) = effect_root() else {
+            return;
+        };
+        const CARRIER: &str = "effect/assist/bomberman/ef_bomberman.eff";
+        const SRC: &str = "effect/fighter/mario/ef_mario.eff";
+        let carrier_base = std::fs::read(root.join(CARRIER)).expect("carrier eff");
+        let file = effect_library::NamcoEffectFile::load(&std::fs::read(root.join(SRC)).unwrap())
+            .expect("Mario parse");
+        let roster = roster_adding(
+            &file,
+            "mario_fb_shoot",
+            vec![
+                shared_slot("P_CmnSlipSpark", "spark1", 1, "sparks", 0),
+                shared_slot("P_CmnDashSmoke", "smoke1", 3, "smoke", 1),
+                crate::mod_project::EmitterSlot {
+                    source_idx: 2,
+                    source_name: "fire3".into(),
+                    name: "bounce".into(),
+                    source_set: "P_MarioFireballBound".into(),
+                    source_file: SRC.into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let clone_name = format!("{}mario_fb_shoot", crate::mod_project::EDIT_CLONE_PREFIX);
+        let op = crate::mod_project::TransplantOp {
+            new_entry_name: clone_name.clone(),
+            src_file_rel: SRC.into(),
+            src_set_name: "mario_fb_shoot".into(),
+            src_set_idx: roster.set_idx,
+            one_slot_slots: Vec::new(),
+            replace_entry: None,
+        };
+        // An edit of the added part, saved at the place it has in the list.
+        let edit = crate::mod_project::AuthoredEdit {
+            set_name: roster.set_name.clone(),
+            entry_name: "mario_fb_shoot".into(),
+            set_idx: roster.set_idx,
+            emitter_name: "sparks".into(),
+            emitter_idx: 1,
+            fields: crate::mod_project::EmitterFieldEdits {
+                emission_rate: Some(77.0),
+                ..Default::default()
+            },
+        };
+        let edited = |file: &effect_library::NamcoEffectFile| {
+            let mut names = Vec::new();
+            for set in &file.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets {
+                super::visit_emitters_ref(&set.emitters, &mut |em| {
+                    if em.data.emission.rate == 77.0 {
+                        names.push(em.data.display_name());
+                    }
+                });
+            }
+            names
+        };
+        let build = |roster: crate::mod_project::EmitterRoster| {
+            let authored = super::CarrierAuthored {
+                set_name: clone_name.clone(),
+                edits: vec![edit.clone()],
+                roster: Some(roster),
+                entry_edit: None,
+            };
+            let mut warnings = Vec::new();
+            let built = super::rebuild_runtime_carrier_eff_bytes_with_edits(
+                &carrier_base,
+                CARRIER,
+                std::slice::from_ref(&op),
+                &root,
+                std::slice::from_ref(&authored),
+                &[],
+                &[],
+                &[],
+                &mut warnings,
+            )
+            .expect("carrier build");
+            (built, warnings)
+        };
+        let (built, warnings) = build(roster.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(crate::eff_validate::problems(&built).is_empty());
+        let carrier = effect_library::NamcoEffectFile::load(&built).expect("carrier re-read");
+        assert_eq!(
+            shipped_part(&carrier, &clone_name, "sparks"),
+            Some(("ef_cmn_line03".into(), None))
+        );
+
+        assert_eq!(
+            shipped_part(&carrier, &clone_name, "smoke"),
+            Some(("ef_cmn_smoke01".into(), Some("sparks".into())))
+        );
+        assert_eq!(
+            shipped_part(&carrier, &clone_name, "bounce"),
+            Some(("ef_cmn_fire01".into(), None))
+        );
+        let shared =
+            effect_library::NamcoEffectFile::load(&std::fs::read(root.join(SHARED)).unwrap())
+                .expect("shared parse");
+        for (from, from_set, part, to) in [
+            (&shared, "P_CmnSlipSpark", "spark1", "sparks"),
+            (&shared, "P_CmnDashSmoke", "smoke1", "smoke"),
+            (&file, "P_MarioFireballBound", "fire3", "bounce"),
+            (&file, "P_MarioFireballShoot", "fire1", "fire1"),
+        ] {
+            assert_eq!(
+                part_program(&carrier, &clone_name, to),
+                part_program(from, from_set, part),
+                "{to}"
+            );
+        }
+
+        assert_eq!(edited(&carrier), ["sparks"]);
+
+        // The paired case: a part the shared file does not have is reported and left out, with
+        // its edit: no other part gets it.
+        let mut gone = roster;
+        gone.slots[1].source_name = "no_such_part".into();
+        let (built, warnings) = build(gone);
+        assert!(
+            warnings.iter().any(|w| w.contains("no_such_part")),
+            "{warnings:?}"
+        );
+        let carrier = effect_library::NamcoEffectFile::load(&built).expect("carrier re-read");
+        assert_eq!(shipped_part(&carrier, &clone_name, "sparks"), None);
+        assert!(edited(&carrier).is_empty(), "{:?}", edited(&carrier));
     }
 }

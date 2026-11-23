@@ -947,6 +947,7 @@ mod tests {
             source_name: names[i].0.clone(),
             name: name.to_string(),
             depth,
+            ..Default::default()
         };
         let same: Vec<EmitterSlot> = names
             .iter()
@@ -1214,6 +1215,7 @@ mod tests {
             source_name: names[i].0.clone(),
             name,
             depth: names[i].1,
+            ..Default::default()
         };
         let mut slots: Vec<EmitterSlot> = (0..names.len())
             .map(|i| slot(i, names[i].0.clone()))

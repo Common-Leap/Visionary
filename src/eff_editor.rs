@@ -36,6 +36,9 @@ use crate::effects::{
 use crate::game_link::GameLink;
 use crate::mod_project::{AuthoredEdit, EmitterFieldEdits, TransplantOp};
 
+mod add_part;
+use add_part::{AddPartPicker, AddedData, PartOrigin, SharedFile};
+
 /// A move that plays an effect, as the Effects page lists it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoveUse {
@@ -366,6 +369,31 @@ struct EffEntry {
     set_idx: usize,
 }
 
+/// A file's effects, by name, each with the set it plays; `sets` is how many sets the file has.
+fn effect_entries(index: &crate::effects::EffIndex, sets: usize) -> Vec<EffEntry> {
+    // Handles carry an original-case and a lowercase duplicate — keep one per lowercase
+    // name. hash40 in ACMD is over the lowercase name, which is what the plugin reports.
+    let mut seen = std::collections::HashSet::new();
+    let mut entries: Vec<EffEntry> = Vec::new();
+    for (name, set_idx) in &index.handles {
+        let lower = name.to_lowercase();
+        if !seen.insert(lower.clone()) {
+            continue;
+        }
+        let idx = *set_idx;
+        if idx < 0 || idx as usize >= sets {
+            continue;
+        }
+        entries.push(EffEntry {
+            hash: hash40::hash40(&lower).0,
+            name: lower,
+            set_idx: idx as usize,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
 /// One edited fighter (from the app's project state) — the primary unit the editor's
 /// selector is organized around. `merged` is the transplants-applied build to parse when
 /// present; `alt_base` covers the data-root path when it differs from the export root.
@@ -539,8 +567,27 @@ pub struct EffEditor {
     /// Plain-English note about the selected texture's layout, refreshed with the thumbnail.
     /// Cached because working it out means decoding the texture, which must not happen per frame.
     texture_form_note: String,
-    /// Pristine snapshots per emitter set, parallel to `ptcl.emitter_sets`.
+    /// Pristine snapshots per emitter set, parallel to `ptcl.emitter_sets`. After the file's own
+    /// parts come those of the parts added from other effects or files, as their files have
+    /// them; `part_origins` says where each came from.
     pristine: Vec<Vec<EmitterSnapshot>>,
+    /// Where each part added from another effect or file came from, by (set, pristine index).
+    part_origins: std::collections::HashMap<(usize, usize), PartOrigin>,
+    /// The textures those parts brought into the pool, in pool order, each with its pixels.
+    carried_textures: Vec<(TextureInfo, Vec<u8>)>,
+    /// Saved parts whose source is not here to copy, as (set, place in the list, slot), and the
+    /// edits made to them: kept, and saved again, for where it is.
+    missing_parts: Vec<(usize, usize, crate::mod_project::EmitterSlot)>,
+    missing_edits: Vec<AuthoredEdit>,
+    /// The open Add part window.
+    add_part: Option<AddPartPicker>,
+    /// The shared effects file, read for the Add part window.
+    shared_parts: SharedFile,
+    /// Pictures of the open file's and the shared file's textures for the Add part window.
+    part_thumbs: TextureThumbs,
+    shared_thumbs: TextureThumbs,
+    /// The part being renamed in the part list, as (set, part, name typed so far).
+    renaming: Option<(usize, usize, String)>,
     entries: Vec<EffEntry>,
     /// The moves that spawn each effect (hash40 of its name), and whether every move has been
     /// read yet.
@@ -685,8 +732,8 @@ pub struct EffEditor {
     /// Undo and redo for effect edits on this page.
     history: EffHistory,
     /// The history of each file opened before, with the file's fingerprint when it was put
-    /// aside (see [`Self::file_fingerprint`]).
-    history_store: Vec<(PathBuf, u64, EffHistory)>,
+    /// aside (see [`Self::file_fingerprint`]) and what its added parts put beside its data.
+    history_store: Vec<(PathBuf, u64, EffHistory, AddedData)>,
 }
 
 impl Default for EffEditor {
@@ -727,6 +774,15 @@ impl Default for EffEditor {
             show_raw_textures: false,
             texture_form_note: String::new(),
             pristine: Vec::new(),
+            part_origins: Default::default(),
+            carried_textures: Vec::new(),
+            missing_parts: Vec::new(),
+            missing_edits: Vec::new(),
+            add_part: None,
+            shared_parts: SharedFile::NotRead,
+            part_thumbs: TextureThumbs::default(),
+            shared_thumbs: TextureThumbs::default(),
+            renaming: None,
             entries: Vec::new(),
             effect_uses: Default::default(),
             effect_uses_ready: false,
@@ -1697,6 +1753,17 @@ impl TextureThumbs {
         index: usize,
         decode: impl FnOnce() -> Option<image::RgbaImage>,
     ) {
+        self.draw_tinted(ui, index, egui::Color32::WHITE, decode);
+    }
+
+    /// As [`Self::draw`], the picture multiplied by `tint`.
+    fn draw_tinted(
+        &mut self,
+        ui: &mut Ui,
+        index: usize,
+        tint: egui::Color32,
+        decode: impl FnOnce() -> Option<image::RgbaImage>,
+    ) {
         let side = THUMB as f32;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
         let frame = ui.ctx().cumulative_frame_nr();
@@ -1740,7 +1807,7 @@ impl TextureThumbs {
                 handle.id(),
                 shown,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
+                tint,
             );
         }
     }
@@ -1905,6 +1972,10 @@ fn texture_slots(em: &EmitterDef, textures: &[TextureInfo]) -> Vec<(usize, usize
     }
     slots
 }
+
+/// The Add part button's hover.
+const ADD_PART_HOVER: &str = "Add a part to this effect: a copy of any part of this file or of \
+     the shared effects, or a glow, sparks, smoke, ring, flash or trail to start from";
 
 /// A part's name in words, as the effect list names effects: "flare1" reads "Flare 1".
 /// Whether an effect is one of the shared ones in `ef_common.eff`, which every fighter plays:
@@ -2452,6 +2523,12 @@ impl EffEditor {
         self.load_error = None;
         self.ptcl = None;
         self.pristine.clear();
+        self.part_origins.clear();
+        self.carried_textures.clear();
+        self.missing_parts.clear();
+        self.missing_edits.clear();
+        self.add_part = None;
+        self.renaming = None;
         self.entries.clear();
         self.selected_entry = None;
         self.selected_emitter = 0;
@@ -2489,28 +2566,7 @@ impl EffEditor {
             .map(|set| set.emitters.iter().map(EmitterSnapshot::of).collect())
             .collect();
 
-        // Handles carry an original-case and a lowercase duplicate — keep one per lowercase
-        // name. hash40 in ACMD is over the lowercase name, which is what the plugin reports.
-        let mut seen = std::collections::HashSet::new();
-        let mut entries: Vec<EffEntry> = Vec::new();
-        for (name, set_idx) in &index.handles {
-            let lower = name.to_lowercase();
-            if !seen.insert(lower.clone()) {
-                continue;
-            }
-            let idx = *set_idx;
-            if idx < 0 || idx as usize >= ptcl.emitter_sets.len() {
-                continue;
-            }
-            entries.push(EffEntry {
-                hash: hash40::hash40(&lower).0,
-                name: lower,
-                set_idx: idx as usize,
-            });
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-        self.entries = entries;
+        self.entries = effect_entries(&index, ptcl.emitter_sets.len());
         self.entry_pristine = loaded.entries.clone();
         self.entry_info = loaded.entries;
         self.ptcl = Some(ptcl);
@@ -2886,7 +2942,7 @@ impl EffEditor {
             return Vec::new();
         };
         let tex_names = self.texture_names();
-        let mut out = Vec::new();
+        let mut out = self.missing_edits.clone();
         for (set_idx, (set, pset)) in ptcl.emitter_sets.iter().zip(&self.pristine).enumerate() {
             for (em_idx, em) in set.emitters.iter().enumerate() {
                 // An emitter the roster added has no pristine of its own — it is a copy of one,
@@ -2931,7 +2987,14 @@ impl EffEditor {
         };
         let mut out = Vec::new();
         for (set_idx, (set, pristine)) in ptcl.emitter_sets.iter().zip(&self.pristine).enumerate() {
-            if part_list_untouched(&set.emitters, pristine) {
+            let missing: Vec<_> = self
+                .missing_parts
+                .iter()
+                .filter(|(set, ..)| *set == set_idx)
+                .collect();
+            if missing.is_empty()
+                && part_list_untouched(&set.emitters, &pristine[..self.file_part_count(set_idx)])
+            {
                 continue;
             }
             out.push(crate::mod_project::EmitterRoster {
@@ -2946,19 +3009,39 @@ impl EffEditor {
                 slots: set
                     .emitters
                     .iter()
-                    .map(|em| crate::mod_project::EmitterSlot {
-                        source_idx: em.source_idx,
-                        // The name the SOURCE emitter has in the file, which is what the
-                        // exporter looks it up by — not the name of the copy.
-                        source_name: pristine
-                            .get(em.source_idx)
-                            .map(|p| p.name.clone())
-                            .unwrap_or_default(),
-                        name: em.name.clone(),
-                        depth: em.depth,
-                    })
+                    .map(
+                        |em| match self.part_origins.get(&(set_idx, em.source_idx)) {
+                            // Added from another effect or file: named as its file has it.
+                            Some(origin) => crate::mod_project::EmitterSlot {
+                                source_idx: origin.index,
+                                source_name: origin.name.clone(),
+                                name: em.name.clone(),
+                                depth: em.depth,
+                                source_set: origin.set_name.clone(),
+                                source_file: origin.file.clone(),
+                            },
+                            None => crate::mod_project::EmitterSlot {
+                                source_idx: em.source_idx,
+                                // The name the SOURCE emitter has in the file, which is what the
+                                // exporter looks it up by — not the name of the copy.
+                                source_name: pristine
+                                    .get(em.source_idx)
+                                    .map(|p| p.name.clone())
+                                    .unwrap_or_default(),
+                                name: em.name.clone(),
+                                depth: em.depth,
+                                ..Default::default()
+                            },
+                        },
+                    )
                     .collect(),
             });
+            if let Some(roster) = out.last_mut() {
+                for (_, place, slot) in missing {
+                    let at = (*place).min(roster.slots.len());
+                    roster.slots.insert(at, slot.clone());
+                }
+            }
         }
         out
     }
@@ -3021,7 +3104,7 @@ impl EffEditor {
         entry_edits: &[crate::mod_project::EntryEdit],
     ) {
         for roster in rosters {
-            let Some(ptcl) = self.ptcl.as_mut() else {
+            let Some(ptcl) = self.ptcl.as_ref() else {
                 return;
             };
             let Some(set_idx) = ptcl
@@ -3040,8 +3123,9 @@ impl EffEditor {
             // A roster is a statement about the emitters the FILE has, so re-applying one — which
             // happens when a second project is opened over an eff this one already rostered —
             // must start from the same place every time, or the duplicates duplicate.
+            let count = self.file_part_count(set_idx);
             let Some(source) = self.pristine.get(set_idx).map(|snapshots| {
-                snapshots
+                snapshots[..count]
                     .iter()
                     .enumerate()
                     .map(|(i, s)| s.to_def(i))
@@ -3049,10 +3133,17 @@ impl EffEditor {
             }) else {
                 continue;
             };
-            let rebuilt: Vec<EmitterDef> = roster
-                .slots
-                .iter()
-                .filter_map(|slot| {
+            let mut rebuilt: Vec<EmitterDef> = Vec::new();
+            self.missing_parts.retain(|(set, ..)| *set != set_idx);
+            for (place, slot) in roster.slots.iter().enumerate() {
+                let em = if slot.is_foreign() {
+                    // A part added from another effect or file, read from there.
+                    let Some(em) = self.foreign_slot_part(set_idx, slot) else {
+                        self.missing_parts.push((set_idx, place, slot.clone()));
+                        continue;
+                    };
+                    em
+                } else {
                     // Stored name at the stored index wins, then the name anywhere, then the
                     // bare index — the same rule the exporter resolves a slot by.
                     let named = |i: usize| {
@@ -3066,15 +3157,20 @@ impl EffEditor {
                             .find(|i| named(*i))
                             .unwrap_or(slot.source_idx)
                     };
-                    let mut em = source.get(idx)?.clone();
+                    let Some(em) = source.get(idx) else {
+                        continue;
+                    };
+                    let mut em = em.clone();
                     em.source_idx = idx;
-                    em.depth = slot.depth;
-                    if !slot.name.is_empty() {
-                        em.name = slot.name.clone();
-                    }
-                    Some(em)
-                })
-                .collect();
+                    em
+                };
+                let mut em = em;
+                em.depth = slot.depth;
+                if !slot.name.is_empty() {
+                    em.name = slot.name.clone();
+                }
+                rebuilt.push(em);
+            }
             if rebuilt.is_empty() && !roster.slots.is_empty() {
                 eprintln!(
                     "[EFF-PROJECT] emitter list for set '{}' resolved to nothing — left as the \
@@ -3083,7 +3179,13 @@ impl EffEditor {
                 );
                 continue;
             }
-            ptcl.emitter_sets[set_idx].emitters = rebuilt;
+            if let Some(set) = self
+                .ptcl
+                .as_mut()
+                .and_then(|p| p.emitter_sets.get_mut(set_idx))
+            {
+                set.emitters = rebuilt;
+            }
         }
 
         for edit in entry_edits {
@@ -3134,7 +3236,20 @@ impl EffEditor {
         let Some(ptcl) = self.ptcl.as_mut() else {
             return;
         };
+        self.missing_edits.clear();
         for edit in edits {
+            // The edits of a part that is not here stay with it: none other gets them.
+            let missing = self.missing_parts.iter().any(|(set, _, slot)| {
+                slot.name == edit.emitter_name
+                    && ptcl
+                        .emitter_sets
+                        .get(*set)
+                        .is_some_and(|s| s.name == edit.set_name)
+            });
+            if missing {
+                self.missing_edits.push(edit.clone());
+                continue;
+            }
             let set_idx = ptcl
                 .emitter_sets
                 .iter()
@@ -3540,8 +3655,12 @@ impl EffEditor {
             .iter()
             .zip(&self.pristine)
             .enumerate()
-            .filter(|(_, (set, pristine))| {
-                !part_list_untouched(&set.emitters, pristine)
+            .filter(|(set_idx, (set, pristine))| {
+                self.missing_parts.iter().any(|(s, ..)| s == set_idx)
+                    || !part_list_untouched(
+                        &set.emitters,
+                        &pristine[..self.file_part_count(*set_idx)],
+                    )
                     || set.emitters.iter().any(|e| {
                         pristine
                             .get(e.source_idx)
@@ -3585,7 +3704,8 @@ impl EffEditor {
             .emitters
             .iter()
             .map(|e| {
-                let copy = pristine.get(e.source_idx).is_none_or(|p| p.name != e.name);
+                let copy = self.part_origins.contains_key(&(set_idx, e.source_idx))
+                    || pristine.get(e.source_idx).is_none_or(|p| p.name != e.name);
                 (e.source_idx, copy)
             })
             .collect();
@@ -3623,11 +3743,18 @@ impl EffEditor {
             for set in &ptcl.emitter_sets {
                 set.name.hash(&mut h);
             }
-            for texture in &ptcl.bntx_textures {
+            // The file's own textures and parts: those that came with added parts are put back
+            // with the history.
+            let own = ptcl
+                .bntx_textures
+                .iter()
+                .filter(|t| !self.carried_textures.iter().any(|(c, _)| c.id == t.id));
+            for texture in own {
                 texture.tex_name.hash(&mut h);
             }
         }
-        for set in &self.pristine {
+        for (set_idx, set) in self.pristine.iter().enumerate() {
+            let set = &set[..self.file_part_count(set_idx)];
             set.len().hash(&mut h);
             for part in set {
                 part.name.hash(&mut h);
@@ -3649,11 +3776,14 @@ impl EffEditor {
             return;
         }
         let key = self.file_fingerprint();
-        self.history_store.retain(|(p, _, _)| *p != path);
+        self.history_store.retain(|(p, ..)| *p != path);
+        let Some(added) = self.added_data() else {
+            return;
+        };
         history.baseline = None;
         history.open_since = None;
         history.cleared = None;
-        self.history_store.push((path, key, history));
+        self.history_store.push((path, key, history, added));
         if self.history_store.len() > HISTORY_FILES {
             self.history_store.remove(0);
         }
@@ -3662,9 +3792,9 @@ impl EffEditor {
     /// Take back the history `path` had, when the file is still the one it was taken in.
     fn restore_history(&mut self, path: &Path) {
         let key = self.file_fingerprint();
-        if let Some(at) = self.history_store.iter().position(|(p, _, _)| p == path) {
-            let (_, was, history) = self.history_store.remove(at);
-            if was == key {
+        if let Some(at) = self.history_store.iter().position(|(p, ..)| p == path) {
+            let (_, was, history, added) = self.history_store.remove(at);
+            if was == key && self.restore_added_data(added) {
                 self.history = history;
             } else {
                 self.history.cleared = Some("the file's effects or textures changed");
@@ -3971,6 +4101,7 @@ impl EffEditor {
     /// values, the part list (copies gone, removed parts back, the file's order) and the
     /// effect's timing.
     fn reset_effect(&mut self, set_idx: usize, entry_name: &str) {
+        let count = self.file_part_count(set_idx);
         let (Some(ptcl), Some(pristine_set)) = (self.ptcl.as_mut(), self.pristine.get(set_idx))
         else {
             return;
@@ -3978,7 +4109,8 @@ impl EffEditor {
         let Some(set) = ptcl.emitter_sets.get_mut(set_idx) else {
             return;
         };
-        set.emitters = pristine_set
+        // The file's own parts: the parts added from elsewhere go.
+        set.emitters = pristine_set[..count]
             .iter()
             .enumerate()
             .map(|(i, p)| p.to_def(i))
@@ -3994,6 +4126,9 @@ impl EffEditor {
         ) {
             *now = was;
         }
+        let set_name = set.name.clone();
+        self.missing_parts.retain(|(s, ..)| *s != set_idx);
+        self.missing_edits.retain(|e| e.set_name != set_name);
         self.clamp_selected_emitter(set_idx);
         touch(&mut self.eff_dirty_at, &mut self.edit_rev);
     }
@@ -4133,6 +4268,12 @@ impl EffEditor {
         self.texture_preview = None;
         self.texture_form_note.clear();
         self.pristine.clear();
+        self.part_origins.clear();
+        self.carried_textures.clear();
+        self.missing_parts.clear();
+        self.missing_edits.clear();
+        self.add_part = None;
+        self.renaming = None;
         self.entries.clear();
         self.selected_entry = None;
         self.selected_emitter = 0;
@@ -4292,6 +4433,7 @@ impl EffEditor {
         self.history_begin_frame(pointer_down, Instant::now());
         let rev = self.edit_rev;
         self.draw_page_right(ui, link);
+        self.draw_add_part(ui.ctx());
         if self.edit_rev != rev {
             self.history_note_edit(Instant::now());
         }
@@ -5424,6 +5566,22 @@ impl EffEditor {
             return;
         }
 
+        // Where each part came from, for its tab's hover.
+        let notes: Vec<String> = self
+            .ptcl
+            .as_ref()
+            .and_then(|p| p.emitter_sets.get(set_idx))
+            .map(|set| {
+                set.emitters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, em)| {
+                        self.part_note(set_idx, em, moved.get(i).copied().unwrap_or(false))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut open_add: Option<egui::Pos2> = None;
         let Some(ptcl) = self.ptcl.as_mut() else {
             return;
         };
@@ -5453,7 +5611,7 @@ impl EffEditor {
             let hover = format!(
                 "{}{}\n\nOne part of the effect. Tick \"Show only this part\" to see which.",
                 em.name,
-                part_place_note(moved, em.source_idx),
+                notes.get(i).map(String::as_str).unwrap_or_default(),
             );
             (text, hover)
         };
@@ -5482,6 +5640,10 @@ impl EffEditor {
                     {
                         self.selected_emitter = i;
                     }
+                }
+                let add = ui.small_button("Add part").on_hover_text(ADD_PART_HOVER);
+                if add.clicked() {
+                    open_add = Some(add.rect.left_bottom());
                 }
             });
         } else {
@@ -5526,7 +5688,14 @@ impl EffEditor {
                 {
                     self.selected_emitter += 1;
                 }
+                let add = ui.small_button("Add part").on_hover_text(ADD_PART_HOVER);
+                if add.clicked() {
+                    open_add = Some(add.rect.left_bottom());
+                }
             });
+        }
+        if let Some(at) = open_add {
+            self.open_add_part(set_idx, at);
         }
         if self.solo_selected.as_deref() != Some(entry_name.as_str()) {
             self.solo_selected = None;
@@ -6106,6 +6275,21 @@ impl EffEditor {
             self.edited_emitters(set_idx).into_iter().collect();
         let moved = self.moved_parts(set_idx);
         let (spawn, spawn_hover) = self.timeline_spawn(set_idx);
+        // Where each part came from, for its hover.
+        let notes: Vec<String> = self
+            .ptcl
+            .as_ref()
+            .and_then(|p| p.emitter_sets.get(set_idx))
+            .map(|set| {
+                set.emitters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, em)| {
+                        self.part_note(set_idx, em, moved.get(i).copied().unwrap_or(false))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let pristine_set: &[EmitterSnapshot] = self.pristine.get(set_idx).map_or(&[], |p| p);
         let Some(set) = self
             .ptcl
@@ -6114,6 +6298,8 @@ impl EffEditor {
         else {
             return;
         };
+        let renaming = &mut self.renaming;
+        let mut rename: Option<(usize, String)> = None;
 
         // Collected and applied after the loop: every one of these changes the list being
         // iterated.
@@ -6208,54 +6394,83 @@ impl EffEditor {
                 let depths: Vec<u8> = set.emitters.iter().map(|e| e.depth).collect();
                 let copy_room: Vec<bool> = (0..count).map(|i| room_to_copy(&depths, i)).collect();
                 let nest_room: Vec<bool> = (0..count).map(|i| room_to_nest(&depths, i)).collect();
+                // The name field has to keep the menu open while it is typed in; every command
+                // closes the menu itself.
+                let menu_config = egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
                 for (i, em) in set.emitters.iter_mut().enumerate() {
-                    ui.menu_button("⋯", |ui| {
-                        if ui
-                            .add_enabled(edited.contains(&i), egui::Button::new("Reset this part"))
-                            .on_hover_text("Put this part back as the game has it")
-                            .clicked()
-                        {
-                            reset = Some(i);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(copy_room[i], egui::Button::new("Copy"))
-                            .on_hover_text("Add another part just like this one")
-                            .on_disabled_hover_text(format!(
-                                "The game holds at most {} parts made from one part",
-                                crate::eff_validate::MAX_CHILDREN
-                            ))
-                            .clicked()
-                        {
-                            duplicate = Some(i);
-                            ui.close();
-                        }
-                        if ui
-                            .button("Remove")
-                            .on_hover_text("Stop this part from playing")
-                            .clicked()
-                        {
-                            remove = Some(i);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(i > 0, egui::Button::new("Draw earlier"))
-                            .clicked()
-                        {
-                            move_by = Some((i, -1));
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(i + 1 < count, egui::Button::new("Draw later"))
-                            .clicked()
-                        {
-                            move_by = Some((i, 1));
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
+                    egui::containers::menu::MenuButton::new("⋯")
+                        .config(menu_config.clone())
+                        .ui(ui, |ui| {
+                            // The name in words, typed over in place: kept from the frame the menu
+                            // opened.
+                            if !matches!(renaming, Some((s, p, _)) if *s == set_idx && *p == i) {
+                                *renaming = Some((set_idx, i, part_words(&em.name)));
+                            }
+                            if let Some((_, _, typed)) = renaming.as_mut() {
+                                let field = ui
+                                    .add(egui::TextEdit::singleline(typed).desired_width(160.0))
+                                    .on_hover_text(format!(
+                                        "The part's name. Enter to keep it.\n\nIn the file: {}",
+                                        em.name
+                                    ));
+                                if field.lost_focus() && typed.trim() != part_words(&em.name) {
+                                    rename = Some((i, typed.clone()));
+                                    if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                                        ui.close();
+                                    }
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(
+                                    edited.contains(&i),
+                                    egui::Button::new("Reset this part"),
+                                )
+                                .on_hover_text("Put this part back as the game has it")
+                                .clicked()
+                            {
+                                reset = Some(i);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(copy_room[i], egui::Button::new("Copy"))
+                                .on_hover_text("Add another part just like this one")
+                                .on_disabled_hover_text(format!(
+                                    "The game holds at most {} parts made from one part",
+                                    crate::eff_validate::MAX_CHILDREN
+                                ))
+                                .clicked()
+                            {
+                                duplicate = Some(i);
+                                ui.close();
+                            }
+                            if ui
+                                .button("Remove")
+                                .on_hover_text("Stop this part from playing")
+                                .clicked()
+                            {
+                                remove = Some(i);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(i > 0, egui::Button::new("Draw earlier"))
+                                .clicked()
+                            {
+                                move_by = Some((i, -1));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(i + 1 < count, egui::Button::new("Draw later"))
+                                .clicked()
+                            {
+                                move_by = Some((i, 1));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
                             .add_enabled(
                                 nest_room[i],
                                 egui::Button::new("Make from the part above"),
@@ -6272,11 +6487,11 @@ impl EffEditor {
                             nest = Some((i, 1));
                             ui.close();
                         }
-                        if em.depth > 0 && ui.button("Make on its own").clicked() {
-                            nest = Some((i, -1));
-                            ui.close();
-                        }
-                    });
+                            if em.depth > 0 && ui.button("Make on its own").clicked() {
+                                nest = Some((i, -1));
+                                ui.close();
+                            }
+                        });
                     ui.horizontal(|ui| {
                         ui.add_space(em.depth as f32 * 12.0);
                         let name = &part_names[i];
@@ -6288,7 +6503,7 @@ impl EffEditor {
                         } else {
                             egui::RichText::new(name)
                         };
-                        let place = part_place_note(moved, em.source_idx);
+                        let place = notes.get(i).map(String::as_str).unwrap_or_default();
                         let hover = if em.depth > 0 {
                             format!(
                                 "{}{place}\n\nMade from the particles of the part above it",
@@ -6470,6 +6685,45 @@ impl EffEditor {
                     ui.end_row();
                 }
             });
+        for (_, _, slot) in self.missing_parts.iter().filter(|(s, ..)| *s == set_idx) {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 110, 110),
+                format!("{} not found", part_words(&slot.name)),
+            )
+            .on_hover_text(format!(
+                "A copy of {} of {} in {}, which is not in the game folder. It is kept in the \
+                 project. Reset effect takes it out.",
+                slot.source_name, slot.source_set, slot.source_file
+            ));
+        }
+        let add = ui.button("Add part").on_hover_text(ADD_PART_HOVER);
+        let open_add = add.clicked().then(|| add.rect.left_bottom());
+        let mut renamed: Option<String> = None;
+        if let Some((i, typed)) = rename {
+            let name = add_part::part_name_from_typed(&typed);
+            let taken: Vec<&str> = set
+                .emitters
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k != i)
+                .map(|(_, e)| e.name.as_str())
+                .collect();
+            let name = add_part::unique_part_name(&name, &taken);
+            if let Some(em) = set
+                .emitters
+                .get_mut(i)
+                .filter(|e| !name.is_empty() && e.name != name)
+            {
+                renamed = Some(format!(
+                    "Rename {} to {}",
+                    part_words(&em.name),
+                    part_words(&name)
+                ));
+                em.name = name;
+                changed = true;
+            }
+            self.renaming = None;
+        }
         if let Some(i) = select {
             self.selected_emitter = i;
             self.emitter_tab = EmitterTab::Attributes;
@@ -6563,10 +6817,16 @@ impl EffEditor {
             self.clamp_selected_emitter(set_idx);
             touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
+        if renamed.is_some() {
+            self.history.next_label = renamed;
+        }
         if let Some(i) = reset {
             self.history_close_step();
             self.reset_part_fields(set_idx, i);
             self.history.next_label = Some(self.reset_part_label(set_idx, i));
+        }
+        if let Some(at) = open_add {
+            self.open_add_part(set_idx, at);
         }
     }
 
@@ -6863,13 +7123,35 @@ impl EffEditor {
         // another kind of texture view, which the game's shader for this part does not take.
         // And texture 2 and 3 name a texture by its id, which one added here has only once the
         // file is written.
+        // A texture that came with an added part leaves the file with it, so only a part that
+        // has it as its own is offered it.
+        let own = self
+            .selected_entry
+            .and_then(|i| self.entries.get(i))
+            .map(|e| e.set_idx)
+            .and_then(|set| {
+                let em = self
+                    .ptcl
+                    .as_ref()?
+                    .emitter_sets
+                    .get(set)?
+                    .emitters
+                    .get(self.selected_emitter)?;
+                self.pristine.get(set)?.get(em.source_idx).cloned()
+            });
         let blocked: Vec<Option<String>> = self
             .ptcl
             .as_ref()
             .map(|p| {
                 p.bntx_textures
                     .iter()
-                    .map(|t| texture_swap_blocked(t, &texture, slot))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        if self.texture_belongs_to_added_part(i, own.as_ref()) {
+                            return Some("It comes with a part added to this file".to_owned());
+                        }
+                        texture_swap_blocked(t, &texture, slot)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -7437,7 +7719,8 @@ impl EffEditor {
             }
         };
         if let Some(ptcl) = self.ptcl.as_mut() {
-            ptcl.bntx_textures.remove(index);
+            let gone = ptcl.bntx_textures.remove(index);
+            self.carried_textures.retain(|(t, _)| t.id != gone.id);
             for set in ptcl.emitter_sets.iter_mut() {
                 for em in set.emitters.iter_mut() {
                     shift(&mut em.texture_index);

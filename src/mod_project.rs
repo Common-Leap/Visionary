@@ -1057,7 +1057,7 @@ pub struct EmitterRoster {
 }
 
 /// One emitter in the result, and where its data comes from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EmitterSlot {
     /// Flat parent-first index of the SOURCE emitter this slot clones.
     pub source_idx: usize,
@@ -1071,6 +1071,22 @@ pub struct EmitterSlot {
     /// Nesting depth in the result: 0 is a root emitter, 1 a child of the slot above it.
     #[serde(default)]
     pub depth: u8,
+    /// The emitter set the source emitter is in, when it is not this roster's own: a part added
+    /// from another effect. Empty means this set, and `source_idx` indexes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_set: String,
+    /// The file that set is in, relative to the game folder: this roster's own for a part of
+    /// another of its effects, `ef_common.eff` for a shared part. Empty means this roster's file.
+    /// The part's textures, models and shaders come with it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_file: String,
+}
+
+impl EmitterSlot {
+    /// Whether this slot copies a part from another effect or file rather than from its own set.
+    pub fn is_foreign(&self) -> bool {
+        !self.source_set.is_empty() || !self.source_file.is_empty()
+    }
 }
 
 /// Changes to what one effect entry SPAWNS — the eff header's side of an effect, as opposed to
