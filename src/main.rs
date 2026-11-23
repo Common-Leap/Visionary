@@ -42,6 +42,7 @@ mod motion_list;
 mod motion_scripts;
 mod move_kinds;
 mod move_nodes;
+mod object_motions;
 mod orientation_widget;
 mod param_labels;
 mod plugin_deploy;

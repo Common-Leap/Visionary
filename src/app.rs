@@ -674,6 +674,30 @@ mod object_edit_tests {
         assert!(project.fighters.contains_key("samus"));
         assert!(!project.fighters.contains_key("samus_lativolt"));
     }
+
+    /// An object's edits made for a made character are dropped by the same name, so the editor
+    /// says so; a removed character's own edits still have nowhere to go.
+    #[test]
+    fn project_drops_a_made_characters_objects_by_name() {
+        let mut project = crate::mod_project::ModProjectFile {
+            version: crate::mod_project::PROJECT_VERSION,
+            name: "t".into(),
+            fighters: HashMap::new(),
+            characters: Default::default(),
+            roster: Default::default(),
+            project_fighters: BTreeSet::new(),
+            moveset_source: None,
+        };
+        let roster = crate::mod_project::RosterMod::default();
+        assert!(project_owner_mod(&mut project, &roster, "samus_lativolt#c08").is_some());
+        assert!(project_owner_mod(&mut project, &roster, "samus#c08").is_none());
+        let agents = BTreeSet::from(["samus_lativolt".to_string()]);
+        assert_eq!(
+            strip_object_agents(&mut project, &agents),
+            ["samus_lativolt"]
+        );
+        assert!(project.fighters.is_empty() && project.characters.is_empty());
+    }
 }
 
 /// The Settings card for one object: which list entry of its param block it shows, the text
@@ -3657,7 +3681,11 @@ fn project_owner_mod<'a>(
 ) -> Option<&'a mut crate::mod_project::FighterMod> {
     let character = crate::character::CharacterKey::parse(owner);
     if character.is_made() {
-        character.authored(roster)?;
+        if character.authored(roster).is_none() {
+            // An object opened for a made character: under its agent, as any other object's.
+            let agent = crate::game_link::object_of_key(owner)?;
+            return Some(project.fighters.entry(agent.to_string()).or_default());
+        }
         Some(
             project
                 .characters
@@ -3900,6 +3928,17 @@ impl<V: Clone> ForkStore for HashMap<String, V> {
     }
 }
 
+/// The script category whose calls a rule of this wire category edits.
+fn rule_script_category(category: u8) -> &'static str {
+    match category {
+        crate::game_link::CAT_SOUND => "sound",
+        crate::game_link::CAT_EXPRESSION
+        | crate::game_link::CAT_MOTION_MODULE_SET_RATE_PARTIAL
+        | crate::game_link::CAT_MOTION_MODULE_SET_FRAME_PARTIAL => "expression",
+        _ => "game",
+    }
+}
+
 fn rule_move_key(key: &str) -> String {
     match crate::character::split_move_key(key) {
         Some((owner, rest)) => {
@@ -3908,6 +3947,11 @@ fn rule_move_key(key: &str) -> String {
         }
         None => key.to_owned(),
     }
+}
+
+/// Drop every rule of one move from a rule store.
+fn forget_move_rules<T>(store: &mut HashMap<String, T>, move_key: &str) {
+    store.retain(|key, _| rule_move_key(key) != move_key);
 }
 
 /// A made character's keys never match its donor: forgetting a fighter keeps the characters made
@@ -4456,10 +4500,7 @@ impl LiveApplyReport {
     fn status_suffix(&self) -> String {
         let mut notes = Vec::new();
         if self.restored_moves > 0 {
-            notes.push(format!(
-                "{} move(s) restored; supported edits sent live",
-                self.restored_moves
-            ));
+            notes.push(format!("{} move(s) restored", self.restored_moves));
         }
         if !self.missing_source.is_empty() {
             notes.push(format!(
@@ -5393,6 +5434,8 @@ pub struct VisionaryApp {
     /// Every object agent opened as a move this session. Anything keyed by one of them is kept
     /// out of the project file and the export (see [`strip_object_agents`]).
     opened_object_agents: BTreeSet<String>,
+    /// Which motions run the scripts of each of them, for its live rules.
+    object_motions: HashMap<String, crate::object_motions::ObjectMotions>,
     /// Object-call argument text being typed on the timeline, by (statement, argument).
     article_arg_edits: HashMap<(usize, usize), String>,
     /// A background catalog read that stopped: (fighter, generation, reason). Not retried until
@@ -5933,6 +5976,7 @@ impl VisionaryApp {
             article_catalog_job: None,
             open_article: None,
             opened_object_agents: BTreeSet::new(),
+            object_motions: HashMap::new(),
             article_arg_edits: HashMap::new(),
             article_catalog_failed: None,
             object_baseline: None,
@@ -6912,7 +6956,6 @@ impl VisionaryApp {
         self.hitbox_dirty_at = None;
         self.acmd_error = None;
         self.acmd_src_buffer = None;
-        self.send_selected_fighter_to_game();
     }
 
     fn select_fighter(&mut self, idx: usize) {
@@ -6935,7 +6978,6 @@ impl VisionaryApp {
         self.state.selected_move = None;
         self.open_article = None;
         self.article_settings = None;
-        self.send_selected_fighter_to_game();
         // A fighter switch is also a move-state boundary.  Clearing only the editable hitboxes
         // left the previous fighter's ACMD script alive, so a stale WHOLE_HIT/HIT_NODE OFF event
         // could hide every newly loaded parameter volume until the next move was opened.
@@ -7272,6 +7314,7 @@ impl VisionaryApp {
             cancel_frame: 0,
         };
         self.opened_object_agents.insert(agent.clone());
+        self.load_object_motions(&agent);
         self.game_link.send_article_probe(&agent);
         self.select_script(Some(agent), move_entry);
     }
@@ -7299,7 +7342,11 @@ impl VisionaryApp {
                 if let Some((body, origin)) = self.warm_source_body(&fighter_name, &move_entry.name)
                 {
                     if body != saved.body {
-                        let captures = self.captures_for_move(&fighter_name, move_entry.hash);
+                        let captures = self.captures_for_move(
+                            &fighter_name,
+                            &move_entry.name,
+                            move_entry.hash,
+                        );
                         let captures = if captures.is_empty() {
                             saved
                                 .captures
@@ -7594,7 +7641,7 @@ impl VisionaryApp {
                     return;
                 };
                 let motion = Self::motion_hash_from_name(move_name);
-                let captures = self.captures_for_move(fighter, motion);
+                let captures = self.captures_for_move(fighter, move_name, motion);
                 let captures = if captures.is_empty() {
                     saved
                         .captures
@@ -14920,7 +14967,7 @@ impl VisionaryApp {
                 }
             }
             if !errors.is_empty() {
-                self.state.status = format!("Move trigger preview refused: {}", errors.join("; "));
+                self.state.status = format!("Not live: {}", errors.join("; "));
             }
             self.gimmicks_editor.set_recipe_errors(recipe_errors);
             self.node_live_cache = Some((revision, effective));
@@ -17286,8 +17333,8 @@ impl VisionaryApp {
                 egui::Color32::from_rgb(235, 185, 100),
                 "source-only",
             );
-            ui.weak("Not live-editable").on_hover_text(
-                "Preserved for export; not live-editable because the native boolean is unmeasured.",
+            ui.weak("Not live").on_hover_text(
+                "Exported as written. One of its values cannot be read from the running game.",
             );
             for event in raw_partial_frames {
                 let active = event.frame == self.state.current_frame;
@@ -22392,13 +22439,12 @@ impl VisionaryApp {
                 })
                 .small(),
             );
-            if self.game_link.article_live_status(agent)
-                == Some(crate::game_link::ArticleLiveSupport::Unsupported)
-            {
+            if let Some((what, why)) = self.open_object_not_live(agent) {
                 ui.colored_label(
                     egui::Color32::from_rgb(235, 170, 90),
-                    RichText::new("Live edits for this clone aren't supported").small(),
-                );
+                    RichText::new(format!("{what} is not live")).small(),
+                )
+                .on_hover_text(why);
             }
         }
         let selected_move = self.state.selected_move.as_ref().map(|m| m.name.clone());
@@ -23006,6 +23052,9 @@ impl VisionaryApp {
             }
             return;
         }
+        if choice == LeaveChoice::Discard {
+            self.discard_object_edits();
+        }
         self.leave_confirmed = true;
         match pending {
             PendingLeave::Script(article, entry) => self.select_script(article, entry),
@@ -23048,6 +23097,23 @@ impl VisionaryApp {
         self.leave_confirmed = false;
     }
 
+    /// Drop the open object script's edits from every store that would bring them back, and take
+    /// its rules out of the running match.
+    fn discard_object_edits(&mut self) {
+        let Some(key) = self.current_move_key() else {
+            return;
+        };
+        self.state.effect_call_edits.remove(&key);
+        self.state.effect_call_full.remove(&key);
+        self.state.sound_script_edits.remove(&key);
+        self.state.expression_script_edits.remove(&key);
+        forget_move_rules(&mut self.hitbox_rules_store, &key);
+        forget_move_rules(&mut self.effect_rules_store, &key);
+        forget_move_rules(&mut self.effect_control_rules_store, &key);
+        self.hitbox_dirty_at = None;
+        self.publish_live_rule_union();
+    }
+
     /// Why the open object script can't be saved: the game's own script the moveset doesn't
     /// define, or, for a clone (which has no game scripts), one the moveset hasn't written yet.
     fn unsaveable_object_script_words(&self) -> &'static str {
@@ -23079,7 +23145,7 @@ impl VisionaryApp {
     fn current_move_key(&self) -> Option<String> {
         let mv = &self.state.selected_move.as_ref()?.name;
         if let Some(agent) = &self.open_article {
-            return Some(Self::move_key(agent, mv));
+            return Some(Self::move_key(&self.owner_spelling(agent), mv));
         }
         let owner = crate::character::CharacterKey::parse(self.state.open_move_owner()?);
         Some(crate::character::move_key(&owner, mv))
@@ -23107,6 +23173,9 @@ impl VisionaryApp {
         match self.active_key() {
             Some(key) if key.engine_fighter().eq_ignore_ascii_case(fighter) => {
                 key.as_str().to_owned()
+            }
+            Some(key) if self.open_article.as_deref() == Some(fighter) => {
+                crate::game_link::object_key_owner(fighter, &key)
             }
             _ => fighter.to_owned(),
         }
@@ -24437,30 +24506,6 @@ impl VisionaryApp {
             .to_motion_module_set_rate_partial_events();
     }
 
-    /// Tell the plugin which fighter (and slot scope, for slot-scoped characters like Shy Guy)
-    /// is selected so article capture/injection scopes strictly to that fighter's own articles.
-    fn send_selected_fighter_to_game(&self) {
-        let selected = self
-            .state
-            .selected_fighter
-            .and_then(|idx| self.state.fighters.get(idx));
-        let kind = selected.and_then(|f| fighter_kind_id(&f.name));
-        let costumes: &[u8] = selected
-            .filter(|f| f.custom_name.is_some())
-            .map(|f| f.slots.as_slice())
-            .unwrap_or(&[]);
-        self.game_link.send_selected_fighter(kind, costumes);
-    }
-
-    fn article_agent_from_rule_key(key: &str) -> Option<String> {
-        let agent = key.split(['/', '#']).next().unwrap_or_default();
-        if !agent.is_empty() && crate::gimmicks::registry::fighter_kind_value(agent).is_none() {
-            Some(agent.to_string())
-        } else {
-            None
-        }
-    }
-
     /// Withhold source-only node tracks at the final publication boundary, including watcher
     /// and reconnect sends. Retain keyed rules so reverting a recipe can restore flat preview.
     fn live_hitbox_rule_union(
@@ -24469,9 +24514,7 @@ impl VisionaryApp {
         let roster = &self.roster.project;
         self.hitbox_rules_store
             .iter()
-            .filter(|(key, _)| {
-                Self::article_agent_from_rule_key(key).is_none() && self.allows_flat(key, false)
-            })
+            .filter(|(key, _)| self.allows_flat(key, false))
             .flat_map(|(key, rules)| {
                 // A call added inside an If only fires when the If passes.
                 let guards = crate::character::parse_move_key(&rule_move_key(key))
@@ -24482,7 +24525,7 @@ impl VisionaryApp {
                         ))
                     })
                     .unwrap_or_default();
-                rules.iter().cloned().filter_map(move |mut rule| {
+                rules.iter().cloned().flat_map(move |mut rule| {
                     if let Some(inject) =
                         rule.inject.as_mut().filter(|inject| inject.guard.is_none())
                     {
@@ -24491,29 +24534,109 @@ impl VisionaryApp {
                             .find(|(frame, _)| *frame == inject.frame)
                             .map(|(_, guard)| guard.clone());
                     }
-                    crate::game_link::ForFighter::scoped(key, rule, roster)
+                    let motions =
+                        self.object_rule_motions(key, rule_script_category(rule.category));
+                    Self::in_object_motions(motions.as_deref(), rule, |rule, motion| {
+                        rule.motion = motion;
+                    })
+                    .into_iter()
+                    .filter_map(|rule| crate::game_link::ForFighter::scoped(key, rule, roster))
+                    .collect::<Vec<_>>()
                 })
             })
             .collect()
     }
 
-    fn live_article_hitbox_rule_union(
-        &self,
-    ) -> Vec<crate::game_link::ForArticle<crate::game_link::HitboxRuleWire>> {
-        self.hitbox_rules_store
+    /// Why the open object script's changes do not reach the running game, and whose they are.
+    fn open_object_not_live(&self, agent: &str) -> Option<(String, &'static str)> {
+        if self.game_link.article_live_status(agent)
+            == Some(crate::game_link::ArticleLiveSupport::Unsupported)
+        {
+            return Some((
+                agent.to_owned(),
+                "The running game has no object of this name. One a moveset adds is only in the \
+                 game as a copy of another object.",
+            ));
+        }
+        let script = &self.state.selected_move.as_ref()?.name;
+        let runs = self
+            .object_motions
+            .get(agent)
+            .is_some_and(|motions| !motions.any(script).is_empty());
+        (!runs).then(|| {
+            (
+                format!("{agent} {script}"),
+                "Changes are matched to an object by the animation it is in, and none of this \
+                 object's animations runs this script.",
+            )
+        })
+    }
+
+    /// Read which of an object's motions run its scripts, from the open project's files, the
+    /// fighter's own folder or the game dump.
+    fn load_object_motions(&mut self, agent: &str) {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+        else {
+            return;
+        };
+        let Some((owner, name)) = agent.split_once('_') else {
+            return;
+        };
+        let slot = self.active_article_slot(fighter);
+        let mut roots: Vec<PathBuf> = self
+            .acmd_romfs_roots()
+            .into_iter()
+            .chain(self.all_roots().into_iter().rev())
+            .map(|root| root.join("fighter").join(owner))
+            .collect();
+        roots.push(fighter.fighter_dir.clone());
+        let dirs = roots.into_iter().flat_map(|root| {
+            let part = root.join("motion").join(name);
+            [part.join(format!("c{slot:02}")), part.join("c00")]
+        });
+        if let Some(motions) = crate::object_motions::ObjectMotions::load(dirs) {
+            self.object_motions.insert(agent.to_owned(), motions);
+        }
+    }
+
+    /// For an object's rule store key, the motions its rules of one script category run in: none
+    /// where the running game cannot take them. `None` for a fighter's key.
+    fn object_rule_motions(&self, key: &str, category: &str) -> Option<Vec<u64>> {
+        let agent = crate::game_link::object_of_key(key)?;
+        if self.game_link.article_live_status(agent)
+            == Some(crate::game_link::ArticleLiveSupport::Unsupported)
+        {
+            return Some(Vec::new());
+        }
+        let key = rule_move_key(key);
+        let script = crate::character::split_move_key(&key).map_or("", |(_, script)| script);
+        Some(
+            self.object_motions
+                .get(agent)
+                .map(|motions| motions.of(category, script))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// `rule` as it is sent: a fighter's as it is, an object's once for every motion that runs
+    /// its script.
+    fn in_object_motions<T: Clone>(
+        motions: Option<&[u64]>,
+        rule: T,
+        set: impl Fn(&mut T, u64),
+    ) -> Vec<T> {
+        let Some(motions) = motions else {
+            return vec![rule];
+        };
+        motions
             .iter()
-            .filter_map(|(key, rules)| {
-                let agent = Self::article_agent_from_rule_key(key)?;
-                Some((agent, rules))
-            })
-            .flat_map(|(agent, rules)| {
-                rules
-                    .iter()
-                    .cloned()
-                    .map(move |rule| crate::game_link::ForArticle {
-                        agent: agent.clone(),
-                        rule,
-                    })
+            .map(|motion| {
+                let mut rule = rule.clone();
+                set(&mut rule, *motion);
+                rule
             })
             .collect()
     }
@@ -24556,10 +24679,7 @@ impl VisionaryApp {
         let roster = &self.roster.project;
         self.effect_rules_store
             .iter()
-            .filter(|(key, _)| {
-                Self::article_agent_from_rule_key(key).is_none()
-                    && self.allows_flat_effect_rules(key)
-            })
+            .filter(|(key, _)| self.allows_flat_effect_rules(key))
             .flat_map(|(key, rules)| {
                 // An effect added inside an If only fires when the If passes.
                 let guards = crate::character::parse_move_key(key)
@@ -24570,7 +24690,8 @@ impl VisionaryApp {
                         ))
                     })
                     .unwrap_or_default();
-                rules.iter().cloned().filter_map(move |mut rule| {
+                let motions = self.object_rule_motions(key, "effect");
+                rules.iter().cloned().flat_map(move |mut rule| {
                     if let Some(inject) =
                         rule.inject.as_mut().filter(|inject| inject.guard.is_none())
                     {
@@ -24579,29 +24700,13 @@ impl VisionaryApp {
                             .find(|(frame, _)| *frame == inject.frame)
                             .map(|(_, guard)| guard.clone());
                     }
-                    crate::game_link::ForFighter::scoped(key, rule, roster)
-                })
-            })
-            .collect()
-    }
-
-    fn live_article_effect_rule_union(
-        &self,
-    ) -> Vec<crate::game_link::ForArticle<crate::game_link::SpawnRuleWire>> {
-        self.effect_rules_store
-            .iter()
-            .filter_map(|(key, rules)| {
-                let agent = Self::article_agent_from_rule_key(key)?;
-                Some((agent, rules))
-            })
-            .flat_map(|(agent, rules)| {
-                rules
-                    .iter()
-                    .cloned()
-                    .map(move |rule| crate::game_link::ForArticle {
-                        agent: agent.clone(),
-                        rule,
+                    Self::in_object_motions(motions.as_deref(), rule, |rule, motion| {
+                        rule.motion = Some(motion);
                     })
+                    .into_iter()
+                    .filter_map(|rule| crate::game_link::ForFighter::scoped(key, rule, roster))
+                    .collect::<Vec<_>>()
+                })
             })
             .collect()
     }
@@ -24612,36 +24717,17 @@ impl VisionaryApp {
         let roster = &self.roster.project;
         self.effect_control_rules_store
             .iter()
-            .filter(|(key, _)| {
-                Self::article_agent_from_rule_key(key).is_none()
-                    && self.allows_flat_effect_rules(key)
-            })
+            .filter(|(key, _)| self.allows_flat_effect_rules(key))
             .flat_map(|(key, rules)| {
-                rules
-                    .iter()
-                    .cloned()
-                    .filter_map(|rule| crate::game_link::ForFighter::scoped(key, rule, roster))
-            })
-            .collect()
-    }
-
-    fn live_article_effect_control_rule_union(
-        &self,
-    ) -> Vec<crate::game_link::ForArticle<crate::game_link::EffectControlRuleWire>> {
-        self.effect_control_rules_store
-            .iter()
-            .filter_map(|(key, rules)| {
-                let agent = Self::article_agent_from_rule_key(key)?;
-                Some((agent, rules))
-            })
-            .flat_map(|(agent, rules)| {
-                rules
-                    .iter()
-                    .cloned()
-                    .map(move |rule| crate::game_link::ForArticle {
-                        agent: agent.clone(),
-                        rule,
+                let motions = self.object_rule_motions(key, "effect");
+                rules.iter().cloned().flat_map(move |rule| {
+                    Self::in_object_motions(motions.as_deref(), rule, |rule, motion| {
+                        rule.motion = Some(motion);
                     })
+                    .into_iter()
+                    .filter_map(|rule| crate::game_link::ForFighter::scoped(key, rule, roster))
+                    .collect::<Vec<_>>()
+                })
             })
             .collect()
     }
@@ -24649,23 +24735,16 @@ impl VisionaryApp {
     fn publish_hitbox_rules(&self) {
         let hitboxes: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&hitboxes);
-        let article_hitboxes: Vec<_> = self.live_article_hitbox_rule_union();
-        self.game_link.send_article_hitbox_rules(&article_hitboxes);
     }
 
     fn publish_effect_rules(&self) {
         let effects: Vec<_> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&effects);
-        let article_effects: Vec<_> = self.live_article_effect_rule_union();
-        self.game_link.send_article_spawn_rules(&article_effects);
     }
 
     fn publish_effect_control_rules(&self) {
         let controls: Vec<_> = self.live_effect_control_rule_union();
         self.game_link.send_effect_control_rules(&controls);
-        let article_controls: Vec<_> = self.live_article_effect_control_rule_union();
-        self.game_link
-            .send_article_effect_control_rules(&article_controls);
     }
 
     /// Publish the complete safe ACMD live-rule union currently staged in the keyed stores.
@@ -27341,11 +27420,17 @@ impl VisionaryApp {
             .ok_or_else(|| anyhow::anyhow!("lib_visionary_mod.nro, the plugin exported mods carry, is missing from Visionary's plugin folder"))?;
         std::fs::create_dir_all(dest)?;
         std::fs::copy(plugin, dest.join("plugin.nro"))?;
+        // An object's script is not part of the project, so its live edits are not exported.
+        let mut hitboxes = self.live_hitbox_rule_union();
+        hitboxes.retain(|rule| rule.agent.is_none());
+        let mut effects = self.live_effect_rule_union();
+        effects.retain(|rule| rule.agent.is_none());
+        let mut controls = self.live_effect_control_rule_union();
+        controls.retain(|rule| rule.agent.is_none());
         let mut messages = vec![
-            serde_json::json!({ "hitbox_rules": self.live_hitbox_rule_union() }).to_string(),
-            serde_json::json!({ "spawn_rules": self.live_effect_rule_union() }).to_string(),
-            serde_json::json!({ "effect_control_rules": self.live_effect_control_rule_union() })
-                .to_string(),
+            serde_json::json!({ "hitbox_rules": hitboxes }).to_string(),
+            serde_json::json!({ "spawn_rules": effects }).to_string(),
+            serde_json::json!({ "effect_control_rules": controls }).to_string(),
         ];
         messages.extend(
             self.gimmicks_editor
@@ -28577,12 +28662,6 @@ impl VisionaryApp {
             .send_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
         self.game_link
             .send_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
-        self.game_link
-            .send_article_spawn_rules::<crate::game_link::SpawnRuleWire>(&[]);
-        self.game_link
-            .send_article_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
-        self.game_link
-            .send_article_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
@@ -28866,12 +28945,28 @@ impl VisionaryApp {
     ///   * run — the plugin tags each playback, and only the newest is loaded. Without it,
     ///     performing a move grounded and then aerial left the union of both branches and the
     ///     editor showed spawns that never occur together.
-    fn captures_for_move(&self, fighter: &str, motion: u64) -> Vec<crate::game_link::CaptureLine> {
+    fn captures_for_move(
+        &self,
+        fighter: &str,
+        move_name: &str,
+        motion: u64,
+    ) -> Vec<crate::game_link::CaptureLine> {
         if let Some(kind) = fighter_kind_id(fighter) {
             self.game_link.latest_run_for(motion, Some(kind))
         } else {
-            self.game_link.latest_article_run_for(fighter, motion)
+            self.captures_for_object(fighter, move_name)
         }
+    }
+
+    /// What the game ran of an object's script: in the first of its motions that was seen.
+    fn captures_for_object(&self, agent: &str, script: &str) -> Vec<crate::game_link::CaptureLine> {
+        self.object_motions
+            .get(agent)
+            .into_iter()
+            .flat_map(|motions| motions.any(script))
+            .map(|motion| self.game_link.latest_article_run_for(agent, motion))
+            .find(|lines| !lines.is_empty())
+            .unwrap_or_default()
     }
 
     /// Forget the persisted donor for the current move as well as the plugin's in-memory
@@ -28926,7 +29021,10 @@ impl VisionaryApp {
             });
         select_donor_captures(stored_is_authoritative, snapshot_captures, || {
             if let Some(agent) = &self.open_article {
-                self.game_link.latest_article_run_for(agent, motion)
+                let script = self.state.selected_move.as_ref();
+                script.map_or_else(Vec::new, |script| {
+                    self.captures_for_object(agent, &script.name)
+                })
             } else {
                 self.game_link
                     .latest_run_for(motion, self.current_fighter_kind())
@@ -31269,8 +31367,7 @@ impl VisionaryApp {
         self.publish_hitbox_rules();
         if missing_donor {
             self.state.status =
-                "This hitbox could not be sent live: perform the move in game once, then try again."
-                    .into();
+                "Not live yet: perform the move in game once, for its added hitbox.".into();
         } else if grab_cut_short {
             self.state.status = "Grab boxes ending on different frames: in game, one grab clear \
                                  ends every grab box, so the longer one ends with the shorter."
@@ -31691,12 +31788,12 @@ impl VisionaryApp {
     fn push_motion_rate_rules(&mut self) {
         let Some(mv_key) = self.current_move_key() else {
             self.state.status =
-                "Rate edit not sent live: no move is selected as the live target".into();
+                "Not live: no move is open to send this animation speed for.".into();
             return;
         };
         let Some(motion) = self.current_motion_hash() else {
             self.state.status =
-                "Rate edit not sent live: this move has no motion name to key a rule on".into();
+                "Not live: this move has no animation to send its speed for.".into();
             return;
         };
         let rules: Vec<crate::game_link::HitboxRuleWire> = self
@@ -36933,8 +37030,7 @@ impl VisionaryApp {
     /// restores state when the game restarted between socket sessions. It sends every effect
     /// edit the editor holds, so nothing is left unsent afterwards.
     fn resend_live_state(&mut self) {
-        self.send_selected_fighter_to_game();
-        if let Some(agent) = &self.open_article {
+        for agent in &self.opened_object_agents {
             self.game_link.send_article_probe(agent);
         }
         self.publish_live_rule_union();
@@ -38327,29 +38423,22 @@ impl VisionaryApp {
         self.publish_effect_control_rules();
         if unsupported_flip_axis {
             self.state.status =
-                "This flip-axis/control token is preserved for source/export, but live preview \
-                 only accepts measured numeric or EF_FLIP_* constants."
+                "Not live: an effect's flip setting in this move. It is exported as written."
                     .into();
         } else if missing_capture {
             self.state.status =
-                "Swapped/retimed effect needs a live capture — perform the move in game once so \
-                 the change previews live (export applies it regardless)."
+                "Not live yet: perform the move in game once, for its swapped or moved effect."
                     .into();
         } else if missing_control_capture {
             self.state.status =
-                "This effect-control edit needs a live capture — perform the move in game once \
-                 so the point action can be matched safely (export applies it regardless)."
+                "Not live yet: perform the move in game once, for its changed effect control."
                     .into();
         } else if unsupported_control {
             self.state.status =
-                "This effect control's symbolic/runtime value cannot be reconstructed safely \
-                 for live preview; the authored export still contains the edit."
-                    .into();
+                "Not live: an effect control in this move. It is exported as written.".into();
         } else if unsupported_work_int {
             self.state.status =
-                "LAST_EFFECT_SET_WORK_INT keeps its authored Work ID in export/source; live \
-                 preview cannot translate symbolic Work IDs or replay them safely after a retime."
-                    .into();
+                "Not live: the work slot an effect is kept in. It is exported as written.".into();
         }
         if unsupported_control || unsupported_work_int || unsupported_flip_axis {
             self.note_live_replay_constant_limit("effect control/work value");
@@ -49263,6 +49352,137 @@ mod live_effect_capture_tests {
         assert!(undo.contains("self.delete_effect_call(*index)"));
         assert!(!undo.contains("self.eff_editor.open = false"));
         assert!(classic.contains("self.eff_editor.open = false"));
+    }
+
+    /// An object's live rules are in the same lists as the fighters', so connecting again sends
+    /// them too; only an object the game refused by name is held back.
+    #[test]
+    fn connecting_again_sends_the_objects_rules() {
+        let app = include_str!("app.rs");
+        let body = |name: &str| {
+            app.split(name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("{name}"))
+                .to_owned()
+        };
+        let resend = body("fn resend_live_state(&mut self) {");
+        let asked = resend
+            .find("self.game_link.send_article_probe(agent);")
+            .expect("asks");
+        let sent = resend
+            .find("self.publish_live_rule_union();")
+            .expect("sends");
+        assert!(asked < sent);
+        let union = body("fn publish_live_rule_union(&self) {");
+        for (publish, list, store) in [
+            (
+                "publish_hitbox_rules",
+                "live_hitbox_rule_union",
+                "self.hitbox_rules_store",
+            ),
+            (
+                "publish_effect_rules",
+                "live_effect_rule_union",
+                "self.effect_rules_store",
+            ),
+            (
+                "publish_effect_control_rules",
+                "live_effect_control_rule_union",
+                "self.effect_control_rules_store",
+            ),
+        ] {
+            assert!(union.contains(&format!("self.{publish}();")), "{publish}");
+            assert!(
+                body(&format!("fn {publish}(&self) {{")).contains(&format!("self.{list}()")),
+                "{publish}"
+            );
+            let rules = body(&format!("fn {list}("));
+            assert!(rules.contains(store), "{list}");
+            assert!(
+                rules.contains(".filter(|(key, _)| self.allows_flat"),
+                "{list}"
+            );
+            assert!(rules.contains("self.object_rule_motions(key, "), "{list}");
+            assert!(
+                rules.contains("ForFighter::scoped(key, rule, roster)"),
+                "{list}"
+            );
+        }
+        assert!(
+            body("fn object_rule_motions(&self, key: &str, category: &str)")
+                .contains("ArticleLiveSupport::Unsupported")
+        );
+    }
+
+    /// "Discard" takes the object's edits out of the running match too: what it goes back to is
+    /// the object as it was, not one the match still plays edited.
+    #[test]
+    fn discarding_an_objects_edits_takes_them_out_of_the_match() {
+        let mut store = HashMap::from([
+            ("mario_fireball/regular".to_owned(), ()),
+            ("mario_fireball/regular#sound".to_owned(), ()),
+            ("mario_fireball/bound".to_owned(), ()),
+            ("mario/regular".to_owned(), ()),
+        ]);
+        forget_move_rules(&mut store, "mario_fireball/regular");
+        let mut left: Vec<_> = store.into_keys().collect();
+        left.sort();
+        assert_eq!(left, ["mario/regular", "mario_fireball/bound"]);
+
+        let app = include_str!("app.rs");
+        let body = |name: &str| {
+            app.split(name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let prompt = body("fn draw_object_leave_prompt(&mut self, ctx: &egui::Context) {");
+        let dropped = prompt
+            .find("if choice == LeaveChoice::Discard {\n            self.discard_object_edits();")
+            .expect("dropped");
+        assert!(dropped < prompt.find("match pending {").expect("goes on"));
+        let discard = body("fn discard_object_edits(&mut self) {");
+        for store in [
+            "hitbox_rules_store",
+            "effect_rules_store",
+            "effect_control_rules_store",
+        ] {
+            assert!(
+                discard.contains(&format!("forget_move_rules(&mut self.{store}, &key);")),
+                "{store}"
+            );
+        }
+        for edits in [
+            "effect_call_edits",
+            "effect_call_full",
+            "sound_script_edits",
+            "expression_script_edits",
+        ] {
+            assert!(
+                discard.contains(&format!("self.state.{edits}.remove(&key);")),
+                "{edits}"
+            );
+        }
+        assert!(discard.contains("self.publish_live_rule_union();"));
+    }
+
+    /// A fighter's rule goes out as it is; an object's once for every motion that runs its
+    /// script, and not at all where none does.
+    #[test]
+    fn an_objects_rule_goes_out_for_each_motion_that_runs_its_script() {
+        let sent = |motions: Option<&[u64]>| {
+            VisionaryApp::in_object_motions(motions, (7u64, "rule"), |rule, motion| rule.0 = motion)
+        };
+        assert_eq!(sent(None), [(7, "rule")]);
+        assert_eq!(sent(Some(&[1, 2])), [(1, "rule"), (2, "rule")]);
+        assert!(sent(Some(&[])).is_empty());
+        assert_eq!(rule_script_category(crate::game_link::CAT_SOUND), "sound");
+        assert_eq!(
+            rule_script_category(crate::game_link::CAT_EXPRESSION),
+            "expression"
+        );
+        assert_eq!(rule_script_category(0), "game");
     }
 
     /// The send of everything on connect clears "unsent" the way Send edits does: the row

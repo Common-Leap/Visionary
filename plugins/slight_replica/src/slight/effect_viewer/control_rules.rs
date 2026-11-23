@@ -22,6 +22,13 @@ pub struct ControlRule {
     /// The fighter this rule was made for; `None` fires for anyone.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    /// The object ("mario_fireball") whose script this rule is for; `None` for the fighter's
+    /// own move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The kind `agent` names in the running game.
+    #[serde(skip)]
+    pub weapon: Option<i32>,
     /// The only costumes this rule runs on; empty = every costume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub costumes: Vec<u8>,
@@ -55,6 +62,7 @@ impl ControlRule {
             && self.motion.map(|m| m == motion).unwrap_or(true)
             && crate::slight::hitbox_viewer::acting_is(
                 self.fighter_kind,
+                self.weapon,
                 &self.costumes,
                 &self.except_costumes,
             )
@@ -81,8 +89,15 @@ fn fingerprint_bytes(bytes: &[u8]) -> u64 {
 }
 
 impl crate::slight::hitbox_viewer::CostumeScoped for ControlRule {
-    fn scope(&self) -> (Option<i32>, Option<u64>) {
-        (self.fighter_kind, self.motion)
+    fn scope(&self) -> crate::slight::hitbox_viewer::MoveScope {
+        (self.fighter_kind, self.weapon, self.motion)
+    }
+    fn object(&mut self) -> Option<(&str, &mut Option<i32>, &mut Option<i32>)> {
+        Some((
+            self.agent.as_deref()?,
+            &mut self.weapon,
+            &mut self.fighter_kind,
+        ))
     }
     fn costumes(&self) -> &[u8] {
         &self.costumes
@@ -124,9 +139,6 @@ fn try_apply_rules(generation: u64, rules: Vec<ControlRule>) -> Result<(), Vec<C
         return Err(rules);
     };
     let count = rules.len();
-    // Preserve a confirmed latch for identical full-list retransmissions, but invalidate the
-    // previous rule generation when any value, timing, or slot changes.
-    let changed = serde_json::to_vec(&*current).ok() != serde_json::to_vec(&rules).ok();
     *current = rules;
     APPLIED_GENERATION.store(generation, Ordering::Release);
     crate::slight::diag::note(format!("effect control rules replaced: {count} rule(s)"));
@@ -141,20 +153,22 @@ fn try_apply_rules(generation: u64, rules: Vec<ControlRule>) -> Result<(), Vec<C
             *pending = None;
         }
     }
-    if changed {
-        crate::slight::effect_viewer::acmd_hooks::reset_control_injection_latches();
-    }
     Ok(())
 }
 
 /// Replace the complete control list, staging it if a game-thread reader currently owns RULES.
-pub fn set_rules(rules: Vec<ControlRule>) -> bool {
+/// Returns the objects whose rules the running game cannot take.
+pub fn set_rules(mut rules: Vec<ControlRule>) -> Vec<String> {
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let unknown = crate::slight::hitbox_viewer::name_objects(
+        &mut rules,
+        crate::slight::slight_consts::fighters::weapon_object,
+    );
     let rules = prepare_rules(rules);
     if let Err(rules) = try_apply_rules(generation, rules) {
         stage_rules(generation, rules);
     };
-    true
+    unknown
 }
 
 /// Apply the newest list staged by a network or game-thread update before a control hook reads it.
@@ -232,94 +246,10 @@ pub fn injections_for(motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u6
                 && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
                 && crate::slight::hitbox_viewer::acting_is(
                     rule.fighter_kind,
+                    rule.weapon,
                     &rule.costumes,
                     &rule.except_costumes,
                 )
-        })
-        .map(|(index, rule)| {
-            (
-                index,
-                rule.inject.clone().unwrap(),
-                rule.work_slot,
-                rule.identity,
-            )
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArticleControlRule {
-    pub agent: String,
-    #[serde(flatten)]
-    pub rule: ControlRule,
-}
-
-static ARTICLE_RULES: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, Vec<ControlRule>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-static HAVE_ARTICLE_INJECT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_article_rules(rules: Vec<ArticleControlRule>) -> Vec<(String, bool)> {
-    let mut statuses: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    let mut by_agent: std::collections::HashMap<String, Vec<ControlRule>> =
-        std::collections::HashMap::new();
-    let mut any_inject = false;
-
-    for entry in rules {
-        let supported = *statuses
-            .entry(entry.agent.clone())
-            .or_insert_with(|| {
-                crate::slight::systems::article_notifier::resolve_article_agent(&entry.agent)
-                    .is_some()
-            });
-        if !supported {
-            continue;
-        }
-        if entry.rule.inject.is_some() {
-            any_inject = true;
-        }
-        by_agent.entry(entry.agent).or_default().push(entry.rule);
-    }
-
-    for list in by_agent.values_mut() {
-        let taken = std::mem::take(list);
-        *list = prepare_rules(taken);
-    }
-
-    let mut guard = loop {
-        if let Some(g) = ARTICLE_RULES.try_lock() {
-            break g;
-        }
-        core::hint::spin_loop();
-    };
-    *guard = by_agent;
-    HAVE_ARTICLE_INJECT.store(any_inject, Ordering::Release);
-    crate::slight::effect_viewer::acmd_hooks::reset_effect_injection_latches();
-    let mut out: Vec<(String, bool)> = statuses.into_iter().collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-pub fn any_inject_article() -> bool {
-    HAVE_ARTICLE_INJECT.load(Ordering::Acquire)
-}
-
-pub fn injections_for_article(
-    agent: &str,
-    motion: u64,
-) -> Vec<(usize, ControlInject, Option<i32>, u64)> {
-    let Some(map) = ARTICLE_RULES.try_lock() else {
-        return Vec::new();
-    };
-    let Some(rules) = map.get(agent) else {
-        return Vec::new();
-    };
-    rules
-        .iter()
-        .enumerate()
-        .filter(|(_, rule)| {
-            rule.inject.is_some() && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
         })
         .map(|(index, rule)| {
             (

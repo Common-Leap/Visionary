@@ -30,6 +30,13 @@ pub struct SpawnRule {
     /// The fighter this rule was made for; `None` fires for anyone.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    /// The object ("mario_fireball") whose script this rule is for; `None` for the fighter's
+    /// own move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The kind `agent` names in the running game.
+    #[serde(skip)]
+    pub weapon: Option<i32>,
     /// The only costumes this rule runs on; empty = every costume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub costumes: Vec<u8>,
@@ -120,6 +127,7 @@ impl SpawnRule {
             && self.motion.map(|m| m == motion).unwrap_or(true)
             && crate::slight::hitbox_viewer::acting_is(
                 self.fighter_kind,
+                self.weapon,
                 &self.costumes,
                 &self.except_costumes,
             )
@@ -152,8 +160,15 @@ fn slot_identity(identity: u64, slot: usize) -> u64 {
 }
 
 impl crate::slight::hitbox_viewer::CostumeScoped for SpawnRule {
-    fn scope(&self) -> (Option<i32>, Option<u64>) {
-        (self.fighter_kind, self.motion)
+    fn scope(&self) -> crate::slight::hitbox_viewer::MoveScope {
+        (self.fighter_kind, self.weapon, self.motion)
+    }
+    fn object(&mut self) -> Option<(&str, &mut Option<i32>, &mut Option<i32>)> {
+        Some((
+            self.agent.as_deref()?,
+            &mut self.weapon,
+            &mut self.fighter_kind,
+        ))
     }
     fn costumes(&self) -> &[u8] {
         &self.costumes
@@ -197,10 +212,6 @@ fn try_apply_rules(generation: u64, rules: Vec<SpawnRule>) -> Result<(), Vec<Spa
         return Err(rules);
     };
     let n = rules.len();
-    // The desktop sends the complete sparse list. Compare the serialized rule data before
-    // replacing it so identical retransmissions preserve a confirmed live latch while a
-    // real edit invalidates every slot from the previous list.
-    let changed = serde_json::to_vec(&*current).ok() != serde_json::to_vec(&rules).ok();
     *current = rules;
     APPLIED_GENERATION.store(generation, Ordering::Release);
     crate::slight::diag::note(format!("spawn rules replaced: {n} rule(s)"));
@@ -217,21 +228,23 @@ fn try_apply_rules(generation: u64, rules: Vec<SpawnRule>) -> Result<(), Vec<Spa
             *pending = None;
         }
     }
-    if changed {
-        crate::slight::effect_viewer::acmd_hooks::reset_effect_injection_latches();
-    }
     Ok(())
 }
 
 /// Replace the complete timing list, staging it if a game-thread reader currently owns RULES.
 /// A staged update is accepted rather than dropped and is applied before the next ACMD query.
-pub fn set_rules(rules: Vec<SpawnRule>) -> bool {
+/// Returns the objects whose rules the running game cannot take.
+pub fn set_rules(mut rules: Vec<SpawnRule>) -> Vec<String> {
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let unknown = crate::slight::hitbox_viewer::name_objects(
+        &mut rules,
+        crate::slight::slight_consts::fighters::weapon_object,
+    );
     let rules = prepare_rules(rules);
     if let Err(rules) = try_apply_rules(generation, rules) {
         stage_rules(generation, rules);
     };
-    true
+    unknown
 }
 
 /// Apply the newest rule list staged by a network or game-thread update. This is called before
@@ -305,6 +318,7 @@ pub fn injections_for(motion: u64) -> Vec<(usize, SpawnInject, u64)> {
                 && r.motion.map(|m| m == motion).unwrap_or(true)
                 && crate::slight::hitbox_viewer::acting_is(
                     r.fighter_kind,
+                    r.weapon,
                     &r.costumes,
                     &r.except_costumes,
                 )
@@ -366,6 +380,16 @@ pub fn replacement_injections_for_suppression(
             let mut cursor = index as isize + direction;
             while cursor >= 0 && (cursor as usize) < rules.len() {
                 let candidate = &rules[cursor as usize];
+                // Another fighter's, costume's or object's rule of the same motion name.
+                if !crate::slight::hitbox_viewer::acting_is(
+                    candidate.fighter_kind,
+                    candidate.weapon,
+                    &candidate.costumes,
+                    &candidate.except_costumes,
+                ) {
+                    cursor += direction;
+                    continue;
+                }
                 if cursor as usize != index
                     && candidate.suppress
                     && candidate
@@ -589,230 +613,4 @@ pub fn alias_for(from: u64, costume: i32) -> Option<u64> {
             a.from == from && (a.slots.is_empty() || slot.is_some_and(|s| a.slots.contains(&s)))
         })
         .map(|a| a.to)
-}
-
-// ── Separate article spawn rules (keyed by agent, isolated from fighter rules) ──
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArticleSpawnRule {
-    pub agent: String,
-    #[serde(flatten)]
-    pub rule: SpawnRule,
-}
-
-static ARTICLE_RULES: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, Vec<SpawnRule>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-static HAVE_ARTICLE_RULES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static HAVE_ARTICLE_INJECT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-impl SpawnRule {
-    fn matches_article(&self, eff_hash: u64, motion: u64, frame: f32) -> bool {
-        self.eff_hash == eff_hash
-            && self.motion.map(|m| m == motion).unwrap_or(true)
-            && self.frame_start.map(|s| frame >= s).unwrap_or(true)
-            && self.frame_end.map(|e| frame <= e).unwrap_or(true)
-    }
-}
-
-/// Replace the complete article spawn-rule table. Returns `(agent, supported)` per agent;
-/// unknown/cloned agents are rejected as unsupported rather than guessed.
-pub fn set_article_rules(rules: Vec<ArticleSpawnRule>) -> Vec<(String, bool)> {
-    let mut statuses: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    let mut by_agent: std::collections::HashMap<String, Vec<SpawnRule>> =
-        std::collections::HashMap::new();
-    let mut any_inject = false;
-    let mut accepted = 0usize;
-
-    for entry in rules {
-        let supported = *statuses
-            .entry(entry.agent.clone())
-            .or_insert_with(|| {
-                crate::slight::systems::article_notifier::resolve_article_agent(&entry.agent)
-                    .is_some()
-            });
-        if !supported {
-            continue;
-        }
-        if entry.rule.inject.is_some() || entry.rule.color_inject.is_some() {
-            any_inject = true;
-        }
-        by_agent.entry(entry.agent).or_default().push(entry.rule);
-        accepted += 1;
-    }
-
-    for list in by_agent.values_mut() {
-        let taken = std::mem::take(list);
-        *list = prepare_rules(taken);
-    }
-
-    if let Some(mut guard) = ARTICLE_RULES.try_lock() {
-        *guard = by_agent;
-    } else {
-        let mut guard = loop {
-            if let Some(g) = ARTICLE_RULES.try_lock() {
-                break g;
-            }
-            core::hint::spin_loop();
-        };
-        *guard = by_agent;
-    }
-    HAVE_ARTICLE_RULES.store(accepted != 0, Ordering::Release);
-    HAVE_ARTICLE_INJECT.store(any_inject, Ordering::Release);
-    crate::slight::effect_viewer::acmd_hooks::reset_effect_injection_latches();
-    crate::slight::diag::note(format!(
-        "article spawn rules replaced: {accepted} rule(s) across {} agent(s)",
-        statuses.len()
-    ));
-    let mut out: Vec<(String, bool)> = statuses.into_iter().collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-pub fn any_article_rules() -> bool {
-    HAVE_ARTICLE_RULES.load(Ordering::Acquire)
-}
-
-pub fn any_inject_article() -> bool {
-    HAVE_ARTICLE_INJECT.load(Ordering::Acquire)
-}
-
-pub fn suppressed_article(agent: &str, eff_hash: u64, motion: u64, motion_frame: f32) -> bool {
-    let Some(map) = ARTICLE_RULES.try_lock() else {
-        return false;
-    };
-    let Some(rules) = map.get(agent) else {
-        return false;
-    };
-    rules.iter().any(|r| {
-        r.suppress && r.stop_func.is_none() && r.matches_article(eff_hash, motion, motion_frame)
-    })
-}
-
-pub fn transform_for_article(
-    agent: &str,
-    eff_hash: u64,
-    motion: u64,
-    motion_frame: f32,
-) -> Option<(Option<[f32; 3]>, Option<[f32; 3]>, Option<f32>)> {
-    let map = ARTICLE_RULES.try_lock()?;
-    let rules = map.get(agent)?;
-    rules
-        .iter()
-        .find(|r| {
-            !r.suppress
-                && (r.pos.is_some() || r.rot.is_some() || r.scale.is_some())
-                && r.matches_article(eff_hash, motion, motion_frame)
-        })
-        .map(|r| (r.pos, r.rot, r.scale))
-}
-
-pub fn rate_for_article(agent: &str, eff_hash: u64, motion: u64, motion_frame: f32) -> Option<f32> {
-    let map = ARTICLE_RULES.try_lock()?;
-    let rules = map.get(agent)?;
-    rules
-        .iter()
-        .find(|r| {
-            !r.suppress && r.rate.is_some() && r.matches_article(eff_hash, motion, motion_frame)
-        })
-        .and_then(|r| r.rate)
-}
-
-pub fn camera_offset_for_article(
-    agent: &str,
-    eff_hash: u64,
-    motion: u64,
-    motion_frame: f32,
-) -> Option<f32> {
-    let map = ARTICLE_RULES.try_lock()?;
-    let rules = map.get(agent)?;
-    rules
-        .iter()
-        .find(|r| {
-            !r.suppress
-                && r.camera_offset.is_some()
-                && r.matches_article(eff_hash, motion, motion_frame)
-        })
-        .and_then(|r| r.camera_offset)
-}
-
-pub fn tint_for_article(
-    agent: &str,
-    eff_hash: u64,
-    motion: u64,
-    motion_frame: f32,
-) -> Option<(Option<[f32; 3]>, Option<f32>)> {
-    let map = ARTICLE_RULES.try_lock()?;
-    let rules = map.get(agent)?;
-    rules
-        .iter()
-        .find(|r| {
-            !r.suppress
-                && (r.tint.is_some() || r.alpha.is_some())
-                && r.matches_article(eff_hash, motion, motion_frame)
-        })
-        .map(|r| (r.tint, r.alpha))
-}
-
-pub fn particle_tint_for_article(
-    agent: &str,
-    eff_hash: u64,
-    motion: u64,
-    motion_frame: f32,
-) -> Option<[f32; 3]> {
-    let map = ARTICLE_RULES.try_lock()?;
-    let rules = map.get(agent)?;
-    rules
-        .iter()
-        .find(|r| {
-            !r.suppress
-                && r.particle_tint.is_some()
-                && r.matches_article(eff_hash, motion, motion_frame)
-        })
-        .and_then(|r| r.particle_tint)
-}
-
-pub fn scale_w_for_article(
-    agent: &str,
-    eff_hash: u64,
-    motion: u64,
-    motion_frame: f32,
-) -> Option<Vec<f32>> {
-    let map = ARTICLE_RULES.try_lock()?;
-    let rules = map.get(agent)?;
-    rules
-        .iter()
-        .find(|r| {
-            !r.suppress
-                && r.scale_w.is_some()
-                && r.matches_article(eff_hash, motion, motion_frame)
-        })
-        .and_then(|r| {
-            r.scale_w
-                .as_ref()
-                .filter(|values| {
-                    (1..=3).contains(&values.len()) && values.iter().all(|value| value.is_finite())
-                })
-                .cloned()
-        })
-}
-
-pub fn injections_for_article(agent: &str, motion: u64) -> Vec<(usize, SpawnInject, u64)> {
-    let Some(map) = ARTICLE_RULES.try_lock() else {
-        return Vec::new();
-    };
-    let Some(rules) = map.get(agent) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for (i, r) in rules.iter().enumerate() {
-        if r.motion.map(|m| m == motion).unwrap_or(true) {
-            if let Some(inj) = &r.inject {
-                out.push((i, inj.clone(), slot_identity(r.identity, i)));
-            }
-        }
-    }
-    out
 }

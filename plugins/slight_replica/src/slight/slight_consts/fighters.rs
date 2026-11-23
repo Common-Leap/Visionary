@@ -200,18 +200,18 @@ pub fn name(kind: FighterKind) -> &'static str {
 /// Number of fighter-kind entries in the game's lowercase-name table.
 const FIGHTER_NAME_COUNT: usize = 118;
 
-/// Resolve a game fighter-kind id (`utility::get_kind`) to its lowercase name (e.g. "mario",
-/// "donkey") by reading the game's own name table — the authoritative, version-correct source.
-pub fn game_kind_name(kind: i32) -> Option<&'static str> {
-    if kind < 0 || kind as usize >= FIGHTER_NAME_COUNT {
-        return None;
-    }
+/// Number of object kinds in the game's lowercase weapon-name tables.
+const WEAPON_COUNT: usize = 0x267;
+
+/// Entry `index` of one of the game's name tables, an array of C-string pointers.
+fn game_name(table: &crate::offsets::GameOffset, index: i32, count: usize) -> Option<&'static str> {
+    let index = usize::try_from(index).ok().filter(|index| *index < count)?;
     unsafe {
         let text = skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize;
         if text == 0 {
             return None;
         }
-        let ptr = *((text + crate::offsets::FIGHTER_NAMES.get() + 8 * kind as usize) as *const *const u8);
+        let ptr = *((text + table.get() + 8 * index) as *const *const u8);
         if ptr.is_null() {
             return None;
         }
@@ -223,4 +223,73 @@ pub fn game_kind_name(kind: i32) -> Option<&'static str> {
             ptr, len,
         )))
     }
+}
+
+/// Resolve a game fighter-kind id (`utility::get_kind`) to its lowercase name (e.g. "mario",
+/// "donkey") by reading the game's own name table — the authoritative, version-correct source.
+pub fn game_kind_name(kind: i32) -> Option<&'static str> {
+    game_name(&crate::offsets::FIGHTER_NAMES, kind, FIGHTER_NAME_COUNT)
+}
+
+/// The fighter that owns an object kind and the object's name, from the game's own tables: the
+/// names smashline builds its agents from ("mario", "hugeflame").
+#[cfg(not(feature = "mod_plugin"))]
+fn weapon_names(kind: i32) -> Option<(&'static str, &'static str)> {
+    Some((
+        game_name(&crate::offsets::WEAPON_OWNER_NAMES, kind, WEAPON_COUNT)?,
+        game_name(&crate::offsets::WEAPON_NAMES, kind, WEAPON_COUNT)?,
+    ))
+}
+
+/// Every object's agent name by kind, read once. Empty when the tables are not where this build
+/// expects them, which the pinned kind of Mario's fireball tells: no object is named then, and
+/// the editor is told its objects cannot be edited live.
+///
+/// Nana makes objects of Popo's kinds and runs her own scripts for them, so a kind of Popo's has
+/// a second name.
+#[cfg(not(feature = "mod_plugin"))]
+static WEAPON_AGENTS: std::sync::LazyLock<Vec<Option<(String, Option<String>)>>> =
+    std::sync::LazyLock::new(|| {
+        let fireball = *smash::lib::lua_const::WEAPON_KIND_MARIO_FIREBALL;
+        if weapon_names(fireball) != Some(("mario", "fireball")) {
+            crate::slight::diag::note("object names: the game's name tables did not match");
+            return Vec::new();
+        }
+        let agents: Vec<_> = (0..WEAPON_COUNT as i32)
+            .map(|kind| {
+                weapon_names(kind).map(|(owner, name)| {
+                    let nana = (owner == "popo").then(|| format!("nana_{name}"));
+                    (format!("{owner}_{name}"), nana)
+                })
+            })
+            .collect();
+        crate::slight::diag::note(format!(
+            "object names: {} read from the game",
+            agents.iter().flatten().count()
+        ));
+        agents
+    });
+
+/// The agent name ("mario_hugeflame") of an object kind made by a fighter of `maker`.
+#[cfg(not(feature = "mod_plugin"))]
+pub fn weapon_agent(kind: i32, maker: i32) -> Option<&'static str> {
+    let (agent, nana) = WEAPON_AGENTS.get(usize::try_from(kind).ok()?)?.as_ref()?;
+    match nana {
+        Some(nana) if maker == *smash::lib::lua_const::FIGHTER_KIND_NANA => Some(nana),
+        _ => Some(agent),
+    }
+}
+
+/// The kind of the object an agent name belongs to, and the fighter that has to have made it
+/// where the kind alone does not say.
+#[cfg(not(feature = "mod_plugin"))]
+pub fn weapon_object(agent: &str) -> Option<(i32, Option<i32>)> {
+    WEAPON_AGENTS.iter().enumerate().find_map(|(kind, names)| {
+        let (own, nana) = names.as_ref()?;
+        if own == agent {
+            return Some((kind as i32, None));
+        }
+        (nana.as_deref() == Some(agent))
+            .then(|| (kind as i32, Some(*smash::lib::lua_const::FIGHTER_KIND_NANA)))
+    })
 }

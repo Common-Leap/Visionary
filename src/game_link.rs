@@ -155,6 +155,14 @@ pub fn plugin_addr() -> SocketAddr {
         .unwrap_or_else(|_| PLUGIN_ADDR.parse().unwrap())
 }
 
+/// The running game's version, when the plugin refused it: it leaves the number in this file
+/// and opens no connection, and removes it on a version it supports.
+fn unsupported_game_note(sd: &std::path::Path) -> Option<String> {
+    let version = std::fs::read_to_string(sd.join("slight/unsupported_game.txt")).ok()?;
+    let version = version.trim();
+    (!version.is_empty() && version.len() < 16).then(|| version.to_owned())
+}
+
 /// Port from the plugin's `gateway.txt` on the emulator SD, if present and parseable.
 ///
 /// Mirrors the plugin's own `rpm_listen_port` parsing (dotted-quad with optional
@@ -287,19 +295,53 @@ pub struct ForFighter<T> {
     /// characters own, whether or not they have a version of the move.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub except_costumes: Vec<u8>,
+    /// The object ("mario_fireball") whose script the rule is for; left out for a rule of the
+    /// fighter's own move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(flatten)]
     pub rule: T,
+}
+
+/// The object a rule store key is for, when it is not a fighter: `mario_fireball/regular`, or
+/// `mario_fireball#c08/regular` for the fireball of the character made on Mario's c08.
+pub fn object_of_key(key: &str) -> Option<&str> {
+    let agent = key.split(['/', '#']).next().unwrap_or_default();
+    (!agent.is_empty() && crate::gimmicks::registry::fighter_kind_value(agent).is_none())
+        .then_some(agent)
+}
+
+/// The fighter that makes an object, from the first part of its agent name. Nana's objects are
+/// her own, but she is played, edited and made into characters as Popo.
+fn object_fighter(agent: &str) -> &str {
+    match agent.split_once('_').map_or(agent, |(owner, _)| owner) {
+        "nana" => "popo",
+        owner => owner,
+    }
+}
+
+/// The spelling an object's edits are kept under while `character` is being edited.
+pub fn object_key_owner(agent: &str, character: &crate::character::CharacterKey) -> String {
+    match character.as_str().split_once('#') {
+        Some((donor, slot)) if donor == object_fighter(agent) => format!("{agent}#{slot}"),
+        _ => agent.to_owned(),
+    }
 }
 
 impl<T> ForFighter<T> {
     /// `key` is a rule store key, which starts with the fighter's name. The rule runs on every
     /// costume; [`Self::scoped`] is the form that knows about made characters.
     pub fn from_key(key: &str, rule: T) -> Self {
-        let fighter = key.split(['/', '#']).next().unwrap_or_default();
+        let agent = object_of_key(key);
+        let fighter = agent.map_or_else(
+            || key.split(['/', '#']).next().unwrap_or_default(),
+            object_fighter,
+        );
         Self {
             fighter_kind: crate::gimmicks::registry::fighter_kind_value(fighter),
             costumes: Vec::new(),
             except_costumes: Vec::new(),
+            agent: agent.map(str::to_owned),
             rule,
         }
     }
@@ -310,7 +352,14 @@ impl<T> ForFighter<T> {
     /// every costume of its donor.
     pub fn scoped(key: &str, rule: T, roster: &crate::mod_project::RosterMod) -> Option<Self> {
         let owner = crate::character::split_move_key(key).map_or(key, |(owner, _)| owner);
-        let owner = crate::character::CharacterKey::parse(owner);
+        let owner = match object_of_key(key) {
+            Some(agent) => crate::character::CharacterKey::parse(&owner.replacen(
+                agent,
+                object_fighter(agent),
+                1,
+            )),
+            None => crate::character::CharacterKey::parse(owner),
+        };
         let mut tagged = Self::from_key(key, rule);
         if owner.is_made() {
             tagged.costumes = owner.made_slots(roster);
@@ -330,13 +379,13 @@ impl<T> ForFighter<T> {
     }
 }
 
-/// A live rule tagged with its article agent (`<owner>_<article>`, e.g. `samus_lativolt`).
-/// Sent on a separate wire family so fighter messages remain byte-identical.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ForArticle<T> {
-    pub agent: String,
-    #[serde(flatten)]
-    pub rule: T,
+/// How many lines each captured run of one object script has.
+fn article_run_lines(lines: &[ArticleCaptureLine]) -> BTreeMap<u32, usize> {
+    let mut runs = BTreeMap::new();
+    for line in lines {
+        *runs.entry(line.run).or_insert(0) += 1;
+    }
+    runs
 }
 
 /// Whether the running plugin supports live edits for a given article agent.
@@ -346,7 +395,7 @@ pub enum ArticleLiveSupport {
     Unsupported,
 }
 
-/// One captured ACMD call from an article owned by the selected fighter (`ArticleAcmdCapture`).
+/// One captured ACMD call from an object a fighter made (`ArticleAcmdCapture`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArticleCaptureLine {
     pub agent: String,
@@ -1543,6 +1592,8 @@ pub struct LinkView {
     pub problem: Option<LinkProblem>,
     pub detail: Option<String>,
     pub dialled: Option<SocketAddr>,
+    /// The game's version, when its plugin said it does not support it.
+    pub unsupported_game: Option<String>,
     /// The address box holds something other than the address in use.
     pub draft_is_new: bool,
 }
@@ -1550,13 +1601,26 @@ pub struct LinkView {
 impl LinkView {
     /// `● Game not connected`, in the state's colour.
     pub fn text(&self, visuals: &egui::Visuals) -> egui::RichText {
-        egui::RichText::new(format!("● {}", self.status.label())).color(self.status.color(visuals))
+        egui::RichText::new(format!("● {}", self.label())).color(self.status.color(visuals))
+    }
+
+    /// What the state is: the game's version when that is why it does not connect.
+    pub fn label(&self) -> String {
+        match &self.unsupported_game {
+            Some(version) if self.status == LinkStatus::NotConnected => {
+                format!("Game version {version} is not supported")
+            }
+            _ => self.status.label().to_owned(),
+        }
     }
 
     /// The explanation, why the last try failed, the address and the full error: hover text
     /// only.
     pub fn hover(&self) -> String {
         let mut text = self.status.hover().to_string();
+        if self.unsupported_game.is_some() {
+            text.push_str("\n\nThe plugin runs on game versions 13.0.4 and 13.0.5.");
+        }
         if let Some(problem) = self.problem_label() {
             text.push_str(&format!("\n\nLast try: {problem}"));
         }
@@ -2090,10 +2154,8 @@ struct Shared {
     /// Fighter kinds forgotten by the desktop roster. Their capture stream is ignored until the
     /// user restores the fighter, so a later playback cannot silently repopulate its memory.
     ignored_capture_kinds: BTreeSet<i32>,
-    /// Separate live-ACMD capture store for the selected fighter's articles, keyed by `(agent, motion)`.
+    /// Separate live-ACMD capture store for fighters' objects, keyed by `(agent, motion)`.
     article_captures: BTreeMap<(String, u64), Vec<ArticleCaptureLine>>,
-    article_capture_claimed_runs: BTreeMap<(String, u64), u32>,
-    article_capture_completed_runs: BTreeSet<(String, u64, u32)>,
     /// Per-agent live support reported by the plugin (`Unsupported` for clones whose runtime kind
     /// smashline does not expose).
     article_live_status: BTreeMap<String, ArticleLiveSupport>,
@@ -2125,6 +2187,8 @@ struct Shared {
     address_draft: String,
     /// The address of the latest attempt, as dialled.
     dialled: Option<SocketAddr>,
+    /// The game's version, when its plugin said it does not support it.
+    unsupported_game: Option<String>,
     attempts: u64,
 }
 
@@ -2135,10 +2199,6 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
     "\"effect_control_rules\":",
-    "\"selected_fighter\":",
-    "\"article_hitbox_rules\":",
-    "\"article_spawn_rules\":",
-    "\"article_effect_control_rules\":",
     "\"effect_aliases\":",
     "\"donor_effs\":",
     "\"donor_bytes\":",
@@ -2302,8 +2362,6 @@ impl Default for Shared {
             capture_completed_runs: BTreeSet::new(),
             ignored_capture_kinds: BTreeSet::new(),
             article_captures: BTreeMap::new(),
-            article_capture_claimed_runs: BTreeMap::new(),
-            article_capture_completed_runs: BTreeSet::new(),
             article_live_status: BTreeMap::new(),
             outbox: Vec::new(),
             gimmick_operations_in_flight: 0,
@@ -2319,6 +2377,7 @@ impl Default for Shared {
             address: None,
             address_draft: String::new(),
             dialled: None,
+            unsupported_game: None,
             attempts: 0,
         }
     }
@@ -2850,6 +2909,7 @@ impl GameLink {
                 problem: s.problem,
                 detail: s.last_error.clone(),
                 dialled: s.dialled,
+                unsupported_game: s.unsupported_game.clone(),
                 draft_is_new: parse_game_address(&s.address_draft) != Ok(s.address),
             })
             .unwrap_or(LinkView {
@@ -2857,6 +2917,7 @@ impl GameLink {
                 problem: None,
                 detail: None,
                 dialled: None,
+                unsupported_game: None,
                 draft_is_new: false,
             })
     }
@@ -3365,26 +3426,6 @@ impl GameLink {
         }
     }
 
-    /// Tell the plugin which fighter (and optional costume slot scope for slot characters such
-    /// as Shy Guy) is currently selected, so article capture/injection scopes strictly to that
-    /// fighter's own articles.
-    pub fn send_selected_fighter(&self, fighter_kind: Option<i32>, costumes: &[u8]) {
-        let costumes: Vec<i32> = costumes.iter().map(|&c| c as i32).collect();
-        let Ok(payload) = serde_json::to_string(&serde_json::json!({
-            "selected_fighter": {
-                "fighter_kind": fighter_kind,
-                "costumes": costumes,
-            }
-        })) else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
-    }
-
     /// Ask the plugin whether live edits for `agent` (e.g. `samus_lativolt`) are supported.
     pub fn send_article_probe(&self, agent: &str) {
         let Ok(payload) = serde_json::to_string(&serde_json::json!({
@@ -3399,70 +3440,23 @@ impl GameLink {
         }
     }
 
-    /// Replace the plugin's separate article hitbox-rule list. Fighter `hitbox_rules` stays untouched.
-    pub fn send_article_hitbox_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let Ok(payload) =
-            serde_json::to_string(&serde_json::json!({ "article_hitbox_rules": rules }))
-        else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
-    }
-
-    /// Replace the plugin's separate article effect spawn-rule list.
-    pub fn send_article_spawn_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let Ok(payload) =
-            serde_json::to_string(&serde_json::json!({ "article_spawn_rules": rules }))
-        else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
-    }
-
-    /// Replace the plugin's separate article effect control-rule list.
-    pub fn send_article_effect_control_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let Ok(payload) =
-            serde_json::to_string(&serde_json::json!({ "article_effect_control_rules": rules }))
-        else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
-    }
-
-    /// Captured ACMD lines for one article `(agent, motion)` from its latest run, separate
-    /// from the fighter capture store.
+    /// Captured ACMD lines for one article `(agent, motion)`, separate from the fighter capture
+    /// store: the run that says most, since an object can die before its script finishes, and
+    /// the latest of equals.
     pub fn latest_article_run_for(&self, agent: &str, motion: u64) -> Vec<CaptureLine> {
         self.shared
             .lock()
             .ok()
             .and_then(|s| {
                 let lines = s.article_captures.get(&(agent.to_string(), motion))?;
-                let latest = lines.iter().map(|l| l.run).max()?;
+                let best = article_run_lines(lines)
+                    .into_iter()
+                    .max_by_key(|(run, lines)| (*lines, *run))?
+                    .0;
                 Some(
                     lines
                         .iter()
-                        .filter(|l| l.run == latest)
+                        .filter(|l| l.run == best)
                         .map(ArticleCaptureLine::to_capture_line)
                         .collect(),
                 )
@@ -3791,6 +3785,9 @@ fn link_thread(
         match result {
             Ok(_) if stopped => {}
             Ok(stream) => {
+                if let Ok(mut s) = shared.lock() {
+                    s.unsupported_game = None;
+                }
                 let end = serve_connection(&shared, stream, &timings, Some(&wake));
                 let mut s = shared.lock().unwrap();
                 reset_session(&mut s);
@@ -3809,7 +3806,15 @@ fn link_thread(
             }
             Err(e) => {
                 let hint = connect_hint(&e);
+                // The emulator's SD card is on this PC only; a file read, so before the lock.
+                let unsupported = addr
+                    .ip()
+                    .is_loopback()
+                    .then(crate::scratch_dirs::emulator_sd_root)
+                    .flatten()
+                    .and_then(|sd| unsupported_game_note(&sd));
                 let mut s = shared.lock().unwrap();
+                s.unsupported_game = unsupported;
                 s.problem = Some(LinkProblem::of_io(&e));
                 s.last_error = Some(format!("connect to {addr}: {e}{hint}"));
             }
@@ -4319,8 +4324,6 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.capture_ends.clear();
             s.capture_completed_runs.clear();
             s.article_captures.clear();
-            s.article_capture_claimed_runs.clear();
-            s.article_capture_completed_runs.clear();
             s.captures_seq += 1;
         }
         "ArticleAcmdCapture" => {
@@ -4330,41 +4333,37 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             let Ok(line) = serde_json::from_value::<ArticleCaptureLine>(c.clone()) else {
                 return;
             };
-            let key = (line.agent.clone(), line.motion);
-            let claim = s
-                .article_capture_claimed_runs
-                .entry(key.clone())
-                .or_insert(line.run);
-            if *claim != line.run {
+            // A clone keeps the kind of the object it was made from, under another fighter.
+            // Nana has no number of her own in the editor; only her own objects are hers.
+            if !line.agent.starts_with("nana_")
+                && crate::gimmicks::registry::fighter_kind_value(object_fighter(&line.agent))
+                    .is_some_and(|owner| owner != line.owner_kind)
+            {
                 return;
             }
-            let bucket = s.article_captures.entry(key).or_default();
+            let bucket = s
+                .article_captures
+                .entry((line.agent.clone(), line.motion))
+                .or_default();
             let candidate = line.to_capture_line();
             if !bucket
                 .iter()
                 .any(|existing| same_capture(&existing.to_capture_line(), &candidate))
             {
                 bucket.push(line);
+                // Every object made can leave a run; the ones that died early say the least.
+                let lines = article_run_lines(bucket);
+                if lines.len() > 4 {
+                    let newest = lines.keys().max().copied();
+                    let least = lines
+                        .iter()
+                        .filter(|(run, _)| Some(**run) != newest)
+                        .min_by_key(|(run, lines)| (**lines, **run))
+                        .map(|(run, _)| *run);
+                    bucket.retain(|line| Some(line.run) != least);
+                }
                 s.captures_seq += 1;
             }
-        }
-        "ArticleAcmdCaptureEnd" => {
-            let Some(e) = body.get("ArticleAcmdCaptureEnd") else {
-                return;
-            };
-            let (Some(agent), Some(motion)) = (
-                e.get("agent").and_then(|a| a.as_str()),
-                e.get("motion").and_then(|m| m.as_u64()),
-            ) else {
-                return;
-            };
-            let run = e.get("run").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
-            let key = (agent.to_string(), motion);
-            if s.article_capture_claimed_runs.get(&key).copied() != Some(run) {
-                return;
-            }
-            s.article_capture_completed_runs
-                .insert((agent.to_string(), motion, run));
         }
         "ArticleLiveStatus" => {
             let Some(st) = body.get("ArticleLiveStatus") else {
@@ -4737,6 +4736,8 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 s.gimmick_controller_capabilities_seq = None;
                 s.gimmick_feature_capabilities = None;
                 s.gimmick_feature_capabilities_seq = None;
+                // Another game, or another plugin, answers for its own objects.
+                s.article_live_status.clear();
             }
             s.client_id = client_id;
         }
@@ -4752,7 +4753,8 @@ mod plugin_costume_scope;
 #[cfg(test)]
 mod costume_scope_tests {
     use super::plugin_costume_scope::{
-        costume_is, prefer_specific_costumes, rule_color, CostumeScoped,
+        costume_is, name_objects, prefer_specific_costumes, rule_color, runs_on, Acting,
+        CostumeScoped, MoveScope, RuleScope,
     };
     use super::ForFighter;
     use crate::roster::RosterKey;
@@ -4777,6 +4779,10 @@ mod costume_scope_tests {
     struct PluginRule {
         #[serde(default)]
         fighter_kind: Option<i32>,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(skip)]
+        weapon: Option<i32>,
         motion: u64,
         damage: f32,
         #[serde(default)]
@@ -4786,8 +4792,15 @@ mod costume_scope_tests {
     }
 
     impl CostumeScoped for PluginRule {
-        fn scope(&self) -> (Option<i32>, Option<u64>) {
-            (self.fighter_kind, Some(self.motion))
+        fn scope(&self) -> MoveScope {
+            (self.fighter_kind, self.weapon, Some(self.motion))
+        }
+        fn object(&mut self) -> Option<(&str, &mut Option<i32>, &mut Option<i32>)> {
+            Some((
+                self.agent.as_deref()?,
+                &mut self.weapon,
+                &mut self.fighter_kind,
+            ))
         }
         fn costumes(&self) -> &[u8] {
             &self.costumes
@@ -4806,8 +4819,195 @@ mod costume_scope_tests {
     fn installed<T: serde::Serialize>(wire: &[ForFighter<T>]) -> Vec<PluginRule> {
         let json = serde_json::to_string(wire).unwrap();
         let mut rules: Vec<PluginRule> = serde_json::from_str(&json).unwrap();
+        assert!(name_objects(&mut rules, game_object).is_empty());
         prefer_specific_costumes(&mut rules);
         rules
+    }
+
+    const FIREBALL: i32 = 0;
+    const FLAME: i32 = 1;
+    const ICE_SHOT: i32 = 2;
+    /// Nana's kind, which the editor has no name for.
+    const NANA: i32 = -2;
+
+    /// The objects of a stand-in game. Nana's are of Popo's kinds, told apart by who made them.
+    fn game_object(agent: &str) -> Option<(i32, Option<i32>)> {
+        match agent {
+            "mario_fireball" => Some((FIREBALL, None)),
+            "mario_hugeflame" => Some((FLAME, None)),
+            "popo_iceshot" => Some((ICE_SHOT, None)),
+            "nana_iceshot" => Some((ICE_SHOT, Some(NANA))),
+            _ => None,
+        }
+    }
+
+    fn kind(fighter: &str) -> i32 {
+        crate::gimmicks::registry::fighter_kind_value(fighter).unwrap()
+    }
+
+    fn fighter(name: &str, color: i32) -> Acting {
+        Acting {
+            fighter: kind(name),
+            color,
+            weapon: -1,
+            founder: None,
+        }
+    }
+
+    fn object(weapon: i32, founder: Option<(i32, i32)>) -> Acting {
+        Acting {
+            fighter: -1,
+            color: -1,
+            weapon,
+            founder,
+        }
+    }
+
+    /// The damage of every rule that runs on `acting`, as the plugin decides it.
+    fn damage_to(rules: &[PluginRule], acting: Acting) -> Vec<f32> {
+        rules
+            .iter()
+            .filter(|rule| {
+                let scope = RuleScope {
+                    fighter: rule.fighter_kind,
+                    weapon: rule.weapon,
+                    costumes: &rule.costumes,
+                    except_costumes: &rule.except_costumes,
+                };
+                runs_on(acting, scope, |wanted, kind| {
+                    kind == wanted
+                        || (wanted == self::kind("popo") && kind == NANA)
+                        || (rule.weapon.is_some() && kind == self::kind("kirby"))
+                })
+            })
+            .map(|rule| rule.damage)
+            .collect()
+    }
+
+    /// Objects and fighters share motion names and number their kinds separately, so neither's
+    /// rules may run on the other, or on another object.
+    #[test]
+    fn an_objects_rule_runs_on_that_object_alone() {
+        let plain = crate::mod_project::RosterMod::default();
+        let rules = installed(&[
+            ForFighter::scoped("mario/regular", jab(5.0), &plain).unwrap(),
+            ForFighter::scoped("mario_fireball/regular", jab(9.0), &plain).unwrap(),
+            ForFighter::scoped("mario_hugeflame/regular#hurt", jab(20.0), &plain).unwrap(),
+        ]);
+        assert_eq!(damage_to(&rules, fighter("mario", 0)), [5.0]);
+        assert_eq!(
+            damage_to(&rules, object(FIREBALL, Some((kind("mario"), 0)))),
+            [9.0]
+        );
+        assert_eq!(
+            damage_to(&rules, object(FLAME, Some((kind("mario"), 0)))),
+            [20.0]
+        );
+        // An object whose maker is not known yet is still that object.
+        assert_eq!(damage_to(&rules, object(FIREBALL, None)), [9.0]);
+        // A clone of the fireball keeps its kind under another fighter, with its own script.
+        assert!(damage_to(&rules, object(FIREBALL, Some((kind("link"), 0)))).is_empty());
+        // Kirby throws the copied fighter's own fireball.
+        assert_eq!(
+            damage_to(&rules, object(FIREBALL, Some((kind("kirby"), 0)))),
+            [9.0]
+        );
+        assert!(damage_to(&rules, fighter("kirby", 0)).is_empty());
+        // No selected fighter takes part: a second character's objects are live beside these.
+        assert_eq!(rules[1].fighter_kind, Some(kind("mario")));
+    }
+
+    /// Nana is played and edited as Popo, and her objects are her own.
+    #[test]
+    fn nanas_objects_are_edited_with_popo_selected() {
+        let popo = crate::character::CharacterKey::parse("popo");
+        assert_eq!(
+            super::object_key_owner("nana_iceshot", &popo),
+            "nana_iceshot"
+        );
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: RosterKey::slot("popo", 8),
+            donor: "popo".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Pair".into(),
+            name_id: "pair".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let pair = crate::character::CharacterKey::parse("popo#c08");
+        let own = super::object_key_owner("nana_iceshot", &pair);
+        assert_eq!(own, "nana_iceshot#c08");
+        let rules = installed(&[
+            ForFighter::scoped("nana_iceshot/shoot", jab(3.0), &roster).unwrap(),
+            ForFighter::scoped(&format!("{own}/shoot"), jab(7.0), &roster).unwrap(),
+        ]);
+        let made_by = |maker, color| object(ICE_SHOT, Some((maker, color)));
+        assert_eq!(damage_to(&rules, made_by(NANA, 0)), [3.0]);
+        assert_eq!(damage_to(&rules, made_by(NANA, 8)), [7.0]);
+        assert!(damage_to(&rules, made_by(kind("popo"), 0)).is_empty());
+        assert!(damage_to(&rules, object(FIREBALL, Some((NANA, 0)))).is_empty());
+        // Popo's own, which a moveset gives them both.
+        let rules =
+            installed(&[ForFighter::scoped("popo_iceshot/shoot", jab(3.0), &roster).unwrap()]);
+        assert_eq!(damage_to(&rules, made_by(kind("popo"), 0)), [3.0]);
+        assert_eq!(damage_to(&rules, made_by(NANA, 0)), [3.0]);
+    }
+
+    /// A character made on Mario throws the same fireball; its edits stay on its own costumes,
+    /// and Mario's stay off them.
+    #[test]
+    fn a_made_characters_object_rules_stay_on_its_costumes() {
+        let roster = roster_with_vision();
+        let vision = crate::character::CharacterKey::parse("mario#c08");
+        let own = super::object_key_owner("mario_fireball", &vision);
+        assert_eq!(own, "mario_fireball#c08");
+        // Another fighter's object opened meanwhile is not Vision's.
+        assert_eq!(
+            super::object_key_owner("link_bowarrow", &vision),
+            "link_bowarrow"
+        );
+        assert_eq!(
+            super::object_of_key(&format!("{own}/regular")),
+            Some("mario_fireball")
+        );
+        assert_eq!(super::object_of_key("mario#c08/attack_11"), None);
+        let rules = installed(&[
+            ForFighter::scoped("mario_fireball/regular", jab(5.0), &roster).unwrap(),
+            ForFighter::scoped(&format!("{own}/regular"), jab(20.0), &roster).unwrap(),
+        ]);
+        let thrown = |color| damage_to(&rules, object(FIREBALL, Some((kind("mario"), color))));
+        assert_eq!(thrown(0), [5.0]);
+        assert_eq!(thrown(8), [20.0]);
+        assert_eq!(thrown(15), [20.0]);
+        // A version of one object does not take the costume from another object's rule.
+        let rules = installed(&[
+            ForFighter::from_key("mario_hugeflame/regular", jab(1.0)),
+            ForFighter::scoped(&format!("{own}/regular"), jab(20.0), &roster).unwrap(),
+        ]);
+        assert_eq!(
+            damage_to(&rules, object(FLAME, Some((kind("mario"), 8)))),
+            [1.0]
+        );
+    }
+
+    /// An object the running game does not have is refused by name; the others stay.
+    #[test]
+    fn an_object_the_game_does_not_have_is_named_and_dropped() {
+        let wire = [
+            ForFighter::from_key("mario_fireball/regular", jab(1.0)),
+            ForFighter::from_key("samus_lativolt/fly", jab(2.0)),
+            ForFighter::from_key("samus_lativolt/start", jab(3.0)),
+            ForFighter::from_key("mario/attack_11", jab(4.0)),
+        ];
+        let json = serde_json::to_string(&wire).unwrap();
+        let mut rules: Vec<PluginRule> = serde_json::from_str(&json).unwrap();
+        assert_eq!(name_objects(&mut rules, game_object), ["samus_lativolt"]);
+        let kept: Vec<f32> = rules.iter().map(|rule| rule.damage).collect();
+        assert_eq!(kept, [1.0, 4.0]);
+        assert_eq!(rules[0].weapon, Some(FIREBALL));
+        assert_eq!(rules[1].weapon, None);
     }
 
     /// The damage costume `color` gets: every matching rule's, which must be exactly one.
@@ -4827,8 +5027,8 @@ mod costume_scope_tests {
         const MARIO: i32 = 1;
         let roster = roster_with_vision();
         let rules = installed(&[
-            ForFighter::scoped("mario/attack_11", jab(5.0), &roster).unwrap(),
-            ForFighter::scoped("mario#c08/attack_11", jab(20.0), &roster).unwrap(),
+            ForFighter::scoped("mario_fireball/regular", jab(5.0), &roster).unwrap(),
+            ForFighter::scoped("mario_fireball#c08/regular", jab(20.0), &roster).unwrap(),
         ]);
         let on_fireball = |founder: Option<(i32, i32)>| -> Vec<f32> {
             rules
@@ -4959,6 +5159,7 @@ mod costume_scope_tests {
             fighter_kind: Some(3),
             costumes: vec![8, 9],
             except_costumes: vec![1],
+            agent: None,
             rule: jab(4.0),
         };
         let json = serde_json::to_string(&tagged).unwrap();
@@ -5001,29 +5202,35 @@ mod costume_scope_tests {
 
     /// Where the plugin must read and check the costume: (file, item, text it must contain).
     const CHECKS: &[(usize, &str, &str)] = &[
-        (0, "staticACTING_COLOR:", "staticACTING_COLOR:"),
+        (
+            0,
+            "structActingSlot{",
+            ",color:std::sync::atomic::AtomicI32",
+        ),
+        // Scripts of several objects run at once, each on its own worker.
+        (0, "fnacting_slot(", "forslotin&ACTING{"),
         (
             0,
             "unsafefnkind_and_color(",
             "FIGHTER_INSTANCE_WORK_ID_INT_COLOR",
         ),
-        (0, "pubunsafefnnote_acting(", "ACTING_COLOR.store(color"),
+        (0, "pubunsafefnnote_acting(", "slot.color.store(color"),
         // A projectile takes the costume of the fighter that made it.
         (
             0,
             "pubunsafefnnote_acting(",
-            "get_founder_id((*boma).battle_object_id)",
+            "founder_fighter((*boma).battle_object_id)",
         ),
         (
             0,
             "pubunsafefnnote_acting(",
-            "FOUNDER_COLOR.store(founder_color",
+            "slot.founder_color.store(founder_color",
         ),
-        (
-            0,
-            "pubfnacting_is(",
-            "&&costume_is(rule_color(ACTING_COLOR.load(",
-        ),
+        (0, "pubfnacting_is(", "color:slot.color.load("),
+        (0, "pubfnacting_is(", "slot.founder_color.load("),
+        // An object's rule runs on that object, whoever is selected.
+        (0, "pubunsafefnnote_acting(", "slot.weapon.store(weapon"),
+        (0, "pubfnacting_is(", "weapon:slot.weapon.load("),
         (0, "pubstructHitboxRule{", "pubcostumes:Vec<u8>"),
         (0, "pubstructHitboxRule{", "pubexcept_costumes:Vec<u8>"),
         (
@@ -5105,8 +5312,12 @@ mod costume_scope_tests {
             );
         }
         let old_call = HITBOX.replacen(
-            "acting_is(self.fighter_kind, &self.costumes, &self.except_costumes)",
-            "acting_is(self.fighter_kind)",
+            "                self.weapon,
+                &self.costumes,
+                &self.except_costumes,
+            )",
+            "                self.weapon,
+            )",
             1,
         );
         assert_ne!(
@@ -6620,6 +6831,86 @@ mod tests {
         );
     }
 
+    /// Moving a grab's end hides the script's own clear. The status code that ends the grab calls
+    /// the same function, and its call must never be hidden: only one made from inside a script's
+    /// block, with no status change going on, can be the script's.
+    #[test]
+    fn the_status_codes_grab_clear_always_goes_through() {
+        let hitbox = include_str!("../plugins/slight_replica/src/slight/hitbox_viewer/mod.rs");
+        let hook = hitbox
+            .split_once("unsafe fn hook_grab_clear_all(")
+            .expect("the hook on the direct clear")
+            .1
+            .split_once("original!()(boma)")
+            .expect("and its call through")
+            .0;
+        let order = [
+            "in_script(",
+            "StatusModule::is_changing(boma)",
+            "grab_clear_suppressed(",
+        ]
+        .map(|check| hook.find(check).unwrap_or_else(|| panic!("no {check}")));
+        assert!(order.is_sorted(), "{order:?}");
+        // A block ends where its script waits, and where status code has its turn.
+        let hooks =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
+        for name in ["hook_acmd_frame(", "hook_acmd_wait("] {
+            let body = hooks
+                .split_once(&format!("unsafe fn {name}"))
+                .expect(name)
+                .1;
+            let waits = body.find("script_waits(").expect("ends the block");
+            assert!(waits < body.find("original!()").expect("waits"), "{name}");
+        }
+        let tick = hitbox
+            .split_once("pub unsafe fn inject_tick(")
+            .expect("tick")
+            .1;
+        assert!(tick
+            .split_once("\n}\n")
+            .unwrap()
+            .0
+            .contains("script_waits(boma);"));
+    }
+
+    /// The registry of live fighters is asked about a projectile's maker from game workers, which
+    /// must never park on it.
+    #[test]
+    fn asking_for_a_projectiles_maker_never_parks() {
+        let agents = include_str!("../plugins/slight_replica/src/slight/agents.rs");
+        let body = agents
+            .split_once("pub fn lookup_by_founder(")
+            .expect("lookup_by_founder")
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(body.contains(".try_lock()?") && !body.contains(".lock()"));
+        let notifier =
+            include_str!("../plugins/slight_replica/src/slight/systems/article_notifier.rs");
+        let founder = notifier
+            .split_once("pub unsafe fn founder_fighter(")
+            .expect("founder_fighter")
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(!founder.contains("lock()") && !founder.contains("agents::"));
+        let hitbox = include_str!("../plugins/slight_replica/src/slight/hitbox_viewer/mod.rs");
+        for reader in [
+            "fn action_for(",
+            "fn action_for_func(",
+            "fn injections_for(",
+        ] {
+            let body = hitbox.split_once(reader).expect(reader).1;
+            let body = body.split_once("\n}\n").unwrap().0;
+            assert!(
+                body.contains("rules_now()") && !body.contains("RULES.lock()"),
+                "{reader}"
+            );
+        }
+    }
+
     /// Effect, sound, game, and expression ACMD coroutines can enter the live-retime scheduler
     /// from different game workers. Its startup markers and motion hints used to share three
     /// blocking `parking_lot` collections; a contended waiter can spin forever on Horizon even
@@ -6643,12 +6934,13 @@ mod tests {
         assert!(
             lifecycle.contains("static MOTION_HINTS: [MotionHintSlot;")
                 && lifecycle.contains("static ACMD_STARTUP_PENDING: [")
-                && lifecycle.contains("static ACMD_PLAYBACK_STARTED: [")
                 && lifecycle.contains("compare_exchange")
                 && !lifecycle.contains("Mutex")
                 && !lifecycle.contains(".lock()"),
             "cross-coroutine startup state must remain fixed-size and lock-free"
         );
+        // What has fired is kept in a map, which is asked for and never waited on.
+        assert!(source.contains("PLAYINGS.try_lock()") && !source.contains("PLAYINGS.lock()"));
 
         let boundary = source
             .split_once("unsafe fn inject_before_acmd_wait")
@@ -7076,17 +7368,15 @@ mod tests {
             "CoroutineBoundary::Control",
             "MotionHint",
             "remember_motion_hint",
-            "reset_effect_injection_latches();",
-            "reset_control_injection_latches();",
-            "ACMD_PLAYBACK_STARTED",
-            "begin_acmd_playback",
+            "playings.started(boid, motion, inherits)",
             "resolve_injection_motion",
             "injection_frame",
-            "MAX_ATTEMPTS_PER_FRAME",
+            "injection_due",
+            "injection_fired",
             "\"AFTER_IMAGE3_ON\" => smash::app::sv_module_access::effect",
             "\"AFTER_IMAGE4_ON_arg29\" => sv::AFTER_IMAGE4_ON_arg29",
             "\"AFTER_IMAGE_OFF\" => sv::AFTER_IMAGE_OFF",
-            "static EFF_FIRED",
+            "static PLAYINGS",
             "InjectGuard::new()",
             "preserve_authored_effect",
         ] {
@@ -10745,9 +11035,9 @@ mod tests {
         assert!(link.gimmick_controller_snapshot().is_none());
     }
 
+    /// An object's rule travels in the same list as the fighters', named by its object.
     #[test]
-    fn wire_round_trip() {
-        // Article rule message encodes and decodes with its `agent` field intact.
+    fn an_objects_rule_names_its_object_and_a_fighters_names_none() {
         let rule = HitboxRuleWire {
             motion: 0x0765_4321,
             category: 0,
@@ -10759,52 +11049,40 @@ mod tests {
             inject: None,
             func: None,
         };
-        let article_msg = ForArticle {
-            agent: "samus_lativolt".to_string(),
-            rule: rule.clone(),
+        let json = |key: &str| {
+            serde_json::to_value(ForFighter::from_key(key, rule.clone())).expect("serialize")
         };
-        let json = serde_json::to_string(&article_msg).expect("serialize ForArticle");
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse ForArticle");
-        assert_eq!(parsed["agent"], "samus_lativolt");
-        assert_eq!(parsed["motion"], 0x0765_4321u64);
-        assert!(
-            parsed.get("fighter_kind").is_none(),
-            "article message must carry agent, not fighter_kind"
-        );
-        let decoded: ForArticle<HitboxRuleWire> =
-            serde_json::from_str(&json).expect("deserialize ForArticle");
-        assert_eq!(decoded.agent, "samus_lativolt");
-        assert_eq!(decoded.rule.motion, 0x0765_4321);
+        let object = json("samus_lativolt/fly");
+        let samus = crate::gimmicks::registry::fighter_kind_value("samus").unwrap();
+        assert_eq!(object["agent"], "samus_lativolt");
+        assert_eq!(object["fighter_kind"], samus);
+        assert_eq!(object["motion"], 0x0765_4321u64);
+        let fighter = json("samus/attack_air_n");
+        assert!(fighter.get("agent").is_none());
+        assert_eq!(fighter["fighter_kind"], samus);
+    }
 
-        // Fighter message stays unchanged (no `agent` field).
-        let fighter_msg = ForFighter::from_key("mario/attack_air_n", rule);
-        let fighter_json: serde_json::Value =
-            serde_json::to_value(&fighter_msg).expect("serialize ForFighter");
-        assert!(fighter_json.get("agent").is_none());
-        assert_eq!(
-            fighter_json["fighter_kind"],
-            crate::gimmicks::registry::fighter_kind_value("mario").unwrap()
-        );
+    fn article_capture(frame: f32, run: u32, owner_kind: i32) -> serde_json::Value {
+        serde_json::json!({
+            "ArticleAcmdCapture": {
+                "agent": "mario_fireball",
+                "owner_kind": owner_kind,
+                "article_kind": 0,
+                "motion": 0x1111_u64,
+                "frame": frame,
+                "func": "ATTACK",
+                "args": [],
+                "run": run,
+                "common": false
+            }
+        })
+    }
 
-        // Inbound ArticleAcmdCapture and ArticleLiveStatus route separately from fighter captures.
+    #[test]
+    fn object_captures_stay_apart_from_fighter_captures() {
         let link = connected_test_link();
-        deliver(
-            &link,
-            "ArticleAcmdCapture",
-            serde_json::json!({
-                "ArticleAcmdCapture": {
-                    "agent": "mario_fireball",
-                    "owner_kind": 0,
-                    "article_kind": 0,
-                    "motion": 0x1111_u64,
-                    "frame": 1.0,
-                    "func": "ATTACK",
-                    "args": [],
-                    "run": 1,
-                    "common": false
-                }
-            }),
-        );
+        let mario = crate::gimmicks::registry::fighter_kind_value("mario").unwrap();
+        deliver(&link, "ArticleAcmdCapture", article_capture(1.0, 1, mario));
         assert!(
             link.latest_run_for(0x1111, Some(0)).is_empty(),
             "article capture with article_kind == fighter_kind must never enter fighter captures"
@@ -10812,21 +11090,648 @@ mod tests {
         let art = link.latest_article_run_for("mario_fireball", 0x1111);
         assert_eq!(art.len(), 1);
         assert_eq!(art[0].func, "ATTACK");
+        // A clone another fighter makes from the fireball runs its own script.
+        deliver(
+            &link,
+            "ArticleAcmdCapture",
+            article_capture(4.0, 1, mario + 1),
+        );
+        assert_eq!(
+            link.latest_article_run_for("mario_fireball", 0x1111).len(),
+            1
+        );
 
         deliver(
             &link,
             "ArticleLiveStatus",
             serde_json::json!({
-                "ArticleLiveStatus": {
-                    "agent": "samus_lativolt",
-                    "status": "unsupported"
-                }
+                "ArticleLiveStatus": { "agent": "samus_lativolt", "status": "unsupported" }
             }),
         );
         assert_eq!(
             link.article_live_status("samus_lativolt"),
             Some(ArticleLiveSupport::Unsupported)
         );
+        // The next game to connect answers for itself.
+        deliver(
+            &link,
+            "GiveClientId",
+            serde_json::json!({"GiveClientId":{"client_id":2}}),
+        );
+        assert_eq!(link.article_live_status("samus_lativolt"), None);
+    }
+
+    /// A fireball that hits on its third frame never finishes its script: a later one that lives
+    /// longer takes its place, and one that lives shorter does not.
+    #[test]
+    fn the_object_run_that_says_most_is_the_one_used() {
+        let link = connected_test_link();
+        let mario = crate::gimmicks::registry::fighter_kind_value("mario").unwrap();
+        let frames = || -> Vec<f32> {
+            link.latest_article_run_for("mario_fireball", 0x1111)
+                .iter()
+                .map(|line| line.frame)
+                .collect()
+        };
+        let line = |frame: f32, run: u32| {
+            deliver(
+                &link,
+                "ArticleAcmdCapture",
+                article_capture(frame, run, mario),
+            );
+        };
+        line(0.0, 1);
+        assert_eq!(frames(), [0.0]);
+        line(0.0, 2);
+        line(9.0, 2);
+        line(0.0, 3);
+        assert_eq!(frames(), [0.0, 9.0]);
+        // The same line again adds nothing; one as long and later is the fresher look.
+        line(9.0, 2);
+        line(8.0, 3);
+        assert_eq!(frames(), [0.0, 8.0]);
+        // Throwing a hundred more keeps a handful of runs, and not at the long one's cost.
+        for run in 4..100 {
+            line(0.0, run);
+        }
+        assert_eq!(frames(), [0.0, 8.0]);
+        let kept = link.shared.lock().unwrap().article_captures
+            [&("mario_fireball".to_owned(), 0x1111)]
+            .len();
+        assert!(kept <= 8, "{kept}");
+    }
+
+    #[test]
+    fn an_unsupported_game_version_is_what_the_status_says() {
+        let sd = tempfile::tempdir().unwrap();
+        assert_eq!(unsupported_game_note(sd.path()), None);
+        std::fs::create_dir_all(sd.path().join("slight")).unwrap();
+        std::fs::write(sd.path().join("slight/unsupported_game.txt"), "13.0.3\n").unwrap();
+        let mut view = LinkView {
+            status: LinkStatus::NotConnected,
+            problem: Some(LinkProblem::Refused),
+            detail: None,
+            dialled: None,
+            unsupported_game: unsupported_game_note(sd.path()),
+            draft_is_new: false,
+        };
+        assert_eq!(view.label(), "Game version 13.0.3 is not supported");
+        // Paired: no note, or a connection, says what the link's state is.
+        view.status = LinkStatus::Connected;
+        assert_eq!(view.label(), "Game connected");
+        view.status = LinkStatus::NotConnected;
+        view.unsupported_game = None;
+        assert_eq!(view.label(), "Game not connected");
+        // The plugin writes the file this reads.
+        let consts = include_str!("../plugins/slight_replica/src/slight/smash_utils.rs");
+        assert!(consts.contains("\"sd:/slight/unsupported_game.txt\""));
+        let boot = include_str!("../plugins/slight_replica/src/lib.rs");
+        assert!(boot.contains("std::fs::write(slight::smash_utils::UNSUPPORTED_GAME"));
+        assert!(boot.contains("std::fs::remove_file(slight::smash_utils::UNSUPPORTED_GAME"));
+    }
+}
+
+/// The plugin's count of an object script's frames, run here: tests in the plugin crate never
+/// run.
+#[cfg(test)]
+#[path = "../plugins/slight_replica/src/slight/effect_viewer/script_frames.rs"]
+mod plugin_script_frames;
+
+#[cfg(test)]
+mod script_frame_tests {
+    use super::plugin_script_frames::{object_frame, ScriptFrames};
+
+    const SCRIPT: u64 = 0x10;
+    const FLY: u64 = 1;
+    const TURN: u64 = 2;
+
+    /// The frame the editor counts for the calls of a script's lines: what its parser starts a
+    /// script on, and what `frame` and `wait` do to it.
+    fn editor_frame(body: &str, call: &str) -> f32 {
+        let hitboxes = crate::acmd::parse_acmd_script(body).to_hitboxes();
+        let damage: f32 = call.parse().unwrap();
+        let frame = hitboxes
+            .iter()
+            .find(|hitbox| hitbox.damage == damage)
+            .unwrap_or_else(|| panic!("no hitbox of {call}"))
+            .active_start;
+        crate::data::script_to_motion_frame(frame)
+    }
+
+    fn body(lines: &str) -> String {
+        format!("unsafe extern \"C\" fn game_fly(agent: &mut L2CAgentBase) {{\n{lines}}}\n")
+    }
+
+    fn attack(damage: &str) -> String {
+        format!(
+            "    if macros::is_excute(agent) {{\n        macros::ATTACK(agent, 0, 0, \
+             Hash40::new(\"top\"), {damage}, 361, 20, 0, 35, 2.4, 0.0, 0.0, 0.0, None, None, None, \
+             0.6, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_SPEED, false, -2.5, 0.0, 0, true, \
+             true, false, false, false, *COLLISION_SITUATION_MASK_GA, \
+             *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, \
+             Hash40::new(\"collision_attr_fire\"), *ATTACK_SOUND_LEVEL_S, \
+             *COLLISION_SOUND_ATTR_MARIO_FIREBALL, *ATTACK_REGION_NONE);\n    }}\n"
+        )
+    }
+
+    /// Measured in the game (13.0.4): Mario's fireball is on motion frame 0 where its script
+    /// starts and on 5 after `frame(5)`, and Fox's blaster bullet on 2 after `wait(2)`. A rule
+    /// the editor makes for each of those calls names the frame counted here.
+    #[test]
+    fn an_objects_calls_are_on_the_frames_the_editor_counts() {
+        let mut scripts = ScriptFrames::default();
+        let fireball = body(&format!(
+            "{}    frame(agent.lua_state_agent, 5.0);\n{}",
+            attack("5.0"),
+            attack("7.0")
+        ));
+        scripts.runs(SCRIPT, 7, FLY, 0.0);
+        assert_eq!(
+            scripts.rule_frame(SCRIPT, 7),
+            Some(editor_frame(&fireball, "5.0"))
+        );
+        scripts.reached(SCRIPT, 7, FLY, 5.0, 5.0);
+        assert_eq!(
+            scripts.rule_frame(SCRIPT, 7),
+            Some(editor_frame(&fireball, "7.0"))
+        );
+        // The motion says 5 there, one more than the rule: what the plugin used to compare.
+        assert_eq!(editor_frame(&fireball, "7.0"), 4.0);
+
+        let bullet = body(&format!(
+            "{}    wait(agent.lua_state_agent, 2.0);\n{}    wait(agent.lua_state_agent, 7.0);\n{}",
+            attack("3.0"),
+            attack("2.0"),
+            attack("1.4")
+        ));
+        scripts.runs(0x20, 8, FLY, 0.0);
+        for (wait, motion, call) in [(2.0, 2.0, "2.0"), (7.0, 9.0, "1.4")] {
+            scripts.waited(0x20, 8, FLY, motion, wait);
+            assert_eq!(
+                scripts.rule_frame(0x20, 8),
+                Some(editor_frame(&bullet, call)),
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_run_of_a_script_is_counted_from_its_start() {
+        let mut scripts = ScriptFrames::default();
+        let after = |scripts: &ScriptFrames| scripts.rule_frame(SCRIPT, 7);
+        scripts.reached(SCRIPT, 7, FLY, 10.0, 10.0);
+        assert_eq!(after(&scripts), Some(9.0));
+        // Another motion, the same one gone back, and another object in the same Lua state.
+        scripts.runs(SCRIPT, 7, TURN, 12.0);
+        assert_eq!(after(&scripts), Some(0.0));
+        scripts.reached(SCRIPT, 7, TURN, 14.0, 4.0);
+        scripts.runs(SCRIPT, 7, TURN, 0.0);
+        assert_eq!(after(&scripts), Some(0.0));
+        scripts.reached(SCRIPT, 7, TURN, 4.0, 4.0);
+        scripts.runs(SCRIPT, 9, TURN, 5.0);
+        assert_eq!(scripts.rule_frame(SCRIPT, 9), Some(0.0));
+        assert_eq!(after(&scripts), None);
+        // The game starting the same motion again before it moved.
+        scripts.reached(SCRIPT, 9, TURN, 5.0, 4.0);
+        scripts.restarted(9);
+        assert_eq!(scripts.rule_frame(SCRIPT, 9), None);
+        scripts.runs(SCRIPT, 9, TURN, 5.0);
+        assert_eq!(scripts.rule_frame(SCRIPT, 9), Some(0.0));
+        // Each of an object's scripts counts for itself.
+        scripts.reached(0x30, 9, TURN, 6.0, 6.0);
+        assert_eq!(scripts.rule_frame(SCRIPT, 9), Some(0.0));
+        assert_eq!(scripts.rule_frame(0x30, 9), Some(5.0));
+        scripts.retain(|object| object != 9);
+        assert_eq!(scripts.rule_frame(0x30, 9), None);
+    }
+
+    /// An added call comes out on the motion frame the game's own `frame` of that number does:
+    /// the start on 0, `frame(5)` on 5.
+    #[test]
+    fn an_added_call_comes_out_with_the_scripts_own_frame() {
+        let due = |script_frame: u32| {
+            let target = crate::data::script_to_motion_frame(script_frame);
+            (0..40)
+                .map(|motion| motion as f32)
+                .find(|motion| target <= object_frame(*motion))
+        };
+        assert_eq!(due(1), Some(0.0));
+        assert_eq!(due(5), Some(5.0));
+        assert_eq!(due(30), Some(30.0));
+    }
+
+    /// The hooks that read and rewrite an object's calls go by this count, and no longer by its
+    /// motion's frame.
+    #[test]
+    fn the_plugin_matches_calls_by_the_scripts_frame() {
+        let hitbox = include_str!("../plugins/slight_replica/src/slight/hitbox_viewer/mod.rs");
+        let rate = include_str!("../plugins/slight_replica/src/slight/hitbox_viewer/rate_hooks.rs");
+        let sound =
+            include_str!("../plugins/slight_replica/src/slight/hitbox_viewer/sound_hooks.rs");
+        let effects =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
+        // Every lookup is on a frame read just before it.
+        for (name, source) in [("hitbox", hitbox), ("rate", rate), ("sound", sound)] {
+            for (at, _) in source.match_indices("action_for") {
+                let before = &source[at.saturating_sub(1200)..at];
+                let Some(read) = before.rfind("let frame = ") else {
+                    continue;
+                };
+                assert!(
+                    before[read..].starts_with("let frame = rule_frame(boma)")
+                        || before[read..].starts_with("let frame = super::rule_frame(boma)"),
+                    "{name}: {}",
+                    &before[read..]
+                );
+            }
+        }
+        for lookup in [
+            "control_suppressed(",
+            "trail_suppressed(",
+            "lifetime_stop_suppressed(",
+        ] {
+            let body = effects
+                .split_once(&format!("unsafe fn {lookup}"))
+                .expect(lookup)
+                .1;
+            assert!(
+                body.split_once("\n}\n")
+                    .unwrap()
+                    .0
+                    .contains("rule_frame(boma)"),
+                "{lookup}"
+            );
+        }
+        for step in [
+            "ScriptStep::Runs)",
+            "ScriptStep::Reached(target))",
+            "ScriptStep::Waited(target))",
+        ] {
+            assert!(effects.contains(step), "{step}");
+        }
+    }
+}
+
+/// The plugin's rule for when an added effect fires, run here: tests in the plugin crate never
+/// run.
+#[cfg(test)]
+#[path = "../plugins/slight_replica/src/slight/effect_viewer/playings.rs"]
+mod plugin_playings;
+
+#[cfg(test)]
+mod playing_tests {
+    use super::plugin_playings::Playings;
+
+    const GROUND: u64 = 1;
+    const AIR: u64 = 2;
+
+    /// One object with added effects, driven the way the plugin drives them.
+    struct Game {
+        playings: Playings,
+        /// Added effects: (motion, frame).
+        effects: Vec<(u64, f32)>,
+        step: f32,
+        fired: Vec<(u64, f32)>,
+    }
+
+    impl Game {
+        fn new(effects: &[(u64, f32)]) -> Self {
+            Self {
+                playings: Playings::default(),
+                effects: effects.to_vec(),
+                step: 1.0,
+                fired: Vec::new(),
+            }
+        }
+
+        fn fire(&mut self, motion: u64, observed: f32, reached: f32) {
+            for (slot, (wanted, target)) in self.effects.clone().into_iter().enumerate() {
+                let due = wanted == motion
+                    && self.playings.at(7, motion, observed, self.step).due(
+                        slot,
+                        slot as u64,
+                        target,
+                        reached,
+                    );
+                if due {
+                    self.playings
+                        .current(7)
+                        .unwrap()
+                        .fire(slot, slot as u64, true);
+                    self.fired.push((motion, target));
+                }
+            }
+        }
+
+        /// The once-per-frame tick.
+        fn tick(&mut self, motion: u64, frame: f32) {
+            self.fire(motion, frame, frame);
+            self.playings.at(7, motion, frame, self.step).pass(frame);
+        }
+
+        /// A script's `frame`/`wait`, `is_excute` or effect call, which says it is on `script`.
+        fn boundary(&mut self, motion: u64, observed: f32, script: f32) {
+            self.fire(motion, observed, script);
+        }
+
+        fn play(&mut self, motion: u64, frames: impl Iterator<Item = f32>) {
+            self.playings.started(7, motion, false);
+            for frame in frames {
+                self.tick(motion, frame);
+            }
+        }
+    }
+
+    fn frames(from: f32, to: f32, step: f32) -> impl Iterator<Item = f32> {
+        (0..)
+            .map(move |n| from + n as f32 * step)
+            .take_while(move |frame| *frame <= to)
+    }
+
+    #[test]
+    fn an_added_effect_fires_once_each_time_its_motion_plays() {
+        let mut game = Game::new(&[(GROUND, 0.0), (GROUND, 5.0)]);
+        for _ in 0..3 {
+            game.play(GROUND, frames(0.0, 30.0, 1.0));
+        }
+        let once = [(GROUND, 0.0), (GROUND, 5.0)];
+        assert_eq!(game.fired, [once, once, once].concat());
+        // The first frame seen can be the one after the start.
+        let mut game = Game::new(&[(GROUND, 0.0), (GROUND, 1.0)]);
+        game.play(GROUND, frames(1.0, 30.0, 1.0));
+        assert_eq!(game.fired, [(GROUND, 0.0), (GROUND, 1.0)]);
+    }
+
+    /// Faster motions step over frames and slower ones stay on them: still once, in order.
+    #[test]
+    fn any_rate_fires_each_effect_once_on_the_first_frame_past_it() {
+        for step in [0.25, 0.3, 0.7, 1.0, 1.6667, 2.5, 4.0] {
+            let mut game =
+                Game::new(&[(GROUND, 0.0), (GROUND, 5.0), (GROUND, 6.5), (GROUND, 20.0)]);
+            game.step = step;
+            // The first frame seen is the start, or the one a whole step after it.
+            game.play(GROUND, frames(0.0, 40.0, step));
+            game.play(GROUND, frames(step, 40.0, step));
+            let once = [(GROUND, 0.0), (GROUND, 5.0), (GROUND, 6.5), (GROUND, 20.0)];
+            assert_eq!(game.fired, [once, once].concat(), "rate {step}");
+        }
+    }
+
+    /// Hitlag: the motion stands still and nothing fires again.
+    #[test]
+    fn a_held_frame_does_not_fire_again() {
+        let mut game = Game::new(&[(GROUND, 5.0)]);
+        game.play(GROUND, frames(0.0, 5.0, 1.0));
+        for _ in 0..20 {
+            game.tick(GROUND, 5.0);
+            game.boundary(GROUND, 5.0, 5.0);
+        }
+        assert_eq!(game.fired, [(GROUND, 5.0)]);
+    }
+
+    /// A script boundary and the tick reach the same frame in either order, at any fraction.
+    #[test]
+    fn a_boundary_and_the_tick_fire_it_once_between_them() {
+        for boundary_first in [true, false] {
+            for offset in [0.0, 0.3, 0.45] {
+                let mut game = Game::new(&[(GROUND, 5.0)]);
+                game.playings.started(7, GROUND, false);
+                for frame in frames(offset, 12.0, 1.0) {
+                    if boundary_first {
+                        game.boundary(GROUND, frame, frame);
+                    }
+                    game.tick(GROUND, frame);
+                    game.boundary(GROUND, frame, frame.floor());
+                    game.boundary(GROUND, frame, frame);
+                }
+                assert_eq!(game.fired, [(GROUND, 5.0)], "{boundary_first} {offset}");
+            }
+        }
+    }
+
+    /// Leaving the ground on frame 20 carries the special on in the air: what it already played
+    /// does not burst out again, and what is ahead still fires.
+    #[test]
+    fn leaving_the_ground_in_mid_move_fires_nothing_twice() {
+        let effects = [
+            (GROUND, 3.0),
+            (GROUND, 20.0),
+            (GROUND, 25.0),
+            (AIR, 3.0),
+            (AIR, 20.0),
+            (AIR, 25.0),
+        ];
+        for told in [true, false] {
+            for last_ground in [19.0, 20.0] {
+                let mut game = Game::new(&effects);
+                game.play(GROUND, frames(0.0, last_ground, 1.0));
+                if told {
+                    game.playings.started(7, AIR, true);
+                }
+                // The air script starts over and runs through its frames up to this one.
+                for script in [0.0, 3.0, 19.0] {
+                    game.boundary(AIR, 20.0, script);
+                }
+                for frame in frames(20.0, 40.0, 1.0) {
+                    game.tick(AIR, frame);
+                }
+                let at = |frame: f32| game.fired.iter().filter(|(_, f)| *f == frame).count();
+                assert_eq!(
+                    (at(3.0), at(20.0), at(25.0)),
+                    (1, 1, 1),
+                    "told {told}, last ground frame {last_ground}: {:?}",
+                    game.fired
+                );
+            }
+        }
+        // Paired: the same motion started afresh in the air fires all of its own.
+        let mut game = Game::new(&effects);
+        game.play(AIR, frames(0.0, 40.0, 1.0));
+        assert_eq!(game.fired, [(AIR, 3.0), (AIR, 20.0), (AIR, 25.0)]);
+    }
+
+    /// A smash attack's release starts its motion over at the frame it was held on.
+    #[test]
+    fn a_motion_started_at_a_later_frame_plays_from_there() {
+        let mut game = Game::new(&[(GROUND, 3.0), (GROUND, 14.0)]);
+        game.play(GROUND, frames(0.0, 10.0, 1.0));
+        game.play(AIR, frames(0.0, 60.0, 1.0));
+        game.play(GROUND, frames(11.0, 40.0, 1.0));
+        assert_eq!(game.fired, [(GROUND, 3.0), (GROUND, 14.0)]);
+    }
+
+    /// A move begun again on its first frame looks, by its frames alone, like one held there.
+    #[test]
+    fn a_motion_begun_again_on_the_same_frame_is_a_new_playing() {
+        let mut game = Game::new(&[(GROUND, 0.0)]);
+        game.play(GROUND, frames(0.0, 0.0, 1.0));
+        game.play(GROUND, frames(0.0, 0.0, 1.0));
+        assert_eq!(game.fired, [(GROUND, 0.0); 2]);
+    }
+
+    /// Not every motion change passes the hooks: one that does not carry on from the frame the
+    /// last motion was on plays from where it starts.
+    #[test]
+    fn a_motion_change_the_hooks_missed_does_not_burst() {
+        let mut game = Game::new(&[(AIR, 5.0), (AIR, 12.0)]);
+        game.play(GROUND, frames(0.0, 3.0, 1.0));
+        for frame in frames(10.0, 20.0, 1.0) {
+            game.tick(AIR, frame);
+        }
+        assert_eq!(game.fired, [(AIR, 12.0)]);
+    }
+
+    /// The first rule can arrive while its motion is already playing: it waits for its frame,
+    /// or for the next time when that has gone.
+    #[test]
+    fn a_rule_that_arrives_in_mid_move_does_not_burst() {
+        let mut game = Game::new(&[]);
+        game.effects = vec![(GROUND, 3.0), (GROUND, 25.0)];
+        for frame in frames(20.0, 40.0, 1.0) {
+            game.tick(GROUND, frame);
+        }
+        assert_eq!(game.fired, [(GROUND, 25.0)]);
+        game.play(GROUND, frames(0.0, 40.0, 1.0));
+        assert_eq!(game.fired[1..], [(GROUND, 3.0), (GROUND, 25.0)]);
+    }
+
+    /// The hooks do not see every loop: a frame that went back is a new playing.
+    #[test]
+    fn a_looping_motion_fires_on_every_loop() {
+        let mut game = Game::new(&[(GROUND, 2.0)]);
+        for _ in 0..3 {
+            for frame in frames(0.0, 10.0, 1.0) {
+                game.tick(GROUND, frame);
+            }
+        }
+        assert_eq!(game.fired, [(GROUND, 2.0); 3]);
+    }
+
+    /// Sending the same rules again, or another object starting a move, changes nothing here:
+    /// what has fired is kept per object and playing, not per rule list.
+    #[test]
+    fn another_objects_start_does_not_refire() {
+        let mut game = Game::new(&[(GROUND, 5.0)]);
+        game.play(GROUND, frames(0.0, 5.0, 1.0));
+        game.playings.at(8, AIR, 0.0, 1.0).pass(0.0);
+        game.playings.started(8, GROUND, false);
+        game.tick(GROUND, 5.0);
+        game.boundary(GROUND, 5.0, 5.0);
+        assert_eq!(game.fired, [(GROUND, 5.0)]);
+        // Paired: this object starting its motion again does.
+        game.play(GROUND, frames(0.0, 5.0, 1.0));
+        assert_eq!(game.fired.len(), 2);
+    }
+
+    /// An edit makes a rule new; on a frame already played it waits for the next playing.
+    #[test]
+    fn an_edited_rule_does_not_fire_late() {
+        let mut game = Game::new(&[(GROUND, 5.0)]);
+        game.play(GROUND, frames(0.0, 8.0, 1.0));
+        let playing = game.playings.at(7, GROUND, 9.0, 1.0);
+        assert!(!playing.due(0, 99, 5.0, 9.0));
+        assert!(playing.due(0, 99, 9.0, 9.0));
+    }
+
+    /// The game may not take a dispatch made as a script starts: it gets one more on its frame.
+    #[test]
+    fn an_unconfirmed_dispatch_gets_one_more_try_on_its_frame() {
+        let mut playings = Playings::default();
+        let playing = playings.at(7, GROUND, 0.0, 1.0);
+        assert!(playing.due(0, 1, 0.0, 0.0));
+        assert_eq!(playing.fire(0, 1, false), 1);
+        assert!(playing.due(0, 1, 0.0, 0.0));
+        assert_eq!(playing.fire(0, 1, false), 2);
+        assert!(!playing.due(0, 1, 0.0, 0.0));
+        // Confirmed on the first try, it is done; unconfirmed, its frame passing ends it too.
+        let playing = playings.at(8, GROUND, 0.0, 1.0);
+        playing.fire(0, 1, true);
+        assert!(!playing.due(0, 1, 0.0, 0.0));
+        playing.fire(1, 1, false);
+        playing.pass(0.0);
+        assert!(!playing.due(1, 1, 0.0, 1.0));
+    }
+
+    /// A moved effect's original call stays hidden, unless its new frame was gone when the move
+    /// arrived: then the original is the only one this playing shows.
+    #[test]
+    fn a_move_that_came_too_late_keeps_the_original_this_time() {
+        // Moved from 20 to 5, and the rule was there from the start: it fired on 5.
+        let mut game = Game::new(&[(GROUND, 5.0)]);
+        game.play(GROUND, frames(0.0, 20.0, 1.0));
+        assert!(!game
+            .playings
+            .at(7, GROUND, 20.0, 1.0)
+            .missed(0, 0, 5.0, 20.0));
+        // It arrived on frame 12.
+        let mut game = Game::new(&[]);
+        game.tick(GROUND, 12.0);
+        game.effects = vec![(GROUND, 5.0)];
+        game.tick(GROUND, 20.0);
+        assert!(game
+            .playings
+            .at(7, GROUND, 20.0, 1.0)
+            .missed(0, 0, 5.0, 20.0));
+        // It carried on from the ground past frame 5: the ground's own copy fired there.
+        let mut game = Game::new(&[(GROUND, 5.0), (AIR, 5.0)]);
+        game.play(GROUND, frames(0.0, 10.0, 1.0));
+        game.playings.started(7, AIR, true);
+        game.tick(AIR, 20.0);
+        assert!(!game.playings.at(7, AIR, 20.0, 1.0).missed(1, 1, 5.0, 20.0));
+    }
+
+    /// Objects come and go all match; nothing is kept for the ones that are gone.
+    #[test]
+    fn nothing_is_kept_for_objects_that_are_gone() {
+        let mut playings = Playings::default();
+        for object in 0..100 {
+            playings.at(object, GROUND, 0.0, 1.0).fire(0, 1, true);
+        }
+        playings.retain(|object| object == 3);
+        assert!(playings.current(3).is_some());
+        assert!((0..100)
+            .filter(|o| *o != 3)
+            .all(|object| playings.current(object).is_none()));
+    }
+
+    const HOOKS: &str =
+        include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
+    const DISPATCH: &str =
+        include_str!("../plugins/slight_replica/src/slight/agent_extender/mod.rs");
+
+    /// Fighters and the objects they make go through the same tick, and that tick through this
+    /// rule.
+    #[test]
+    fn the_plugin_ticks_fighters_and_objects_the_same_way() {
+        let callback = |name: &str| {
+            DISPATCH
+                .split(&format!("unsafe extern \"C\" fn {name}("))
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("no {name}"))
+                .to_owned()
+        };
+        for name in ["fighter_line_main", "weapon_line_main"] {
+            let body = callback(name);
+            assert!(
+                body.contains("acmd_hooks::inject_tick(lua_state);"),
+                "{name}"
+            );
+            assert!(
+                body.contains("hitbox_viewer::inject_tick(lua_state);"),
+                "{name}"
+            );
+        }
+        for call in [
+            ".due(slot, identity, target, reached.frame)",
+            ".fire(slot, identity, confirmed)",
+            ".pass(frame)",
+            "playings.started(boid, motion, inherits)",
+        ] {
+            assert!(HOOKS.contains(call), "{call}");
+        }
+        // Nothing clears what another object fired.
+        assert!(!HOOKS.contains("reset_effect_injection_latches"));
     }
 }
 
@@ -11001,6 +11906,7 @@ mod link_policy_tests {
             problem: Some(LinkProblem::Refused),
             detail: Some("connect: Connection refused (os error 111)".into()),
             dialled: None,
+            unsupported_game: None,
             draft_is_new: false,
         };
         assert!(view.hover().contains("Last try: Refused"));

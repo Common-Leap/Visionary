@@ -10,7 +10,7 @@
 //! sound does not leave the original base call playing. Calls whose authored tail is symbolic or
 //! otherwise not measurable remain source/export-only and are deliberately not silenced.
 
-use super::{any_rules, read_args_exact, record, HbOverrides, LuaArg, CAT_SOUND, RULES};
+use super::{any_rules, read_args_exact, record, rules_now, HbOverrides, LuaArg, CAT_SOUND};
 
 /// The family: macro name, how many leading `Hash40` arguments it takes, and whether one more
 /// argument follows them.
@@ -123,7 +123,7 @@ fn sound_action(
     frame: f32,
     func: &str,
 ) -> Option<(bool, Option<HbOverrides>)> {
-    let rules = RULES.lock();
+    let rules = rules_now()?;
     let hit = rules
         .iter()
         .find(|r| {
@@ -244,15 +244,8 @@ unsafe fn sound_action_for_call(lua_state: u64, func: &'static str, args: &[LuaA
         return false;
     };
     let motion = super::acting_motion(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let hit = if smash::app::utility::get_category(&mut *boma)
-        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
-    {
-        super::action_for_boma_func(boma, CAT_SOUND, motion, key, frame, func)
-    } else {
-        sound_action(motion, key, frame, func)
-    };
-    let Some((suppress, overrides)) = hit else {
+    let frame = super::rule_frame(boma);
+    let Some((suppress, overrides)) = sound_action(motion, key, frame, func) else {
         return false;
     };
     crate::slight::diag::note(format!(

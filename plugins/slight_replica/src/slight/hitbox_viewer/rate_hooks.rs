@@ -75,7 +75,7 @@ fn rate_action(motion: u64, frame: f32) -> Option<(bool, Option<HbOverrides>)> {
     let hit = super::action_for(CAT_MOTION_RATE, motion, 0, frame);
     if hit.is_none() && MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MISS_BUDGET {
         let loaded: Vec<String> = {
-            let rules = super::RULES.lock();
+            let rules = super::rules_now()?;
             rules
                 .iter()
                 .filter(|r| r.category == CAT_MOTION_RATE)
@@ -135,7 +135,7 @@ unsafe fn rate_action_for_call(lua_state: u64, args: &[LuaArg]) -> bool {
         return false;
     };
     let motion = super::acting_motion(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let frame = super::rule_frame(boma);
     let Some((suppress, overrides)) = rate_action(motion, frame) else {
         return false;
     };
@@ -199,7 +199,7 @@ unsafe fn hook_motion_module_set_rate(
     record_for_boma(boma, "MotionModule::set_rate", &args);
     if super::any_direct_rules(boma) {
         let motion = super::acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = super::rule_frame(boma);
         let key = super::numeric_point_key("MotionModule::set_rate", &[rate]);
         if let Some((suppress, overrides)) =
             super::action_for(CAT_MOTION_MODULE_SET_RATE, motion, key, frame)
@@ -233,7 +233,7 @@ unsafe fn hook_motion_module_set_helper_calculation(
     record_for_boma(boma, "MotionModule::set_helper_calculation", &args);
     if super::any_direct_rules(boma) {
         let motion = super::acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = super::rule_frame(boma);
         let key = super::numeric_point_key(
             "MotionModule::set_helper_calculation",
             &[if enabled { 1.0 } else { 0.0 }],
@@ -271,7 +271,7 @@ unsafe fn hook_motion_module_set_rate_partial(
     record_for_boma(boma, "MotionModule::set_rate_partial", &args);
     if super::any_direct_rules(boma) {
         let motion = super::acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = super::rule_frame(boma);
         let key =
             super::numeric_point_key("MotionModule::set_rate_partial", &[part_kind as f32, rate]);
         if let Some((suppress, overrides)) =
@@ -315,7 +315,7 @@ unsafe fn hook_motion_module_set_frame_partial(
     record_for_boma(boma, "MotionModule::set_frame_partial", &args);
     if super::any_direct_rules(boma) {
         let motion = super::acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = super::rule_frame(boma);
         // Keyed on the part kind and the pristine seek frame only. `sync` stays out of the key
         // so an edit that flips it still matches the call it was staged against.
         let key = super::numeric_point_key(

@@ -434,9 +434,15 @@ pub fn poll_tcp_edits() -> Vec<ParsedEdit> {
     out
 }
 
+/// Name the objects whose rules the running game cannot take, so the editor can say so.
+fn refuse_objects(unknown: Vec<String>) {
+    for agent in unknown {
+        notify_article_live_status(&agent, false);
+    }
+}
+
 /// Apply the two timing-rule lists as soon as the socket thread receives them. These setters
-/// only replace lock-protected data and reset injection latches; they do not touch any game
-/// module or Lua state, so they can safely apply before the first ACMD boundary. A contended
+/// only replace lock-protected data; they do not touch any game module or Lua state, so they can safely apply before the first ACMD boundary. A contended
 /// setter stages the complete list for the next boundary instead of dropping it; false is
 /// reserved for malformed or unrelated payloads that the normal parser should handle.
 pub fn apply_timing_rules_from_network(raw: &str) -> bool {
@@ -449,7 +455,8 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
         >(rules.clone()) else {
             return false;
         };
-        return crate::slight::effect_viewer::spawn_rules::set_rules(rules);
+        refuse_objects(crate::slight::effect_viewer::spawn_rules::set_rules(rules));
+        return true;
     }
     if let Some(rules) = value.get("effect_control_rules") {
         let Ok(rules) = serde_json::from_value::<
@@ -457,7 +464,10 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
         >(rules.clone()) else {
             return false;
         };
-        return crate::slight::effect_viewer::control_rules::set_rules(rules);
+        refuse_objects(crate::slight::effect_viewer::control_rules::set_rules(
+            rules,
+        ));
+        return true;
     }
     false
 }
@@ -586,93 +596,22 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::HitboxRule>>(
             rules_v.clone(),
         ) {
-            Ok(rules) => crate::slight::hitbox_viewer::set_rules(rules),
+            Ok(rules) => refuse_objects(crate::slight::hitbox_viewer::set_rules(rules)),
             Err(e) => crate::slight::diag::note(format!("hitbox_rules parse error: {e}")),
         }
         return None;
     }
 
-    // Currently selected fighter (and optional costume slot scope) for article capture/injection.
-    if let Some(sel_v) = v.get("selected_fighter") {
-        #[derive(serde::Deserialize)]
-        struct SelectedWire {
-            #[serde(default)]
-            fighter_kind: Option<i32>,
-            #[serde(default)]
-            costumes: Vec<i32>,
-        }
-        match serde_json::from_value::<SelectedWire>(sel_v.clone()) {
-            Ok(sel) => {
-                crate::slight::systems::article_notifier::set_selected_fighter(
-                    sel.fighter_kind,
-                    sel.costumes,
-                );
-            }
-            Err(e) => crate::slight::diag::note(format!("selected_fighter parse error: {e}")),
-        }
-        return None;
-    }
-
-    // Query whether a specific article agent (e.g. a clone) has a readable runtime weapon kind.
-    if let Some(probe_v) = v.get("article_probe") {
-        if let Some(agent) = probe_v.get("agent").and_then(|a| a.as_str()) {
-            let supported =
-                crate::slight::systems::article_notifier::resolve_article_agent(agent).is_some();
-            notify_article_live_status(agent, supported);
-        }
-        return None;
-    }
-
-    // Article hitbox rules: separate from fighter `hitbox_rules`, keyed by `agent`.
-    if let Some(rules_v) = v.get("article_hitbox_rules") {
-        match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::ArticleHitboxRule>>(
-            rules_v.clone(),
-        ) {
-            Ok(rules) => {
-                for (agent, supported) in crate::slight::hitbox_viewer::set_article_rules(rules) {
-                    notify_article_live_status(&agent, supported);
-                }
-            }
-            Err(e) => crate::slight::diag::note(format!("article_hitbox_rules parse error: {e}")),
-        }
-        return None;
-    }
-
-    // Article effect spawn rules: separate from fighter `spawn_rules`, keyed by `agent`.
-    if let Some(rules_v) = v.get("article_spawn_rules") {
-        match serde_json::from_value::<
-            Vec<crate::slight::effect_viewer::spawn_rules::ArticleSpawnRule>,
-        >(rules_v.clone())
-        {
-            Ok(rules) => {
-                for (agent, supported) in
-                    crate::slight::effect_viewer::spawn_rules::set_article_rules(rules)
-                {
-                    notify_article_live_status(&agent, supported);
-                }
-            }
-            Err(e) => crate::slight::diag::note(format!("article_spawn_rules parse error: {e}")),
-        }
-        return None;
-    }
-
-    // Article effect control rules: separate from fighter `effect_control_rules`.
-    if let Some(rules_v) = v.get("article_effect_control_rules") {
-        match serde_json::from_value::<
-            Vec<crate::slight::effect_viewer::control_rules::ArticleControlRule>,
-        >(rules_v.clone())
-        {
-            Ok(rules) => {
-                for (agent, supported) in
-                    crate::slight::effect_viewer::control_rules::set_article_rules(rules)
-                {
-                    notify_article_live_status(&agent, supported);
-                }
-            }
-            Err(e) => {
-                crate::slight::diag::note(format!("article_effect_control_rules parse error: {e}"))
-            }
-        }
+    // Ask whether the running game has this object, so its edits can go live.
+    if let Some(agent) = v
+        .get("article_probe")
+        .and_then(|probe| probe.get("agent"))
+        .and_then(|agent| agent.as_str())
+    {
+        notify_article_live_status(
+            agent,
+            crate::slight::slight_consts::fighters::weapon_object(agent).is_some(),
+        );
         return None;
     }
 
@@ -841,7 +780,7 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
             rules_v.clone(),
         ) {
             Ok(rules) => {
-                let _ = crate::slight::effect_viewer::spawn_rules::set_rules(rules);
+                refuse_objects(crate::slight::effect_viewer::spawn_rules::set_rules(rules))
             }
             Err(e) => crate::slight::diag::note(format!("spawn_rules parse error: {e}")),
         }
@@ -853,9 +792,9 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::control_rules::ControlRule>>(
             rules_v.clone(),
         ) {
-            Ok(rules) => {
-                let _ = crate::slight::effect_viewer::control_rules::set_rules(rules);
-            }
+            Ok(rules) => refuse_objects(crate::slight::effect_viewer::control_rules::set_rules(
+                rules,
+            )),
             Err(e) => crate::slight::diag::note(format!("effect_control_rules parse error: {e}")),
         }
         return None;
