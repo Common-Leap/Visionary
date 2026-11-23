@@ -551,28 +551,4 @@ mod tests {
         let folder = CostumeFolder::resolve_with(dir.path(), None);
         assert_eq!(folder.files().count(), 1);
     }
-
-    /// Against the real Shy Guy moveset: its c40 body model borrows Pac-Man's c00 materials and
-    /// its motion folder borrows Villager's animations.
-    #[test]
-    #[ignore = "needs VISIONARY_SHARE_ROOT (a mod romfs with config.json) and VISIONARY_VANILLA"]
-    fn shy_guy_slot_resolves_its_shares() {
-        let root = PathBuf::from(std::env::var_os("VISIONARY_SHARE_ROOT").unwrap());
-        let vanilla = PathBuf::from(std::env::var_os("VISIONARY_VANILLA").unwrap());
-        let model = CostumeFolder::resolve_with(
-            &root.join("fighter/pacman/model/body/c40"),
-            Some(&vanilla),
-        );
-        let motion = CostumeFolder::resolve_with(
-            &root.join("fighter/pacman/motion/body/c40"),
-            Some(&vanilla),
-        );
-        eprintln!(
-            "model: {:?}\nmotion: {:?}",
-            model.summary(),
-            motion.summary()
-        );
-        assert!(model.get("model.xmb").is_some());
-        assert!(motion.get("d00specialn.nuanmb").is_some());
-    }
 }

@@ -1018,12 +1018,9 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
 #[test]
 #[ignore = "reads every moveset under VISIONARY_MOVESETS; run with --ignored"]
 fn corpus_sweep_reports_every_article() {
-    let Some(movesets) = std::env::var_os("VISIONARY_MOVESETS").map(PathBuf::from) else {
-        eprintln!(
-            "corpus sweep skipped: set VISIONARY_MOVESETS to the folder holding the movesets"
-        );
-        return;
-    };
+    let movesets = std::env::var_os("VISIONARY_MOVESETS")
+        .map(PathBuf::from)
+        .expect("set VISIONARY_MOVESETS to the folder holding the movesets");
     let dump = dump_root();
     let mut skipped = Vec::new();
     let mut sets = Vec::new();
@@ -1235,6 +1232,41 @@ mod tests {
             &names
         )
         .is_ok());
+    }
+
+    /// Every object call in the game's own scripts edits and reverts byte for byte, or is refused
+    /// (a call in a loop has no one line of its own). Set `VISIONARY_SCRIPT_DUMP` to the script
+    /// dump's `smashline` folder to run it.
+    #[test]
+    fn every_dumped_object_call_round_trips() {
+        let Some(root) = std::env::var_os("VISIONARY_SCRIPT_DUMP").map(PathBuf::from) else {
+            return;
+        };
+        let (mut scripts, mut failures) = (0, Vec::new());
+        for package in subdirs(&root) {
+            for agent in subdirs(&root.join(&package)) {
+                for file in std::fs::read_dir(root.join(&package).join(&agent))
+                    .unwrap()
+                    .flatten()
+                {
+                    let Ok(text) = std::fs::read_to_string(file.path()) else {
+                        continue;
+                    };
+                    for function in text.split("unsafe extern \"C\" fn ").skip(1) {
+                        if !function.contains("ArticleModule::") {
+                            continue;
+                        }
+                        let name = function.split('(').next().unwrap_or_default();
+                        let body = format!("unsafe extern \"C\" fn {function}");
+                        let (failed, refused) = round_trip(&body, &format!("{agent}/{name}"));
+                        failures.extend(failed);
+                        scripts += usize::from(refused.is_empty());
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        assert!(scripts > 1000, "{scripts} scripts");
     }
 
     #[test]

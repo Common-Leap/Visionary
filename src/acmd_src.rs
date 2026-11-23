@@ -19404,35 +19404,6 @@ pub fn install() {
         );
     }
 
-    /// Point `VISIONARY_PROBE_SOURCE` at a real project to see how it indexes:
-    /// `cargo test probe_linked_source -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn probe_linked_source() {
-        let Some(root) = std::env::var_os("VISIONARY_PROBE_SOURCE") else {
-            return;
-        };
-        //NOCARGO
-        let index = SourceIndex::build(Path::new(&root)).unwrap();
-        let mut fighters: Vec<_> = index
-            .fighters
-            .iter()
-            .map(|(name, f)| (name.clone(), f.scripts.len()))
-            .collect();
-        fighters.sort();
-        println!(
-            "{} scripts, {} conflicts",
-            index.script_count(),
-            index.conflict_count()
-        );
-        for (name, count) in fighters {
-            println!("  {name:?}: {count}");
-        }
-        for conflict in &index.conflicts {
-            println!("  conflict {}/{}", conflict.fighter, conflict.script);
-        }
-    }
-
     const TILTS: &str = r#"use super::*;
 
 unsafe extern "C" fn game_attack_s3_kick(agent: &mut L2CAgentBase) {

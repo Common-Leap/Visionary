@@ -1222,30 +1222,53 @@ mod tests {
         );
     }
 
-    /// Whether prc-rs's open+save reproduces a real, game/mod-written `vl.prc` byte for byte.
+    /// In the game's own files, setting a number of each block (a list's last variant) leaves
+    /// every other value as it was. Needs VISIONARY_DATA_ROOT (an extracted game); skipped
+    /// otherwise.
     #[test]
-    #[ignore = "reads a real moveset checkout"]
-    fn real_latios_open_save_is_byte_identical() {
-        let real = PathBuf::from("C:/Users/notja/Documents/Coding/SSBU Modding/Movesets/Latios-Moveset/romfs/fighter/samus/param/vl.prc");
+    fn writing_every_fighter_param_file_leaves_every_other_value_alone() {
+        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT") else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
-        let (copy, saved) = (dir.path().join("vl.prc"), dir.path().join("saved.prc"));
-        std::fs::copy(&real, &copy).unwrap();
-        prc::save(&saved, &prc::open(&copy).unwrap()).unwrap();
-        let (before, after) = (
-            std::fs::read(&copy).unwrap(),
-            std::fs::read(&saved).unwrap(),
-        );
-        assert_eq!(before.len(), after.len(), "saved file length differs");
-        assert!(before == after, "saved bytes differ from the original");
-    }
-
-    #[test]
-    #[ignore = "reads a real moveset checkout"]
-    fn real_latios_file() {
-        let file = PathBuf::from("C:/Users/notja/Documents/Coding/SSBU Modding/Movesets/Latios-Moveset/romfs/fighter/samus/param/vl.prc");
-        let block = param_block(&[file], &[], "lativolt", &HashMap::new());
-        assert!(block.present);
-        assert_eq!(block.variants.len(), 4);
+        let copy = dir.path().join("vl.prc");
+        let mut written = 0;
+        for fighter in std::fs::read_dir(Path::new(&root).join("fighter"))
+            .unwrap()
+            .flatten()
+        {
+            let file = fighter.path().join("param/vl.prc");
+            if !file.is_file() {
+                continue;
+            }
+            std::fs::copy(&file, &copy).unwrap();
+            let mut expected = prc::open(&file).unwrap();
+            for (block, value) in &mut expected.0 {
+                let (variant, value) = match value {
+                    prc::ParamKind::List(list) => match list.0.iter_mut().enumerate().next_back() {
+                        Some(last) => last,
+                        None => continue,
+                    },
+                    value => (0, value),
+                };
+                let prc::ParamKind::Struct(fields) = value else {
+                    continue;
+                };
+                let Some((field, number)) = fields.0.iter_mut().find_map(|(field, v)| match v {
+                    prc::ParamKind::Float(number) => Some((field.0, number)),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                *number += 1.0;
+                let (block, field) = (format!("{:#x}", block.0), format!("{field:#x}"));
+                let value = f64::from(*number);
+                write_param_field(&copy, &block, &field, variant, value, &labels()).unwrap();
+                written += 1;
+            }
+            assert!(prc::open(&copy).unwrap() == expected, "{}", file.display());
+        }
+        assert!(written > 0);
     }
 
     /// Latios's shape: `update_int_2(*FIGHTER_KIND_SAMUS, slots, (hash40("param_cshot"), hash40("life"), 60))`.
