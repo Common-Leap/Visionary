@@ -1461,8 +1461,11 @@ pub struct TransplantOp {
 pub fn eff_game_rel(path: &std::path::Path, root: Option<&std::path::Path>) -> String {
     use std::path::Component;
     let slashed = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    // Windows paths split on Linux too: a project travels between the two.
+    let full = slashed(path);
+    let path = std::path::Path::new(&full);
     let under_root = root
-        .and_then(|root| path.strip_prefix(root).ok())
+        .and_then(|root| path.strip_prefix(slashed(root)).ok())
         .filter(|rel| !rel.as_os_str().is_empty())
         .map(slashed);
     if let Some(rel) = &under_root {
@@ -1509,7 +1512,7 @@ pub fn eff_game_rel(path: &std::path::Path, root: Option<&std::path::Path>) -> S
         };
         return format!("effect/fighter/{fighter}/{file}");
     }
-    slashed(path)
+    full
 }
 
 /// True when `source_rel` is a relative game path that stays inside whatever folder it is
@@ -2492,6 +2495,13 @@ mod eff_game_rel_tests {
     fn an_eff_under_the_root_keeps_its_game_path() {
         let root = Path::new("C:/dump");
         assert_eq!(eff_game_rel(&root.join(MARIO), Some(root)), MARIO);
+        assert_eq!(
+            eff_game_rel(
+                Path::new(r"C:\dump\custom\a.eff"),
+                Some(Path::new(r"C:\dump"))
+            ),
+            "custom/a.eff"
+        );
     }
 
     /// The bug: File → Open Effect File… on a mod's eff recorded `C:/mods/…/ef_mario.eff`.
@@ -2521,6 +2531,10 @@ mod eff_game_rel_tests {
     fn a_bare_fighter_eff_maps_to_that_fighters_path() {
         assert_eq!(
             eff_game_rel(Path::new("C:/Users/me/Downloads/ef_Mario.eff"), None),
+            MARIO
+        );
+        assert_eq!(
+            eff_game_rel(Path::new(r"C:\Users\me\Downloads\ef_mario.eff"), None),
             MARIO
         );
         assert_eq!(
