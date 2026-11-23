@@ -847,12 +847,6 @@ impl VisionaryApp {
                 .as_deref()
                 .map(ProjectParts::load)
                 .unwrap_or_default();
-            // A project that names its own move code links it on opening.
-            if let Some(folder) = parts.link("", Part::Moves, 0) {
-                if self.acmd_src.as_ref().map(|index| index.root.as_path()) != Some(folder) {
-                    self.link_acmd_source(folder.to_path_buf());
-                }
-            }
             self.project_parts_cache = workspace.map(|at| (at, parts));
         }
         if let Some(status) = self.roster.take_settled_status() {
@@ -2328,16 +2322,10 @@ impl VisionaryApp {
                 else {
                     return;
                 };
-                self.link_acmd_source(folder.clone());
-                if self.acmd_src.as_ref().map(|index| index.root.as_path())
-                    == Some(folder.as_path())
-                {
-                    self.change_parts(|parts| parts.set_link("", Part::Moves, 0, Some(folder)));
-                }
+                self.link_acmd_source(folder);
             }
             PageAction::UnlinkMoveCode => {
                 self.unlink_acmd_source();
-                self.change_parts(|parts| parts.set_link("", Part::Moves, 0, None));
             }
             PageAction::PickFolder(fighter, part, slot) => {
                 let Some(folder) = rfd::FileDialog::new()

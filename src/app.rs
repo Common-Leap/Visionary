@@ -984,6 +984,38 @@ fn own_param_files(owner: &str, own_roots: &[PathBuf], shared: &[PathBuf]) -> Ve
 }
 
 #[cfg(test)]
+mod recorded_eff_source_tests {
+    use super::recorded_eff_source;
+    use crate::mod_project::EffMod;
+
+    /// Edits made on a download's file find it again, until it is gone; the game's own otherwise.
+    #[test]
+    fn edits_find_the_file_they_were_made_on() {
+        const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ef_mario.eff");
+        std::fs::write(&path, b"eff").unwrap();
+        let edits = [
+            EffMod {
+                source_rel: "effect/fighter/link/ef_link.eff".into(),
+                ..Default::default()
+            },
+            EffMod {
+                source_rel: MARIO.into(),
+                source_path: Some(path.clone()),
+                ..Default::default()
+            },
+        ];
+        let of = |rel: &str| recorded_eff_source(rel, edits.iter());
+        assert_eq!(of(MARIO), Some(path.clone()));
+        assert_eq!(of(&MARIO.to_uppercase()), Some(path.clone()));
+        assert_eq!(of("effect/fighter/link/ef_link.eff"), None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(of(MARIO), None);
+    }
+}
+
+#[cfg(test)]
 mod own_param_files_tests {
     use super::*;
 
@@ -3770,6 +3802,18 @@ fn made_effect_lookup(
     Some(own.ok_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff")))
 }
 
+/// The file the edits of effect file `rel` were made on, when that is not the one its game path
+/// leads to and it is still there.
+fn recorded_eff_source<'a>(
+    rel: &str,
+    mut edits: impl Iterator<Item = &'a crate::mod_project::EffMod>,
+) -> Option<PathBuf> {
+    edits
+        .find(|eff| eff.source_rel.eq_ignore_ascii_case(rel))
+        .and_then(|eff| eff.source_path.clone())
+        .filter(|path| path.is_file())
+}
+
 /// Whether `status` is the effect alias push's own success line, which says nothing the user
 /// acted on.
 fn alias_status_is_routine(status: &str) -> bool {
@@ -6094,6 +6138,14 @@ impl VisionaryApp {
         if let Some(open) = self.eff_editor.loaded_path_for(source_rel) {
             return open.to_path_buf();
         }
+        if let Some(path) = recorded_eff_source(source_rel, self.eff_mods.values()) {
+            return path;
+        }
+        self.game_eff_source(source_rel)
+    }
+
+    /// The file `source_rel` alone leads to: the project's own copy, then the dump's or a mod's.
+    fn game_eff_source(&self, source_rel: &str) -> PathBuf {
         if let Some(found) = self.project_eff_source(source_rel) {
             return found;
         }
@@ -21941,24 +21993,39 @@ impl VisionaryApp {
         picked
     }
 
-    /// Whether the move under `key` (`fighter/move`) holds an edit of any category.
+    /// Whether the move under `key` (`fighter/move`) holds an edit of any category, for the
+    /// fighter or any character made on it: their versions of a move ship together, and each
+    /// reads the game's own from whichever of them has it.
     fn move_has_edits(&self, key: &str) -> bool {
-        let Some((fighter, move_name)) = crate::character::split_move_key(key) else {
+        let Some((owner, move_name)) = crate::character::parse_move_key(key) else {
             return false;
         };
+        let engine = owner.engine_fighter();
+        self.owner_edits_move(engine, move_name)
+            || crate::character::made_on(engine, &self.roster.project)
+                .any(|made| self.owner_edits_move(made.key.as_str(), move_name))
+    }
+
+    fn owner_edits_move(&self, owner: &str, move_name: &str) -> bool {
+        let key = Self::move_key(owner, move_name);
         self.state
             .edit_log
             .entries
-            .get(fighter)
+            .get(owner)
             .is_some_and(|moves| moves.contains_key(move_name))
             || self
                 .state
                 .effect_call_edits
-                .get(key)
+                .get(&key)
                 .is_some_and(|edits| !edits.is_empty())
-            || self.state.effect_call_full.contains_key(key)
-            || self.state.sound_script_edits.contains_key(key)
-            || self.state.expression_script_edits.contains_key(key)
+            || self.state.effect_call_full.contains_key(&key)
+            || self.state.sound_script_edits.contains_key(&key)
+            || self.state.expression_script_edits.contains_key(&key)
+            || self.node_effect_scripts.contains_key(&key)
+            || self
+                .move_graphs
+                .get(owner)
+                .is_some_and(|graphs| graphs.contains_key(move_name))
     }
 
     /// Forget the source snapshots of moves that were only looked at.
@@ -23733,7 +23800,8 @@ impl VisionaryApp {
         // some of the donor's costumes are not part of the donor as a whole.
         if let Some(mut eff) = self.eff_mods.get(&donor).cloned() {
             if !self.eff_mods.contains_key(key.as_str()) {
-                eff.source_rel = key.effect_rel(&self.roster.project);
+                eff.set_source_rel(key.effect_rel(&self.roster.project));
+                eff.source_path = None;
                 eff.transplants.retain(|op| op.one_slot_slots.is_empty());
                 self.eff_mods.insert(key.as_str().to_owned(), eff);
             }
@@ -25481,11 +25549,22 @@ impl VisionaryApp {
         let owner = self.eff_owner(&rel);
         let own_rel =
             crate::character::CharacterKey::parse(&owner).effect_rel(&self.roster.project);
+        let is_preview = crate::scratch_dirs::is_transplant_preview_name(&rel);
+        let opened = self
+            .eff_editor
+            .loaded_path()
+            .filter(|open| {
+                !is_preview
+                    && made_effect_lookup(&rel, &self.roster.project, |_| None).is_none()
+                    && self.game_eff_source(&rel) != **open
+            })
+            .map(Path::to_path_buf);
         let entry = self.eff_mods.entry(owner).or_default();
         // NEVER key the project to the transient merged preview — rebuilding from it
         // would re-apply the transplant ops onto an already-merged file.
-        if !crate::scratch_dirs::is_transplant_preview_name(&rel) {
+        if !is_preview {
             entry.source_rel = rel;
+            entry.source_path = opened;
         } else if entry.source_rel.is_empty() {
             entry.source_rel = own_rel;
         }
@@ -25624,17 +25703,17 @@ impl VisionaryApp {
                 fm.expression_scripts.insert(mv.to_string(), script.clone());
             }
         }
-        // Keep every source visited during the session. `ModProjectFile::is_empty` deliberately
-        // ignores this provenance-only field, so browsing without edits still does not create a
-        // mod, while an edited project can be reopened without fetching any visited move again.
+        // Only an edited move's baseline is worth saving; see `drop_unedited_move_sources`.
+        let edited_moves = project.edited_moves();
         for (key, snapshot) in &self.move_source_cache {
-            let Some((fighter, move_name)) = crate::character::split_move_key(key) else {
+            let Some((owner, move_name)) = crate::character::parse_move_key(key) else {
                 continue;
             };
-            // Only an edited move's baseline is worth saving; see `drop_unedited_move_sources`.
-            if !self.move_has_edits(key) {
+            let engine = owner.engine_fighter().to_lowercase();
+            if !edited_moves.contains(&(engine, move_name.to_owned())) {
                 continue;
             }
+            let fighter = owner.as_str();
             if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
                 fm.move_sources
                     .insert(move_name.to_string(), snapshot.clone());
@@ -27999,14 +28078,15 @@ impl VisionaryApp {
                 return;
             }
         };
-        // A file from before v4 has its fighter list seeded by `migrate`, from edits alone.
-        let seeded = project.version < 4;
+        // A file from before projects kept a fighter list and a moveset link: `migrate` seeds the
+        // list, from edits alone.
+        let (version, keeps_scope) = (project.version, project.keeps_scope());
         // Before anything reads the project: bring it to the current format, and refuse a file
         // written by a newer build. Loading one of those would present it as complete and then
         // re-save it with whatever this build cannot read silently removed.
         // Edits saved for a made character before it had its own store move into it; any that
         // match no character stay limited to their costumes and are reported.
-        let migration_findings = match project.migrate() {
+        let mut migration_findings = match project.migrate() {
             Ok(findings) => findings,
             Err(error) => {
                 self.state.status = format!("Project load failed: {error}");
@@ -28083,22 +28163,19 @@ impl VisionaryApp {
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
         // The project's fighters and moveset link. Adopted before the edits below, which read
-        // the linked source and the indexed fighters; `migrate` seeded a v1-v3 file's list.
+        // the linked source and the indexed fighters.
         self.project_fighters = std::mem::take(&mut project.project_fighters);
         // Already edited when saved: these are not first edits, so the next build adds nothing
         // (a fighter the user removed while it had edits stays removed).
         self.edited_fighters = crate::project_scope::edited_fighters(&project);
         self.authored_characters = crate::project_scope::authored_characters(&project.roster);
-        // A project saved before projects recorded their moveset, or one never linked, that lives
-        // in the moveset's own crate (`Empoleon-Moveset/modproject.json`) is about that crate.
-        let stored = project
-            .moveset_source
-            .take()
-            .map(PathBuf::from)
-            .or_else(|| {
-                path.parent()
-                    .and_then(crate::project_scope::workspace_moveset)
-            });
+        let stored = crate::project_scope::moveset_of_project(
+            project.moveset_source.take().map(PathBuf::from),
+            path.parent(),
+            version,
+            keeps_scope,
+            || load_config_path(ACMD_SRC_CONFIG_KEY),
+        );
         let (moveset, index, problem) =
             crate::project_scope::moveset_on_load(stored, crate::acmd_src::SourceIndex::build);
         self.project_moveset = moveset;
@@ -28116,7 +28193,7 @@ impl VisionaryApp {
         self.reindex_fighters();
         // The seeding knew only fighter names. With the rows and the moveset known, edits on a
         // costume-gated agent go to the slot character (Empoleon), not Falco's own row.
-        if seeded {
+        if !keeps_scope {
             let mut rows = self.project_fighters.clone();
             crate::project_scope::reassign_seeded_fighters(&mut rows, |name| {
                 self.script_owner_rows(name)
@@ -28164,6 +28241,7 @@ impl VisionaryApp {
         let mut n_eff = 0;
         // Base fighters' edits under their names, made characters' under their own keys; the
         // game's source for either comes from the engine fighter.
+        let edited_moves = project.edited_moves();
         let owners: Vec<(String, crate::mod_project::FighterMod)> = project
             .fighters
             .into_iter()
@@ -28181,15 +28259,7 @@ impl VisionaryApp {
             for (move_name, snapshot) in &fm.move_sources {
                 // A snapshot of a move with no edit is browsing provenance, possibly from
                 // another moveset linked at the time; it is not a baseline for anything.
-                let edited = fm.acmd.contains_key(move_name)
-                    || fm
-                        .effect_calls
-                        .get(move_name)
-                        .is_some_and(|edits| !edits.is_empty())
-                    || fm.effect_calls_full.contains_key(move_name)
-                    || fm.sound_scripts.contains_key(move_name)
-                    || fm.expression_scripts.contains_key(move_name);
-                if !edited {
+                if !edited_moves.contains(&(engine.to_lowercase(), move_name.clone())) {
                     continue;
                 }
                 self.move_source_cache
@@ -28297,6 +28367,13 @@ impl VisionaryApp {
                     + eff.textures_removed.len()
                     + eff.rosters.len()
                     + eff.entry_edits.len();
+                if let Some(path) = eff.source_path.as_ref().filter(|path| !path.is_file()) {
+                    migration_findings.push(format!(
+                        "{fighter}'s effects were edited in {}, which is missing, so the game's \
+                         own file is used",
+                        path.display()
+                    ));
+                }
                 self.eff_mods.insert(fighter.clone(), eff);
             }
             // Live color/speed tweaks: restore into the override store and re-send.

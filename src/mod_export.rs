@@ -3141,7 +3141,7 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
     #[test]
     fn an_older_project_keeps_the_donors_edits_on_its_made_characters_costumes() {
         let mut project = project();
-        project.version = crate::mod_project::OWN_CHARACTER_STORES_VERSION - 1;
+        project.version = 7;
         project.roster.authored.push(made(8, 8..=15, "Vision"));
         project.fighters.insert("mario".into(), game_edit("9.0"));
         let findings = project.migrate().unwrap();
@@ -3166,7 +3166,8 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
     fn a_current_project_never_copies_the_donors_edits_into_its_made_characters() {
         for (version, own_edit) in [
             (crate::mod_project::PROJECT_VERSION, false),
-            (crate::mod_project::OWN_CHARACTER_STORES_VERSION - 1, true),
+            (8, false),
+            (7, true),
         ] {
             let mut project = project();
             project.version = version;
@@ -3208,7 +3209,8 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
     #[test]
     fn an_older_project_with_no_made_characters_only_gets_its_version_raised() {
         let mut project = project();
-        project.version = crate::mod_project::OWN_CHARACTER_STORES_VERSION - 1;
+        // Not one that gets a fighter list, which is all an earlier one would add.
+        project.version = 9;
         project.fighters.insert("mario".into(), game_edit("9.0"));
         let before = serde_json::to_value(&project).unwrap();
         assert!(project.migrate().unwrap().is_empty());

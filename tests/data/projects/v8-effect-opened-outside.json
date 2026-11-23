@@ -1,0 +1,69 @@
+{
+  "version": 8,
+  "name": "unnamed_mod",
+  "fighters": {
+    "mario": {
+      "display": "",
+      "acmd": {},
+      "effect_calls": {},
+      "effect_calls_full": {},
+      "effect_dropped_lines": {},
+      "effect_frame_residue": {},
+      "sound_scripts": {},
+      "expression_scripts": {},
+      "capture_branch_warnings": {},
+      "move_sources": {},
+      "eff": {
+        "source_rel": "/mods/coolmod/effect/fighter/mario/ef_mario.eff",
+        "authored": [],
+        "transplants": [],
+        "textures": [],
+        "textures_added": [],
+        "textures_removed": [],
+        "rosters": [
+          {
+            "set_name": "P_MarioFireballShoot",
+            "entry_name": "mario_fb_shoot",
+            "set_idx": 4,
+            "slots": [
+              {
+                "source_idx": 0,
+                "source_name": "flare1",
+                "name": "flare1",
+                "depth": 0
+              },
+              {
+                "source_idx": 0,
+                "source_name": "flare1",
+                "name": "flare1_2",
+                "depth": 0,
+                "source_set": "P_MarioFireballBound",
+                "source_file": "/mods/coolmod/effect/fighter/mario/ef_mario.eff"
+              },
+              {
+                "source_idx": 1,
+                "source_name": "fire1",
+                "name": "fire1",
+                "depth": 0
+              },
+              {
+                "source_idx": 2,
+                "source_name": "fire2",
+                "name": "fire2",
+                "depth": 0
+              },
+              {
+                "source_idx": 3,
+                "source_name": "spark2",
+                "name": "spark2",
+                "depth": 0
+              }
+            ]
+          }
+        ],
+        "entry_edits": []
+      },
+      "live_tweaks": []
+    }
+  }
+}

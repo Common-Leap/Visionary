@@ -395,6 +395,28 @@ pub fn workspace_moveset(dir: &Path) -> Option<PathBuf> {
         .map(|_| dir.to_path_buf())
 }
 
+/// The moveset a just-read project uses: the one it records (`stored`, resolved), else the one
+/// its page kept in `parts.json` before projects recorded one, else the crate the project is kept
+/// in, else, for a project from before projects kept a link (`keeps_scope`), this machine's: its
+/// scripts must not turn vanilla because the link now belongs to the project.
+pub fn moveset_of_project(
+    stored: Option<PathBuf>,
+    dir: Option<&Path>,
+    version: u32,
+    keeps_scope: bool,
+    global: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    stored
+        .or_else(|| {
+            let dir = dir.filter(|_| version < 10)?;
+            crate::project_parts::ProjectParts::load(dir)
+                .link("", crate::project_parts::Part::Moves, 0)
+                .map(|folder| crate::project_parts::project_absolute(dir, folder))
+        })
+        .or_else(|| dir.and_then(workspace_moveset))
+        .or_else(|| (!keeps_scope).then(global).flatten())
+}
+
 /// Re-open a loaded project's moveset link with `build`. Returns the path to keep, the index
 /// when it built, and the problem to show when it did not. The stored path is always kept: a
 /// crate that is missing today (an unplugged drive, a renamed folder) must not be unlinked by
@@ -418,6 +440,37 @@ pub fn moveset_on_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a project's moves come from when it records no link of its own: the one its page
+    /// kept, the crate it is in, and this machine's link only when it never kept one.
+    #[test]
+    fn a_project_from_before_links_uses_this_machines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let global = || Some(PathBuf::from("/machine"));
+        let of = |stored: Option<&str>, version: u32, keeps_scope: bool| {
+            let stored = stored.map(PathBuf::from);
+            moveset_of_project(stored, Some(dir), version, keeps_scope, global)
+        };
+        // A project from before links, and one the user left without.
+        assert_eq!(of(None, 7, false), global());
+        assert_eq!(of(None, 8, false), global());
+        assert_eq!(of(None, 8, true), None);
+        assert_eq!(of(None, 10, true), None);
+        assert_eq!(of(Some("/mine"), 10, true), Some(PathBuf::from("/mine")));
+        // One whose page named its move code; the project's own link takes over from 10 on.
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.set_link(
+            "",
+            crate::project_parts::Part::Moves,
+            0,
+            Some(PathBuf::from("/page")),
+        );
+        parts.save(dir).unwrap();
+        assert_eq!(of(None, 8, false), Some(PathBuf::from("/page")));
+        assert_eq!(of(None, 10, true), None);
+        assert_eq!(of(Some("/mine"), 8, true), Some(PathBuf::from("/mine")));
+    }
     use crate::data::FighterSource;
     use std::path::PathBuf;
 

@@ -1,0 +1,85 @@
+{
+  "version": 9,
+  "name": "r3-gimmick",
+  "fighters": {
+    "mario": {
+      "display": "",
+      "acmd": {},
+      "effect_calls": {},
+      "effect_calls_full": {},
+      "effect_dropped_lines": {},
+      "effect_frame_residue": {},
+      "sound_scripts": {},
+      "expression_scripts": {},
+      "capture_branch_warnings": {},
+      "move_sources": {},
+      "eff": null,
+      "live_tweaks": [],
+      "behavior": {
+        "initial": "on",
+        "states": [
+          {
+            "name": "on"
+          }
+        ],
+        "vars": [],
+        "transitions": [
+          {
+            "from": "on",
+            "to": "on",
+            "guard": {
+              "Button": {
+                "button": "jump",
+                "edge": "Pressed"
+              }
+            },
+            "on_frame": true,
+            "actions": [
+              {
+                "AddDamage": {
+                  "amount": {
+                    "Const": {
+                      "Float": 1.0
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "emission_plan": {
+          "bindings": [
+            {
+              "hook": "onChargeTick",
+              "transitions": [
+                0
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "roster": {
+    "authored": [
+      {
+        "key": "mario#c07",
+        "donor": "mario",
+        "slot": 7,
+        "display_name": "Vision",
+        "name_id": "vision",
+        "moveset_scaffolded": false,
+        "files_root": null
+      }
+    ]
+  },
+  "project_fighters": [
+    {
+      "name": "mario"
+    },
+    {
+      "name": "mario",
+      "character": "Vision"
+    }
+  ]
+}

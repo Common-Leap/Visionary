@@ -16,16 +16,12 @@ use serde::{Deserialize, Serialize};
 use crate::data::{EditRecord, EffectCallEdit};
 
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
-/// v9 reconciles the fork's v8 (`project_fighters`, `moveset_source`) and Common-Leap's v8
-/// (`characters` per-character stores for made characters) so both v8 lines migrate cleanly.
-pub const PROJECT_VERSION: u32 = 9;
-
-/// The first project version in which characters made in Visionary keep their own edits in
-/// [`ModProjectFile::characters`]. Before v9 (including fork v8 files written before this
-/// merge), a made character with no `characters` entry played its donor's edits on its own
-/// costumes; [`ModProjectFile::migrate`] gives such a project's made characters a copy of them,
-/// once.
-pub const OWN_CHARACTER_STORES_VERSION: u32 = 9;
+/// Every project is saved as this. Two lines of Visionary wrote version 8: the one this file
+/// belongs to, whose made characters have stores of their own (`characters`), and a fork, whose
+/// projects keep a fighter list and a moveset link (`project_fighters`, `moveset_source`) and
+/// whose made characters share their donor's edits. The fork's 9 has all three. See
+/// [`ModProjectFile::migrate`].
+pub const PROJECT_VERSION: u32 = 10;
 
 /// Oldest project version supported by the load-time field defaults and migrations.
 pub const OLDEST_SUPPORTED_VERSION: u32 = 1;
@@ -61,11 +57,12 @@ pub struct ModProjectFile {
     /// project created. Added in v3.
     #[serde(default, skip_serializing_if = "RosterMod::is_empty")]
     pub roster: RosterMod,
-    /// The fighters this project works on: the left fighter list shows exactly these. Added in
-    /// v4. Older projects load with it empty and get it seeded from what they already edit.
+    /// The fighters this project works on: the left fighter list shows exactly these. Projects
+    /// from before it was kept ([`Self::keeps_scope`]) load with it empty and get it seeded from
+    /// what they already edit.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub project_fighters: BTreeSet<ProjectFighter>,
-    /// The moveset folder this project is linked to, as an absolute path in memory. Added in v4.
+    /// The moveset folder this project is linked to, as an absolute path in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moveset_source: Option<String>,
 }
@@ -370,9 +367,20 @@ impl ModProjectFile {
         self.all_move_edits().all(|f| !f.has_edits()) && self.roster.is_empty()
     }
 
+    /// Whether this file is from a Visionary that kept a project's fighter list and moveset link
+    /// in it, so one that is missing is one the user left empty. Version 8 was written by both
+    /// lines (see [`PROJECT_VERSION`]), and only the fork's ever has either.
+    pub fn keeps_scope(&self) -> bool {
+        match self.version {
+            1..=3 | 5..=7 => false,
+            8 => !self.project_fighters.is_empty() || self.moveset_source.is_some(),
+            _ => true,
+        }
+    }
+
     /// Add the fighters this project already edits to `project_fighters`: every fighter with
     /// edits, and every character it authored. Additive and idempotent. [`Self::migrate`] runs
-    /// it for files saved before the list existed (see there): a v4, v8, or v9 file's list is
+    /// it for files saved before the list existed ([`Self::keeps_scope`]): otherwise the list is
     /// what the user left it as.
     pub fn seed_project_fighters(&mut self) {
         for (name, fighter) in &self.fighters {
@@ -384,6 +392,27 @@ impl ModProjectFile {
             self.project_fighters
                 .insert(ProjectFighter::character(&entry.donor, &entry.display_name));
         }
+    }
+
+    /// The moves any character of a fighter edits, by engine fighter (lowercase) and move: the
+    /// fighter's versions of a move ship together, and each reads the game's own from whichever
+    /// of them has it.
+    pub fn edited_moves(&self) -> HashSet<(String, String)> {
+        let characters = self.characters.iter().map(|(key, edits)| {
+            let key = crate::character::CharacterKey::made(key.clone());
+            (key.engine_fighter().to_lowercase(), edits)
+        });
+        self.fighters
+            .iter()
+            .map(|(name, edits)| (name.to_lowercase(), edits))
+            .chain(characters)
+            .flat_map(|(engine, edits)| {
+                edits
+                    .edited_moves()
+                    .map(move |name| (engine.clone(), name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Every fighter's and every made character's edits. Anything that asks a question of all
@@ -530,16 +559,16 @@ impl ModProjectFile {
         if self.version < OLDEST_SUPPORTED_VERSION {
             anyhow::bail!("unsupported project version {}", self.version);
         }
-        // `project_fighters` was added in the fork's v4. Files from before it (v1–v3) and from
-        // Common-Leap's line (v7; it never wrote v4–v6) get it from what they already edit. A
-        // v4, v8, or v9 file's list is the user's own and is left alone, so a removal survives a
-        // reopen.
-        if self.version < 4 || (5..=7).contains(&self.version) {
+        // Decided before the version is stamped.
+        let keeps_scope = self.keeps_scope();
+        // A removal from the list survives a reopen; a file from before the list gets it from
+        // what it already edits.
+        if !keeps_scope {
             self.seed_project_fighters();
         }
         // Older builds recorded an eff opened from outside the eff root by its absolute path.
-        // Rewrite it to the game path it stands for; one with no game path stays as it is and
-        // export refuses it.
+        // Rewrite it to the game path it stands for, and keep where the file is; one with no game
+        // path stays as it is and export refuses it.
         for fighter in self
             .fighters
             .values_mut()
@@ -547,17 +576,22 @@ impl ModProjectFile {
         {
             if let Some(eff) = fighter.eff.as_mut() {
                 if !eff.source_rel.is_empty() && !is_mod_relative(&eff.source_rel) {
-                    eff.source_rel = eff_game_rel(std::path::Path::new(&eff.source_rel), None);
+                    let path = std::path::PathBuf::from(&eff.source_rel);
+                    let rel = eff_game_rel(&path, None);
+                    if rel != eff.source_rel {
+                        eff.source_path = Some(path);
+                        eff.set_source_rel(rel);
+                    }
                 }
             }
         }
-        // Decided before the version is stamped. A project saved before made characters had
-        // their own stores is one whose version predates them. Builds between the change and the
-        // version bump wrote the old version number with a `characters` map, so a file that
-        // already has one is not shared, whatever its version says: copying the donor's edits
-        // into it again would hand the character donor edits made after it was created. A file
-        // with no made characters needs nothing, so a base-only project is unchanged.
-        let shared_with_donor = self.version < OWN_CHARACTER_STORES_VERSION
+        // A project saved before made characters had their own stores is one whose version
+        // predates them: anything before 8, and the fork's 8. Builds between the change and the
+        // version bump wrote 7 with a `characters` map, so a file that already has one is not
+        // shared, whatever its version says: copying the donor's edits into it again would hand
+        // the character donor edits made after it was created. A file with no made characters
+        // needs nothing, so a base-only project is unchanged.
+        let shared_with_donor = (self.version < 8 || (self.version == 8 && keeps_scope))
             && self.characters.is_empty()
             && !self.roster.authored.is_empty();
         self.version = PROJECT_VERSION;
@@ -688,7 +722,8 @@ impl ModProjectFile {
             }
             if let Some(mut eff) = donor.eff.clone().filter(|eff| !eff.is_empty()) {
                 if own.eff.is_none() {
-                    eff.source_rel = key.effect_rel(&self.roster);
+                    eff.set_source_rel(key.effect_rel(&self.roster));
+                    eff.source_path = None;
                     eff.transplants.retain(|op| op.one_slot_slots.is_empty());
                     own.eff = Some(eff);
                     copied += 1;
@@ -1032,6 +1067,23 @@ pub struct FighterMod {
 }
 
 impl FighterMod {
+    /// Every move with an edit of any category.
+    fn edited_moves(&self) -> impl Iterator<Item = &String> {
+        self.acmd
+            .keys()
+            .chain(
+                self.effect_calls
+                    .iter()
+                    .filter(|(_, edits)| !edits.is_empty())
+                    .map(|(name, _)| name),
+            )
+            .chain(self.effect_calls_full.keys())
+            .chain(self.effect_scripts.keys())
+            .chain(self.sound_scripts.keys())
+            .chain(self.expression_scripts.keys())
+            .chain(self.move_graphs.keys())
+    }
+
     /// Whether this fighter holds anything an export would build.
     ///
     /// Deliberately does not consult `effect_dropped_lines`. It is a note about what an export
@@ -1063,6 +1115,10 @@ pub struct EffMod {
     /// Source .eff path relative to the dump export root,
     /// e.g. "effect/fighter/mario/ef_mario.eff".
     pub source_rel: String,
+    /// The file on disk the edits were made on, when the game path alone leads to another: an
+    /// eff opened from a download or a mod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub authored: Vec<AuthoredEdit>,
     /// Emitter sets copied in from a donor eff. Serialized as `one_slot` before the
@@ -1089,6 +1145,24 @@ pub struct EffMod {
 }
 
 impl EffMod {
+    /// Name the edited file `rel`. What was copied from the file itself still is: a part added
+    /// from another of its effects, an effect borrowed within it.
+    pub fn set_source_rel(&mut self, rel: String) {
+        let slashed = |path: &str| path.replace('\\', "/").to_lowercase();
+        let own = slashed(&std::mem::replace(&mut self.source_rel, rel));
+        let from = self
+            .rosters
+            .iter_mut()
+            .flat_map(|roster| &mut roster.slots)
+            .map(|slot| &mut slot.source_file)
+            .chain(self.transplants.iter_mut().map(|op| &mut op.src_file_rel));
+        for file in from {
+            if !own.is_empty() && slashed(file) == own {
+                file.clone_from(&self.source_rel);
+            }
+        }
+    }
+
     /// How many effects differ from the file: a part's values or texture, the part list, or the
     /// timing. Counted by effect name, so an effect with all three is one.
     pub fn changed_effects(&self) -> usize {
@@ -2333,30 +2407,197 @@ mod persistence_tests {
 mod older_project_tests {
     use super::*;
 
-    /// Projects saved by older builds. Set `VISIONARY_OLD_PROJECTS` to a folder of them.
+    /// A project as a build of that version saved it: the same one, Mario with a gimmick and
+    /// Vision made on his c07. `v7` is as the app saved it; the others are that file opened and
+    /// saved by the build named (8baaee5, c44379d, b5dc441).
+    fn saved(json: &str) -> ModProjectFile {
+        serde_json::from_str(json).unwrap()
+    }
+    const V7: &str = include_str!("../tests/data/projects/v7.json");
+    const V8: &str = include_str!("../tests/data/projects/v8.json");
+    const V8_NEW_CHARACTER: &str = include_str!("../tests/data/projects/v8-new-character.json");
+    const V8_FORK: &str = include_str!("../tests/data/projects/v8-fork.json");
+    const V9_FORK_NEW_CHARACTER: &str =
+        include_str!("../tests/data/projects/v9-fork-new-character.json");
+
+    fn rows() -> BTreeSet<ProjectFighter> {
+        BTreeSet::from([
+            ProjectFighter::fighter("mario"),
+            ProjectFighter::character("mario", "Vision"),
+        ])
+    }
+
+    /// Which projects give a made character the donor's edits it used to share, and which get a
+    /// fighter list from what they edit. Version 8 is two formats.
     #[test]
-    fn older_projects_load_and_expand() {
-        let Some(root) = std::env::var_os("VISIONARY_OLD_PROJECTS") else {
-            return;
-        };
-        let mut checked = 0;
-        for entry in std::fs::read_dir(root).unwrap().flatten() {
-            let path = entry.path().join("modproject.json");
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let mut project: super::ModProjectFile = serde_json::from_str(&text)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            project
-                .migrate()
-                .and_then(|_| crate::mod_export::validate_project(&project))
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            crate::move_nodes::project::expand(&project)
-                .unwrap_or_else(|errors| panic!("{}: {errors:?}", path.display()));
-            checked += 1;
+    fn each_saved_version_is_brought_to_the_current_one() {
+        let vision = crate::roster::RosterKey::slot("mario", 7);
+        // The list the fork's user left, with Mario taken out of it.
+        let mut kept: serde_json::Value = serde_json::from_str(V8_FORK).unwrap();
+        kept["project_fighters"].as_array_mut().unwrap().remove(0);
+        let mut linked: serde_json::Value = serde_json::from_str(V8_FORK).unwrap();
+        linked.as_object_mut().unwrap().remove("project_fighters");
+        linked["moveset_source"] = "moveset".into();
+        let mut v9: serde_json::Value = serde_json::from_str(V9_FORK_NEW_CHARACTER).unwrap();
+        v9["project_fighters"].as_array_mut().unwrap().remove(0);
+        let only_vision = BTreeSet::from([ProjectFighter::character("mario", "Vision")]);
+        for (name, json, copied, list) in [
+            ("v7", V7.to_string(), false, rows()),
+            ("v8", V8.to_string(), false, rows()),
+            (
+                "v8, a new character",
+                V8_NEW_CHARACTER.to_string(),
+                false,
+                rows(),
+            ),
+            ("the fork's v8", V8_FORK.to_string(), true, rows()),
+            (
+                "the fork's v8, a row removed",
+                kept.to_string(),
+                true,
+                only_vision.clone(),
+            ),
+            (
+                "the fork's v8, linked only",
+                linked.to_string(),
+                true,
+                BTreeSet::new(),
+            ),
+            ("the fork's v9", v9.to_string(), false, only_vision),
+        ] {
+            let before = saved(&json);
+            let mut project = saved(&json);
+            let findings = project.migrate().unwrap();
+            assert_eq!(project.version, 10, "{name}");
+            crate::mod_export::validate_project(&project).unwrap();
+            assert_eq!(project.project_fighters, list, "{name}");
+            let own = project.characters.get(&vision);
+            if copied {
+                let mut expected = before.fighters["mario"].behavior.clone();
+                expected.costumes = vec![7];
+                assert_eq!(own.unwrap().behavior, expected, "{name}");
+                assert_eq!(findings.len(), 1, "{name}: {findings:?}");
+            } else {
+                assert_eq!(
+                    serde_json::to_value(own).unwrap(),
+                    serde_json::to_value(before.characters.get(&vision)).unwrap(),
+                    "{name}"
+                );
+                assert!(findings.is_empty(), "{name}: {findings:?}");
+            }
+            // Saved, it is a current project: opening it again changes nothing.
+            let current = serde_json::to_value(&project).unwrap();
+            let mut reopened: ModProjectFile = serde_json::from_value(current.clone()).unwrap();
+            assert!(reopened.migrate().unwrap().is_empty(), "{name}");
+            assert_eq!(serde_json::to_value(&reopened).unwrap(), current, "{name}");
         }
-        println!("checked {checked} older projects");
-        assert!(checked > 0);
+    }
+
+    /// Whether the file was saved by a build that kept a fighter list and a moveset link in it,
+    /// so a project without a link is one the user left without.
+    #[test]
+    fn only_some_versions_keep_a_link_of_their_own() {
+        for (json, keeps) in [
+            (V7, false),
+            (V8, false),
+            (V8_NEW_CHARACTER, false),
+            (V8_FORK, true),
+            (V9_FORK_NEW_CHARACTER, true),
+        ] {
+            assert_eq!(saved(json).keeps_scope(), keeps);
+        }
+        assert!(ModProjectFile::default().keeps_scope());
+        for version in [1, 2, 3, 5, 6, 7] {
+            assert!(!ModProjectFile {
+                version,
+                ..Default::default()
+            }
+            .keeps_scope());
+        }
+    }
+
+    /// An effect file opened from a download by 8baaee5, one of its parts copied from another of
+    /// its effects. The game path takes the place of the file's own, and the part is still the
+    /// file's own; where the file is stays known.
+    #[test]
+    fn an_effect_file_opened_from_outside_keeps_its_file_and_its_own_parts() {
+        const OPENED: &str = include_str!("../tests/data/projects/v8-effect-opened-outside.json");
+        const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+        const LINK: &str = "/mods/other/effect/fighter/link/ef_link.eff";
+        let mut project = saved(OPENED);
+        let eff = project
+            .fighters
+            .get_mut("mario")
+            .unwrap()
+            .eff
+            .as_mut()
+            .unwrap();
+        let path = eff.source_rel.clone();
+        assert_eq!(eff.rosters[0].slots[1].source_file, path);
+        // Borrowed within the file, spelled as Windows does, and from another file.
+        for file in [path.replace('/', "\\"), LINK.to_string()] {
+            eff.transplants.push(TransplantOp {
+                new_entry_name: "borrowed".into(),
+                src_file_rel: file,
+                src_set_name: "mario_fb_bound".into(),
+                src_set_idx: 0,
+                one_slot_slots: Vec::new(),
+                replace_entry: None,
+            });
+        }
+        project.migrate().unwrap();
+        let eff = project.fighters["mario"].eff.as_ref().unwrap();
+        assert_eq!(eff.source_rel, MARIO);
+        assert_eq!(
+            eff.source_path.as_deref(),
+            Some(std::path::Path::new(&path))
+        );
+        assert_eq!(eff.rosters[0].slots[1].source_file, MARIO);
+        assert!(eff.rosters[0].slots[0].source_file.is_empty());
+        assert_eq!(eff.transplants[0].src_file_rel, MARIO);
+        assert_eq!(eff.transplants[1].src_file_rel, LINK);
+        // Saved and opened again, the file is still known.
+        let saved_again = serde_json::to_string(&project).unwrap();
+        let mut reopened = saved(&saved_again);
+        reopened.migrate().unwrap();
+        let eff = reopened.fighters["mario"].eff.as_ref().unwrap();
+        assert_eq!(
+            eff.source_path.as_deref(),
+            Some(std::path::Path::new(&path))
+        );
+    }
+
+    /// A move of the donor's that only its made character edits keeps the game's own version of
+    /// it, wherever it is saved; so does one edited only as nodes.
+    #[test]
+    fn a_moves_baseline_is_kept_for_every_character_that_edits_it() {
+        let mut project = saved(V8);
+        let vision = project.characters.values_mut().next().unwrap();
+        vision
+            .sound_scripts
+            .insert("attack_11".into(), crate::data::AcmdScript::default());
+        vision
+            .move_graphs
+            .insert("attack_s3".into(), Default::default());
+        let mario = project.fighters.get_mut("mario").unwrap();
+        mario
+            .effect_scripts
+            .insert("attack_hi3".into(), crate::data::AcmdScript::default());
+        mario.effect_calls.insert("attack_lw3".into(), Vec::new());
+        let edited = project.edited_moves();
+        let mut moves: Vec<_> = edited
+            .iter()
+            .map(|(fighter, name)| (fighter.as_str(), name.as_str()))
+            .collect();
+        moves.sort();
+        assert_eq!(
+            moves,
+            [
+                ("mario", "attack_11"),
+                ("mario", "attack_hi3"),
+                ("mario", "attack_s3")
+            ]
+        );
     }
 
     #[test]
@@ -2459,13 +2700,6 @@ mod older_project_tests {
     }
 
     #[test]
-    fn v8_project_is_not_reseeded() {
-        let mut project = with_edited_fox(8);
-        project.migrate().unwrap();
-        assert!(project.project_fighters.is_empty());
-    }
-
-    #[test]
     fn v4_project_is_not_reseeded() {
         // A v4 file's list is the user's own: fox was removed while it still had edits.
         let mut project = with_edited_fox(4);
@@ -2504,7 +2738,7 @@ mod eff_game_rel_tests {
         );
     }
 
-    /// The bug: File → Open Effect File… on a mod's eff recorded `C:/mods/…/ef_mario.eff`.
+    /// The bug: File → Open Effect File on a mod's eff recorded `C:/mods/…/ef_mario.eff`.
     #[test]
     fn an_eff_outside_the_root_is_recorded_from_its_effect_folder() {
         let root = Path::new("C:/dump");
