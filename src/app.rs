@@ -5131,9 +5131,6 @@ pub struct VisionaryApp {
     sources_focus: Option<SourceRow>,
     /// Scroll `sources_focus` into view once, on the first frame after `open_sources`.
     sources_scroll: bool,
-    /// A picked dump folder awaiting the user's decision. Held across frames because egui
-    /// is immediate-mode: the "Use ... instead" / "Use anyway" choice is drawn every frame.
-    pending_dump: Option<(PathBuf, crate::sources::DumpCheck)>,
     /// The current dump's check, so the window doesn't walk the folder every frame.
     dump_status: Option<(PathBuf, crate::sources::DumpCheck)>,
     /// Costume slot targeted by Project Files model/motion imports. Session-only: the imported
@@ -5867,7 +5864,6 @@ impl VisionaryApp {
             show_sources: false,
             sources_focus: None,
             sources_scroll: false,
-            pending_dump: None,
             dump_status: None,
             workspace_asset_slot: 0,
             move_has_no_script: false,
@@ -6056,13 +6052,6 @@ impl VisionaryApp {
         // Re-link the user's own ACMD source. Resuming a project later replaces this with the
         // project's own link.
         app.relink_global_acmd_source();
-
-        // First run: the dump comes before the Project Hub. Left showing, the hub covered the
-        // left panel's "Step 1 — your game dump" and let New Project start with no dump;
-        // `apply_game_dump` brings it up once a dump is set.
-        if app.state.data_root.is_none() {
-            app.project_hub.show = false;
-        }
 
         // Profiling helper: preselect a fighter by internal name so a `VISIONARY_PROFILE` run
         // measures the loaded-model path (3D viewport, bone overlays) instead of the empty
@@ -9835,7 +9824,7 @@ impl VisionaryApp {
                 ui.label(egui::RichText::new("Game dump").small().strong())
                     .on_hover_text(
                         "The ArcExplorer game dump vanilla fighters, models and motions are read \
-                     from (File → Sources…). Vanilla ACMD itself comes from the \
+                     from (File → Sources). Vanilla ACMD itself comes from the \
                      dumped-script mirror on GitHub.",
                     );
                 match &self.state.data_root {
@@ -9870,7 +9859,7 @@ impl VisionaryApp {
                         };
                         ui.label(egui::RichText::new(text).small().color(color));
                         if ui
-                            .small_button("Link…")
+                            .small_button("Link")
                             .on_hover_text(
                                 "Pick any folder of the Rust project that builds your plugin: its \
                                  root, plugin/, or src/. Cargo works out which crates it builds.",
@@ -9936,10 +9925,7 @@ impl VisionaryApp {
                 .zip(self.state.selected_move.as_ref())
                 .map(|(f, m)| (f.name.clone(), m.name.clone()));
             let Some((fighter, move_name)) = selection else {
-                ui.label(
-                    egui::RichText::new("Select a fighter and a move to see its script.")
-                        .color(egui::Color32::GRAY),
-                );
+                ui.weak("No move open");
                 return;
             };
 
@@ -9991,17 +9977,17 @@ impl VisionaryApp {
                 .filter(|characters| !characters.is_empty());
             if let Some(characters) = gated_characters {
                 let base = fighter_display_name(&fighter);
+                let characters = characters.join(", ");
                 ui.label(
-                    egui::RichText::new(format!(
-                        "This moveset installs {fighter}'s scripts only on {}'s costume slots \
-                         (set_costume); {base}'s own slots play the game's. Edits made here \
-                         change {}.",
-                        characters.join(", "),
-                        characters.join(", "),
-                    ))
-                    .small()
-                    .color(egui::Color32::from_rgb(230, 190, 90)),
-                );
+                    egui::RichText::new(format!("Only on {characters}'s costumes"))
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 190, 90)),
+                )
+                .on_hover_text(format!(
+                    "This moveset installs {fighter}'s scripts only on {characters}'s costume slots \
+                     (set_costume); {base}'s own slots play the game's. Edits made here change \
+                     {characters}."
+                ));
             }
 
             // Everything that needs `&self` is resolved before the buffer is borrowed
@@ -10043,14 +10029,17 @@ impl VisionaryApp {
             };
 
             if any_ambiguous {
+                let ambiguous: Vec<&str> = scripts
+                    .iter()
+                    .filter(|(_, _, _, ambiguous, _)| *ambiguous)
+                    .map(|(_, name, ..)| name.as_str())
+                    .collect();
                 ui.label(
-                    egui::RichText::new(
-                        "One or more source functions are duplicated; those categories are \
-                         blocked until the project has one owner for each script.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_rgb(230, 190, 90)),
-                );
+                    egui::RichText::new(format!("Defined twice: {}", ambiguous.join(", ")))
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 190, 90)),
+                )
+                .on_hover_text("Not read or written until the project defines each once");
             }
 
             if view != SourceView::Generated {
@@ -11295,16 +11284,11 @@ impl VisionaryApp {
 
     fn draw_left_panel(&mut self, ui: &mut Ui) {
         if self.state.data_root.is_none() {
-            ui.add_space(6.0);
-            ui.strong("Step 1 — your game dump");
-            ui.label(
-                "Choose the folder ArcExplorer exported from data.arc.\n\
-                 It holds fighter/ and effect/.",
-            );
-            ui.add_space(4.0);
             if ui
-                .button("Choose game dump…")
-                .on_hover_text("Choose the folder containing extracted fighter files")
+                .button("Choose game dump")
+                .on_hover_text(
+                    "The folder ArcExplorer exported from data.arc, with fighter/ and effect/",
+                )
                 .clicked()
             {
                 self.pick_game_dump();
@@ -22542,15 +22526,17 @@ impl VisionaryApp {
             ui.colored_label(
                 egui::Color32::from_rgb(235, 170, 90),
                 RichText::new(if self.open_article_in_source && self.acmd_src.is_some() {
-                    format!(
-                        "{agent} is open. Syncing saves its changes into the linked source; they \
-                         are not kept in the project or exported yet."
-                    )
+                    format!("{agent}: not kept in the project or exported")
                 } else {
-                    self.unsaveable_object_script_words().to_string()
+                    format!("{agent}: changes can't be saved")
                 })
                 .small(),
-            );
+            )
+            .on_hover_text(if self.open_article_in_source && self.acmd_src.is_some() {
+                "Sync to save its changes into the linked source"
+            } else {
+                self.unsaveable_object_script_words()
+            });
             if self.game_link.article_live_status(agent)
                 == Some(crate::game_link::ArticleLiveSupport::Unsupported)
             {
@@ -22584,7 +22570,7 @@ impl VisionaryApp {
                                 ui.colored_label(warn, RichText::new(warning).small());
                             }
                             if row.scripts.is_empty() && row.game_scripts.is_empty() {
-                                ui.weak(RichText::new("No scripts listed for it: the linked source has none, and the game's weren't found.").small());
+                                ui.weak(RichText::new("No scripts").small());
                             }
                             for script in &row.scripts {
                                 let open = self.open_article.as_deref() == Some(agent.as_str())
@@ -22617,7 +22603,7 @@ impl VisionaryApp {
                                 }
                             }
                             if ui
-                                .small_button("Settings…")
+                                .small_button("Settings")
                                 .on_hover_text("Size, speed, life and params, each with where it is set")
                                 .clicked()
                             {
@@ -26359,22 +26345,8 @@ impl VisionaryApp {
         self.dump_status = None;
     }
 
-    /// Apply a dump the user has accepted. On first run (no dump yet, no project open) this is
-    /// step 1 of setup, so step 2 follows: the Project Hub.
-    fn apply_game_dump(&mut self, path: PathBuf) {
-        // No recent-projects condition: a returning user whose dump setting was lost had the
-        // hub held back at startup too, and gets it here.
-        let first_run = self.state.data_root.is_none() && self.project_path.is_none();
-        self.set_data_root(path);
-        if first_run && self.state.data_root.is_some() {
-            self.project_hub.show = true;
-        }
-    }
-
-    /// Pick a folder as the ArcExplorer dump. A folder that passes `check_dump` is applied
-    /// straight away; anything else is held in `pending_dump` for the Sources window to ask
-    /// about, since the answer arrives on a later frame. Shared by the Sources window and
-    /// the left panel.
+    /// Pick a folder as the ArcExplorer dump and use it. One that lacks something a dump has is
+    /// used all the same: the Sources window then shows what.
     fn pick_game_dump(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Choose your ArcExplorer dump")
@@ -26382,17 +26354,10 @@ impl VisionaryApp {
         else {
             return;
         };
-        match crate::sources::check_dump(&path) {
-            crate::sources::DumpCheck::Ok => {
-                self.pending_dump = None;
-                self.apply_game_dump(path);
-            }
-            other => {
-                self.pending_dump = Some((path, other));
-                // The question is drawn in the Sources window, so make sure it is showing.
-                self.open_sources(SourceRow::Dump);
-            }
+        if crate::sources::check_dump(&path) != crate::sources::DumpCheck::Ok {
+            self.open_sources(SourceRow::Dump);
         }
+        self.set_data_root(path);
     }
 
     fn draw_sources_window(&mut self, ctx: &egui::Context) {
@@ -26418,7 +26383,6 @@ impl VisionaryApp {
         };
         let dump_path = self.state.data_root.clone();
         let dump_status = self.dump_status.clone();
-        let pending = self.pending_dump.clone();
         let mods_total = self.roster.library.mods.len();
         let mods_enabled = self.roster.library.enabled().count();
         let fighters_with_files = self.project_romfs_slots.len();
@@ -26431,8 +26395,7 @@ impl VisionaryApp {
 
         let mut open = true;
         let mut change_dump = false;
-        let mut use_pending: Option<PathBuf> = None;
-        let mut drop_pending = false;
+        let mut use_dump: Option<PathBuf> = None;
         let mut reveal_path: Option<PathBuf> = None;
         let mut open_library = false;
         let mut open_workspace = false;
@@ -26442,8 +26405,8 @@ impl VisionaryApp {
 
         let weak = egui::Color32::GRAY;
         let warn = egui::Color32::from_rgb(220, 180, 90);
-        // Which of fighter/ and effect/ a folder lacks, as "fighter/ and effect/" style text.
-        let missing_text = |fighter: bool, effect: bool, joiner: &str| {
+        // Which of fighter/ and effect/ a folder lacks.
+        let missing_text = |fighter: bool, effect: bool| {
             let mut gone = Vec::new();
             if fighter {
                 gone.push("fighter/");
@@ -26451,7 +26414,7 @@ impl VisionaryApp {
             if effect {
                 gone.push("effect/");
             }
-            gone.join(joiner)
+            gone.join(" and ")
         };
         // One row: a framed block, highlighted when it is the one asked for.
         let row = |ui: &mut Ui,
@@ -26468,8 +26431,8 @@ impl VisionaryApp {
                 .stroke(stroke)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(title).strong());
-                    ui.label(RichText::new(description).small().color(weak));
+                    ui.label(RichText::new(title).strong())
+                        .on_hover_text(description);
                     ui.add_space(2.0);
                     body(ui);
                 });
@@ -26488,8 +26451,8 @@ impl VisionaryApp {
                         ui,
                         SourceRow::Dump,
                         "Game dump (ArcExplorer)",
-                        "The fighter/, effect/ and ui/ folders you exported from data.arc. \
-                         Shared by every project.",
+                        "The fighter/, effect/ and ui/ folders you exported from data.arc, shared by \
+                         every project",
                         &mut |ui| {
                             match (&dump_path, &dump_status) {
                                 (Some(path), Some((_, check))) => {
@@ -26497,36 +26460,36 @@ impl VisionaryApp {
                                         RichText::new(path.display().to_string()).monospace().small(),
                                     );
                                     match check {
-                                        DumpCheck::Ok => {
-                                            ui.label(
-                                                RichText::new("Looks like a full game dump.").small(),
-                                            );
-                                        }
-                                        DumpCheck::Missing { fighter, effect, .. } => {
+                                        DumpCheck::Ok => {}
+                                        DumpCheck::Missing { fighter, effect, suggestion } => {
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "Missing {}.",
-                                                    missing_text(*fighter, *effect, " and ")
+                                                    "Missing {}",
+                                                    missing_text(*fighter, *effect)
                                                 ))
                                                 .small()
                                                 .color(warn),
                                             );
+                                            if let Some(better) = suggestion {
+                                                if ui
+                                                    .button(format!("Use {}", better.display()))
+                                                    .clicked()
+                                                {
+                                                    use_dump = Some(better.clone());
+                                                }
+                                            }
                                         }
                                         DumpCheck::LooksLikeMod(hints) => {
+                                            let hints: Vec<String> =
+                                                hints.iter().map(hint_text).collect();
                                             ui.label(
-                                                RichText::new(
-                                                    "This folder looks like a mod, not a game dump:",
-                                                )
+                                                RichText::new(format!(
+                                                    "Looks like a mod: {}",
+                                                    hints.join(", ")
+                                                ))
                                                 .small()
                                                 .color(warn),
                                             );
-                                            for hint in hints {
-                                                ui.label(
-                                                    RichText::new(format!("• it {}", hint_text(hint)))
-                                                        .small()
-                                                        .color(warn),
-                                                );
-                                            }
                                         }
                                     }
                                 }
@@ -26534,63 +26497,8 @@ impl VisionaryApp {
                                     ui.label(RichText::new("not set").small().color(weak));
                                 }
                             }
-                            if let Some((picked, check)) = &pending {
-                                ui.separator();
-                                ui.label(
-                                    RichText::new(picked.display().to_string()).monospace().small(),
-                                );
-                                match check {
-                                    DumpCheck::Missing { fighter, effect, suggestion } => {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "That folder has no {}, so it isn't a game dump.",
-                                                missing_text(*fighter, *effect, " or ")
-                                            ))
-                                            .small()
-                                            .color(warn),
-                                        );
-                                        if let Some(better) = suggestion {
-                                            if ui
-                                                .button(format!("Use {} instead", better.display()))
-                                                .clicked()
-                                            {
-                                                use_pending = Some(better.clone());
-                                            }
-                                        }
-                                    }
-                                    DumpCheck::LooksLikeMod(hints) => {
-                                        ui.label(
-                                            RichText::new(
-                                                "That folder looks like a mod, not a game dump:",
-                                            )
-                                            .small()
-                                            .color(warn),
-                                        );
-                                        for hint in hints {
-                                            ui.label(
-                                                RichText::new(format!("• it {}", hint_text(hint)))
-                                                    .small()
-                                                    .color(warn),
-                                            );
-                                        }
-                                        if ui.button("Use anyway").clicked() {
-                                            use_pending = Some(picked.clone());
-                                        }
-                                    }
-                                    DumpCheck::Ok => {}
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui.button("Pick another").clicked() {
-                                        change_dump = true;
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        drop_pending = true;
-                                    }
-                                });
-                                ui.separator();
-                            }
                             ui.horizontal(|ui| {
-                                if ui.button("Change…").clicked() {
+                                if ui.button("Change").clicked() {
                                     change_dump = true;
                                 }
                                 if ui
@@ -26609,7 +26517,7 @@ impl VisionaryApp {
                         ui,
                         SourceRow::ReferenceMods,
                         "Reference mods",
-                        "Other people's mods to view alongside the game. Shared by every project.",
+                        "Other people's mods to view alongside the game, shared by every project",
                         &mut |ui| {
                             ui.label(
                                 RichText::new(format!("{mods_enabled} of {mods_total} enabled"))
@@ -26624,15 +26532,11 @@ impl VisionaryApp {
                         ui,
                         SourceRow::ProjectFiles,
                         "This project's files",
-                        "Your edited game files (romfs/). These win over the dump in previews and \
-                         are included when you export.",
+                        "Your edited game files (romfs/): shown in place of the dump's and included \
+                         when you export",
                         &mut |ui| {
                             if !has_project {
-                                ui.label(
-                                    RichText::new("Open or create a project to have its own files.")
-                                        .small()
-                                        .color(weak),
-                                );
+                                ui.label(RichText::new("no project open").small().color(weak));
                                 return;
                             }
                             ui.label(
@@ -26643,7 +26547,7 @@ impl VisionaryApp {
                                 if ui.button("Open folder").clicked() {
                                     reveal_path = romfs.clone();
                                 }
-                                if ui.button("Project Files…").clicked() {
+                                if ui.button("Project files").clicked() {
                                     open_workspace = true;
                                 }
                             });
@@ -26654,9 +26558,9 @@ impl VisionaryApp {
                         SourceRow::MovesetCode,
                         "Moveset code",
                         if has_project {
-                            "The Rust project that builds your plugin. Saved with this project."
+                            "The Rust project that builds your plugin, saved with this project"
                         } else {
-                            "The Rust project that builds your plugin. Used while browsing without a project."
+                            "The Rust project that builds your plugin, used while browsing without a project"
                         },
                         &mut |ui| {
                             match (&linked, &problem) {
@@ -26673,17 +26577,11 @@ impl VisionaryApp {
                                 }
                             }
                             if matches!(linked, Some((_, true))) {
-                                ui.label(
-                                    RichText::new(
-                                        "this crate doesn't name its fighters — add the fighter \
-                                         to the project yourself",
-                                    )
-                                    .small()
-                                    .color(warn),
-                                );
+                                ui.label(RichText::new("names no fighters").small().color(warn))
+                                    .on_hover_text("Add its fighters to the project yourself");
                             }
                             ui.horizontal(|ui| {
-                                if ui.button("Link…").clicked() {
+                                if ui.button("Link").clicked() {
                                     link = true;
                                 }
                                 if ui
@@ -26711,17 +26609,11 @@ impl VisionaryApp {
         if !open {
             self.show_sources = false;
             self.sources_focus = None;
-            self.pending_dump = None;
         }
-        if drop_pending {
-            self.pending_dump = None;
-        }
-        if let Some(path) = use_pending {
-            self.pending_dump = None;
-            self.apply_game_dump(path);
+        if let Some(path) = use_dump {
+            self.set_data_root(path);
         }
         if change_dump {
-            self.pending_dump = None;
             self.pick_game_dump();
         }
         if let Some(path) = reveal_path {
@@ -40445,7 +40337,7 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Sources…").on_hover_text("Your game dump, reference mods, this project's files and moveset code").clicked() {
+                    if ui.button("Sources").on_hover_text("Your game dump, reference mods, this project's files and moveset code").clicked() {
                         self.open_sources(SourceRow::Dump);
                         ui.close();
                     }
@@ -42882,41 +42774,39 @@ fn draw_source_pane(
     revert: &mut bool,
 ) {
     let Some(buffer) = buffer else {
-        let message = match reason {
-            NoSource::NotLinked => "No source project is linked, so this move has no code of \
-                 its own to show. Link one above, or switch to Generated to see what an \
-                 export would write."
-                .to_string(),
-            NoSource::FighterAbsent => format!(
-                "The linked project has no scripts for {fighter} at all. If this move came \
-                 from live capture, that is expected — switch to Generated to see what an \
-                 export would write for it."
+        let (state, hover) = match reason {
+            NoSource::NotLinked => (
+                "not linked".to_string(),
+                "Link your moveset above, or look at Generated for what an export would write",
             ),
-            NoSource::MoveAbsent => format!(
-                "The linked project has {fighter}, but not {move_name}. Switch to Generated \
-                 to see what an export would write for it."
+            NoSource::FighterAbsent => (
+                format!("No scripts for {fighter}"),
+                "Generated shows what an export would write",
             ),
-            NoSource::Ambiguous => format!(
-                "The linked project has duplicate source owners for {fighter}/{move_name}. \
-                 Resolve the duplicate functions, then rescan the project."
+            NoSource::MoveAbsent => (
+                format!("No {move_name} script"),
+                "Generated shows what an export would write",
             ),
-            NoSource::NothingOpen => {
-                "Open one of this move's scripts above to edit it.".to_string()
-            }
+            NoSource::Ambiguous => (
+                "Defined twice".to_string(),
+                "Keep one of the functions, then rescan",
+            ),
+            NoSource::NothingOpen => (
+                "No script open".to_string(),
+                "Open one of this move's scripts above",
+            ),
         };
-        ui.label(egui::RichText::new(message).color(egui::Color32::GRAY));
+        ui.weak(state).on_hover_text(hover);
         return;
     };
 
     if buffer.move_name != move_name || buffer.fighter != fighter {
         ui.label(
-            egui::RichText::new(format!(
-                "Showing {} / {} — open a script for the selected move to edit it here.",
-                buffer.fighter, buffer.move_name
-            ))
-            .small()
-            .color(egui::Color32::from_rgb(230, 190, 90)),
-        );
+            egui::RichText::new(format!("{} / {}", buffer.fighter, buffer.move_name))
+                .small()
+                .color(egui::Color32::from_rgb(230, 190, 90)),
+        )
+        .on_hover_text("Not the open move's: open one of its scripts above to edit it here");
     }
     ui.horizontal_wrapped(|ui| {
         ui.label(
@@ -43015,13 +42905,9 @@ fn draw_verification(ui: &mut egui::Ui, report: &crate::acmd_verify::Report, has
 /// copyable — which is most of the point of showing it.
 fn draw_generated_pane(ui: &mut egui::Ui, text: &mut String) {
     if text.is_empty() {
-        ui.label(
-            egui::RichText::new(
-                "This move has no hitboxes or effect spawns loaded yet, so an export would \
-                 write nothing for it. Fetch the move, or perform it in game with the plugin \
-                 connected to capture it live.",
-            )
-            .color(egui::Color32::GRAY),
+        ui.weak("No code").on_hover_text(
+            "The move has no hitboxes or effect spawns loaded yet. Fetch it, or perform it in game \
+             with the plugin connected.",
         );
         return;
     }

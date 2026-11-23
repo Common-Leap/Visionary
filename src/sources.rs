@@ -1,8 +1,9 @@
-//! Checks that a folder picked as the ArcExplorer dump really is one.
+//! What a folder used as the ArcExplorer dump lacks of one.
 //!
 //! A mod folder picked by mistake looks plausible (it has `fighter/` and
-//! `effect/`) but lacks most of the game, so every later lookup would quietly
-//! come up empty. [`check_dump`] tells the two apart so the UI can warn.
+//! `effect/`) but lacks most of the game, so every later lookup quietly comes
+//! up empty. [`check_dump`] says so for the UI to show; the folder is used
+//! whatever it finds.
 
 use std::path::{Path, PathBuf};
 
@@ -143,23 +144,14 @@ pub fn check_dump(dir: &Path) -> DumpCheck {
     }
 }
 
-/// A plain-language reason for a hint, for the warning shown to the modder.
+/// What a hint saw, as the Sources window lists it.
 pub fn hint_text(hint: &ModHint) -> String {
     match hint {
-        ModHint::InfoToml => "has an info.toml, which mods ship and dumps don't".into(),
-        ModHint::Plugin => "contains a plugin (.nro file), which a game dump never does".into(),
-        ModHint::RomfsWrapper => {
-            "is, or contains, a romfs folder — pick the folder that contains fighter/ and effect/"
-                .into()
-        }
-        ModHint::FewFighters(n) => {
-            format!("holds only {n} fighters — a full dump has about 90")
-        }
-        ModHint::NotVanilla => {
-            format!(
-                "is missing {CARRIER_BASE_REL}, a file every full dump has, so it won't be used to fill in files a partial romfs copy leaves out"
-            )
-        }
+        ModHint::InfoToml => "info.toml".into(),
+        ModHint::Plugin => "a plugin (.nro)".into(),
+        ModHint::RomfsWrapper => "romfs/".into(),
+        ModHint::FewFighters(n) => format!("{n} of about 90 fighters"),
+        ModHint::NotVanilla => format!("no {CARRIER_BASE_REL}"),
     }
 }
 

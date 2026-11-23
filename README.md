@@ -44,18 +44,17 @@ ArcExplorer export/
 └── item/      (optional — items fighters hold in their moves)
 ```
 
-On first run Visionary asks for this folder (the **ArcExplorer dump**) before anything
-else, then shows the Project Hub (the hub waits until a dump is set). It checks the folder: one without `fighter/` and `effect/`
-is refused with the reason, one that looks like a mod (an `info.toml`, a `.nro`, a `romfs/`
-wrapper or only a handful of fighters) is warned about, and a folder that holds a valid dump
-one level down offers that folder instead. The `fighter` folder provides character models,
-motion data, and parameters; the `effect` folder provides the `.eff` files used by the
-effect editor.
+Choose this folder (the **ArcExplorer dump**) with **Choose game dump** in the left panel
+or in **File → Sources**. Any folder is used as it is: a dump without `fighter/` or
+`effect/`, or one that looks like a mod, only shows what it lacks in the Sources window.
+The `fighter` folder provides character models, motion data, and parameters; the `effect`
+folder provides the `.eff` files used by the effect editor. Visionary never changes a file
+in the dump.
 
 ### Sources window
 
-**File → Sources…** is the one place that shows every input, top to bottom in load order,
-with what each is for and whether it is OK, missing or has a problem:
+**File → Sources** is the one place that shows every input, top to bottom in load order,
+and what is missing or has a problem:
 
 1. **Base game — ArcExplorer dump.** Global: the same game for every project.
 2. **Reference mods.** Global: the enabled Mod Library entries, opened from this row.
@@ -64,14 +63,15 @@ with what each is for and whether it is OK, missing or has a problem:
 
 The precedence rule: a file in the project's `romfs/` wins over everything else, in the
 fighter list and in previews (models, motions, params and icons), so a copied and edited
-model previews from `romfs/` and not from the dump. Effects are the exception: they still
-come from the dump and the reference mods, so exporting an edited effect can never write
+model previews from `romfs/` and not from the dump. Effect files are read
+from the project's copy too; exporting writes the edited one into the exported mod, never
 over a file in `romfs/`. Between the dump and the reference mods nothing changes: the dump stays
 authoritative for a fighter's model, motion and parameter paths, and mods add fighters and
 slots. The dump and the Mod Library belong to the machine; the project's files and moveset
 link belong to the project. The moveset link is saved per project in `modproject.json`
 (relative to the project folder when the crate is inside it), so opening a project re-links
-its crate. Without a project open, the link is the global one, as before.
+its crate. Without a project open, the link is the global one, as before; a project saved
+before projects kept a link opens with the global one and keeps it.
 
 ### Project fighters
 
