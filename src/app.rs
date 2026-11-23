@@ -4179,9 +4179,8 @@ fn trail_edge_point(
     Some(mat.transform_point3(glam::Vec3::from(offset)))
 }
 
-/// Paint one trail into the viewport: the swept ribbon between its two edges over the visible
-/// stretch of swing, fading toward the tail, plus the blade segment at the head. A selected
-/// trail outside its window still shows where its edges are now, as a dashed segment.
+/// Outline the selected trail in the viewport: the swept edges over the visible stretch of
+/// swing, or, outside its window, where its edges are now, as a dashed segment.
 ///
 /// Returns the screen distance from `click_pos` to the head segment when the click is close
 /// enough to pick the trail.
@@ -4197,15 +4196,22 @@ fn draw_trail_preview(
     selected: bool,
     click_pos: Option<egui::Pos2>,
 ) -> Option<f32> {
-    let color = if selected {
-        egui::Color32::from_rgb(255, 205, 120)
-    } else {
-        egui::Color32::from_rgb(240, 160, 60)
-    };
-    let edges_at = |matrices: &std::collections::HashMap<String, glam::Mat4>| {
+    if !selected && click_pos.is_none() {
+        return None;
+    }
+    let color = egui::Color32::from_rgb(255, 205, 120);
+    let edges_in = |matrices: &std::collections::HashMap<String, glam::Mat4>| {
         let a = trail_edge_point(matrices, &geometry.bone1, geometry.offset1)?;
         let b = trail_edge_point(matrices, &geometry.bone2, geometry.offset2)?;
         Some((rs.world_to_screen(a, rect)?, rs.world_to_screen(b, rect)?))
+    };
+    let edges_at = |frame: f32| {
+        // The current frame's matrices are already in hand; reuse them.
+        if frame == frame_num as f32 {
+            edges_in(current_matrices)
+        } else {
+            edges_in(&rs.bone_world_matrices_at(crate::trail_preview::motion_frame(frame)))
+        }
     };
     let span = crate::trail_preview::visible_span(
         ec.active_start,
@@ -4213,71 +4219,44 @@ fn draw_trail_preview(
         geometry.frames,
         frame_num as f32,
     );
-    let head = match span {
-        Some((tail, head)) => {
-            let samples = crate::trail_preview::sample_frames(tail, head);
-            let edges: Vec<Option<(egui::Pos2, egui::Pos2)>> = samples
-                .iter()
-                .map(|&f| {
-                    // The current frame's matrices are already in hand; reuse them.
-                    if f == frame_num as f32 {
-                        edges_at(current_matrices)
-                    } else {
-                        edges_at(&rs.bone_world_matrices_at(crate::trail_preview::motion_frame(f)))
-                    }
-                })
+    let (a, b) = match span {
+        Some((tail, head)) if selected => {
+            let edges: Vec<_> = crate::trail_preview::sample_frames(tail, head)
+                .into_iter()
+                .map(edges_at)
                 .collect();
-            let mut mesh = egui::Mesh::default();
-            let last = samples.len().saturating_sub(1).max(1) as f32;
-            let peak = if selected { 150.0 } else { 110.0 };
-            for (k, pair) in edges.windows(2).enumerate() {
-                let (Some((a0, b0)), Some((a1, b1))) = (pair[0], pair[1]) else {
-                    continue;
-                };
-                let tint = |at: usize| {
-                    let alpha = (peak * at as f32 / last) as u8;
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
-                };
-                let base = mesh.vertices.len() as u32;
-                mesh.colored_vertex(a0, tint(k));
-                mesh.colored_vertex(b0, tint(k));
-                mesh.colored_vertex(a1, tint(k + 1));
-                mesh.colored_vertex(b1, tint(k + 1));
-                mesh.add_triangle(base, base + 1, base + 2);
-                mesh.add_triangle(base + 1, base + 3, base + 2);
-            }
-            if !mesh.is_empty() {
-                painter.add(egui::Shape::mesh(mesh));
-            }
-            let head = edges.last().copied().flatten();
-            if let Some((a, b)) = head {
-                let width = if selected { 2.5 } else { 1.5 };
-                painter.line_segment([a, b], egui::Stroke::new(width, color));
-            }
-            head
+            let swept: Vec<_> = edges.iter().copied().flatten().collect();
+            let outline = (swept.iter().map(|edge| edge.0))
+                .chain(swept.iter().rev().map(|edge| edge.1))
+                .collect();
+            painter.add(egui::Shape::closed_line(
+                outline,
+                egui::Stroke::new(2.5, color),
+            ));
+            edges.last().copied().flatten()?
         }
+        Some((_, head)) => edges_at(head)?,
         None if selected => {
-            let head = edges_at(current_matrices);
-            if let Some((a, b)) = head {
-                painter.extend(egui::Shape::dashed_line(
-                    &[a, b],
-                    egui::Stroke::new(1.5, color),
-                    5.0,
-                    4.0,
-                ));
-            }
-            head
+            let (a, b) = edges_in(current_matrices)?;
+            painter.extend(egui::Shape::dashed_line(
+                &[a, b],
+                egui::Stroke::new(1.5, color),
+                5.0,
+                4.0,
+            ));
+            (a, b)
         }
-        None => None,
-    }?;
-    let (a, b) = head;
-    painter.text(
-        b + egui::vec2(4.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        &ec.effect_name,
-        egui::FontId::monospace(9.0),
-        color,
-    );
+        None => return None,
+    };
+    if selected {
+        painter.text(
+            b + egui::vec2(4.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &ec.effect_name,
+            egui::FontId::monospace(9.0),
+            color,
+        );
+    }
     let cp = click_pos?;
     let ab = b - a;
     let t = if ab.length_sq() > 0.0 {
@@ -14360,7 +14339,7 @@ impl VisionaryApp {
                         if ec.disabled {
                             continue;
                         }
-                        // A trail is a swept ribbon between two edges, not a point.
+                        // A trail is swept between two edges, not a point.
                         if effect_call_is_trail(ec) {
                             if let Some(geometry) = crate::trail_preview::trail_geometry(ec) {
                                 let t = self.perf.start();

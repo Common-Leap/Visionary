@@ -1,11 +1,11 @@
-//! Viewport preview of AFTER_IMAGE sword trails.
+//! Picking and outlining AFTER_IMAGE sword trails in the viewport; `preview_trail` draws them.
 //!
-//! A trail is a ribbon stretched between two edges, each an offset from a named joint, swept
-//! along as the animation moves those joints. The viewport used to mark one with the same
-//! circle an ordinary spawn gets, at its first joint with no offset, which shows neither the
-//! blade it follows nor the arc it draws. This module reads the edge geometry back out of the
-//! call and works out which stretch of the swing is on screen at a given frame; `app.rs` samples
-//! the skeleton along that stretch and paints the ribbon.
+//! A trail is stretched between two edges, each an offset from a named joint, swept along as the
+//! animation moves those joints. An ordinary spawn's circle, at its first joint with no offset,
+//! shows neither the blade it follows nor the arc it draws. This module reads the edge geometry
+//! back out of the call and works out which stretch of the swing is on screen at a given frame;
+//! `app.rs` samples the skeleton along that stretch, outlines it for the selected trail and tests
+//! clicks against the blade at its head.
 //!
 //! The editor's own fields win over the source text: the joints come from `bone_name` and
 //! `trail_bone2`, which the panel edits, and only the offsets — which no panel field exposes —
@@ -20,10 +20,10 @@ const LENGTH_SLOT: usize = 3;
 const EDGE1_OFFSET_SLOTS: [usize; 3] = [5, 6, 7];
 const EDGE2_OFFSET_SLOTS: [usize; 3] = [9, 10, 11];
 
-/// How many frames of swing the ribbon spans when the call's length slot cannot be read.
+/// How many frames of swing the trail spans when the call's length slot cannot be read.
 pub const DEFAULT_TRAIL_FRAMES: f32 = 8.0;
-/// Ribbon samples per game frame. Fast swings cover a lot of arc in one frame, and a straight
-/// quad per frame turns a curve into a fan of visible facets.
+/// Outline samples per game frame. Fast swings cover a lot of arc in one frame, and one straight
+/// segment per frame turns a curve into visible corners.
 pub const SAMPLES_PER_FRAME: u32 = 3;
 
 /// The two edges of a trail and how long its tail lasts.
@@ -97,7 +97,7 @@ pub fn trail_geometry(call: &EffectCall) -> Option<TrailGeometry> {
 ///
 /// The head follows the blade from the call's frame until the trail is switched off; after
 /// that it stays where the blade was, and the tail keeps advancing until it catches up and the
-/// ribbon is gone. `None` when nothing of the trail is on screen.
+/// trail is gone. `None` when nothing of the trail is on screen.
 pub fn visible_span(
     active_start: u32,
     active_end: u32,
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ribbon_grows_holds_after_off_and_then_drains() {
+    fn the_trail_grows_holds_after_off_and_then_drains() {
         // On at 1, off at 7, 4 frames of tail.
         assert_eq!(visible_span(1, 7, 4.0, 0.5), None);
         assert_eq!(visible_span(1, 7, 4.0, 1.0), None);
