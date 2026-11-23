@@ -1,17 +1,15 @@
-//! Access the game's loaded ARC/search tables and patch raw heap buffers (SSBU 13.0.4).
+//! Access the game's loaded ARC/search tables and patch raw heap buffers.
 //!
 //! Ported from the original effect viewer's `resource_reload.rs`. Uses the real
 //! `smash-arc` crate structs (not hand-computed offsets) to resolve a game path to its
 //! search index / loaded-data buffer.
 
+use crate::offsets;
 use smash_arc::{ArcLookup, Hash40, Region, SearchLookup};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Freeze-pinpoint marker, shared with the rest of the injection path (trace opt-in only).
 use super::effect_reload::mark;
-
-// SSBU 13.0.4 — pointer-to-FilesystemInfo (smashline `resources::types::FilesystemInfo::instance`).
-const FILESYSTEM_INFO_PTR_OFFSET: usize = 0x5331f20;
 
 #[repr(C)]
 struct CppVector {
@@ -94,7 +92,7 @@ fn filesystem_info() -> Option<&'static FilesystemInfo> {
     let text =
         unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as *const u8 };
     let fs_info_ptr = unsafe {
-        text.add(FILESYSTEM_INFO_PTR_OFFSET)
+        text.add(offsets::FILESYSTEM_INFO.get())
             .cast::<*const FilesystemInfo>()
     };
     let fs_info = unsafe { *fs_info_ptr };
@@ -127,7 +125,7 @@ pub struct ResidentDirectoryState {
 /// The game's directory-release routine. It recursively decrements the directory tree's
 /// ownership counts and queues every group whose count reaches zero for the resource worker.
 /// Its callers hold `FilesystemInfo::_mutex`; this wrapper does the same.
-#[skyline::from_offset(0x353eff0)]
+#[skyline::from_offset(offsets::QUEUE_DIRECTORY_RELEASE.get())]
 fn queue_directory_release(filesystem: *mut FilesystemInfo, directory: *mut LoadedDirectory);
 
 pub fn loaded_arc() -> Option<&'static smash_arc::LoadedArc> {
@@ -484,45 +482,6 @@ pub fn evict_resident_file(file_hash: u64) -> Option<(u32, u32, usize, u32, u8)>
         old
     };
     Some((fp as u32, di, old_data, old_ref_count, old_state))
-}
-
-/// Mark a loaded directory incomplete so the next normal `ensure_dir_loaded` call schedules it.
-///
-/// This is paired with [`evict_resident_file`]. Clearing only the file record makes
-/// `load_effects` return 0: the directory descriptor's flag bit 0 remains set, so the resource
-/// wrapper concludes that the directory is already complete and never asks Arcropolis to read
-/// the missing file. The carrier is already gone and its effect unload has returned when this is
-/// called, so no live owner can be relying on the directory's resource reference.
-///
-/// The function does not enqueue or signal the worker. The replacement item's own loader does
-/// both through the game's normal path.
-pub fn evict_resident_directory(dir_hash: u64) -> Option<(u32, u32, u8, u8, u32)> {
-    let fs = filesystem_info()?;
-    let dir_index = dir_info_index_for_path_hash(dir_hash)?;
-    if fs.loaded_directories.is_null()
-        || dir_index as usize >= fs._loaded_directory_len as usize
-        || fs._mutex.is_null()
-    {
-        return None;
-    }
-    let old = unsafe {
-        skyline::nn::os::LockMutex(fs._mutex.cast());
-        let entry = &mut *fs.loaded_directories.add(dir_index as usize);
-        let old = (
-            dir_index,
-            entry.ref_count.load(Ordering::Acquire),
-            entry.flags,
-            entry.state as u8,
-            entry.incoming_request_count.load(Ordering::Acquire),
-        );
-        entry.ref_count.store(0, Ordering::Release);
-        entry.flags &= !1;
-        entry.state = LoadState::Unloaded;
-        entry.incoming_request_count.store(0, Ordering::Release);
-        skyline::nn::os::UnlockMutex(fs._mutex.cast());
-        old
-    };
-    Some(old)
 }
 
 /// Arc `DirInfo` index for a directory path hash — the index space the game's directory

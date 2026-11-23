@@ -19,20 +19,24 @@
 //!   L2CFighter{Common,Base}_RESET                       -> per-fighter/agent reset
 //! Init is handled lazily on first frame (idempotent via `agents::has_initialized`).
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::LazyLock;
 
+use parking_lot::Mutex;
 use smash::app::sv_system;
 use smash::lua2cpp::L2CFighterBase;
 use smash::phx::Hash40;
-use smashline::{api, StatusLine};
+use smashline::{api, ObjectEvent, StatusLine};
 
 use crate::slight::agents;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static FIGHT_STARTED: AtomicBool = AtomicBool::new(false);
-/// Live fighter (category 0) count, tracked via Initialize/Finalize. When it returns
-/// to zero the match has ended → run SLight teardown (replaces the old polling).
-static LIVE_FIGHTERS: AtomicI64 = AtomicI64::new(0);
+/// Concrete live fighter lifetimes tracked across Initialize/Finalize. A battle object id can be
+/// recycled, so the module accessor participates in the identity.
+static LIVE_FIGHTERS: LazyLock<Mutex<HashSet<(u32, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub fn install() {
     if INSTALLED
@@ -65,7 +69,17 @@ pub fn install() {
         StatusLine::Main,
         weapon_line_main as *const (),
     );
-    skyline::println!("[SLight] dispatch installed (smashline-2 per-agent line callbacks)");
+    // Unlike a global callback, the category-scoped state callback does not ask smashline to
+    // wrap unrelated agents. Finalize is the only reliable game-thread boundary after the last
+    // fighter frame: without it, the desktop retains the final live roster forever on match exit.
+    api::install_state_callback(
+        Some(Hash40::new("fighter")),
+        ObjectEvent::Finalize,
+        fighter_finalize as *const (),
+    );
+    skyline::println!(
+        "[SLight] dispatch installed (smashline-2 per-agent line + fighter finalize callbacks)"
+    );
 }
 
 /// Per-fighter `StatusLine::Main` callback (every frame for the fighter's current status).
@@ -73,6 +87,7 @@ pub fn install() {
 unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     let lua_state = agent.agent.lua_state_agent;
     handle_init(lua_state);
+    #[cfg(not(feature = "mod_plugin"))]
     if let Some(boma) = boma_from_lua(lua_state) {
         crate::slight::effect_viewer::effect_reload::pump_auto_carrier(boma);
         // Model/motion iteration has its own Alucard owner and lifecycle gate. Keep this on the
@@ -81,14 +96,29 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
         crate::slight::effect_viewer::effect_reload::pump_asset_carrier(boma);
         crate::slight::effect_viewer::acmd_hooks::pump_carrier_follows(boma);
     }
-    // Live hitbox injection still runs from the per-agent callback. Effect/control retiming is
-    // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, not from this
-    // status callback.
-    crate::slight::hitbox_viewer::inject_tick(lua_state);
+    // Live hitbox injection runs from the per-agent callback. Effect/control retiming is
+    // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, and from here
+    // for any frame no boundary reaches (see `acmd_hooks::inject_tick`).
+    #[cfg(not(feature = "mod_plugin"))]
+    {
+        crate::slight::hitbox_viewer::inject_tick(lua_state);
+        crate::slight::effect_viewer::acmd_hooks::inject_tick(lua_state);
+    }
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
     // its auto "live fetch" adopts the WHOLE script instead of the first few frames.
+    #[cfg(not(feature = "mod_plugin"))]
     crate::slight::hitbox_viewer::capture_tick(lua_state);
     handle_frame(lua_state);
+    if let Some(boid) = boid_from_lua(lua_state) {
+        crate::slight::gimmicks::grab_control::observe(boid);
+        crate::slight::gimmicks::item_control::observe(boid);
+        // Complete form activation before OnSwitch actions sample/write native state,
+        // and deliver queued actions on this same owning Main callback.
+        crate::slight::gimmicks::live_behavior::observe_form(boid);
+        crate::slight::gimmicks::damage_control::flush(boid);
+        crate::slight::gimmicks::grab_control::flush(boid);
+        crate::slight::gimmicks::operations::flush_fighter_status(boid);
+    }
 }
 
 /// Per-weapon/agent `StatusLine::Main` callback. Global work is deliberately driven only by a
@@ -96,10 +126,37 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
 unsafe extern "C" fn weapon_line_main(agent: &mut L2CFighterBase) {
     let lua_state = agent.agent.lua_state_agent;
     handle_init(lua_state);
-    // Article/weapon hitbox capture and injection remain on the existing Main path. ACMD effect
-    // retiming is generic and is handled by the effect coroutine/frame hooks for this agent too.
-    crate::slight::hitbox_viewer::capture_tick(lua_state);
+    // Article/weapon hitbox and effect injection/capture run strictly against the separate
+    // article tables and only for the selected fighter's own articles.
+    #[cfg(not(feature = "mod_plugin"))]
+    {
+        crate::slight::hitbox_viewer::inject_tick_article(lua_state);
+        crate::slight::effect_viewer::acmd_hooks::inject_tick_article(lua_state);
+        crate::slight::hitbox_viewer::article_capture_tick(lua_state);
+    }
+    crate::slight::gimmicks::deflect_volume::on_weapon_main(agent);
     handle_frame(lua_state);
+}
+
+/// Match-exit boundary. Smash stops invoking fighter line callbacks before the desktop can be
+/// told that the live roster is empty, so the final fighter's `Finalize` event must publish that
+/// transition. Concrete `(boid, accessor)` identities protect boid reuse, and `is_ready_go`
+/// prevents an in-match transformation from being mistaken for the end of the match.
+unsafe extern "C" fn fighter_finalize(agent: &mut L2CFighterBase) {
+    let Some(boma) = boma_from_lua(agent.agent.lua_state_agent) else {
+        return;
+    };
+    let identity = ((*boma).battle_object_id, boma as u64);
+    let last_tracked_fighter = {
+        let mut fighters = LIVE_FIGHTERS.lock();
+        fighters.remove(&identity) && fighters.is_empty()
+    };
+    if last_tracked_fighter
+        && crate::slight::frame_context::is_fight_active()
+        && !smash::app::sv_information::is_ready_go()
+    {
+        end_match();
+    }
 }
 
 /// Reset FIGHT_STARTED so on_fight_start() re-runs. Called from the RESET path
@@ -140,12 +197,20 @@ unsafe fn handle_init(lua_state: u64) {
     };
     let boid = rec.boid;
 
+    if rec.category == 0 {
+        // A boid is reusable and is therefore not a lifecycle identity. Track the accessor too;
+        // this also handles a replacement fighter being initialized before its predecessor's
+        // Finalize callback arrives.
+        LIVE_FIGHTERS
+            .lock()
+            .insert((rec.boid, rec.module_accessor_addr));
+    }
+
     if agents::has_initialized(boid) {
         return;
     }
 
     if rec.category == 0 {
-        LIVE_FIGHTERS.fetch_add(1, Ordering::Relaxed);
         crate::slight::effect_viewer::init_fighter(boid);
     } else {
         crate::slight::systems::main_module::on_init_weapon(boid);
@@ -172,10 +237,13 @@ fn run_one_frame() {
     // These pumps use shared state and are independent of the fighter whose Main callback
     // happened to run.  Calling them from every fighter turned an eight-CPU match into eight
     // donor retries/status probes per game frame; keep them on the single global frame pass.
-    crate::slight::effect_viewer::effect_reload::pump_donor_queue();
-    crate::slight::effect_viewer::effect_reload::pump_coload_tick();
-    crate::slight::effect_viewer::effect_reload::pump_carrier_status();
-    crate::slight::effect_viewer::asset_bundle::pump_status();
+    #[cfg(not(feature = "mod_plugin"))]
+    {
+        crate::slight::effect_viewer::effect_reload::pump_donor_queue();
+        crate::slight::effect_viewer::effect_reload::pump_coload_tick();
+        crate::slight::effect_viewer::effect_reload::pump_carrier_status();
+        crate::slight::effect_viewer::asset_bundle::pump_status();
+    }
 
     let after_win = crate::slight::frame_context::is_after_win();
     if !after_win && !FIGHT_STARTED.swap(true, Ordering::Relaxed) {
@@ -199,11 +267,14 @@ fn run_one_frame() {
         unsafe { skyline::nn::os::GetSystemTick() }.wrapping_sub(frame_start),
     );
 
+    #[allow(unused_variables)]
     let n = ROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(not(feature = "mod_plugin"))]
     if n % 30 == 0 {
         // Every SD-card poll in the plugin happens here, on this cadence. See `slight::sd_poll`
         // for why none of them may run per frame.
         crate::slight::sd_poll::tick();
+        crate::rust_extender::debuggable_server::notify_gimmick_agents();
 
         let tracker_count = crate::slight::effect_viewer::tracker::EFFECT_TRACKER
             .lock()
@@ -239,11 +310,18 @@ pub fn driver_has_ticked() -> bool {
     ROF_CALLS.load(Ordering::Relaxed) > 0
 }
 
-fn teardown_match() {
+fn end_match() {
+    LIVE_FIGHTERS.lock().clear();
     FIGHT_STARTED.store(false, Ordering::Relaxed);
-    crate::slight::pending::process();
-    crate::rust_extender::debuggable_server::remove_all();
-    crate::slight::main_smash::uninstall();
+    crate::slight::frame_context::set_fight_active(false);
+    crate::slight::frame_context::set_current_agent(None);
+    crate::slight::gimmicks::on_match_end();
+    crate::slight::agents::clear_all();
+    #[cfg(not(feature = "mod_plugin"))]
+    crate::rust_extender::debuggable_server::notify_gimmick_agents();
+    crate::slight::diag::note("GIMMICK_MATCH_END version=1");
+    crate::slight::diag::flush();
+    skyline::println!("[SLight] match ended — published empty gimmick roster");
 }
 
 // Per-frame dispatch is driven by the smashline-2 `StatusLine::Main` line callbacks registered in

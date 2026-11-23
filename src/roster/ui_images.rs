@@ -153,7 +153,7 @@ pub fn export_ui_images(
             if !UI_IMAGE_KINDS.contains(&kind) {
                 // Allow custom kinds but warn if unknown.
             }
-            let slot = key_slot.unwrap_or(entry_slot);
+            let slot = entry.backing.colour_of(key_slot.unwrap_or(entry_slot));
             let png_bytes = match std::fs::read(&ov.png_path) {
                 Ok(b) => b,
                 Err(e) => {

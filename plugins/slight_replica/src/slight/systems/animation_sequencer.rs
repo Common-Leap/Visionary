@@ -85,16 +85,6 @@ pub struct Sequencer {
 }
 
 impl Sequencer {
-    pub fn current_sequence(&self) -> Option<&Sequence> {
-        if !self.valid {
-            if crate::slight::smash_utils::debug_logging_enabled() {
-                skyline::println!("[SLight] Tried to get current sequence of invalid Sequencer");
-            }
-            return None;
-        }
-        self.sequences.get(self.current_sequence_index)
-    }
-
     fn current_sequence_mut(&mut self) -> Option<&mut Sequence> {
         if !self.valid {
             if crate::slight::smash_utils::debug_logging_enabled() {

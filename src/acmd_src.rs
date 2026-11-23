@@ -87,7 +87,7 @@ pub(crate) fn scan_macro_sites_unscoped(text: &str, range: Range<usize>) -> Vec<
     let mut i = range.start;
     while i < range.end {
         // Skip over anything that is not live code before testing for the prefix.
-        if let Some(next) = skip_trivia(text, i) {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
             i = next;
             continue;
         }
@@ -194,6 +194,14 @@ pub(crate) fn bare_macro_name_at(text: &str, i: usize, limit: usize) -> Option<R
 /// never rewritten this way — write-back addresses calls through [`scan_macro_sites`], which
 /// recognises the bare spelling directly and edits only argument text.
 pub(crate) fn qualify_bare_macros(source: &str) -> std::borrow::Cow<'_, str> {
+    // ACMD macros take the agent first. Other upper-case calls (the named-argument msc forms
+    // such as `ATK_SET_SHIELD_SETOFF_MUL2(ID=3, …)`) are not `macros::` calls and stay as written.
+    let agent = crate::acmd::agent_param_name(source).unwrap_or_else(|| "agent".to_string());
+    let takes_agent = |open: usize| {
+        let args = &source[open + 1..];
+        let first = args.split([',', ')']).next().unwrap_or("").trim();
+        first == agent || first == "agent"
+    };
     let mut inserts: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < source.len() {
@@ -202,22 +210,14 @@ pub(crate) fn qualify_bare_macros(source: &str) -> std::borrow::Cow<'_, str> {
             continue;
         }
         if let Some(name) = bare_macro_name_at(source, i, source.len()) {
-            inserts.push(i);
+            if takes_agent(name.end) {
+                inserts.push(i);
+            }
             i = name.end;
             continue;
         }
         if !source.is_char_boundary(i) {
             i += 1;
-            continue;
-        }
-        if source[i..].starts_with("is_excute(")
-            && !source[..i]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.'))
-        {
-            inserts.push(i);
-            i += "is_excute(".len();
             continue;
         }
         i += 1;
@@ -252,7 +252,7 @@ fn scan_named_sites(text: &str, name: &str, range: Range<usize>) -> Vec<MacroSit
     let mut sites = Vec::new();
     let mut i = range.start;
     while i < range.end {
-        if let Some(next) = skip_trivia(text, i) {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
             i = next;
             continue;
         }
@@ -353,7 +353,7 @@ pub fn raw_trail_line(line: &str) -> Option<MacroSite> {
 /// The scanners walk byte by byte, so `i` can land inside a multi-byte character — a
 /// non-ASCII identifier in the user's code is enough. A continuation byte can never start
 /// any of these, and returning early keeps the `&text[i..]` below from panicking on it.
-fn skip_trivia(text: &str, i: usize) -> Option<usize> {
+pub(crate) fn skip_trivia(text: &str, i: usize) -> Option<usize> {
     if !text.is_char_boundary(i) {
         return None;
     }
@@ -361,11 +361,25 @@ fn skip_trivia(text: &str, i: usize) -> Option<usize> {
     if let Some(body) = rest.strip_prefix("//") {
         return Some(i + 2 + body.find('\n').map_or(body.len(), |n| n + 1));
     }
-    if let Some(body) = rest.strip_prefix("/*") {
-        return Some(match body.find("*/") {
-            Some(end) => i + 4 + end,
-            None => text.len(),
-        });
+    if rest.starts_with("/*") {
+        let bytes = text.as_bytes();
+        let mut cursor = i + 2;
+        let mut depth = 1usize;
+        while cursor < bytes.len() {
+            if bytes[cursor..].starts_with(b"/*") {
+                depth += 1;
+                cursor += 2;
+            } else if bytes[cursor..].starts_with(b"*/") {
+                depth -= 1;
+                cursor += 2;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            } else {
+                cursor += 1;
+            }
+        }
+        return Some(text.len());
     }
     if rest.starts_with('"') {
         return Some(i + string_literal_len(rest));
@@ -415,15 +429,35 @@ fn string_literal_len(rest: &str) -> usize {
 
 fn char_literal_len(rest: &str) -> Option<usize> {
     let bytes = rest.as_bytes();
-    let mut j = 1;
-    while j < bytes.len() && j <= 4 {
-        match bytes[j] {
-            b'\\' => j += 2,
-            b'\'' => return Some(j + 1),
-            _ => j += 1,
-        }
+    if bytes.first() != Some(&b'\'') {
+        return None;
     }
-    None
+    let end = if bytes.get(1) == Some(&b'\\') {
+        match bytes.get(2)? {
+            b'u' if bytes.get(3) == Some(&b'{') => {
+                let close = rest[4..].find('}')? + 4;
+                let digits = &rest[4..close];
+                if digits.is_empty()
+                    || !digits
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() || byte == b'_')
+                {
+                    return None;
+                }
+                close + 1
+            }
+            b'x' => {
+                if !bytes.get(3..5)?.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                5
+            }
+            _ => 3,
+        }
+    } else {
+        1 + rest.get(1..)?.chars().next()?.len_utf8()
+    };
+    (bytes.get(end) == Some(&b'\'')).then_some(end + 1)
 }
 
 /// Split a call's arguments starting just after its `(`. Returns the argument spans and the
@@ -435,7 +469,7 @@ fn split_call_args(text: &str, open: usize, limit: usize) -> Option<(Vec<Range<u
     let mut start = open;
     let mut i = open;
     while i < limit {
-        if let Some(next) = skip_trivia(text, i) {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
             i = next;
             continue;
         }
@@ -486,6 +520,38 @@ pub struct ScriptSite {
     /// Set when the registered function only forwards to another function in the project,
     /// such as `game_attacks4reverse(agent) { game_attacks4_impl(agent, Facing::Reverse) }`.
     pub delegate: Option<Delegate>,
+}
+
+/// One smashline status registration in the user's source: `.status(Main, KIND, f)` or
+/// `.on_start(f)`. Articles (fighter objects, projectiles) are agents like any other, so this
+/// is how an article's size, speed and life are found: they live in its status code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSite {
+    /// The status kind exactly as written (`*WEAPON_X_STATUS_KIND_SHOOT`, `0`); empty for `on_start`.
+    pub kind_expr: String,
+    /// The last path segment of the phase (`Pre`, `Main`, `End`, `Init`, `Exec`, ...), or `Start`
+    /// for `on_start`.
+    pub phase: String,
+    /// The Rust function registered.
+    pub function: String,
+    pub file: PathBuf,
+    /// The function item, from its line start through its closing brace.
+    pub span: Range<usize>,
+}
+
+/// A status registration the index saw but could not turn into a [`StatusSite`], kept so it is
+/// shown to the user rather than silently missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedStatus {
+    /// The agent, when it is known (a no-op status on a known agent, say).
+    pub agent_hint: Option<String>,
+    pub kind_expr: String,
+    pub phase: String,
+    pub file: PathBuf,
+    /// 1-based line of the registration.
+    pub line: usize,
+    /// One sentence on why no site was recorded.
+    pub reason: String,
 }
 
 /// The shared implementation a forwarding script calls, as this caller sees it.
@@ -572,7 +638,7 @@ impl ScriptConflict {
             .collect();
         if crates.len() > 1 {
             return format!(
-                "{}: {} is defined by {} separate crates ({}) — link the folder of the one you                  build instead of the folder holding all of them",
+                "{}: {} is defined by {} separate crates ({}) — link the folder of the one you build instead of the folder holding all of them",
                 self.fighter,
                 self.script,
                 crates.len(),
@@ -646,8 +712,22 @@ pub struct SourceIndex {
     /// Scales each fighter's frame callback sets (`ModelModule::set_scale` and its siblings),
     /// by fighter. See [`crate::fighter_scale`].
     pub scales: HashMap<String, crate::fighter_scale::SourceScales>,
+    /// Hurtbox overrides each fighter's frame/init callback applies (`FighterUtil::set_hit_data`
+    /// or `set_hurtboxes`), by fighter. See [`crate::fighter_hurtboxes`].
+    pub hurtboxes: HashMap<String, Vec<crate::fighter_hurtboxes::SourceHurtbox>>,
     /// A `fighter_param` `scale` the moveset overrides through `param_config`.
     pub param_scale: Option<f32>,
+    /// Fighters the crate installs only on chosen costume slots: every `Agent::new("falco")`
+    /// it builds is narrowed with `.set_costume(…)`. Empoleon plays on Falco's c80–c87 this
+    /// way, so its scripts are that slot character's, and vanilla Falco's own slots keep the
+    /// game's. See [`scan_agent_gating`].
+    pub costume_gated: HashSet<String>,
+    /// Agent (`dedede_fireball`, `pacman`) -> the status scripts the project registers on it.
+    /// A registration on a parameter agent (`fn install(agent: &mut Agent)`) is attributed through
+    /// the module that installs it, as ACMD scripts are.
+    pub statuses: HashMap<String, Vec<StatusSite>>,
+    /// Status registrations that could not be attributed to an agent or a function.
+    pub unresolved_statuses: Vec<UnresolvedStatus>,
 }
 
 /// Project-wide facts the per-file indexing pass needs.
@@ -728,13 +808,54 @@ impl SourceIndex {
             .iter()
             .map(|(file, text)| (file.clone(), text.as_str()))
             .collect();
+        // Compiled files above the linked folder. A folder linked inside a crate
+        // (`src/emperte/`) is often told which fighter it is only by the crate root
+        // (`src/lib.rs` handing it `Agent::new("falco")`), so those files are read for who owns
+        // what, though their own scripts are not indexed.
+        let mut context: Vec<(PathBuf, String)> = Vec::new();
+        // Where a walk up from a script file stops looking for the module that names it.
+        let mut scope_root = root.to_path_buf();
         if let Some(compiled) = compiled_files(root, &texts) {
             // Cargo spells paths its own way (drive-letter case, separators); compare by key.
-            let compiled: HashSet<String> =
+            let keys: HashSet<String> =
                 compiled.iter().map(|file| crate::cargo_project::path_key(file)).collect();
-            let built = |file: &PathBuf| compiled.contains(&crate::cargo_project::path_key(file));
+            let built = |file: &PathBuf| keys.contains(&crate::cargo_project::path_key(file));
             sources.retain(|(file, _)| built(file));
             files.retain(built);
+            let linked: HashSet<String> =
+                files.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let mut outside: Vec<&PathBuf> = compiled
+                .iter()
+                .filter(|file| !linked.contains(&crate::cargo_project::path_key(file)))
+                .collect();
+            outside.sort();
+            for file in outside {
+                // Respell under the linked folder's own ancestors, so the scopes these files
+                // declare are the same paths the walk from a linked file meets.
+                let key = crate::cargo_project::path_key(file);
+                let Some((ancestor, depth)) = root.ancestors().skip(1).find_map(|ancestor| {
+                    let prefix = crate::cargo_project::path_key(ancestor);
+                    let prefix = prefix.trim_end_matches(['\\', '/']);
+                    let rest = key.strip_prefix(prefix)?;
+                    rest.starts_with(['\\', '/']).then(|| {
+                        (ancestor, rest.split(['\\', '/']).filter(|s| !s.is_empty()).count())
+                    })
+                }) else {
+                    continue;
+                };
+                let parts: Vec<_> = file.components().collect();
+                let Some(tail) = parts.len().checked_sub(depth).map(|start| &parts[start..]) else {
+                    continue;
+                };
+                let respelled = tail.iter().fold(ancestor.to_path_buf(), |dir, part| dir.join(part));
+                let Ok(text) = std::fs::read_to_string(&respelled) else {
+                    continue;
+                };
+                if scope_root.starts_with(ancestor) {
+                    scope_root = ancestor.to_path_buf();
+                }
+                context.push((respelled, text));
+            }
         }
         // A fighter declaration in `src/fighters/mario/mod.rs` owns every nested module below
         // it, not only Rust files immediately beside it. Keep declarations as directory scopes
@@ -743,9 +864,19 @@ impl SourceIndex {
         let mut project_wide: Vec<String> = Vec::new();
         let mut project_registrations: HashMap<String, Vec<RegisteredScript>> = HashMap::new();
         let mut facts = ProjectFacts::default();
-        for (file, text) in &sources {
+        // Fighter → (constructions narrowed to costumes, constructions that are not).
+        let mut gating: HashMap<String, (usize, usize)> = HashMap::new();
+        for (file, text) in sources.iter().chain(&context) {
             for function in scan_acmd_functions(text) {
                 *facts.definitions.entry(function.name).or_default() += 1;
+            }
+            for (fighter, gated) in scan_agent_gating(text) {
+                let counts = gating.entry(fighter).or_default();
+                if gated {
+                    counts.0 += 1;
+                } else {
+                    counts.1 += 1;
+                }
             }
             let names = scan_fighter_names(text);
             for name in &names {
@@ -810,9 +941,11 @@ impl SourceIndex {
                 &project_wide,
                 &project_registrations,
                 &facts,
+                &scope_root,
             );
         }
         index.resolve_delegates(&sources);
+        index.index_statuses(&sources, &fighter_scopes, &scope_root);
         index.hash_macros =
             crate::hash_macros::HashMacros::scan(sources.iter().map(|(_, text)| text.as_str()));
         crate::hash_macros::set_current(index.hash_macros.clone());
@@ -825,14 +958,69 @@ impl SourceIndex {
         );
         index.scales = crate::fighter_scale::scan(
             &sources,
-            |file| fighter_for_file(file, root, &fighter_scopes),
+            |file| fighter_for_file(file, &scope_root, &fighter_scopes),
+            &index.consts,
+        );
+        index.hurtboxes = crate::fighter_hurtboxes::scan(
+            &sources,
+            |file| fighter_for_file(file, &scope_root, &fighter_scopes),
             &index.consts,
         );
         index.param_scale = crate::fighter_scale::param_config_scale(
             sources.iter().map(|(_, text)| text.as_str()),
         );
+        // One agent for every costume is enough to make the fighter's own slots modded too.
+        index.costume_gated = gating
+            .into_iter()
+            .filter(|(_, (gated, ungated))| *gated > 0 && *ungated == 0)
+            .map(|(fighter, _)| fighter)
+            .collect();
         index.files = files;
         Ok(index)
+    }
+
+    /// Whether the crate installs `fighter`'s scripts only on chosen costume slots.
+    #[cfg(test)]
+    pub fn is_costume_gated(&self, fighter: &str) -> bool {
+        self.costume_gated.contains(&normalize_fighter(fighter))
+    }
+
+    /// Every script the project has for `fighter` and for its objects (`pacman_bigpacman`), as
+    /// (agent, script name, body), the project's hash macros expanded so `Hash40::new` names
+    /// read as written in the game's own scripts. A forwarding script's body is what it runs.
+    pub fn fighter_script_bodies(&self, fighter: &str) -> Vec<(String, String, String)> {
+        let fighter = normalize_fighter(fighter);
+        let objects = format!("{fighter}_");
+        let unattributed = self.unattributed_scripts().is_some();
+        let mut texts: HashMap<&Path, Option<String>> = HashMap::new();
+        let mut out = Vec::new();
+        for (agent, table) in &self.fighters {
+            let own = *agent == fighter || (agent.is_empty() && unattributed);
+            if !own && !agent.starts_with(&objects) {
+                continue;
+            }
+            let agent = if own { &fighter } else { agent };
+            for (name, site) in &table.scripts {
+                let body = match &site.delegate {
+                    Some(delegate) => delegate.body.clone(),
+                    None => {
+                        let text = texts
+                            .entry(site.file.as_path())
+                            .or_insert_with(|| std::fs::read_to_string(&site.file).ok());
+                        // The span came from this file's text; a later edit can shrink it.
+                        let Some(source) = text.as_deref().and_then(|t| t.get(site.span.clone()))
+                        else {
+                            continue;
+                        };
+                        source.to_owned()
+                    }
+                };
+                let body = self.hash_macros.expand_in(&body).into_owned();
+                out.push((agent.clone(), name.clone(), body));
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Total number of indexed scripts, across every fighter.
@@ -1015,7 +1203,18 @@ impl SourceIndex {
                 // A forwarding wrapper has no body of its own; show what it runs. The resolved
                 // text was built from the same snapshot as the span, at index time.
                 if let Some(delegate) = &site.delegate {
-                    let text = self.hash_macros.expand_in(&delegate.body);
+                    let text = if prefix == "effect_" {
+                        let expanded = std::fs::read_to_string(&delegate.file)
+                            .ok()
+                            .map(|file_text| {
+                                expand_same_file_effect_helpers(&delegate.body, &file_text)
+                            })
+                            .unwrap_or_else(|| delegate.body.clone());
+                        unroll_string_array_loops(&expanded)
+                    } else {
+                        delegate.body.clone()
+                    };
+                    let text = self.hash_macros.expand_in(&text);
                     let text = self.helpers.inline(&text);
                     let text = self.consts.substitute(&text);
                     body.push_str(&header_named(&text, &name));
@@ -1032,9 +1231,16 @@ impl SourceIndex {
                 if let Ok(text) = std::fs::read_to_string(&site.file) {
                     // The span came from this file's text; a concurrent edit can shrink it.
                     if let Some(source) = text.get(site.span.clone()) {
+                        let expanded = if prefix == "effect_" {
+                            unroll_string_array_loops(&expand_same_file_effect_helpers(
+                                source, &text,
+                            ))
+                        } else {
+                            source.to_string()
+                        };
                         // `cmn!("swing_06")` reads as the name it hashes; the file keeps the
                         // macro, and write-back puts edits back into it.
-                        let source = self.hash_macros.expand_in(source);
+                        let source = self.hash_macros.expand_in(&expanded);
                         // `RUMBLE_HIT(agent, kind)` reads as the vanilla call it makes.
                         let source = self.helpers.inline(&source);
                         // `WALK_LW_DAMAGE` reads as its value; an edit to it goes to the const.
@@ -1229,6 +1435,7 @@ impl SourceIndex {
         project_wide: &[String],
         project_registrations: &HashMap<String, Vec<RegisteredScript>>,
         facts: &ProjectFacts,
+        scope_root: &Path,
     ) {
         let functions = scan_acmd_functions(text);
         if functions.is_empty() {
@@ -1325,7 +1532,7 @@ impl SourceIndex {
             let fallback = function
                 .fighter
                 .clone()
-                .or_else(|| fighter_for_file(file, &self.root, fighter_scopes))
+                .or_else(|| fighter_for_file(file, scope_root, fighter_scopes))
                 .or(registration_fighter)
                 .or_else(|| sole(project_wide))
                 // A folder of ACMD modules is often shared without the plugin's install
@@ -1350,6 +1557,131 @@ impl SourceIndex {
                 );
             }
         }
+    }
+
+    /// Record every `.status(..)` / `.on_start(..)` registration. The agent is the call's own
+    /// receiver, else the module's fighter the way ACMD scripts find theirs (`status::install(agent)`
+    /// in a module that holds an `Agent::new`). The registered function is looked up in its own
+    /// file first, then project-wide when its name is defined exactly once. Whatever cannot be
+    /// resolved goes to `unresolved_statuses` with the reason.
+    fn index_statuses(
+        &mut self,
+        sources: &[(PathBuf, String)],
+        fighter_scopes: &HashMap<PathBuf, Vec<String>>,
+        scope_root: &Path,
+    ) {
+        let mut defined: HashMap<String, Vec<(usize, Range<usize>)>> = HashMap::new();
+        for (n, (_, text)) in sources.iter().enumerate() {
+            for function in scan_plain_functions(text) {
+                defined.entry(function.name).or_default().push((n, function.span));
+            }
+        }
+        for (n, (file, text)) in sources.iter().enumerate() {
+            for registration in scan_status_registrations(text) {
+                let line = text[..registration.at].matches('\n').count() + 1;
+                let agent = registration
+                    .agent
+                    .clone()
+                    .or_else(|| fighter_for_file(file, scope_root, fighter_scopes));
+                let unresolved = UnresolvedStatus {
+                    agent_hint: agent.clone(),
+                    kind_expr: registration.kind_expr.clone(),
+                    phase: registration.phase.clone(),
+                    file: file.clone(),
+                    line,
+                    reason: String::new(),
+                };
+                if registration.noop {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "registered as a no-op with noop_status!".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                }
+                let Some(agent) = agent else {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "the agent is a parameter and no single module installs it from an Agent::new, or several agents claim the module".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                };
+                if !is_identifier(&registration.function) {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "registered with a closure or expression, not a named function".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                }
+                let candidates = defined.get(&registration.function).map(Vec::as_slice).unwrap_or(&[]);
+                let own = candidates.iter().filter(|(at, _)| *at == n).collect::<Vec<_>>();
+                // `fly::bullet_seed_end` names the function in the `fly` module beside the
+                // registering file, however many other modules define the same name.
+                let in_module = registration.module.as_deref().map(|module| {
+                    let dir = file.parent().unwrap_or(Path::new(""));
+                    let stem_dir = file.with_extension("");
+                    candidates
+                        .iter()
+                        .filter(|(at, _)| {
+                            let path = &sources[*at].0;
+                            [dir, stem_dir.as_path()].iter().any(|base| {
+                                *path == base.join(format!("{module}.rs")) || *path == base.join(module).join("mod.rs")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                // A path that names no module beside the file (`super::status::f`, a `pub use`
+                // re-export, an inline `mod fly {}`) says nothing: the name alone decides.
+                let found = match (in_module.as_deref(), own.as_slice(), candidates) {
+                    (Some([one]), _, _) => Some((*one).clone()),
+                    (Some([_, _, ..]), _, _) => None,
+                    (_, [one], _) => Some((*one).clone()),
+                    (_, [], [one]) => Some(one.clone()),
+                    _ => None,
+                };
+                let Some((at, span)) = found else {
+                    let reason = if candidates.is_empty() {
+                        "the registered function is not defined in the project source".to_string()
+                    } else if registration.module.is_some() {
+                        format!(
+                            "the registered function name is defined in {} places, and its path doesn't say which",
+                            candidates.len()
+                        )
+                    } else {
+                        format!(
+                            "the registered function name is defined in {} places, none of them in the registering file",
+                            candidates.len()
+                        )
+                    };
+                    self.unresolved_statuses.push(UnresolvedStatus { reason, ..unresolved });
+                    continue;
+                };
+                let site = StatusSite {
+                    kind_expr: registration.kind_expr,
+                    phase: registration.phase,
+                    function: registration.function,
+                    file: sources[at].0.clone(),
+                    span,
+                };
+                let sites = self.statuses.entry(agent).or_default();
+                if !sites.contains(&site) {
+                    sites.push(site);
+                }
+            }
+        }
+    }
+
+    /// The status scripts registered on `agent`, each with its function's source text.
+    pub fn status_bodies(&self, agent: &str) -> Vec<(&StatusSite, String)> {
+        let Some(sites) = self.statuses.get(&normalize_fighter(agent)) else {
+            return Vec::new();
+        };
+        sites
+            .iter()
+            .filter_map(|site| {
+                let text = std::fs::read_to_string(&site.file).ok()?;
+                Some((site, text.get(site.span.clone())?.to_string()))
+            })
+            .collect()
     }
 
     fn record_script(&mut self, fighter: &str, script: String, site: ScriptSite) {
@@ -1406,7 +1738,31 @@ fn fighter_for_file(
     let mut directory = file.parent()?;
     loop {
         if let Some(names) = fighter_scopes.get(directory) {
-            return (names.len() == 1).then(|| names[0].clone());
+            if names.len() == 1 {
+                return Some(names[0].clone());
+            }
+            // Fighter kinds never contain `_`; `falco_arwing` is an article. A folder whose
+            // files declare a fighter's articles beside it (`specials.rs` registers the
+            // `falco_cannon` shots, `misc.rs` the `falco_arwing` entry) still holds that
+            // fighter's own scripts, and one declaring only articles doesn't own its other
+            // files at all: keep walking to the module that names the fighter. A folder
+            // named for the mod (`emperte/`) rather than the fighter is then still Falco's.
+            // `Agent::new("fighter")` / `("weapon")` is smashline's agent for every fighter or
+            // weapon: its registrations name it as their receiver, and it owns no module (King
+            // Boo's `status/` holds one beside the statuses it installs on `dedede`).
+            let generic = |name: &str| matches!(name, "fighter" | "weapon");
+            let fighters: Vec<&String> =
+                names.iter().filter(|name| !name.contains('_') && !generic(name)).collect();
+            match fighters.as_slice() {
+                [] => {}
+                [fighter] if names.iter().all(|name| {
+                    *name == **fighter || name.starts_with(&format!("{fighter}_")) || generic(name)
+                }) =>
+                {
+                    return Some((*fighter).clone());
+                }
+                _ => return None,
+            }
         }
         if directory == root {
             return None;
@@ -1532,6 +1888,116 @@ fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
     routes
 }
 
+/// Each `Agent::new("…")` in `text`, with whether it is narrowed to costume slots:
+/// `.set_costume(…)` in the constructor's own chain, or called later on the variable it was
+/// bound to, directly (`agent.set_costume(…)`) or through a rebinding (`let agent =
+/// agent.set_costume(…);`, Empoleon's spelling). `common` hooks every fighter and is skipped.
+///
+/// A costume list handed in through a function parameter is not followed; the agent then
+/// reads as ungated, which keeps the fighter's own slots credited, as before.
+fn scan_agent_gating(text: &str) -> Vec<(String, bool)> {
+    let text = &without_comments(text);
+    let boundaries = statement_boundaries(text);
+    // `(receiver, offset)` for each `.set_costume(` call.
+    let gated_receivers: Vec<(&str, usize)> = {
+        let mut receivers = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = text[search..].find(".set_costume(") {
+            let at = search + rel;
+            search = at + 1;
+            let head = text[statement_start(&boundaries, at)..at].trim_start();
+            let head = head
+                .strip_prefix("let ")
+                .and_then(|rest| rest.split_once('=').map(|(_, value)| value))
+                .unwrap_or(head)
+                .trim_start();
+            let head = head.strip_prefix("&mut").unwrap_or(head).trim_start();
+            let head = head.strip_prefix('&').unwrap_or(head).trim_start();
+            let head = head.strip_prefix('*').unwrap_or(head).trim_start();
+            let end = ident_end(head, 0);
+            if end > 0 {
+                receivers.push((&head[..end], at));
+            }
+        }
+        receivers
+    };
+    let mut found = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let Some(fighter) = agent_literal(&text[at..]) else {
+            continue;
+        };
+        if fighter.is_empty() || fighter == "common" {
+            continue;
+        }
+        let end = chain_end(text, at);
+        let mut gated = text[at..end].contains(".set_costume(");
+        if !gated {
+            let head = text[statement_start(&boundaries, at)..at].trim();
+            if let Some(binding) = head.strip_prefix("let ") {
+                let binding = binding.trim_start();
+                let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim_start();
+                let name_end = ident_end(binding, 0);
+                // Only later in the binding's own block: another function's `agent` is not it.
+                let scope = at..block_end(text, at);
+                gated = name_end > 0
+                    && gated_receivers.iter().any(|(receiver, offset)| {
+                        *receiver == &binding[..name_end] && scope.contains(offset)
+                    });
+            }
+        }
+        found.push((fighter, gated));
+    }
+    found
+}
+
+/// The `}` closing the block `start` sits in, or the end of `text`.
+fn block_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    text.len()
+}
+
+/// Where the expression starting at `start` ends: its `;`, the `}` closing the block it is
+/// the tail of, or the end of `text`.
+fn chain_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    text.len()
+}
+
 /// Visionary names fighters after the dump folder (`mario`); ACMD attributes and
 /// `Agent::new` calls often spell the same character `fighter_mario`.
 fn normalize_fighter(name: &str) -> String {
@@ -1578,7 +2044,15 @@ fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet
         let mut ancestor = Some(root);
         for _ in 0..4 {
             let Some(dir) = ancestor else { break };
-            if dir.join("Cargo.toml").is_file() {
+            let manifest = dir.join("Cargo.toml");
+            if manifest.is_file() {
+                // A plain package builds only itself: a crate nested inside it (a
+                // `plugin(old)/` backup with its own manifest) is not a workspace member, and
+                // cargo never compiles it.
+                let toml = std::fs::read_to_string(&manifest).unwrap_or_default();
+                if toml.contains("[package]") && !toml.contains("[workspace]") {
+                    manifests.clear();
+                }
                 manifests.push(dir.to_path_buf());
                 break;
             }
@@ -1916,7 +2390,9 @@ fn scan_fighter_names(text: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
         let name = normalize_fighter(&name);
-        if !name.is_empty() && !names.contains(&name) {
+        // `Agent::new("common")` hooks every fighter at once (opff, status lines). It is no
+        // one's character, and counting it made a mod's own folder name two fighters.
+        if !name.is_empty() && name != "common" && !names.contains(&name) {
             names.push(name);
         }
     };
@@ -2024,6 +2500,120 @@ fn scan_registrations(text: &str) -> Vec<Registration<'_>> {
     out.into_iter()
         .map(|(_, script, function, agent)| Registration { script, function, agent })
         .collect()
+}
+
+/// One `.status(Phase, KIND, f)` or `.on_start(f)` call, or one phase of a `noop_status!`.
+struct StatusRegistration {
+    /// Offset of the call, for its line number.
+    at: usize,
+    agent: Option<String>,
+    phase: String,
+    kind_expr: String,
+    /// The function's own name: a path (`jackbox::jackbox_main`) keeps its last segment. Anything
+    /// that is not a name (a closure) is kept as written.
+    function: String,
+    /// The module a path names the function in (`fly` for `fly::bullet_seed_end`), when it has one.
+    module: Option<String>,
+    /// A phase registered with `noop_status!`: there is no function to follow.
+    noop: bool,
+}
+
+/// The module segment before a function's name in a path (`fly` in `fly::bullet_seed_end`), when
+/// it is a plain module name rather than `self`, `super` or `crate`.
+fn function_module(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (module, _) = text.rsplit_once("::")?;
+    let last = module.rsplit("::").next()?.trim();
+    (!last.is_empty()
+        && !matches!(last, "self" | "super" | "crate")
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then(|| last.to_string())
+}
+
+/// A path's last segment, unless the text is not a plain path (a closure), which stays as written.
+fn function_name(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        text.rsplit("::").next().unwrap_or(text).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Every `.status(..)` / `.on_start(..)` / `noop_status!(..)` registration in `text`, in document
+/// order, with the agent each is made on when the call itself says (as [`scan_registrations`]).
+fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
+    let mut out: Vec<StatusRegistration> = Vec::new();
+    let boundaries = statement_boundaries(text);
+    let bindings = agent_bindings(text, &boundaries);
+    for marker in [".status(", ".on_start(", "noop_status!("] {
+        let mut search = 0;
+        while search < text.len() {
+            if !text.is_char_boundary(search) {
+                search += 1;
+                continue;
+            }
+            if let Some(next) = skip_trivia(text, search) {
+                search = next;
+                continue;
+            }
+            if !text[search..].starts_with(marker) {
+                search += 1;
+                continue;
+            }
+            let at = search;
+            let open = search + marker.len() - 1;
+            search = open + 1;
+            let Some((args, _)) = split_call_args(text, open + 1, text.len()) else {
+                continue;
+            };
+            let receiver = &text[statement_start(&boundaries, at)..at];
+            // `$agent.status($phase, $kind, …)` is the body of a `macro_rules!`: its invocations
+            // are the registrations (`noop_status!` ones are read below), not the template.
+            if args.iter().take(2).any(|arg| text[arg.clone()].trim_start().starts_with('$')) {
+                continue;
+            }
+            match (marker, args.len()) {
+                (".status(", 3..) => out.push(StatusRegistration {
+                    at,
+                    agent: receiver_agent(receiver, &bindings),
+                    phase: function_name(&text[args[0].clone()]),
+                    kind_expr: text[args[1].clone()].trim().to_string(),
+                    function: function_name(&text[args[2].clone()]),
+                    module: function_module(&text[args[2].clone()]),
+                    noop: false,
+                }),
+                (".on_start(", 1) => out.push(StatusRegistration {
+                    at,
+                    agent: receiver_agent(receiver, &bindings),
+                    phase: "Start".to_string(),
+                    kind_expr: String::new(),
+                    function: function_name(&text[args[0].clone()]),
+                    module: function_module(&text[args[0].clone()]),
+                    noop: false,
+                }),
+                ("noop_status!(", 3..) => {
+                    let agent = receiver_agent(&text[args[0].clone()], &bindings);
+                    let kind_expr = text[args[1].clone()].trim().to_string();
+                    let phases = text[args[2].clone()].trim().trim_start_matches('[').trim_end_matches(']');
+                    for phase in phases.split(',').map(str::trim).filter(|phase| !phase.is_empty()) {
+                        out.push(StatusRegistration {
+                            at,
+                            agent: agent.clone(),
+                            phase: function_name(phase),
+                            kind_expr: kind_expr.clone(),
+                            function: String::new(),
+                            module: None,
+                            noop: true,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort_by_key(|registration| registration.at);
+    out
 }
 
 /// Offsets of every `;`, `{` and `}` outside strings and comments, ascending.
@@ -2142,6 +2732,15 @@ fn keyword_at(text: &str, at: usize, word: &str) -> bool {
         && bytes.get(at + word.len()).is_some_and(|b| !is_ident_byte(*b))
 }
 
+/// The span (declaration line start through closing brace) of the one function named `name` in
+/// `text`. `None` when there is none, or more than one, since which one a call reaches would then
+/// depend on module scoping this does not model.
+pub(crate) fn function_item(text: &str, name: &str) -> Option<Range<usize>> {
+    let mut found = scan_plain_functions(text).into_iter().filter(|f| f.name == name);
+    let first = found.next()?;
+    found.next().is_none().then_some(first.span)
+}
+
 /// Every `fn NAME(…) … { … }` in `text` with a body, nested ones included.
 fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
     let bytes = text.as_bytes();
@@ -2220,6 +2819,274 @@ fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
         });
     }
     found
+}
+
+/// Expand same-file agent-only helper calls inside an `effect_` script (for example Shy Guy's
+/// `stilt_trails_on(agent);` in `effect_special_air_lw` / `effect_special_air_lw_ledge`) so the
+/// effect parser, timeline, and 3D trail preview see the macros the helper emits.
+fn expand_same_file_effect_helpers(source: &str, file_text: &str) -> String {
+    const EFFECT_MACROS: &[&str] = &[
+        "AFTER_IMAGE",
+        "EFFECT",
+        "FOOT_EFFECT",
+        "LANDING_EFFECT",
+        "BURN_COLOR",
+        "FLASH",
+        "COL_NORMAL",
+        "LAST_EFFECT",
+    ];
+    let mut helpers: HashMap<String, Option<(String, String)>> = HashMap::new();
+    for func in scan_plain_functions(file_text) {
+        let Some(params) = func.params.as_ref() else {
+            continue;
+        };
+        if params.len() != 1 || !params[0].1.contains("L2CAgentBase") {
+            continue;
+        }
+        let inner = file_text[func.body.start + 1..func.body.end - 1].trim();
+        if inner.is_empty() || !EFFECT_MACROS.iter().any(|m| inner.contains(m)) {
+            continue;
+        }
+        let entry = (params[0].0.clone(), inner.to_string());
+        helpers
+            .entry(func.name)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(entry));
+    }
+    let helpers: HashMap<String, (String, String)> = helpers
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?)))
+        .collect();
+    if helpers.is_empty() {
+        return source.to_string();
+    }
+    fn expand_rec(
+        text: &str,
+        helpers: &HashMap<String, (String, String)>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> String {
+        if depth >= 3 {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            let expanded = trimmed
+                .strip_suffix(';')
+                .and_then(|stmt| {
+                    let open = stmt.find('(')?;
+                    let close = stmt.rfind(')')?;
+                    if close + 1 != stmt.len() {
+                        return None;
+                    }
+                    let callee = stmt[..open].trim();
+                    let arg = stmt[open + 1..close].trim();
+                    if !is_identifier(callee) || !is_identifier(arg) || visited.contains(callee) {
+                        return None;
+                    }
+                    let (param, body) = helpers.get(callee)?;
+                    let substituted = if param != arg {
+                        replace_identifier(body, param, arg)
+                    } else {
+                        body.clone()
+                    };
+                    visited.insert(callee.to_string());
+                    let nested = expand_rec(&substituted, helpers, visited, depth + 1);
+                    visited.remove(callee);
+                    let mut block = String::new();
+                    for body_line in nested.lines() {
+                        let t = body_line.trim();
+                        if !t.is_empty() {
+                            block.push_str(indent);
+                            block.push_str(t);
+                            block.push('\n');
+                        }
+                    }
+                    Some(block)
+                });
+            if let Some(block) = expanded {
+                out.push_str(&block);
+                changed = true;
+            } else {
+                out.push_str(line);
+            }
+        }
+        if changed {
+            out
+        } else {
+            text.to_string()
+        }
+    }
+    expand_rec(source, &helpers, &mut HashSet::new(), 0)
+}
+
+/// Replace every standalone identifier occurrence of `from` with `to`, skipping strings and
+/// comments.
+fn replace_identifier(text: &str, from: &str, to: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let end = ident_end(text, i);
+            if &text[i..end] == from {
+                out.push_str(&text[last..i]);
+                out.push_str(to);
+                last = end;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if last == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Unroll `for <ident> in ["a", "b", ...] { <body> }` loops in effect scripts by substituting
+/// each string literal for `<ident>` inside `<body>` (for example Shy Guy's
+/// `for shoe in ["stiltshoel", "stiltshoer"] { AFTER_IMAGE4_ON_arg29(..., Hash40::new(shoe), ...); }`).
+fn unroll_string_array_loops(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(next) = skip_trivia(source, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(source, i, "for") {
+            i += 1;
+            continue;
+        }
+        let for_start = i;
+        let mut cur = i + 3;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        let var_end = ident_end(source, cur);
+        if var_end == cur {
+            i += 3;
+            continue;
+        }
+        let var = &source[cur..var_end];
+        cur = var_end;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        if !keyword_at(source, cur, "in") {
+            i = var_end;
+            continue;
+        }
+        cur += 2;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        if bytes.get(cur) != Some(&b'[') {
+            i = cur;
+            continue;
+        }
+        let Some(arr_close) = match_bracket(source, cur) else {
+            i = cur + 1;
+            continue;
+        };
+        let items = parse_string_literal_list(&source[cur + 1..arr_close]);
+        if items.is_empty() || items.len() > 16 {
+            i = arr_close + 1;
+            continue;
+        }
+        let mut brace = arr_close + 1;
+        while brace < source.len() && bytes[brace].is_ascii_whitespace() {
+            brace += 1;
+        }
+        if bytes.get(brace) != Some(&b'{') {
+            i = brace;
+            continue;
+        }
+        let Some(body_close) = match_brace(source, brace) else {
+            i = brace + 1;
+            continue;
+        };
+        let line_start = source[..for_start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = &source[line_start..for_start];
+        let inner = &source[brace + 1..body_close];
+        out.push_str(&source[last..line_start]);
+        for (idx, item) in items.iter().enumerate() {
+            let expanded = replace_identifier(inner, var, item);
+            for body_line in expanded.lines() {
+                let t = body_line.trim();
+                if !t.is_empty() {
+                    out.push_str(indent);
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+            if idx + 1 == items.len() && out.ends_with('\n') {
+                out.pop();
+            }
+        }
+        last = body_close + 1;
+        i = body_close + 1;
+    }
+    if last == 0 {
+        return source.to_string();
+    }
+    out.push_str(&source[last..]);
+    out
+}
+
+fn match_bracket(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_string_literal_list(inner: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    for raw in inner.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && !t[1..t.len() - 1].contains('"')
+        {
+            items.push(t.to_string());
+        } else {
+            return Vec::new();
+        }
+    }
+    items
 }
 
 /// Every `impl … { … }` block's braces, with the type's last path segment for an inherent
@@ -2711,7 +3578,7 @@ fn resolve_shared_body(
 }
 
 /// The offset of the `;` ending the statement that starts at `start`, at bracket depth 0.
-fn statement_end(text: &str, start: usize) -> Option<usize> {
+pub(crate) fn statement_end(text: &str, start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = start;
@@ -3259,7 +4126,12 @@ struct Replacement {
 }
 
 /// Rewrite `text` with every replacement applied. Spans must not overlap.
-fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
+fn apply(text: &str, edits: Vec<Replacement>) -> String {
+    apply_mapped(text, edits).0
+}
+
+/// [`apply`], with where each offset of `text` that no edit covers lands in the result.
+fn apply_mapped(text: &str, mut edits: Vec<Replacement>) -> (String, impl Fn(usize) -> usize) {
     // An empty span is an argument a project helper fixes (see `scan_macro_sites`): the value
     // lives in the helper's body, not at this call, so writing here would add an argument.
     edits.retain(|edit| {
@@ -3272,6 +4144,9 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
     edits.sort_by_key(|e| e.span.start);
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
+    // (end of an applied span in `text`, total growth up to and including it)
+    let mut shifts: Vec<(usize, isize)> = Vec::new();
+    let mut growth = 0isize;
     for edit in edits {
         if edit.span.start < cursor {
             continue; // overlapping — the earlier edit wins
@@ -3279,9 +4154,16 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
         out.push_str(&text[cursor..edit.span.start]);
         out.push_str(&edit.value);
         cursor = edit.span.end;
+        growth += edit.value.len() as isize - edit.span.len() as isize;
+        shifts.push((edit.span.end, growth));
     }
     out.push_str(&text[cursor..]);
-    out
+    let map = move |at: usize| {
+        let before = shifts.partition_point(|(end, _)| *end <= at);
+        let growth = before.checked_sub(1).map_or(0, |i| shifts[i].1);
+        (at as isize + growth) as usize
+    };
+    (out, map)
 }
 
 /// Format a float the way ACMD source spells one, and only if it actually differs.
@@ -3365,7 +4247,7 @@ fn bool_edit(text: &str, span: &Range<usize>, new: bool) -> Option<Replacement> 
 }
 
 /// `2.0`, `0.75`, `-1.5` — always with a decimal point, since these slots are floats.
-fn format_float(value: f32) -> String {
+pub(crate) fn format_float(value: f32) -> String {
     let mut text = format!("{value:.4}");
     while text.ends_with('0') && !text.ends_with(".0") {
         text.pop();
@@ -3393,12 +4275,19 @@ struct EffectTimingMove {
 fn effect_source_is_flat(stmts: &[crate::data::EffectStmt]) -> bool {
     stmts.iter().all(|stmt| match stmt {
         crate::data::EffectStmt::Frame(_) => true,
-        crate::data::EffectStmt::Excute(macros) => macros
-            .iter()
-            .all(|macro_stmt| !matches!(macro_stmt, crate::data::EffectMacro::Raw(_))),
+        crate::data::EffectStmt::Excute(macros) => macros.iter().all(|macro_stmt| {
+            !matches!(
+                macro_stmt,
+                crate::data::EffectMacro::Raw(_) | crate::data::EffectMacro::NativeCall(_)
+            )
+        }),
         crate::data::EffectStmt::Wait(_)
+        | crate::data::EffectStmt::NativeExecuteFrame(_)
+        | crate::data::EffectStmt::NativeMotionLoopSync
         | crate::data::EffectStmt::Loop { .. }
         | crate::data::EffectStmt::Cond { .. }
+        | crate::data::EffectStmt::BareNativeCall(_)
+        | crate::data::EffectStmt::BareEffect(_)
         | crate::data::EffectStmt::Raw(_) => false,
     })
 }
@@ -3410,8 +4299,63 @@ fn all_effect_source_sites(text: &str) -> Vec<MacroSite> {
         "visionary_last_effect_set_scale_w",
         0..text.len(),
     ));
+    sites.extend(native_effect_control_sites(text));
     sites.sort_by_key(|site| site.span.start);
     sites
+}
+
+fn native_effect_control_sites(text: &str) -> Vec<MacroSite> {
+    [
+        "EffectModule::set_disable_render_offset_last",
+        "EffectModule::enable_sync_init_pos_last",
+    ]
+    .into_iter()
+    .flat_map(|name| scan_named_sites(text, name, 0..text.len()))
+    .collect()
+}
+
+fn is_native_effect_control_name(name: &str) -> bool {
+    matches!(
+        name,
+        "EffectModule::set_disable_render_offset_last" | "EffectModule::enable_sync_init_pos_last"
+    )
+}
+
+/// Match only the physical, direct-in-execute form the effect parser types. Keeping this
+/// predicate in lockstep with that parser is essential: every typed control consumes one call
+/// ordinal, while malformed/two-argument source remains Raw and consumes none.
+fn is_typed_native_effect_control(text: &str, site: &MacroSite) -> bool {
+    if !is_native_effect_control_name(&site.name)
+        || site.args.len() != 1
+        || site.arg(text, 0).map(str::trim) != Some("agent.module_accessor")
+    {
+        return false;
+    }
+    let Some(line) = line_range_at(text, site.span.start).and_then(|range| text.get(range)) else {
+        return false;
+    };
+    let expected = format!("{}(agent.module_accessor);", site.name);
+    if line.trim() != expected.as_str() {
+        return false;
+    }
+
+    let Some((open, _close)) = enclosing_effect_execute(text, site.span.start) else {
+        return false;
+    };
+    // Reuse the parser's exact physical body boundary and root-statement mask: counting a
+    // control the importer retained as Raw would shift every later source-edit ordinal.
+    let header_line = text[..open].bytes().filter(|byte| *byte == b'\n').count();
+    let source_line = text[..site.span.start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let lines = text.lines().collect::<Vec<_>>();
+    let (body_end, _) = crate::acmd::find_block_end(&lines, header_line);
+    if source_line <= header_line || source_line >= body_end {
+        return false;
+    }
+    crate::acmd::direct_native_statement_lines(&lines[header_line + 1..body_end])
+        .contains(&(source_line - header_line - 1))
 }
 
 fn line_range_at(text: &str, offset: usize) -> Option<Range<usize>> {
@@ -3421,17 +4365,29 @@ fn line_range_at(text: &str, offset: usize) -> Option<Range<usize>> {
 }
 
 fn enclosing_effect_execute(text: &str, site_start: usize) -> Option<(usize, usize)> {
-    let mut cursor = site_start;
-    while let Some(relative) = text[..cursor].rfind("is_excute(") {
-        let at = relative;
-        cursor = at;
-        let line = line_range_at(text, at)?;
-        // A commented-out block is not the one the site runs in.
-        if !without_comments(&text[line.start..at + "is_excute(".len()]).ends_with("is_excute(") {
+    // Use the same exact physical header the effect parser recognizes, but discover headers
+    // with the comment/string-aware source scanner. A raw `rfind` can select `is_excute` text
+    // inside a comment or literal and then silently drop a real native control from ordinals.
+    for header in scan_macro_sites(text, 0..site_start)
+        .into_iter()
+        .filter(|site| site.name == "is_excute" && site.args.len() == 1)
+    {
+        let Some(line) = line_range_at(text, header.span.start) else {
+            continue;
+        };
+        // An `if` on this function's own agent, under whatever name it gives it, written over
+        // several lines or as one (`if macros::is_excute(agent) { EFFECT(…); }`).
+        // The same headers the effect parser reads as an Execute block.
+        if !crate::acmd::is_plain_excute_header(text.get(line.clone())?) {
             continue;
         }
-        let open = text[at..line.end].find('{').map(|offset| at + offset)?;
-        let close = matching_brace(text, open)?;
+        let open = header.span.end + text[header.span.end..line.end].find('{')?;
+        if text.as_bytes().get(open) != Some(&b'{') {
+            continue;
+        }
+        let Some(close) = matching_brace(text, open) else {
+            continue;
+        };
         if open < site_start && site_start <= close {
             return Some((open, close));
         }
@@ -4233,6 +5189,22 @@ fn canonicalize_effect_call_for_source(
             }
         }
     }
+    // A stop the editor never set is written with the defaults (see `acmd::emit_spawn_stop`),
+    // which the parser then reads back as set. Compare both as the line the source holds; a
+    // call with no stop has neither.
+    let trail = call.trail_command.is_some() || call.spawn_func == "AFTER_IMAGE_ON" || call.raw_line.is_some();
+    let stopped = call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME;
+    if stopped && trail {
+        call.trail_off = Some(call.trail_off.unwrap_or(crate::data::TRAIL_OFF_DEFAULT));
+    } else if stopped && call.follows_bone {
+        let (fade, detach) = crate::data::EFFECT_OFF_KIND_DEFAULT;
+        call.off_fade = Some(call.off_fade.unwrap_or(fade));
+        call.off_detach = Some(call.off_detach.unwrap_or(detach));
+    }
+    if !stopped {
+        call.off_fade = None;
+        call.off_detach = None;
+    }
     call.offset = call.offset.map(source_compare_float);
     call.rotation = call.rotation.map(source_compare_float);
     call.scale = source_compare_float(call.scale);
@@ -4303,9 +5275,30 @@ pub fn rewrite_effect_calls(
         return Ok((text.to_string(), report));
     }
 
-    let (mut timing_moves, timing_skipped) =
+    let (mut timing_moves, mut timing_skipped) =
         plan_effect_timing_moves(text, label, &script, &pristine, &edited, &ordinals, &sites);
-    report.skipped.extend(timing_skipped);
+    // The block mover above needs a flat `frame` script with each spawn alone in its block.
+    // When it refuses, every retime goes through the line mover instead, which follows `wait`s
+    // and moves just the spawn's own lines; its refusal keeps the block mover's reasons.
+    let line_retimes: Vec<usize> = if timing_skipped.is_empty() || edited.len() != pristine.len() {
+        Vec::new()
+    } else {
+        pristine
+            .iter()
+            .zip(&edited)
+            .enumerate()
+            .filter(|(_, (before, after))| {
+                before.active_start != after.active_start || before.active_end != after.active_end
+            })
+            .filter(|(_, (before, after))| structural_identity_matches(before, after))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    if line_retimes.is_empty() {
+        report.skipped.append(&mut timing_skipped);
+    } else {
+        timing_moves.clear();
+    }
     // Timing moves are only valid for a one-to-one list whose call identity stays the same.
     // Otherwise a rename/disable/add/remove could still carry a previously approved block move
     // through the value-writing pass and leave a partial structural edit in the source.
@@ -4551,9 +5544,67 @@ pub fn rewrite_effect_calls(
     }
 
     let value_count = edits.len();
-    let valued = apply(text, edits.clone());
-    let moved =
-        apply_effect_timing_moves(text, &timing_moves, &pristine, &ordinals, &sites, &edits);
+    let (valued, map) = apply_mapped(text, edits.clone());
+    let moved = if line_retimes.is_empty() {
+        apply_effect_timing_moves(text, &timing_moves, &pristine, &ordinals, &sites, &edits)
+    } else {
+        let retimed: Option<Vec<crate::source_timing::EffectRetimed>> = line_retimes
+            .iter()
+            .map(|&index| {
+                let ordinal = *ordinals.get(index)?;
+                let spawn = sites.get(ordinal)?;
+                let mut calls = vec![map(spawn.span.start)..map(spawn.span.end)];
+                if let Some(modifiers) = modifier_sites.get(ordinal) {
+                    let mut extra: Vec<&MacroSite> = [
+                        &modifiers.rate,
+                        &modifiers.work_int,
+                        &modifiers.camera_offset,
+                        &modifiers.tint,
+                        &modifiers.particle_tint,
+                        &modifiers.alpha,
+                        &modifiers.scale_w,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    extra.sort_by_key(|site| site.span.start);
+                    calls.extend(extra.iter().map(|site| map(site.span.start)..map(site.span.end)));
+                }
+                Some(crate::source_timing::EffectRetimed {
+                    calls,
+                    before: &pristine[index],
+                    after: &edited[index],
+                })
+            })
+            .collect();
+        let result = retimed
+            .ok_or_else(|| "a retimed effect has no source call".to_string())
+            .and_then(|retimed| {
+                let spawns: Vec<Range<usize>> =
+                    sites.iter().map(|site| map(site.span.start)..map(site.span.end)).collect();
+                crate::source_timing::retime_effects(&valued, &spawns, &edited, &retimed)
+            });
+        match result {
+            Ok(updated) => {
+                timing_moves = line_retimes
+                    .iter()
+                    .map(|&index| EffectTimingMove {
+                        call_index: index,
+                        new_start: edited[index].active_start,
+                        new_end: edited[index].active_end,
+                        move_start: pristine[index].active_start != edited[index].active_start,
+                        move_end: pristine[index].active_end != edited[index].active_end,
+                    })
+                    .collect();
+                Some(updated)
+            }
+            Err(reason) => {
+                report.skipped.append(&mut timing_skipped);
+                report.skipped.push(format!("{label}: the effect retime was not written — {reason}"));
+                Some(valued.clone())
+            }
+        }
+    };
     let (updated, moved_count) = match moved {
         Some(updated) => {
             let count = timing_moves
@@ -4576,13 +5627,66 @@ pub fn rewrite_effect_calls(
     // conditional, loop, or opaque statement makes the insertion context ambiguous;
     // leave it alone and explain why rather than placing a new spawn in the wrong arm.
     let mut updated = updated;
-    let additions_allowed = effect_source_is_flat(&script.stmts);
-    if edited.len() > pristine.len() && !additions_allowed {
-        report.skipped.push(format!(
-            "{label}: added effect spawns are inside a source with a branch, loop, wait, or opaque statement — source syncing cannot choose their execution context"
-        ));
+    let flat = effect_source_is_flat(&script.stmts);
+    // The frame-block inserter below reads only `frame(…)`. A script stepped by `wait` — most of
+    // them — goes through the timeline-following inserter instead, which is also what a retime
+    // uses, so an added effect lands on the same frame either way.
+    let mut additions_allowed = flat;
+    if edited.len() > pristine.len() && !flat {
+        let mut timed: Vec<crate::source_timing::EffectAddition> = Vec::new();
+        let mut written = 0usize;
+        let mut with_helpers = updated.clone();
+        for call in edited.iter().skip(pristine.len()) {
+            if call.disabled {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn is disabled — source syncing does not invent a disabled source call"
+                ));
+                continue;
+            }
+            // A copy of a spawn that sat in a condition carries that condition only as verbatim
+            // context lines, not as a guard; which arm the copy belongs in is unknown.
+            if call.leading.iter().chain(&call.trailing).any(|line| line.contains('{')) {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn copies one inside a condition in the source — source syncing cannot choose its execution context"
+                ));
+                continue;
+            }
+            let lines = crate::acmd::effect_call_insert_lines(call);
+            if lines.is_empty() {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn has no source representation — source syncing left it unchanged"
+                ));
+                continue;
+            }
+            ensure_effect_helpers(&mut with_helpers, call);
+            written += lines.len();
+            timed.push(crate::source_timing::EffectAddition {
+                frame: call.active_start,
+                lines,
+                guard: call.guard.clone(),
+            });
+            if let Some(stop) = crate::acmd::effect_call_stop_insert_line(call) {
+                written += 1;
+                timed.push(crate::source_timing::EffectAddition {
+                    frame: call.active_end.max(call.active_start),
+                    lines: vec![stop],
+                    guard: None,
+                });
+            }
+        }
+        match crate::source_timing::add_effects(&with_helpers, &timed) {
+            Ok(text) => {
+                updated = text;
+                report.changed += written;
+                // The read-back below checks these exactly as it checks the flat path's.
+                additions_allowed = true;
+            }
+            Err(reason) => report.skipped.push(format!(
+                "{label}: the added effect spawns were not written — {reason}"
+            )),
+        }
     }
-    if edited.len() > pristine.len() && additions_allowed {
+    if edited.len() > pristine.len() && flat {
         let mut additions: Vec<&crate::data::EffectCall> =
             edited.iter().skip(pristine.len()).collect();
         additions.sort_by_key(|call| call.active_start);
@@ -4646,7 +5750,26 @@ pub fn rewrite_effect_calls(
     }
     if report.skipped.is_empty() {
         let reparsed = crate::acmd::parse_effect_script(&updated).to_effect_calls();
-        if effect_call_set_signature(&reparsed) != effect_call_set_signature(&edited) {
+        // A line move re-wraps a spawn that sat in a condition, so the lines around it — kept on
+        // each call as provenance, not as anything an export reads back — are its own now.
+        let signature = |calls: &[crate::data::EffectCall]| {
+            if line_retimes.is_empty() {
+                return effect_call_set_signature(calls);
+            }
+            let bare: Vec<crate::data::EffectCall> = calls
+                .iter()
+                .cloned()
+                .map(|mut call| {
+                    // Structure moves with the spawn; what still acts on it must not.
+                    call.leading.clear();
+                    call.trailing
+                        .retain(|line| crate::source_timing::touches_last_effect(line));
+                    call
+                })
+                .collect();
+            effect_call_set_signature(&bare)
+        };
+        if signature(&reparsed) != signature(&edited) {
             // Do not return a source move that failed its own semantic read-back. Value edits are
             // still safe to keep, but the timing operation is refused as one batch so a future
             // parser/source-shape change cannot leave only half of a retime on disk.
@@ -4660,18 +5783,47 @@ pub fn rewrite_effect_calls(
     Ok((updated, report))
 }
 
-/// Sync edited effect calls for one move back into the project source on disk.
-pub fn sync_effect_calls(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::EffectCall],
-    edited: &[crate::data::EffectCall],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("effect", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_effect_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+/// `pub fn $name(index, fighter, move_name, pristine, edited)`: sync one family's edited
+/// points into the project's `$prefix` function through `$rewrite`.
+macro_rules! point_syncs {
+    ($($name:ident: $prefix:literal, $rewrite:ident, $event:ident;)*) => {$(
+        pub fn $name(
+            index: &SourceIndex,
+            fighter: &str,
+            move_name: &str,
+            pristine: &[crate::data::$event],
+            edited: &[crate::data::$event],
+        ) -> Result<SyncReport> {
+            let script_name = crate::acmd::acmd_script_name($prefix, move_name);
+            sync_script(index, fighter, &script_name, |body| {
+                $rewrite(body, &format!("{fighter}/{move_name}"), pristine, edited)
+            })
+        }
+    )*};
+}
+
+point_syncs! {
+    sync_effect_calls: "effect", rewrite_effect_calls, EffectCall;
+    sync_hitboxes: "game", rewrite_hitboxes, Hitbox;
+    sync_attack_mods: "game", rewrite_attack_mods, AttackModState;
+    sync_speed_ex: "game", rewrite_speed_ex, SetSpeedExEvent;
+    sync_speed: "game", rewrite_speed, SetSpeedEvent;
+    sync_add_speed_no_limit: "game", rewrite_add_speed_no_limit, AddSpeedNoLimitEvent;
+    sync_correct: "game", rewrite_correct, CorrectEvent;
+    sync_ft_catch_stop: "game", rewrite_ft_catch_stop, FtCatchStopEvent;
+    sync_motion_module_set_rate: "game", rewrite_motion_module_set_rate, MotionModuleSetRateEvent;
+    sync_clr_speed: "game", rewrite_clr_speed, ClrSpeedEvent;
+    sync_change_kinetic: "game", rewrite_change_kinetic, ChangeKineticEvent;
+    sync_kinetic_energy: "game", rewrite_kinetic_energy, KineticEnergyEvent;
+    sync_work_flags: "game", rewrite_work_flags, WorkFlagEvent;
+    sync_work_transition_terms: "game", rewrite_work_transition_terms, WorkTransitionTermEvent;
+    sync_work_module_inc_int: "game", rewrite_work_module_inc_int, WorkModuleIncIntEvent;
+    sync_work_module_sets: "game", rewrite_work_module_sets, WorkModuleSetEvent;
+    sync_kinetic_add_speed: "game", rewrite_kinetic_add_speed, KineticAddSpeedEvent;
+    sync_kinetic_clear_speed_all: "game", rewrite_kinetic_clear_speed_all, KineticClearSpeedAllEvent;
+    sync_set_air: "game", rewrite_set_air, SetAirEvent;
+    sync_reverse_lr: "game", rewrite_reverse_lr, ReverseLrEvent;
+    sync_expressions: "expression", rewrite_expressions, ExpressionEvent;
 }
 
 /// Read one indexed script, hand its text to `rewrite`, and splice the result back in.
@@ -4968,8 +6120,17 @@ fn spawn_and_modifier_sites(text: &str) -> (Vec<MacroSite>, Vec<ModifierSites>) 
         "visionary_last_effect_set_scale_w",
         0..text.len(),
     ));
+    sites.extend(native_effect_control_sites(text));
     sites.sort_by_key(|site| site.span.start);
     for site in sites {
+        if is_native_effect_control_name(&site.name) {
+            adjacent = false;
+            if is_typed_native_effect_control(text, &site) {
+                spawns.push(site);
+                modifiers.push(ModifierSites::default());
+            }
+            continue;
+        }
         if is_spawn_macro(&site.name) {
             // A trail is a spawn for ordinal purposes but never anchors a modifier, matching
             // the parser — see the `AfterImage` arm of `eval_effect_stmts`. A colour command is
@@ -5046,7 +6207,11 @@ fn is_spawn_macro(name: &str) -> bool {
 fn is_effect_control_macro(name: &str) -> bool {
     matches!(
         name,
-        "EFFECT_DETACH_KIND" | "EFFECT_DETACH_KIND_WORK" | "ENABLE_AREA" | "UNABLE_AREA"
+        "EFFECT_DETACH_KIND"
+            | "EFFECT_DETACH_KIND_WORK"
+            | "EFFECT_OFF_KIND_WORK"
+            | "ENABLE_AREA"
+            | "UNABLE_AREA"
     )
 }
 
@@ -5218,6 +6383,17 @@ fn control_edits(
             control_unk_edit(text, label, site, 2, *unk, edits, report);
         }
         (
+            crate::data::EffectControl::OffKindWork { preset_id: old_id },
+            crate::data::EffectControl::OffKindWork { preset_id: new_id },
+        ) if old_id != new_id => {
+            // Slot identity and both flags are a closed source tuple, not editable scalar values.
+            // Changing the preset through a source sync would rewrite structural native fields.
+            report.skipped.push(format!(
+                "{label}: `{}` changed off-kind Work preset — source syncing does not rewrite closed slot/flag tuples",
+                site.name
+            ));
+        }
+        (
             crate::data::EffectControl::EnableArea { .. },
             crate::data::EffectControl::EnableArea { kind },
         )
@@ -5229,6 +6405,14 @@ fn control_edits(
                 edits.push(edit);
             }
         }
+        (
+            crate::data::EffectControl::SetDisableRenderOffsetLast,
+            crate::data::EffectControl::SetDisableRenderOffsetLast,
+        )
+        | (
+            crate::data::EffectControl::EnableSyncInitPosLast,
+            crate::data::EffectControl::EnableSyncInitPosLast,
+        ) => {}
         _ => report.skipped.push(format!(
             "{label}: `{}` has a control payload that does not match its source command",
             site.name
@@ -5392,6 +6576,8 @@ pub fn rewrite_hitboxes(
 
     let mut report = SyncReport::default();
     let mut edits = Vec::new();
+    // Ordinary hitboxes whose frames changed, moved once their values are written.
+    let mut retimed: Vec<(usize, Range<usize>)> = Vec::new();
     // Hitboxes are keyed by id + part, which is what the game uses to tell them apart and
     // what stays stable across a retime. Two calls sharing a key in one script would be
     // ambiguous, so those are reported rather than guessed at.
@@ -5447,6 +6633,10 @@ pub fn rewrite_hitboxes(
                 ));
                 continue;
             };
+            if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end
+            {
+                retimed.push((position, macro_site.span.clone()));
+            }
             let (call_edits, missing) = attack_abs_edits(text, macro_site, before, hitbox);
             if !missing.is_empty() {
                 report.skipped.push(format!(
@@ -5507,11 +6697,7 @@ pub fn rewrite_hitboxes(
             };
             if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end
             {
-                report.skipped.push(format!(
-                    "{label}: ATTACK_FP hitbox {} was retimed — its frames are the block it sits \
-                     in, not arguments, so source syncing cannot move it",
-                    before.id
-                ));
+                retimed.push((position, macro_site.span.clone()));
             }
             let (call_edits, missing) = attack_fp_edits(text, macro_site, before, hitbox);
             if !missing.is_empty() {
@@ -5597,15 +6783,11 @@ pub fn rewrite_hitboxes(
             ));
             continue;
         };
-        // A hitbox's frames are the `frame(...)` block it sits in and the `ATTACK_CLEAR` that
-        // ends it, not arguments of the call — so a retime is reported. The values it also
-        // changed are still worth writing, so this does not skip the call.
+        // A hitbox's frames are the `frame(...)` block it sits in and the clear that ends it,
+        // not arguments of the call. It moves through [`crate::source_timing`] once its values
+        // are written, which are written either way.
         if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end {
-            report.skipped.push(format!(
-                "{label}: hitbox {} was retimed — its frames are the block it sits in, not \
-                 arguments, so source syncing cannot move it",
-                before.id
-            ));
+            retimed.push((position, macro_site.span.clone()));
         }
         let (call_edits, missing) = if is_grab {
             catch_edits(text, macro_site, before, hitbox)
@@ -5627,21 +6809,33 @@ pub fn rewrite_hitboxes(
     }
 
     report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited hitboxes for one move back into the project source on disk.
-pub fn sync_hitboxes(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::Hitbox],
-    edited: &[crate::data::Hitbox],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_hitboxes(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+    let (written, map) = apply_mapped(text, edits);
+    if retimed.is_empty() {
+        return Ok((written, report));
+    }
+    let moved: Vec<crate::source_timing::Retimed> = retimed
+        .iter()
+        .map(|(position, call)| crate::source_timing::Retimed {
+            position: *position,
+            call: map(call.start)..map(call.end),
+            before: &pristine[*position],
+            after: &edited[*position],
+        })
+        .collect();
+    match crate::source_timing::retime_hitboxes(&written, pristine, &moved) {
+        Ok(timed) => {
+            report.changed += moved.len();
+            Ok((timed, report))
+        }
+        Err(reason) => {
+            let ids: Vec<String> = moved.iter().map(|m| m.before.id.to_string()).collect();
+            report.skipped.push(format!(
+                "{label}: hitbox {} was retimed, but its frames were left as they are — {reason}",
+                ids.join(", ")
+            ));
+            Ok((written, report))
+        }
+    }
 }
 
 /// The new text for one changed `ATTACK` argument, by the kind of slot it is.
@@ -6567,6 +7761,66 @@ fn text_edit(text: &str, span: &Range<usize>, new: &str) -> Option<Replacement> 
     })
 }
 
+/// The shared walk behind the direct point-family source rewrites.
+///
+/// Leaves the script alone when its buildable `sites` and the editor's events disagree in
+/// count, and skips any changed event whose site is out of flat source order or that was
+/// retimed. `edit` checks one changed event's site shape and emits its replacements.
+/// `shape` names the calls in the count and per-site messages, says what source syncing
+/// retunes instead of retiming, and carries the sites.
+fn rewrite_points<C: PartialEq>(
+    text: &str,
+    label: &str,
+    (count_noun, site_noun, retunes, sites): (&str, &str, &str, Vec<MacroSite>),
+    pristine: &[crate::data::PointEvent<C>],
+    edited: &[crate::data::PointEvent<C>],
+    mut edit: impl FnMut(
+        &MacroSite,
+        &crate::data::PointEvent<C>,
+        &crate::data::PointEvent<C>,
+        &mut SyncReport,
+        &mut Vec<Replacement>,
+    ),
+) -> Result<(String, SyncReport)> {
+    let mut report = SyncReport::default();
+    if pristine.len() != sites.len() || edited.len() != pristine.len() {
+        report.skipped.push(format!(
+            "{label}: source has {} buildable {count_noun} call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
+            sites.len(),
+            pristine.len(),
+            edited.len()
+        ));
+        return Ok((text.to_string(), report));
+    }
+
+    let mut edits = Vec::new();
+    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
+        if before == now {
+            continue;
+        }
+        if before.site != index || now.site != index {
+            report.skipped.push(format!(
+                "{label}: {site_noun} site {} does not match the flat source order — source syncing refuses positional guessing",
+                before.site
+            ));
+            continue;
+        }
+        if before.frame != now.frame {
+            report.skipped.push(format!(
+                "{label}: {site_noun} site {} was retimed from frame {} to {} — source syncing only {retunes}",
+                before.site, before.frame, now.frame
+            ));
+            continue;
+        }
+        let Some(site) = sites.get(index) else {
+            continue;
+        };
+        edit(site, before, now, &mut report, &mut edits);
+    }
+    report.changed = edits.len();
+    Ok((apply(text, edits), report))
+}
+
 // ── Hurtbox state write-back ─────────────────────────────────────────────────
 
 /// The hurtbox commands, with the argument count each one has after `agent`.
@@ -7027,20 +8281,6 @@ pub fn rewrite_attack_mods(
     Ok((apply(text, edits), report))
 }
 
-/// Sync edited post-hoc hitbox modifiers for one move back into the project source on disk.
-pub fn sync_attack_mods(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::AttackModState],
-    edited: &[crate::data::AttackModState],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_attack_mods(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
-}
-
 // ── Playback rate write-back ─────────────────────────────────────────────────
 
 /// The `FT_MOTION_RATE` calls in `text`, in document order — index `n` is site `n`.
@@ -7116,6 +8356,802 @@ pub fn sync_motion_rates(
     })
 }
 
+// ── Article call write-back ─────────────────────────────────────────────────
+
+/// The module paths an article call is written with, as [`crate::data::ArticleCall::parse`]
+/// reads them.
+const ARTICLE_MODULE: &str = "ArticleModule::";
+const ARTICLE_LUA_BIND: &str = "smash::app::lua_bind::";
+
+/// Every `ArticleModule::f(..)` call in `text` written as a whole statement, in document order:
+/// `[let x = ][smash::app::lua_bind::]ArticleModule::f(args);`.
+///
+/// Located in the file's own text, never rebuilt from the editor's model of a call (a timeline
+/// call carries the timeline's spelling, not the file's). A call inside an expression
+/// (`if ArticleModule::is_exist(..)`, an argument of another call) is not a statement and is not
+/// counted: the parser keeps those as raw lines, so the walk never reports them either.
+pub(crate) fn article_call_sites(text: &str) -> Vec<MacroSite> {
+    let bytes = text.as_bytes();
+    let mut sites = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        if !text.is_char_boundary(i) || !text[i..].starts_with(ARTICLE_MODULE) {
+            i += 1;
+            continue;
+        }
+        let start = if text[..i].ends_with(ARTICLE_LUA_BIND) {
+            i - ARTICLE_LUA_BIND.len()
+        } else {
+            i
+        };
+        let name_start = i + ARTICLE_MODULE.len();
+        // Not a longer or differently qualified name that merely ends in `ArticleModule::`.
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.')
+        {
+            i = name_start;
+            continue;
+        }
+        let mut name_end = name_start;
+        while name_end < text.len()
+            && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || bytes.get(name_end) != Some(&b'(') {
+            i = name_end;
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, name_end + 1, text.len()) else {
+            i = name_end + 1;
+            continue;
+        };
+        i = close + 1;
+        if article_statement_semicolon(text, start, close).is_some() {
+            sites.push(MacroSite {
+                name: text[name_start..name_end].to_string(),
+                span: start..close + 1,
+                args,
+            });
+        }
+    }
+    sites
+}
+
+/// The `;` ending the statement a call from `start` to its `)` at `close` makes, if the call is
+/// a whole statement: preceded by the start of a block or statement (`{`, `;`, `}`), optionally
+/// through a `let` binding on the same line, and followed by `;`.
+fn article_statement_semicolon(text: &str, start: usize, close: usize) -> Option<usize> {
+    let after = &text[close + 1..];
+    let semicolon = close + 1 + (after.len() - after.trim_start().len());
+    if text.as_bytes().get(semicolon) != Some(&b';') {
+        return None;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+    let prefix = text[line_start..start].trim();
+    let before = if prefix.is_empty() {
+        &text[..line_start]
+    } else if let Some(binding) = prefix.strip_prefix("let ") {
+        // `let id = ` and nothing else: no operator before the `=`.
+        let pattern = binding.strip_suffix('=')?.trim_end();
+        if pattern.is_empty()
+            || pattern.ends_with(['=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'])
+            || pattern.contains(['(', ';', '"', '{', '}'])
+        {
+            return None;
+        }
+        let at = text[line_start..start].find("let ")? + line_start;
+        &text[..at]
+    } else {
+        &text[..start]
+    };
+    matches!(last_code_char(before), None | Some('{' | ';' | '}')).then_some(semicolon)
+}
+
+/// The last character of `text` that is code: not whitespace and not inside a comment.
+fn last_code_char(text: &str) -> Option<char> {
+    let mut last = None;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            if !(text[i..].starts_with("//") || text[i..].starts_with("/*")) {
+                last = text[..next.min(text.len())].chars().next_back();
+            }
+            i = next;
+            continue;
+        }
+        let Some(c) = text[i..].chars().next() else {
+            break;
+        };
+        if !c.is_whitespace() {
+            last = Some(c);
+        }
+        i += c.len_utf8();
+    }
+    last
+}
+
+/// The frame block `site` sits in, as [`source_frame_block`] finds it, when its `frame(..)` line
+/// comes before the `is_excute` block holding the site and on a line of its own. (A `frame` inside
+/// the block, or on the block's own line, is not a frame block this can retime.)
+fn article_frame_block(text: &str, site: &MacroSite) -> Option<EffectSourceBlock> {
+    let (open, _) = enclosing_effect_execute(text, site.span.start)?;
+    let frame = scan_named_sites(text, "frame", 0..text.len())
+        .into_iter()
+        .rev()
+        .find(|frame| frame.span.end <= site.span.start)?;
+    let frame_line = line_range_at(text, frame.span.start)?;
+    let execute_line = line_range_at(text, open)?;
+    if execute_line.start < frame_line.end {
+        return None;
+    }
+    source_frame_block(text, site)
+}
+
+/// Why the call at `site` is not `call` at `frame`, if it is not. The writer pairs by position
+/// with a list read from this same text, so every field must agree: function, argument count,
+/// article, every argument (the target by what it names, since a timeline call carries the
+/// timeline's spelling of it) and, where the source states one, the frame.
+fn article_pairing_mismatch(
+    text: &str,
+    site: &MacroSite,
+    frame: u32,
+    call: &crate::data::ArticleCall,
+) -> Option<String> {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    if site.name != call.op.name() {
+        return Some(format!("the source calls `{}` where the list has `{}`", site.name, call.op.name()));
+    }
+    if site.args.len() != call.args.len() + 2 {
+        return Some(format!(
+            "the source's `{}` has {} argument(s) where the list has {}",
+            site.name,
+            site.args.len(),
+            call.args.len() + 2
+        ));
+    }
+    if squash(&text[site.args[1].clone()]) != squash(&call.article) {
+        return Some(format!(
+            "the source's `{}` acts on `{}` where the list has `{}`",
+            site.name,
+            text[site.args[1].clone()].trim(),
+            call.article
+        ));
+    }
+    let target_slot = call.op.target_index();
+    for (slot, expected) in call.args.iter().enumerate() {
+        let written = &text[site.args[slot + 2].clone()];
+        let agrees = if Some(slot) == target_slot {
+            crate::data::ArticleTarget::read(written) == call.target
+        } else {
+            squash(written) == squash(expected)
+        };
+        if !agrees {
+            return Some(format!(
+                "the source's `{}` passes `{}` where the list has `{expected}`",
+                site.name,
+                written.trim()
+            ));
+        }
+    }
+    if let Some(block) = article_frame_block(text, site) {
+        if block.frame != frame {
+            return Some(format!(
+                "the source's `{}` is under frame {} where the list has it at frame {frame}",
+                site.name, block.frame
+            ));
+        }
+    }
+    None
+}
+
+/// Rewrite edited article calls into the user's own source.
+///
+/// `pristine` is the calls `text` holds, as [`AcmdScript::to_article_calls`]
+/// (crate::data::AcmdScript::to_article_calls) reads them from it, and `edited` is the same list
+/// with the user's edits, as (script frame, call). They are paired with the file's own call
+/// statements **by position**, the way [`rewrite_motion_rates`] pairs rates, and every pair must
+/// agree exactly ([`article_pairing_mismatch`]); otherwise nothing is written and the reason is
+/// reported. The editor's own lists go through [`rewrite_editor_article_calls`], which puts them
+/// in this form.
+///
+/// - An argument edit replaces only that argument's bytes, so the receiver, any `let` binding,
+///   the module path and the spacing stay as written. A changed target keeps the file's own
+///   spelling of it (`ArticleOperationTarget(..)` or bare, symbolic or numeric).
+/// - A frame change moves the statement to the new frame's block, creating the block when the
+///   function has none, as effect blocks move. See [`move_call_to_frame`].
+/// - Changing which `ArticleModule` function is called, or adding or removing arguments or calls,
+///   is structural and reported.
+pub fn rewrite_article_calls(
+    text: &str,
+    label: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<(String, SyncReport)> {
+    let mut report = SyncReport::default();
+    let same = article_call_unchanged;
+    if pristine.len() == edited.len() && pristine.iter().zip(edited).all(|(a, b)| same(a, b)) {
+        return Ok((text.to_string(), report));
+    }
+    if pristine.len() != edited.len() {
+        report.skipped.push(format!(
+            "{label}: article calls were added or removed — source syncing only retunes existing \
+             calls, so use an export to land that"
+        ));
+        return Ok((text.to_string(), report));
+    }
+    let sites = article_call_sites(text);
+    if sites.len() != pristine.len() {
+        report.skipped.push(format!(
+            "{label}: the source has {} `ArticleModule` call(s) and the editor models {} — one of \
+             them is inside a branch, a loop or an expression, which this cannot address by \
+             position",
+            sites.len(),
+            pristine.len()
+        ));
+        return Ok((text.to_string(), report));
+    }
+    for (index, (site, (frame, call))) in sites.iter().zip(pristine).enumerate() {
+        if let Some(reason) = article_pairing_mismatch(text, site, *frame, call) {
+            report.skipped.push(format!(
+                "{label}: article call #{} is not what the source holds there ({reason}), so no \
+                 article call was changed; reload the move",
+                index + 1
+            ));
+            return Ok((text.to_string(), report));
+        }
+    }
+    let assigned: Vec<usize> = (0..sites.len()).collect();
+
+    let mut edits = Vec::new();
+    let mut moves = Vec::new();
+    for (site, &index) in sites.iter().zip(&assigned) {
+        let (was, now) = (&pristine[index], &edited[index]);
+        if same(was, now) {
+            continue;
+        }
+        let ((from, before), (to, after)) = (was, now);
+        let number = index + 1;
+        if before.op != after.op {
+            report.skipped.push(format!(
+                "{label}: article call #{number} changes which function it calls (`{}` to `{}`) — \
+                 source syncing only retunes existing calls, so use an export to land that",
+                before.op.name(),
+                after.op.name()
+            ));
+            continue;
+        }
+        if before.args.len() != after.args.len() {
+            report.skipped.push(format!(
+                "{label}: article call #{number} (`{}`) had arguments added or removed — source \
+                 syncing only retunes existing arguments",
+                site.name
+            ));
+            continue;
+        }
+        let mut replace = |span: &Range<usize>, value: String| {
+            if text[span.clone()].trim() != value.trim() {
+                edits.push(Replacement { span: span.clone(), value });
+            }
+        };
+        if before.article != after.article {
+            replace(&site.args[1], after.article.clone());
+        }
+        let target_slot = before.op.target_index();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for (slot, (was, now)) in before.args.iter().zip(&after.args).enumerate() {
+            let span = &site.args[slot + 2];
+            if Some(slot) == target_slot && after.target != crate::data::ArticleTarget::Unspecified {
+                // By what it names only: the text in `args` may still be the spelling from before
+                // an edit that set `target`. Written in the file's own spelling, not the editor's.
+                if before.target != after.target {
+                    replace(span, after.target.respell(&text[span.clone()]));
+                }
+            } else if squash(was) != squash(now) {
+                replace(span, now.clone());
+            }
+        }
+        if from != to {
+            moves.push((index, *from, *to));
+        }
+    }
+
+    report.changed = edits.len();
+    let mut out = apply(text, edits);
+    // Which editor call each statement in `out` is, in document order: a move can carry a call
+    // past others, and every later move must still find its own call.
+    let mut order: Vec<usize> = assigned;
+    for (index, from, to) in moves {
+        let number = index + 1;
+        let current = article_call_sites(&out);
+        let Some(site) = order
+            .iter()
+            .position(|&call| call == index)
+            .and_then(|position| current.get(position))
+        else {
+            report.skipped.push(format!(
+                "{label}: article call #{number} could not be found again after an earlier move"
+            ));
+            break;
+        };
+        if article_frame_block(&out, site).is_some_and(|block| block.frame == to) {
+            continue; // Already there: a sync ran before with this edit.
+        }
+        match move_call_to_frame(&out, site, from, to) {
+            Ok((moved, at)) => {
+                let after = article_call_sites(&moved);
+                let Some(position) = after.iter().position(|site| site.span.start == at) else {
+                    report.skipped.push(format!(
+                        "{label}: article call #{number} moved, but could not be found again, so no \
+                         later article call was moved"
+                    ));
+                    out = moved;
+                    report.changed += 1;
+                    break;
+                };
+                order.retain(|&call| call != index);
+                order.insert(position, index);
+                out = moved;
+                report.changed += 1;
+            }
+            Err(reason) => report.skipped.push(format!(
+                "{label}: `{}` (article call #{number}) could not move from frame {from} to frame \
+                 {to}: {reason}",
+                site.name
+            )),
+        }
+    }
+    Ok((out, report))
+}
+
+/// The editor's edited article calls in the order, and against the values, of `source`: the
+/// calls `text` holds now, read with the same parser (`to_article_calls`). This is the per-write
+/// baseline hitboxes and effects use. An earlier sync may have moved a call past another,
+/// renamed its article, or retimed it, so the file's list and the editor's original list
+/// (`pristine`, edited into `edited`) no longer line up by position.
+///
+/// A source call can be editor call `i` only when they have the same function and argument count
+/// and every field (frame, article, each argument, the target by what it names) is either as call
+/// `i` was, as it is edited, or — only for a field the user changed on that call — some value in
+/// between that an earlier sync wrote. Among those, a call that agrees on every field is paired
+/// first; then each remaining source call takes its one best match. Several equal matches are
+/// accepted only when they are the same call, edited the same way. Anything else is refused with
+/// the reason, and nothing is guessed by position.
+pub fn article_calls_in_source_order(
+    source: &[(u32, crate::data::ArticleCall)],
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> std::result::Result<Vec<(u32, crate::data::ArticleCall)>, String> {
+    if pristine.len() != edited.len() {
+        return Err(
+            "article calls were added or removed — source syncing only retunes existing calls, so \
+             use an export to land that"
+                .into(),
+        );
+    }
+    if source.len() != pristine.len() {
+        return Err(format!(
+            "the source has {} article call(s) where the editor has {}, so they cannot be matched \
+             up; reload the move",
+            source.len(),
+            pristine.len()
+        ));
+    }
+    // The file holds exactly the calls the editor loaded, in their order: call `i` is the `i`th,
+    // even where several are the same call (Cuphead's four identical bullets in one frame).
+    if source.iter().zip(pristine).all(|(held, loaded)| article_call_unchanged(held, loaded)) {
+        return Ok(edited.to_vec());
+    }
+    let was: Vec<Vec<String>> = pristine.iter().map(article_call_fields).collect();
+    let then: Vec<Vec<String>> = edited.iter().map(article_call_fields).collect();
+    // `None`: this source call cannot be editor call `index`. Otherwise how many fields agree,
+    // and whether all of them do.
+    let score = |(_, call): &(u32, crate::data::ArticleCall), fields: &[String], index: usize| {
+        let (before, after) = (&pristine[index].1, &edited[index].1);
+        if (call.op != before.op && call.op != after.op) || call.args.len() != before.args.len() {
+            return None;
+        }
+        let mut agree = 0;
+        for (field, now) in fields.iter().enumerate() {
+            let old = &was[index][field];
+            let new = then[index].get(field).unwrap_or(old);
+            if now == old || now == new {
+                agree += 1;
+            } else if old == new {
+                // A value neither side has, on a field the user did not change: not this call.
+                return None;
+            }
+        }
+        Some((agree, agree == fields.len()))
+    };
+    let interchangeable = |a: usize, b: usize| {
+        article_call_unchanged(&pristine[a], &pristine[b]) && article_call_unchanged(&edited[a], &edited[b])
+    };
+    let fields: Vec<Vec<String>> = source.iter().map(article_call_fields).collect();
+
+    let mut assigned: Vec<Option<usize>> = vec![None; source.len()];
+    let mut used = vec![false; pristine.len()];
+    while assigned.iter().any(Option::is_none) {
+        let mut progress = false;
+        // Calls that agree on everything settle first; only then the closest match.
+        for full_only in [true, false] {
+            for (position, call) in source.iter().enumerate() {
+                if assigned[position].is_some() {
+                    continue;
+                }
+                let scored: Vec<(usize, usize, bool)> = (0..pristine.len())
+                    .filter(|&index| !used[index])
+                    .filter_map(|index| score(call, &fields[position], index).map(|(agree, full)| (index, agree, full)))
+                    .filter(|(_, _, full)| *full || !full_only)
+                    .collect();
+                if scored.is_empty() {
+                    if full_only {
+                        continue;
+                    }
+                    return Err(format!(
+                        "the source's `{}` call on {} at frame {} matches none of the editor's article \
+                         calls as they were or as edited, so none was changed; reload the move",
+                        call.1.op.name(),
+                        call.1.article,
+                        call.0
+                    ));
+                }
+                let best = scored.iter().map(|(_, agree, _)| *agree).max().unwrap_or(0);
+                let top: Vec<usize> = scored
+                    .iter()
+                    .filter(|(_, agree, _)| *agree == best)
+                    .map(|(index, _, _)| *index)
+                    .collect();
+                if top.iter().all(|&index| interchangeable(top[0], index)) {
+                    assigned[position] = Some(top[0]);
+                    used[top[0]] = true;
+                    progress = true;
+                }
+            }
+            if progress {
+                break;
+            }
+        }
+        if !progress {
+            let position = assigned.iter().position(Option::is_none).unwrap_or(0);
+            let (frame, call) = &source[position];
+            return Err(format!(
+                "the source's `{}` call on {} at frame {frame} could be more than one of the \
+                 editor's article calls, so none was changed; reload the move, or edit one call at \
+                 a time and sync in between",
+                call.op.name(),
+                call.article
+            ));
+        }
+    }
+    Ok(assigned
+        .into_iter()
+        .map(|index| edited[index.expect("every source call was assigned")].clone())
+        .collect())
+}
+
+/// [`rewrite_article_calls`] for the editor's lists: the baseline is what `text` holds now (see
+/// [`article_calls_in_source_order`]), so a sync after an earlier sync of the same move still
+/// pairs each call with its own statement. When the lists cannot be matched, the reason is
+/// reported unless the file already holds exactly the edited calls.
+pub fn rewrite_editor_article_calls(
+    text: &str,
+    label: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<(String, SyncReport)> {
+    let source = crate::acmd::parse_acmd_script(text).to_article_calls();
+    match article_calls_in_source_order(&source, pristine, edited) {
+        Ok(ordered) => rewrite_article_calls(text, label, &source, &ordered),
+        Err(reason) => {
+            let mut report = SyncReport::default();
+            // Nothing to do only when the FILE already holds every edited call, in any order.
+            let mut left: Vec<&(u32, crate::data::ArticleCall)> = source.iter().collect();
+            let settled = source.len() == edited.len()
+                && edited.iter().all(|call| {
+                    left.iter()
+                        .position(|held| article_call_unchanged(held, call))
+                        .map(|at| left.remove(at))
+                        .is_some()
+                });
+            if !settled {
+                report.skipped.push(format!("{label}: {reason}"));
+            }
+            Ok((text.to_string(), report))
+        }
+    }
+}
+
+/// What an article call does, field by field, as comparable text: its frame, its article, then
+/// every argument with whitespace removed. A known target is compared by what it names, since a
+/// timeline call keeps the timeline's spelling of it and an edit may set only `target`.
+fn article_call_fields((frame, call): &(u32, crate::data::ArticleCall)) -> Vec<String> {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let target_slot = call.op.target_index();
+    let mut fields = vec![frame.to_string(), squash(&call.article)];
+    for (slot, arg) in call.args.iter().enumerate() {
+        fields.push(if Some(slot) == target_slot && call.target != crate::data::ArticleTarget::Unspecified {
+            format!("target {:?}", call.target)
+        } else {
+            squash(arg)
+        });
+    }
+    fields
+}
+
+/// Whether two calls do the same thing: `source`, `edited` and `origin` only say how one was read.
+fn article_call_unchanged(a: &(u32, crate::data::ArticleCall), b: &(u32, crate::data::ArticleCall)) -> bool {
+    a.1.op == b.1.op && article_call_fields(a) == article_call_fields(b)
+}
+
+/// Sync edited article calls for one move back into the project source on disk. `pristine` and
+/// `edited` are the editor's lists; the baseline is re-read from the file on every sync.
+pub fn sync_article_calls(
+    index: &SourceIndex,
+    fighter: &str,
+    move_name: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<SyncReport> {
+    let script_name = crate::acmd::acmd_script_name("game", move_name);
+    sync_script(index, fighter, &script_name, |body| {
+        rewrite_editor_article_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
+    })
+}
+
+/// Why frame blocks in `text` do not say when a line runs, if they do not: a `wait` makes the
+/// time a block runs at depend on what came before it, and a loop runs its blocks more than once.
+fn frame_order_unreliable(text: &str) -> Option<&'static str> {
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        let word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if word_start {
+            // `wait(..)`, `macros::wait(..)` and the `wait_loop_*` family all hold the script.
+            let rest = &text[i..];
+            let wait_call = rest.strip_prefix("wait").is_some_and(|after| {
+                after.trim_start().starts_with('(') || after.starts_with("_loop")
+            });
+            if wait_call {
+                return Some("the script uses `wait`, so a frame block's place does not say when it runs");
+            }
+            for keyword in ["for", "while", "loop"] {
+                let end = i + keyword.len();
+                if text[i..].starts_with(keyword)
+                    && bytes.get(end).is_some_and(|b| b.is_ascii_whitespace() || *b == b'{')
+                {
+                    return Some("the script has a loop, so its frame blocks can run more than once");
+                }
+            }
+        }
+        i += 1;
+        while i < text.len() && !text.is_char_boundary(i) {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The brace depth of `at` inside `body` (0 directly in it), ignoring literals and comments.
+fn brace_depth(text: &str, body: Range<usize>, at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = body.start;
+    while i < at {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        match text.as_bytes()[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// The frame argument `old` respelled as `frame`: `10.0` gives `14.0`, `10` gives `14`.
+fn frame_arg_like(old: &str, frame: u32) -> String {
+    crate::project_consts::format_literal_like(old, f64::from(frame))
+        .unwrap_or_else(|| format_float(frame as f32))
+}
+
+/// Move the statement calling `site` from its frame block (at frame `from`) to frame `to`.
+///
+/// This works for any call `site` locates, not only effects. The statement must be a whole line
+/// (or lines) directly inside a `frame(..); if is_excute(..) { .. }` block, the shape effect
+/// timing moves accept. Then:
+///
+/// - If it is the block's only statement (comments aside) and no block exists at `to`, the whole
+///   block, comments included, is retimed and placed in frame order, exactly as an effect block
+///   moves.
+/// - If a block already exists at `to`, the statement joins the end of it, and a block the
+///   statement leaves with nothing in it at all is removed; one left holding comments stays.
+/// - Otherwise a new block is made at `to` from the frame line, `is_excute` header and closing
+///   line of the block it left, so it is written the way the user writes blocks.
+///
+/// Every byte moved keeps its own line endings and indentation. Returns the new text and where
+/// the moved call now starts, or why it cannot be moved.
+fn move_call_to_frame(text: &str, site: &MacroSite, from: u32, to: u32) -> Result<(String, usize), String> {
+    if let Some(reason) = frame_order_unreliable(text) {
+        return Err(reason.into());
+    }
+    let block = article_frame_block(text, site).ok_or(
+        "it is not directly inside a `frame(..)` statement's `is_excute` block",
+    )?;
+    if block.frame != from {
+        return Err(format!("its block is at frame {}, not {from}", block.frame));
+    }
+    if brace_depth(text, block.execute_body.clone(), site.span.start) != 0 {
+        return Err("it is inside a condition or block within its frame block".into());
+    }
+    let line_of = |at: usize| line_range_at(text, at).ok_or("its line could not be found");
+    let start_line = line_of(site.span.start)?;
+    let prefix = text[start_line.start..site.span.start].trim();
+    if !(prefix.is_empty() || prefix.starts_with("let ")) {
+        return Err("another statement shares its line".into());
+    }
+    let semicolon = article_statement_semicolon(text, site.span.start, site.span.end - 1)
+        .or_else(|| {
+            let after = &text[site.span.end..];
+            let at = site.span.end + (after.len() - after.trim_start().len());
+            (text.as_bytes().get(at) == Some(&b';')).then_some(at)
+        })
+        .ok_or("it is not a whole statement")?;
+    let end_line = line_of(semicolon)?;
+    let tail = text[semicolon + 1..end_line.end].trim();
+    if !(tail.is_empty() || tail.starts_with("//")) {
+        return Err("another statement shares its line".into());
+    }
+    let statement = start_line.start..end_line.end;
+    if statement.start < block.execute_body.start || statement.end > block.execute_body.end {
+        return Err("its block opens or closes on the same line as it".into());
+    }
+    let statement_text = &text[statement.clone()];
+    let call_offset = site.span.start - statement.start;
+    // What else the block holds: nothing at all, or only comments (which move with a block that
+    // moves whole, as an effect block's do, and stay put otherwise).
+    let rest = format!(
+        "{}{}",
+        &text[block.execute_body.start..statement.start],
+        &text[statement.end..block.execute_body.end]
+    );
+    let empty = rest.trim().is_empty();
+    let alone = rest.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.ends_with("*/")
+    });
+
+    // Where a block closes: the start of the line holding its `}`, which must hold nothing else.
+    let closing_line = |close: usize| -> Result<Range<usize>, String> {
+        let line = line_of(close)?;
+        if !text[line.start..close].trim().is_empty() {
+            return Err(format!(
+                "a block at frame {to} closes on the same line as its last statement"
+            ));
+        }
+        Ok(line)
+    };
+    let target = source_frame_blocks(text)
+        .into_iter()
+        .find(|candidate| candidate.frame == to && candidate.range != block.range);
+
+    // (removed range, insertion point, inserted text, call's offset in the inserted text)
+    let (removed, anchor, inserted, offset) = match &target {
+        Some(target) => {
+            let anchor = closing_line(target.execute_body.end)?.start;
+            let removed = if empty { block.range.clone() } else { statement.clone() };
+            (removed, anchor, statement_text.to_string(), call_offset)
+        }
+        None => {
+            let frame_arg = block.frame_arg.clone();
+            let new_arg = frame_arg_like(&text[frame_arg.clone()], to);
+            let (removed, chunk, offset) = if alone {
+                let relative = frame_arg.start - block.range.start..frame_arg.end - block.range.start;
+                let mut chunk = text[block.range.clone()].to_string();
+                let growth = new_arg.len() as isize - relative.len() as isize;
+                chunk.replace_range(relative, &new_arg);
+                let offset = (site.span.start - block.range.start) as isize + growth;
+                (block.range.clone(), chunk, offset as usize)
+            } else {
+                // `{` ends its header line and `}` starts its closing line, or the block cannot
+                // be copied without the statements it holds.
+                let header_end = line_of(block.execute_body.start - 1)?.end;
+                if !text[block.execute_body.start..header_end].trim().is_empty() {
+                    return Err("its block's `is_excute` line also holds a statement".into());
+                }
+                let closer = closing_line(block.execute_body.end)
+                    .map_err(|_| "its block closes on the same line as a statement".to_string())?;
+                let mut header = text[block.range.start..header_end].to_string();
+                header.replace_range(
+                    frame_arg.start - block.range.start..frame_arg.end - block.range.start,
+                    &new_arg,
+                );
+                let offset = header.len() + call_offset;
+                let chunk = format!("{header}{statement_text}{}", &text[closer.start..block.range.end]);
+                (statement.clone(), chunk, offset)
+            };
+            // A block the call leaves behind keeps its frame line, which still orders the rest.
+            let moving = if alone { block.range.clone() } else { statement.clone() };
+            (removed, frame_insertion_point(text, to, &moving)?, chunk, offset)
+        }
+    };
+    if removed.start < anchor && anchor < removed.end {
+        return Err("its new place is inside the lines it leaves".into());
+    }
+    let mut out = String::with_capacity(text.len() + inserted.len());
+    let at = if anchor <= removed.start {
+        out.push_str(&text[..anchor]);
+        let at = out.len() + offset;
+        out.push_str(&inserted);
+        out.push_str(&text[anchor..removed.start]);
+        out.push_str(&text[removed.end..]);
+        at
+    } else {
+        out.push_str(&text[..removed.start]);
+        out.push_str(&text[removed.end..anchor]);
+        let at = out.len() + offset;
+        out.push_str(&inserted);
+        out.push_str(&text[anchor..]);
+        at
+    };
+    Ok((out, at))
+}
+
+/// Where a new block for `frame` goes: before the first `frame(..)` statement for a later frame
+/// (outside `moving`, the block being moved), else at the end of the function. Every frame line
+/// counts, not only those with an `is_excute` block: placing a block after a later frame would
+/// make it run at that later frame.
+fn frame_insertion_point(text: &str, frame: u32, moving: &Range<usize>) -> Result<usize, String> {
+    let mut later: Option<usize> = None;
+    for site in scan_named_sites(text, "frame", 0..text.len()) {
+        if moving.start <= site.span.start && site.span.start < moving.end {
+            continue;
+        }
+        let Some(line) = line_range_at(text, site.span.start) else {
+            continue;
+        };
+        if !text[line.clone()].trim_start().starts_with("frame(") {
+            continue;
+        }
+        let value = site.arg(text, 1).and_then(|value| value.trim().parse::<f32>().ok());
+        let Some(value) = value else {
+            return Err(format!(
+                "a `frame` statement is not a plain number (`{}`), so where frame {frame} goes is \
+                 unclear",
+                text[site.span.clone()].trim()
+            ));
+        };
+        if crate::data::script_frame(value) > frame && later.is_none_or(|at| line.start < at) {
+            later = Some(line.start);
+        }
+    }
+    if let Some(at) = later {
+        return Ok(at);
+    }
+    let close = text.rfind('}').ok_or("the function has no closing brace")?;
+    let line = line_range_at(text, close).ok_or("the function has no closing brace")?;
+    if !text[line.start..close].trim().is_empty() {
+        return Err("the function's closing brace shares its line with a statement".into());
+    }
+    Ok(line.start)
+}
+
 // ── Kinetic speed write-back ────────────────────────────────────────────────
 
 /// The buildable `SET_SPEED_EX` calls in source order.
@@ -7138,82 +9174,46 @@ pub fn rewrite_speed_ex(
     pristine: &[crate::data::SetSpeedExEvent],
     edited: &[crate::data::SetSpeedExEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = speed_ex_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `SET_SPEED_EX` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `SET_SPEED_EX` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `SET_SPEED_EX` site {} was retimed from frame {} to {} — source syncing only retunes velocity values",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        if before.call.kinetic_kind != now.call.kinetic_kind {
-            report.skipped.push(format!(
+    let shape = (
+        "`SET_SPEED_EX`",
+        "`SET_SPEED_EX`",
+        "retunes velocity values",
+        speed_ex_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if before.call.kinetic_kind != now.call.kinetic_kind {
+                report.skipped.push(format!(
                 "{label}: `SET_SPEED_EX` site {} changed kinetic kind — source syncing preserves that structural token",
                 before.site
             ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::SetSpeedExCall::FUNC || site.args.len() != 4 {
-            report.skipped.push(format!(
+                return;
+            }
+            if site.name != crate::data::SetSpeedExCall::FUNC || site.args.len() != 4 {
+                report.skipped.push(format!(
                 "{label}: `SET_SPEED_EX` site {} no longer has its verified four-argument shape",
                 before.site
             ));
-            continue;
-        }
-        // Slot 0 is `agent`; x and y are the two following `ToF32` arguments.
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.speed_x) {
-                edits.push(edit);
+                return;
             }
-        }
-        if let Some(span) = site.args.get(2) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.speed_y) {
-                edits.push(edit);
+            // Slot 0 is `agent`; x and y are the two following `ToF32` arguments.
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.speed_x) {
+                    edits.push(edit);
+                }
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited `SET_SPEED_EX` values into the project's `game_` function.
-pub fn sync_speed_ex(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::SetSpeedExEvent],
-    edited: &[crate::data::SetSpeedExEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_speed_ex(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(2) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.speed_y) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The buildable direct `SET_SPEED` calls and generated helper calls in source order.
@@ -7237,78 +9237,42 @@ pub fn rewrite_speed(
     pristine: &[crate::data::SetSpeedEvent],
     edited: &[crate::data::SetSpeedEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = speed_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `SET_SPEED` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `SET_SPEED` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `SET_SPEED` site {} was retimed from frame {} to {} — source syncing only retunes velocity values",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if !matches!(
-            site.name.as_str(),
-            crate::data::SetSpeedCall::FUNC | "visionary_set_speed"
-        ) || site.args.len() != 3
-        {
-            report.skipped.push(format!(
-                "{label}: `SET_SPEED` site {} no longer has its verified three-argument shape",
-                before.site
-            ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.speed_x) {
-                edits.push(edit);
+    let shape = (
+        "`SET_SPEED`",
+        "`SET_SPEED`",
+        "retunes velocity values",
+        speed_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if !matches!(
+                site.name.as_str(),
+                crate::data::SetSpeedCall::FUNC | "visionary_set_speed"
+            ) || site.args.len() != 3
+            {
+                report.skipped.push(format!(
+                    "{label}: `SET_SPEED` site {} no longer has its verified three-argument shape",
+                    before.site
+                ));
+                return;
             }
-        }
-        if let Some(span) = site.args.get(2) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.speed_y) {
-                edits.push(edit);
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.speed_x) {
+                    edits.push(edit);
+                }
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited `SET_SPEED` values into the project's `game_` function.
-pub fn sync_speed(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::SetSpeedEvent],
-    edited: &[crate::data::SetSpeedEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_speed(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(2) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.speed_y) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The buildable `ADD_SPEED_NO_LIMIT` calls in source order.
@@ -7326,75 +9290,39 @@ pub fn rewrite_add_speed_no_limit(
     pristine: &[crate::data::AddSpeedNoLimitEvent],
     edited: &[crate::data::AddSpeedNoLimitEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = add_speed_no_limit_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `ADD_SPEED_NO_LIMIT` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `ADD_SPEED_NO_LIMIT` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `ADD_SPEED_NO_LIMIT` site {} was retimed from frame {} to {} — source syncing only retunes velocity values",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::AddSpeedNoLimitCall::FUNC || site.args.len() != 3 {
-            report.skipped.push(format!(
+    let shape = (
+        "`ADD_SPEED_NO_LIMIT`",
+        "`ADD_SPEED_NO_LIMIT`",
+        "retunes velocity values",
+        add_speed_no_limit_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::AddSpeedNoLimitCall::FUNC || site.args.len() != 3 {
+                report.skipped.push(format!(
                 "{label}: `ADD_SPEED_NO_LIMIT` site {} no longer has its verified three-argument shape",
                 before.site
             ));
-            continue;
-        }
-        // Slot 0 is `agent`; x and y are the following `ToF32` arguments.
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.speed_x) {
-                edits.push(edit);
+                return;
             }
-        }
-        if let Some(span) = site.args.get(2) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.speed_y) {
-                edits.push(edit);
+            // Slot 0 is `agent`; x and y are the following `ToF32` arguments.
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.speed_x) {
+                    edits.push(edit);
+                }
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited `ADD_SPEED_NO_LIMIT` values into the project's `game_` function.
-pub fn sync_add_speed_no_limit(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::AddSpeedNoLimitEvent],
-    edited: &[crate::data::AddSpeedNoLimitEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_add_speed_no_limit(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(2) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.speed_y) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The buildable `CORRECT` calls in source order.
@@ -7412,69 +9340,33 @@ pub fn rewrite_correct(
     pristine: &[crate::data::CorrectEvent],
     edited: &[crate::data::CorrectEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = correct_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `CORRECT` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `CORRECT` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `CORRECT` site {} was retimed from frame {} to {} — source syncing only retunes its authored kind token",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::CorrectCall::FUNC || site.args.len() != 2 {
-            report.skipped.push(format!(
-                "{label}: `CORRECT` site {} no longer has its verified two-argument shape",
-                before.site
-            ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.kind.trim()) {
-                edits.push(edit);
+    let shape = (
+        "`CORRECT`",
+        "`CORRECT`",
+        "retunes its authored kind token",
+        correct_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::CorrectCall::FUNC || site.args.len() != 2 {
+                report.skipped.push(format!(
+                    "{label}: `CORRECT` site {} no longer has its verified two-argument shape",
+                    before.site
+                ));
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited `CORRECT` kind tokens into the project's `game_` function.
-pub fn sync_correct(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::CorrectEvent],
-    edited: &[crate::data::CorrectEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_correct(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.kind.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The buildable `FT_CATCH_STOP` calls in source order.
@@ -7492,74 +9384,38 @@ pub fn rewrite_ft_catch_stop(
     pristine: &[crate::data::FtCatchStopEvent],
     edited: &[crate::data::FtCatchStopEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = ft_catch_stop_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `FT_CATCH_STOP` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `FT_CATCH_STOP` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `FT_CATCH_STOP` site {} was retimed from frame {} to {} — source syncing only retunes its two numeric arguments",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::FtCatchStopCall::FUNC || site.args.len() != 3 {
-            report.skipped.push(format!(
+    let shape = (
+        "`FT_CATCH_STOP`",
+        "`FT_CATCH_STOP`",
+        "retunes its two numeric arguments",
+        ft_catch_stop_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::FtCatchStopCall::FUNC || site.args.len() != 3 {
+                report.skipped.push(format!(
                 "{label}: `FT_CATCH_STOP` site {} no longer has its verified three-argument shape",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.arg1) {
-                edits.push(edit);
+                return;
             }
-        }
-        if let Some(span) = site.args.get(2) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.arg2) {
-                edits.push(edit);
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.arg1) {
+                    edits.push(edit);
+                }
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited `FT_CATCH_STOP` values into the project's `game_` function.
-pub fn sync_ft_catch_stop(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::FtCatchStopEvent],
-    edited: &[crate::data::FtCatchStopEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_ft_catch_stop(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(2) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.arg2) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The buildable `FT_START_ADJUST_MOTION_FRAME_arg1` calls in source order.
@@ -7675,81 +9531,45 @@ pub fn rewrite_motion_module_set_rate(
     pristine: &[crate::data::MotionModuleSetRateEvent],
     edited: &[crate::data::MotionModuleSetRateEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = motion_module_set_rate_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `MotionModule::set_rate` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_rate` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_rate` site {} was retimed from frame {} to {} — source syncing only retunes its numeric rate",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::MotionModuleSetRateCall::FUNC
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
-        {
-            report.skipped.push(format!(
+    let shape = (
+        "`MotionModule::set_rate`",
+        "`MotionModule::set_rate`",
+        "retunes its numeric rate",
+        motion_module_set_rate_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::MotionModuleSetRateCall::FUNC
+                || site.args.len() != 2
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
+            {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate` site {} no longer has its verified receiver/arity shape",
                 before.site
             ));
-            continue;
-        }
-        if !(now.call.rate.is_finite() && now.call.rate >= 0.0) {
-            report.skipped.push(format!(
+                return;
+            }
+            if !(now.call.rate.is_finite() && now.call.rate >= 0.0) {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate` site {} has a non-finite or negative rate — source syncing leaves the call intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.rate) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited direct `MotionModule::set_rate` values into the project's `game_` function.
-pub fn sync_motion_module_set_rate(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::MotionModuleSetRateEvent],
-    edited: &[crate::data::MotionModuleSetRateEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_motion_module_set_rate(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.rate) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The verified direct `MotionModule::set_helper_calculation` calls in source order.
@@ -7779,63 +9599,41 @@ pub fn rewrite_motion_module_set_helper_calculation(
     pristine: &[crate::data::MotionModuleSetHelperCalculationEvent],
     edited: &[crate::data::MotionModuleSetHelperCalculationEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = motion_module_set_helper_calculation_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `MotionModule::set_helper_calculation` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_helper_calculation` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_helper_calculation` site {} was retimed from frame {} to {} — source syncing only retunes its boolean value",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::MotionModuleSetHelperCalculationCall::FUNC
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| !matches!(value.trim(), "false" | "true"))
-        {
-            report.skipped.push(format!(
+    let shape = (
+        "`MotionModule::set_helper_calculation`",
+        "`MotionModule::set_helper_calculation`",
+        "retunes its boolean value",
+        motion_module_set_helper_calculation_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::MotionModuleSetHelperCalculationCall::FUNC
+                || site.args.len() != 2
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| !matches!(value.trim(), "false" | "true"))
+            {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_helper_calculation` site {} no longer has its verified receiver/arity/boolean shape",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = bool_edit(text, span, now.call.enabled) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = bool_edit(text, span, now.call.enabled) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// Sync edited helper-calculation booleans into the project's `game_` function.
@@ -7899,77 +9697,55 @@ pub fn rewrite_motion_module_set_rate_partial(
     pristine: &[crate::data::MotionModuleSetRatePartialEvent],
     edited: &[crate::data::MotionModuleSetRatePartialEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = motion_module_set_rate_partial_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `MotionModule::set_rate_partial` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_rate_partial` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_rate_partial` site {} was retimed from frame {} to {} — source syncing only retunes its numeric rate",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        if before.call.part_kind != now.call.part_kind {
-            report.skipped.push(format!(
+    let shape = (
+        "`MotionModule::set_rate_partial`",
+        "`MotionModule::set_rate_partial`",
+        "retunes its numeric rate",
+        motion_module_set_rate_partial_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if before.call.part_kind != now.call.part_kind {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate_partial` site {} changed part kind — source syncing only retunes its numeric rate",
                 before.site
             ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::MotionModuleSetRatePartialCall::FUNC
-            || site.args.len() != 3
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| value.trim() != before.call.part_kind.trim())
-        {
-            report.skipped.push(format!(
+                return;
+            }
+            if site.name != crate::data::MotionModuleSetRatePartialCall::FUNC
+                || site.args.len() != 3
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| value.trim() != before.call.part_kind.trim())
+            {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate_partial` site {} no longer has its verified receiver/part-kind/arity shape",
                 before.site
             ));
-            continue;
-        }
-        if !(now.call.rate.is_finite() && now.call.rate >= 0.0) {
-            report.skipped.push(format!(
+                return;
+            }
+            if !(now.call.rate.is_finite() && now.call.rate >= 0.0) {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate_partial` site {} has a non-finite or negative rate — source syncing leaves the call intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(2) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.rate) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
+            if let Some(span) = site.args.get(2) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.rate) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// Sync edited direct `MotionModule::set_rate_partial` values into the project's `game_` function.
@@ -8054,89 +9830,67 @@ pub fn rewrite_motion_module_set_frame_partial(
     pristine: &[crate::data::MotionModuleSetFramePartialEvent],
     edited: &[crate::data::MotionModuleSetFramePartialEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = motion_module_set_frame_partial_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `MotionModule::set_frame_partial` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_frame_partial` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `MotionModule::set_frame_partial` site {} was retimed from frame {} to {} — source syncing only retunes its seek frame and sync flag",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        if before.call.part_kind != now.call.part_kind {
-            report.skipped.push(format!(
+    let shape = (
+        "`MotionModule::set_frame_partial`",
+        "`MotionModule::set_frame_partial`",
+        "retunes its seek frame and sync flag",
+        motion_module_set_frame_partial_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if before.call.part_kind != now.call.part_kind {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_frame_partial` site {} changed part kind — source syncing only retunes its seek frame and sync flag",
                 before.site
             ));
-            continue;
-        }
-        if before.call.sync.is_some() != now.call.sync.is_some() {
-            report.skipped.push(format!(
+                return;
+            }
+            if before.call.sync.is_some() != now.call.sync.is_some() {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_frame_partial` site {} added or removed its `sync` argument — source syncing does not change a call's arity",
                 before.site
             ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::MotionModuleSetFramePartialCall::FUNC
-            || site.args.len() != usize::from(before.call.sync.is_some()) + 3
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| value.trim() != before.call.part_kind.trim())
-        {
-            report.skipped.push(format!(
+                return;
+            }
+            if site.name != crate::data::MotionModuleSetFramePartialCall::FUNC
+                || site.args.len() != usize::from(before.call.sync.is_some()) + 3
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| value.trim() != before.call.part_kind.trim())
+            {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_frame_partial` site {} no longer has its verified receiver/part-kind/arity shape",
                 before.site
             ));
-            continue;
-        }
-        if !(now.call.frame.is_finite() && now.call.frame >= 0.0) {
-            report.skipped.push(format!(
+                return;
+            }
+            if !(now.call.frame.is_finite() && now.call.frame >= 0.0) {
+                report.skipped.push(format!(
                 "{label}: `MotionModule::set_frame_partial` site {} has a non-finite or negative seek frame — source syncing leaves the call intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(2) {
-            if let Some(edit) = to_f32_edit(text, span, now.call.frame) {
-                edits.push(edit);
+                return;
             }
-        }
-        if let (Some(span), Some(sync)) = (site.args.get(3), now.call.sync) {
-            if let Some(edit) = bool_edit(text, span, sync) {
-                edits.push(edit);
+            if let Some(span) = site.args.get(2) {
+                if let Some(edit) = to_f32_edit(text, span, now.call.frame) {
+                    edits.push(edit);
+                }
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
+            if let (Some(span), Some(sync)) = (site.args.get(3), now.call.sync) {
+                if let Some(edit) = bool_edit(text, span, sync) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// Sync edited direct `MotionModule::set_frame_partial` values into the project's `game_`
@@ -8202,80 +9956,44 @@ pub fn rewrite_clr_speed(
     pristine: &[crate::data::ClrSpeedEvent],
     edited: &[crate::data::ClrSpeedEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = clr_speed_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `CLR_SPEED` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `CLR_SPEED` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `CLR_SPEED` site {} was retimed from frame {} to {} — source syncing only retunes its authored kinetic token",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if !matches!(
-            site.name.as_str(),
-            crate::data::ClrSpeedCall::FUNC | "visionary_clr_speed"
-        ) || site.args.len() != 2
-        {
-            report.skipped.push(format!(
-                "{label}: `CLR_SPEED` site {} no longer has its verified two-argument shape",
-                before.site
-            ));
-            continue;
-        }
-        if now.call.kinetic_kind.trim().is_empty() {
-            report.skipped.push(format!(
+    let shape = (
+        "`CLR_SPEED`",
+        "`CLR_SPEED`",
+        "retunes its authored kinetic token",
+        clr_speed_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if !matches!(
+                site.name.as_str(),
+                crate::data::ClrSpeedCall::FUNC | "visionary_clr_speed"
+            ) || site.args.len() != 2
+            {
+                report.skipped.push(format!(
+                    "{label}: `CLR_SPEED` site {} no longer has its verified two-argument shape",
+                    before.site
+                ));
+                return;
+            }
+            if now.call.kinetic_kind.trim().is_empty() {
+                report.skipped.push(format!(
                 "{label}: `CLR_SPEED` site {} has an empty kinetic kind — source syncing leaves the authored token intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.kinetic_kind.trim()) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited `CLR_SPEED` kinetic tokens into the project's `game_` function.
-pub fn sync_clr_speed(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::ClrSpeedEvent],
-    edited: &[crate::data::ClrSpeedEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_clr_speed(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.kinetic_kind.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// Whether a direct `KineticModule::change_kinetic` receiver is one of the measured source forms.
@@ -8306,86 +10024,50 @@ pub fn rewrite_change_kinetic(
     pristine: &[crate::data::ChangeKineticEvent],
     edited: &[crate::data::ChangeKineticEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = change_kinetic_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `KineticModule::change_kinetic` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `KineticModule::change_kinetic` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `KineticModule::change_kinetic` site {} was retimed from frame {} to {} — source syncing only retunes its authored kinetic token",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::ChangeKineticCall::FUNC || site.args.len() != 2 {
-            report.skipped.push(format!(
+    let shape = (
+        "`KineticModule::change_kinetic`",
+        "`KineticModule::change_kinetic`",
+        "retunes its authored kinetic token",
+        change_kinetic_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::ChangeKineticCall::FUNC || site.args.len() != 2 {
+                report.skipped.push(format!(
                 "{label}: `KineticModule::change_kinetic` site {} no longer has its verified two-argument shape",
                 before.site
             ));
-            continue;
-        }
-        if site
-            .arg(text, 0)
-            .is_none_or(|value| !is_change_kinetic_receiver(value))
-        {
-            report.skipped.push(format!(
+                return;
+            }
+            if site
+                .arg(text, 0)
+                .is_none_or(|value| !is_change_kinetic_receiver(value))
+            {
+                report.skipped.push(format!(
                 "{label}: `KineticModule::change_kinetic` site {} no longer targets a measured module receiver",
                 before.site
             ));
-            continue;
-        }
-        if now.call.kinetic_type.trim().is_empty() {
-            report.skipped.push(format!(
+                return;
+            }
+            if now.call.kinetic_type.trim().is_empty() {
+                report.skipped.push(format!(
                 "{label}: `KineticModule::change_kinetic` site {} has an empty kinetic type — source syncing leaves the authored token intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.kinetic_type.trim()) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited kinetic-type tokens into the project's `game_` function.
-pub fn sync_change_kinetic(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::ChangeKineticEvent],
-    edited: &[crate::data::ChangeKineticEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_change_kinetic(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.kinetic_type.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// Whether a direct kinetic-energy receiver is one of the measured source forms.
@@ -8425,91 +10107,55 @@ pub fn rewrite_kinetic_energy(
     pristine: &[crate::data::KineticEnergyEvent],
     edited: &[crate::data::KineticEnergyEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = kinetic_energy_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable direct kinetic-energy call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: direct kinetic-energy site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: direct kinetic-energy site {} was retimed from frame {} to {} — source syncing only retunes its authored ID token",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        if before.call.action != now.call.action {
-            report.skipped.push(format!(
+    let shape = (
+        "direct kinetic-energy",
+        "direct kinetic-energy",
+        "retunes its authored ID token",
+        kinetic_energy_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if before.call.action != now.call.action {
+                report.skipped.push(format!(
                 "{label}: direct kinetic-energy site {} changed between suspend and resume — source syncing preserves the authored operation",
                 before.site
             ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != before.call.func()
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !is_kinetic_energy_receiver(value))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| value.trim().is_empty())
-        {
-            report.skipped.push(format!(
+                return;
+            }
+            if site.name != before.call.func()
+                || site.args.len() != 2
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !is_kinetic_energy_receiver(value))
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| value.trim().is_empty())
+            {
+                report.skipped.push(format!(
                 "{label}: direct kinetic-energy site {} no longer has its verified receiver/operation/ID shape",
                 before.site
             ));
-            continue;
-        }
-        if now.call.kinetic_energy_id.trim().is_empty() {
-            report.skipped.push(format!(
+                return;
+            }
+            if now.call.kinetic_energy_id.trim().is_empty() {
+                report.skipped.push(format!(
                 "{label}: direct kinetic-energy site {} has an empty energy ID — source syncing leaves the authored token intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.kinetic_energy_id.trim()) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited direct kinetic-energy IDs into the project's `game_` function.
-pub fn sync_kinetic_energy(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::KineticEnergyEvent],
-    edited: &[crate::data::KineticEnergyEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_kinetic_energy(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.kinetic_energy_id.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 fn valid_work_flag_token(value: &str) -> bool {
@@ -8578,91 +10224,55 @@ pub fn rewrite_work_flags(
     pristine: &[crate::data::WorkFlagEvent],
     edited: &[crate::data::WorkFlagEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = work_flag_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable direct WorkModule flag call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: WorkModule flag site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: WorkModule flag site {} was retimed from frame {} to {} — source syncing only retunes its authored flag token",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        if before.call.action != now.call.action {
-            report.skipped.push(format!(
+    let shape = (
+        "direct WorkModule flag",
+        "WorkModule flag",
+        "retunes its authored flag token",
+        work_flag_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if before.call.action != now.call.action {
+                report.skipped.push(format!(
                 "{label}: WorkModule flag site {} changed between on_flag and off_flag — source syncing preserves the authored operation",
                 before.site
             ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != before.call.func()
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| value.trim() != before.call.flag.trim())
-        {
-            report.skipped.push(format!(
+                return;
+            }
+            if site.name != before.call.func()
+                || site.args.len() != 2
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| value.trim() != before.call.flag.trim())
+            {
+                report.skipped.push(format!(
                 "{label}: WorkModule flag site {} no longer has its verified receiver/operation/flag shape",
                 before.site
             ));
-            continue;
-        }
-        if !valid_work_flag_token(&now.call.flag) {
-            report.skipped.push(format!(
+                return;
+            }
+            if !valid_work_flag_token(&now.call.flag) {
+                report.skipped.push(format!(
                 "{label}: WorkModule flag site {} has an unsupported or empty flag token — source syncing leaves the authored token intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.flag.trim()) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited WorkModule flag tokens into the project's `game_` function.
-pub fn sync_work_flags(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::WorkFlagEvent],
-    edited: &[crate::data::WorkFlagEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_work_flags(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.flag.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// Return whether a direct transition-term operation uses a measured receiver spelling.
@@ -8709,91 +10319,63 @@ pub fn rewrite_work_transition_terms(
     pristine: &[crate::data::WorkTransitionTermEvent],
     edited: &[crate::data::WorkTransitionTermEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = work_transition_term_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable direct WorkModule transition-term call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: WorkModule transition-term site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: WorkModule transition-term site {} was retimed from frame {} to {} — source syncing only retunes its authored transition term",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        if before.call.action != now.call.action {
-            report.skipped.push(format!(
+    let shape = (
+        "direct WorkModule transition-term",
+        "WorkModule transition-term",
+        "retunes its authored transition term",
+        work_transition_term_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if before.call.action != now.call.action {
+                report.skipped.push(format!(
                 "{label}: WorkModule transition-term site {} changed between enable and unable — source syncing preserves the authored operation",
                 before.site
             ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != before.call.func()
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !valid_work_transition_term_receiver(&site.name, value.trim()))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| value.trim() != before.call.transition_term.trim())
-        {
-            report.skipped.push(format!(
+                return;
+            }
+            if before.call.receiver != now.call.receiver {
+                report.skipped.push(format!(
+                "{label}: WorkModule transition-term site {} changed receiver — source syncing preserves the authored receiver",
+                before.site
+            ));
+                return;
+            }
+            if site.name != before.call.func()
+                || site.args.len() != 2
+                || site.arg(text, 0).is_none_or(|value| {
+                    value.trim() != before.call.receiver.token()
+                        || !valid_work_transition_term_receiver(&site.name, value.trim())
+                })
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| value.trim() != before.call.transition_term.trim())
+            {
+                report.skipped.push(format!(
                 "{label}: WorkModule transition-term site {} no longer has its verified receiver/operation/term shape",
                 before.site
             ));
-            continue;
-        }
-        if !valid_work_flag_token(&now.call.transition_term) {
-            report.skipped.push(format!(
+                return;
+            }
+            if !valid_work_flag_token(&now.call.transition_term) {
+                report.skipped.push(format!(
                 "{label}: WorkModule transition-term site {} has an unsupported or empty transition term — source syncing leaves the authored token intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.transition_term.trim()) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited WorkModule transition-term tokens into the project's `game_` function.
-pub fn sync_work_transition_terms(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::WorkTransitionTermEvent],
-    edited: &[crate::data::WorkTransitionTermEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_work_transition_terms(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.transition_term.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The verified direct `WorkModule::inc_int` calls in source order. Standard scripts use
@@ -8818,84 +10400,48 @@ pub fn rewrite_work_module_inc_int(
     pristine: &[crate::data::WorkModuleIncIntEvent],
     edited: &[crate::data::WorkModuleIncIntEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = work_module_inc_int_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable direct WorkModule::inc_int call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: WorkModule::inc_int site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: WorkModule::inc_int site {} was retimed from frame {} to {} — source syncing only retunes its authored slot",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::WorkModuleIncIntCall::FUNC
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
-            || site
-                .arg(text, 1)
-                .is_none_or(|value| value.trim() != before.call.slot.trim())
-        {
-            report.skipped.push(format!(
+    let shape = (
+        "direct WorkModule::inc_int",
+        "WorkModule::inc_int",
+        "retunes its authored slot",
+        work_module_inc_int_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::WorkModuleIncIntCall::FUNC
+                || site.args.len() != 2
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
+                || site
+                    .arg(text, 1)
+                    .is_none_or(|value| value.trim() != before.call.slot.trim())
+            {
+                report.skipped.push(format!(
                 "{label}: WorkModule::inc_int site {} no longer has its verified receiver/arity/slot shape",
                 before.site
             ));
-            continue;
-        }
-        if !valid_work_flag_token(&now.call.slot) {
-            report.skipped.push(format!(
+                return;
+            }
+            if !valid_work_flag_token(&now.call.slot) {
+                report.skipped.push(format!(
                 "{label}: WorkModule::inc_int site {} has an unsupported or empty slot token — source syncing leaves the authored call intact",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            if let Some(edit) = text_edit(text, span, now.call.slot.trim()) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited direct `WorkModule::inc_int` slot tokens into the project's `game_` function.
-pub fn sync_work_module_inc_int(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::WorkModuleIncIntEvent],
-    edited: &[crate::data::WorkModuleIncIntEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_work_module_inc_int(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                if let Some(edit) = text_edit(text, span, now.call.slot.trim()) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The verified direct `WorkModule::set_int` / `set_float` / `set_int64` calls in source order.
@@ -8994,6 +10540,15 @@ pub fn rewrite_work_module_sets(
             ));
             continue;
         }
+        if before.call.receiver.trim() != now.call.receiver.trim() {
+            report.skipped.push(format!(
+                "{label}: WorkModule set site {} changed receiver from {:?} to {:?} — source syncing preserves the authored receiver",
+                before.site,
+                before.call.receiver.trim(),
+                now.call.receiver.trim()
+            ));
+            continue;
+        }
         let Some(site) = sites.get(index) else {
             continue;
         };
@@ -9042,20 +10597,6 @@ pub fn rewrite_work_module_sets(
     }
     report.changed = edits.len();
     Ok((apply(text, edits), report))
-}
-
-/// Sync edited WorkModule value setters into the project's `game_` function.
-pub fn sync_work_module_sets(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::WorkModuleSetEvent],
-    edited: &[crate::data::WorkModuleSetEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_work_module_sets(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
 }
 
 /// Whether a direct `KineticModule::add_speed` receiver is one of the measured source forms.
@@ -9129,83 +10670,47 @@ pub fn rewrite_kinetic_add_speed(
     pristine: &[crate::data::KineticAddSpeedEvent],
     edited: &[crate::data::KineticAddSpeedEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = kinetic_add_speed_sites(text);
-    let mut report = SyncReport::default();
-    if pristine.len() != sites.len() || edited.len() != pristine.len() {
-        report.skipped.push(format!(
-            "{label}: source has {} buildable `KineticModule::add_speed` call(s), while the editor has {} pristine and {} edited point(s) — malformed or looped calls are source-only",
-            sites.len(),
-            pristine.len(),
-            edited.len()
-        ));
-        return Ok((text.to_string(), report));
-    }
-
-    let mut edits = Vec::new();
-    for (index, (before, now)) in pristine.iter().zip(edited).enumerate() {
-        if before == now {
-            continue;
-        }
-        if before.site != index || now.site != index {
-            report.skipped.push(format!(
-                "{label}: `KineticModule::add_speed` site {} does not match the flat source order — source syncing refuses positional guessing",
-                before.site
-            ));
-            continue;
-        }
-        if before.frame != now.frame {
-            report.skipped.push(format!(
-                "{label}: `KineticModule::add_speed` site {} was retimed from frame {} to {} — source syncing only retunes its authored vector",
-                before.site, before.frame, now.frame
-            ));
-            continue;
-        }
-        let Some(site) = sites.get(index) else {
-            continue;
-        };
-        if site.name != crate::data::KineticAddSpeedCall::FUNC
-            || site.args.len() != 2
-            || site
-                .arg(text, 0)
-                .is_none_or(|value| !is_kinetic_add_speed_receiver(value))
-            || site
-                .arg(text, 1)
-                .and_then(parse_source_zero_z_vector)
-                .is_none()
-        {
-            report.skipped.push(format!(
+    let shape = (
+        "`KineticModule::add_speed`",
+        "`KineticModule::add_speed`",
+        "retunes its authored vector",
+        kinetic_add_speed_sites(text),
+    );
+    rewrite_points(
+        text,
+        label,
+        shape,
+        pristine,
+        edited,
+        |site, before, now, report, edits| {
+            if site.name != crate::data::KineticAddSpeedCall::FUNC
+                || site.args.len() != 2
+                || site
+                    .arg(text, 0)
+                    .is_none_or(|value| !is_kinetic_add_speed_receiver(value))
+                || site
+                    .arg(text, 1)
+                    .and_then(parse_source_zero_z_vector)
+                    .is_none()
+            {
+                report.skipped.push(format!(
                 "{label}: `KineticModule::add_speed` site {} no longer has its verified receiver/vector shape",
                 before.site
             ));
-            continue;
-        }
-        if let Some(span) = site.args.get(1) {
-            let value = format!(
-                "&Vector3f{{x: {}, y: {}, z: 0.0}}",
-                crate::acmd::num(now.call.speed_x),
-                crate::acmd::num(now.call.speed_y)
-            );
-            if let Some(edit) = text_edit(text, span, &value) {
-                edits.push(edit);
+                return;
             }
-        }
-    }
-    report.changed = edits.len();
-    Ok((apply(text, edits), report))
-}
-
-/// Sync edited direct kinetic-vector additions into the project's `game_` function.
-pub fn sync_kinetic_add_speed(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::KineticAddSpeedEvent],
-    edited: &[crate::data::KineticAddSpeedEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_kinetic_add_speed(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
+            if let Some(span) = site.args.get(1) {
+                let value = format!(
+                    "&Vector3f{{x: {}, y: {}, z: 0.0}}",
+                    crate::acmd::num(now.call.speed_x),
+                    crate::acmd::num(now.call.speed_y)
+                );
+                if let Some(edit) = text_edit(text, span, &value) {
+                    edits.push(edit);
+                }
+            }
+        },
+    )
 }
 
 /// The measured direct `KineticModule::set_consider_ground_friction` calls in source order.
@@ -9833,20 +11338,6 @@ pub fn rewrite_kinetic_clear_speed_all(
     Ok((updated, report))
 }
 
-/// Sync edited direct `KineticModule::clear_speed_all` points into the project's `game_` function.
-pub fn sync_kinetic_clear_speed_all(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::KineticClearSpeedAllEvent],
-    edited: &[crate::data::KineticClearSpeedAllEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_kinetic_clear_speed_all(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
-}
-
 /// Rewrite `SET_AIR` presence and frame placement in a flat `game_` function.
 pub fn rewrite_set_air(
     text: &str,
@@ -9937,20 +11428,6 @@ pub fn rewrite_set_air(
     Ok((updated, report))
 }
 
-/// Sync edited `SET_AIR` points into the project's `game_` function.
-pub fn sync_set_air(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::SetAirEvent],
-    edited: &[crate::data::SetAirEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_set_air(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
-}
-
 // ── Facing-direction point write-back ───────────────────────────────────────
 
 /// The exact argument-less `REVERSE_LR` calls in a source function.
@@ -10024,14 +11501,14 @@ fn frame_literal(line: &str) -> Option<f32> {
     line[comma + 1..end].trim().parse().ok()
 }
 
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
+pub(crate) fn matching_brace(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = open;
     while i < bytes.len() {
-        // A brace inside a comment or a string is not structure: `// if is_excute(agent) {`
-        // left in a body used to swallow the real block that closes after it.
-        if let Some(next) = skip_trivia(text, i) {
+        // A brace inside a comment, a string or a raw string is not structure:
+        // `// if is_excute(agent) {` left in a body used to swallow the real block after it.
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
             i = next;
             continue;
         }
@@ -10046,6 +11523,63 @@ fn matching_brace(text: &str, open: usize) -> Option<usize> {
             _ => {}
         }
         i += 1;
+    }
+    None
+}
+
+/// Skip Rust comments and literals while finding lexical block boundaries. In particular,
+/// braces inside raw strings must not change the nesting depth used by source-site ownership.
+pub(crate) fn skip_rust_literal_or_comment(text: &str, i: usize) -> Option<usize> {
+    let rest = text.get(i..)?;
+    if rest.starts_with("//") {
+        return skip_trivia(text, i);
+    }
+    if rest.starts_with("/*") {
+        return skip_trivia(text, i);
+    }
+
+    let bytes = rest.as_bytes();
+    // Raw strings have zero or more `#` markers between `r` and the opening quote.
+    let raw_prefix = if bytes.first() == Some(&b'r') {
+        Some(1)
+    } else if bytes.starts_with(b"br") {
+        Some(2)
+    } else {
+        None
+    };
+    if let Some(prefix) = raw_prefix {
+        let hashes = bytes[prefix..]
+            .iter()
+            .take_while(|byte| **byte == b'#')
+            .count();
+        let quote = prefix + hashes;
+        if bytes.get(quote) == Some(&b'\"') {
+            let terminator = format!("\"{}", "#".repeat(hashes));
+            let after_open = i + quote + 1;
+            let end = text[after_open..]
+                .find(&terminator)
+                .map(|offset| after_open + offset + terminator.len())
+                .unwrap_or(text.len());
+            return Some(end);
+        }
+    }
+
+    let quote_at = if bytes.starts_with(b"br\"") || bytes.starts_with(b"rb\"") {
+        Some(2)
+    } else if bytes.starts_with(b"b\"") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(quote_at) = quote_at {
+        return Some(i + quote_at + string_literal_len(&rest[quote_at..]));
+    }
+
+    if rest.starts_with('"') {
+        return Some(i + string_literal_len(rest));
+    }
+    if rest.starts_with('\'') {
+        return char_literal_len(rest).map(|len| i + len);
     }
     None
 }
@@ -10558,20 +12092,6 @@ pub fn rewrite_reverse_lr(
     Ok((updated, report))
 }
 
-/// Sync edited `REVERSE_LR` points into the project's `game_` function.
-pub fn sync_reverse_lr(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::ReverseLrEvent],
-    edited: &[crate::data::ReverseLrEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("game", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_reverse_lr(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
-}
-
 // ── Expression write-back ───────────────────────────────────────────────────
 
 /// The measured expression calls in source order, with the leading `agent` included in the
@@ -10704,20 +12224,6 @@ pub fn rewrite_expressions(
 
     report.changed = edits.len();
     Ok((apply(text, edits), report))
-}
-
-/// Write measured expression arguments back into the project's own `expression_` function.
-pub fn sync_expressions(
-    index: &SourceIndex,
-    fighter: &str,
-    move_name: &str,
-    pristine: &[crate::data::ExpressionEvent],
-    edited: &[crate::data::ExpressionEvent],
-) -> Result<SyncReport> {
-    let script_name = crate::acmd::acmd_script_name("expression", move_name);
-    sync_script(index, fighter, &script_name, |body| {
-        rewrite_expressions(body, &format!("{fighter}/{move_name}"), pristine, edited)
-    })
 }
 
 // ── Sound write-back ─────────────────────────────────────────────────────────
@@ -11310,6 +12816,47 @@ pub(super) fn install(agent: &mut Agent) {
 }
 "#;
 
+    /// The Effects page reads which moves play a moveset's own effects from these bodies:
+    /// the fighter's scripts and its objects', and nobody else's.
+    #[test]
+    fn script_bodies_cover_the_fighter_and_its_objects_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/pacman/acmd.rs",
+            r#"unsafe extern "C" fn effect_attack_lw3(agent: &mut L2CAgentBase) {
+    EFFECT(agent, Hash40::new("carrot_pull"), Hash40::new("top"), 0, 0, 6.8, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, true);
+}
+unsafe extern "C" fn effect_hop(agent: &mut L2CAgentBase) {
+    macros::EFFECT_FOLLOW(agent, Hash40::new("fryguy_fire"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 4.4, true);
+}
+unsafe extern "C" fn effect_win(agent: &mut L2CAgentBase) {
+    macros::EFFECT(agent, Hash40::new("mario_only"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+}
+pub fn install() {
+    Agent::new("pacman").acmd("effect_attacklw3", effect_attack_lw3, Priority::Low).install();
+    Agent::new("pacman_bigpacman").acmd("effect_specialnhop", effect_hop, Priority::Low).install();
+    Agent::new("mario").acmd("effect_win1", effect_win, Priority::Low).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let bodies = index.fighter_script_bodies("pacman");
+        let found: Vec<(&str, &str)> = bodies
+            .iter()
+            .map(|(agent, script, _)| (agent.as_str(), script.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("pacman", "effect_attacklw3"),
+                ("pacman_bigpacman", "effect_specialnhop")
+            ]
+        );
+        assert!(bodies[0].2.contains("carrot_pull"), "{}", bodies[0].2);
+        assert!(bodies[1].2.contains("fryguy_fire"), "{}", bodies[1].2);
+    }
+
     fn shared_smash_project(acmd: &str) -> (tempfile::TempDir, SourceIndex) {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "src/pacman/acmd/smashes.rs", acmd);
@@ -11593,6 +13140,206 @@ pub(super) fn install(agent: &mut Agent) {
         assert!(std::fs::read_to_string(script_file)
             .unwrap()
             .contains("6.0"));
+    }
+
+    /// Empoleon's layout: the module is named for the mod (`emperte/`), not the fighter it
+    /// plays on; the ACMD folder also declares Falco's articles; the mod's folder hooks the
+    /// `common` agent. None of that may take Falco's own scripts away from him.
+    #[test]
+    fn a_module_named_for_the_mod_still_belongs_to_its_base_fighter() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            r#"mod emperte;
+pub fn main() {
+    let agent = &mut Agent::new("falco");
+    emperte::install(agent);
+    agent.install();
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/mod.rs",
+            "mod acmd;\nmod vars;\npub fn install(agent: &mut Agent) { acmd::install(agent); }\n",
+        );
+        write(
+            tmp.path(),
+            "src/emperte/vars.rs",
+            "pub fn install() { Agent::new(\"common\").on_line(Main, hook).install(); }\n",
+        );
+        write(
+            tmp.path(),
+            "src/emperte/acmd/mod.rs",
+            "mod aerials;\nmod specials;\npub fn install(agent: &mut Agent) { aerials::install(agent); specials::install(agent); }\n",
+        );
+        let aerials = write(
+            tmp.path(),
+            "src/emperte/acmd/aerials.rs",
+            r#"unsafe extern "C" fn game_attackairb(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_attackairb", game_attackairb, Priority::Low);
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/acmd/specials.rs",
+            r#"unsafe extern "C" fn game_specialnstart(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 3.0);
+}
+unsafe extern "C" fn game_fly(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_specialnstart", game_specialnstart, Priority::Low);
+    Agent::new("falco_cannon").acmd("game_fly", game_fly, Priority::Low).install();
+    Agent::new("falco_arwing").install();
+}
+"#,
+        );
+
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]
+name = \"empoleon\"
+
+[lib]
+crate-type = [\"cdylib\"]
+",
+        );
+        // A backup crate kept beside the live one; cargo never builds it.
+        write(tmp.path(), "plugin(old)/Cargo.toml", "[package]
+name = \"empoleon\"
+");
+        write(tmp.path(), "plugin(old)/src/lib.rs", "mod aerials;
+");
+        write(
+            tmp.path(),
+            "plugin(old)/src/aerials.rs",
+            "unsafe extern \"C\" fn game_attackairb(agent: &mut L2CAgentBase) {}
+",
+        );
+
+        // Linked at the moveset, its crate's `src/`, or the mod's own folder: the folder
+        // linked inside the crate is told it is Falco's only by `src/lib.rs` above it.
+        for linked in ["", "src", "src/emperte"] {
+            let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
+            assert_eq!(
+                index.script("falco", "game_attackairb").unwrap().file,
+                aerials,
+                "linked at {linked:?}"
+            );
+            assert!(index.script("falco", "game_specialnstart").is_some(), "linked at {linked:?}");
+            assert!(index.script("falco_cannon", "game_fly").is_some(), "linked at {linked:?}");
+            assert!(index.script("falco_cannon", "game_attackairb").is_none(), "linked at {linked:?}");
+            assert!(!index.has_fighter("common"), "linked at {linked:?}");
+            assert!(index.conflicts.is_empty(), "linked at {linked:?}");
+        }
+    }
+
+    /// Empoleon installs Falco's agent narrowed to its own costumes, through a rebinding:
+    /// `let agent = agent.set_costume(…)`. Its scripts are Empoleon's slots', not Falco's own,
+    /// wherever the folder is linked — the gating is read from the crate root above it.
+    #[test]
+    fn a_costume_narrowed_agent_marks_its_fighter_costume_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]
+name = \"empoleon\"
+
+[lib]
+crate-type = [\"cdylib\"]
+",
+        );
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            r#"mod emperte;
+pub fn main() {
+    // let other = Agent::new("mario").set_costume(all.to_vec());
+    let agent_emperte = &mut Agent::new("falco");
+    let agent_emperte = agent_emperte.set_costume(costume.to_vec());
+    emperte::install(agent_emperte);
+    agent_emperte.install();
+    Agent::new("falco_cannon").install();
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/mod.rs",
+            r#"unsafe extern "C" fn game_attackairb(agent: &mut L2CAgentBase) {}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_attackairb", game_attackairb, Priority::Low);
+}
+"#,
+        );
+        for linked in ["", "src", "src/emperte"] {
+            let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
+            assert!(index.is_costume_gated("falco"), "linked at {linked:?}");
+            assert!(index.is_costume_gated("fighter_falco"), "attribute spelling");
+            assert!(!index.is_costume_gated("falco_cannon"), "linked at {linked:?}");
+            assert!(!index.is_costume_gated("mario"), "a commented-out line is not code");
+            assert!(index.script("falco", "game_attackairb").is_some(), "linked at {linked:?}");
+        }
+    }
+
+    #[test]
+    fn costume_gating_reads_chains_and_stays_inside_the_binding() {
+        let gating = scan_agent_gating(
+            r#"pub fn a() {
+    Agent::new("falco")
+        .set_costume(costume.to_vec())
+        .acmd("game_attack11", attack11, Priority::Low)
+        .install();
+}
+pub fn b() {
+    let agent = &mut Agent::new("mario");
+    agent.install();
+}
+pub fn c() {
+    let agent = &mut Agent::new("luigi");
+    agent.set_costume(slots);
+    agent.install();
+}
+pub fn d() -> Agent { Agent::new("pikachu").set_costume(slots) }
+pub fn e() { let x = Agent::new("common"); x.set_costume(slots); }
+"#,
+        );
+        assert_eq!(
+            gating,
+            vec![
+                ("falco".to_string(), true),
+                ("mario".to_string(), false),
+                ("luigi".to_string(), true),
+                ("pikachu".to_string(), true),
+            ]
+        );
+    }
+
+    /// One agent for every costume beside a narrowed one modifies the fighter's own slots too.
+    #[test]
+    fn an_ungated_agent_beside_a_gated_one_is_not_costume_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "acmd.rs",
+            r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco").set_costume(slots).acmd("game_attack11", game_attack11, Priority::Low).install();
+    Agent::new("falco").on_start(start).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert!(!index.is_costume_gated("falco"));
     }
 
     /// A project whose functions are named for the mod, not the script, has to read the same
@@ -12485,6 +14232,225 @@ visionary_set_speed(agent, 9, 10);
     }
 
     #[test]
+    fn native_effect_control_ordinals_keep_a_later_spawn_and_control_retime_aligned() {
+        let source = r###"unsafe extern "C" fn effect_native_control(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        EffectModule::set_disable_render_offset_last(agent.module_accessor);
+    }
+    frame(agent.lua_state_agent, 8.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_second"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"###;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(pristine.len(), 3);
+        assert_eq!(
+            spawn_site_names(source),
+            vec![
+                "EFFECT_FOLLOW".to_string(),
+                "EffectModule::set_disable_render_offset_last".to_string(),
+                "EFFECT_FOLLOW".to_string(),
+            ]
+        );
+
+        let mut edited = pristine.clone();
+        edited[1].active_start = 7;
+        edited[2].offset[0] = 4.0;
+        let (after, report) =
+            rewrite_effect_calls(source, "test/native_effect_control", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert!(
+            report.changed >= 2,
+            "expected retime and transform: {report:?}"
+        );
+        assert!(
+            after.contains("EffectModule::set_disable_render_offset_last(agent.module_accessor);")
+        );
+        assert!(
+            after.contains("Hash40::new(\"sys_second\"), Hash40::new(\"top\"), 4.0, 0, 0"),
+            "{after}"
+        );
+        let reparsed = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert_eq!(reparsed.len(), 3);
+        assert_eq!(reparsed[1].active_start, 7);
+        assert_eq!(reparsed[2].offset[0], 4.0);
+    }
+
+    #[test]
+    fn native_effect_control_scanner_matches_only_direct_typed_statements_for_ordinals() {
+        let source = r###"unsafe extern "C" fn effect_native_control_shapes(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        EffectModule::set_disable_render_offset_last(agent.module_accessor);
+        EffectModule::enable_sync_init_pos_last();
+        EffectModule::set_disable_render_offset_last(boma);
+        EffectModule::enable_sync_init_pos_last(agent.module_accessor, 0);
+        EffectModule::set_disable_render_offset_last(agent.module_accessor );
+        if custom_effect_guard(agent) {
+            EffectModule::set_disable_render_offset_last(agent.module_accessor);
+        }
+        // EffectModule::enable_sync_init_pos_last(agent.module_accessor);
+        let _literal = r#"EffectModule::enable_sync_init_pos_last(agent.module_accessor);"#;
+    }
+
+    EffectModule::enable_sync_init_pos_last(agent.module_accessor);
+}
+"###;
+        let parsed = crate::acmd::parse_effect_script(source);
+        assert_eq!(parsed.call_macro_ordinals(), vec![0]);
+        assert_eq!(
+            spawn_site_names(source),
+            vec!["EffectModule::set_disable_render_offset_last".to_string()]
+        );
+        let native_sites = native_effect_control_sites(source);
+        assert_eq!(
+            native_sites.len(),
+            7,
+            "comments and string contents are not call sites: {native_sites:#?}"
+        );
+        let opaque_two_arg = native_sites
+            .iter()
+            .find(|site| {
+                site.name == "EffectModule::enable_sync_init_pos_last" && site.args.len() == 2
+            })
+            .expect("the opaque two-argument source site is still visible to move safety");
+        assert!(all_effect_source_sites(source)
+            .iter()
+            .any(|site| site.span == opaque_two_arg.span));
+        assert_eq!(
+            spawn_site_names(source).len(),
+            1,
+            "nested, malformed, and bare native calls must not consume call ordinals"
+        );
+    }
+
+    #[test]
+    fn fake_execute_headers_cannot_shift_native_control_source_ordinals() {
+        let source = r###"unsafe extern "C" fn effect_fake_headers(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+        /* if macros::is_excute(agent) { */
+        let _header_text = r#"if macros::is_excute(agent) { }"#;
+        EffectModule::set_disable_render_offset_last(agent.module_accessor);
+        /* } */
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_second"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"###;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(pristine.len(), 3);
+        assert_eq!(
+            spawn_site_names(source),
+            [
+                "EFFECT_FOLLOW",
+                "EffectModule::set_disable_render_offset_last",
+                "EFFECT_FOLLOW",
+            ]
+        );
+        let mut edited = pristine.clone();
+        edited[2].scale = 1.5;
+        let (after, report) =
+            rewrite_effect_calls(source, "test/fake_headers", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.changed, 1);
+        assert!(after.contains("/* if macros::is_excute(agent) { */"));
+        assert!(after.contains("r#\"if macros::is_excute(agent) { }\"#"));
+        let reparsed = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert_eq!(reparsed.len(), 3);
+        assert_eq!(reparsed[0].scale, 1.0);
+        assert_eq!(reparsed[2].scale, 1.5);
+    }
+
+    #[test]
+    fn native_effect_controls_require_matching_plain_execute_headers() {
+        for header in [
+            "if macros::is_excute(agent){",
+            "if macros::is_excute(agent) && native_guard(agent) {",
+            "if !macros::is_excute(agent) {",
+        ] {
+            let source = format!("unsafe extern \"C\" fn effect_header(agent: &mut L2CAgentBase) {{\n    {header}\n        EffectModule::enable_sync_init_pos_last(agent.module_accessor);\n    }}\n}}\n");
+            let parsed = crate::acmd::parse_effect_script(&source);
+            assert!(
+                parsed.to_effect_calls().is_empty(),
+                "noncanonical guard admitted a native control: {source}"
+            );
+            assert!(
+                spawn_site_names(&source).is_empty(),
+                "noncanonical guard consumed an ordinal: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_effect_ordinals_use_the_importers_scope_and_physical_boundaries() {
+        for (body, expected_controls) in [
+            ("        if macros::is_excute(agent) {\n            EffectModule::enable_sync_init_pos_last(agent.module_accessor);\n        }", 0),
+            ("        let _brace = r#\"{\"#;\n        EffectModule::enable_sync_init_pos_last(agent.module_accessor);", 1),
+            ("        let _brace = '\\u{7b}';\n        EffectModule::enable_sync_init_pos_last(agent.module_accessor);", 1),
+        ] {
+            let source = format!("unsafe extern \"C\" fn effect_scope(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n{body}\n    }}\n}}\n");
+            syn::parse_file(&source).unwrap();
+            let parsed = crate::acmd::parse_effect_script(&source);
+            let control_count = parsed.to_effect_calls().iter().filter(|call| call.control.is_some()).count();
+            assert_eq!(control_count, expected_controls, "only genuine root statements may gain typed native controls: {source}");
+            assert_eq!(spawn_site_names(&source).len(), expected_controls, "source scanner must count exactly the imported native controls: {source}");
+        }
+    }
+
+    #[test]
+    fn two_argument_sync_call_stays_raw_and_consumes_no_source_call_ordinal() {
+        let source = r#"unsafe extern "C" fn effect_raw_sync_control(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        EffectModule::enable_sync_init_pos_last(agent.module_accessor, 0);
+        EffectModule::set_disable_render_offset_last(boma);
+        EffectModule::set_disable_render_offset_last(agent.module_accessor, 0);
+    }
+    frame(agent.lua_state_agent, 8.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_second"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let parsed = crate::acmd::parse_effect_script(source);
+        assert_eq!(parsed.call_macro_ordinals(), vec![0, 1]);
+        let pristine = parsed.to_effect_calls();
+        assert_eq!(pristine.len(), 2);
+        assert_eq!(
+            spawn_site_names(source),
+            vec!["EFFECT_FOLLOW".to_string(), "EFFECT_FOLLOW".to_string()]
+        );
+
+        let mut edited = pristine.clone();
+        edited[1].offset[0] = 4.0;
+        let (after, report) =
+            rewrite_effect_calls(source, "test/raw_sync_control", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert!(
+            after.contains("EffectModule::enable_sync_init_pos_last(agent.module_accessor, 0);")
+        );
+        assert!(after.contains("EffectModule::set_disable_render_offset_last(boma);"));
+        assert!(after
+            .contains("EffectModule::set_disable_render_offset_last(agent.module_accessor, 0);"));
+        assert!(
+            after.contains("Hash40::new(\"sys_second\"), Hash40::new(\"top\"), 4.0, 0, 0"),
+            "{after}"
+        );
+        let reparsed = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[1].offset[0], 4.0);
+    }
+
+    #[test]
     fn c4_control_values_write_back_without_reordering_the_effect_script() {
         let source = r#"unsafe extern "C" fn effect_c4(agent: &mut L2CAgentBase) {
     if macros::is_excute(agent) {
@@ -12493,7 +14459,7 @@ visionary_set_speed(agent, 9, 10);
         macros::ENABLE_AREA(agent, 2);
         macros::UNABLE_AREA(agent, 2);
     }
-}
+
 "#;
         let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
         assert_eq!(pristine.len(), 4);
@@ -12524,6 +14490,49 @@ visionary_set_speed(agent, 9, 10);
             edited,
             "source write-back must parse back to the edited control values"
         );
+    }
+
+    #[test]
+    fn off_kind_control_keeps_following_effect_source_ordinal_aligned() {
+        let source = r#"unsafe extern "C" fn effect_control_ordinal(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT_OFF_KIND_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, false, true);
+        macros::EFFECT_FOLLOW(agent, Hash40::new("sys_hit_elec"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let parsed = crate::acmd::parse_effect_script(source);
+        assert_eq!(parsed.call_macro_ordinals(), vec![0, 1]);
+        let pristine = parsed.to_effect_calls();
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        let Some(crate::data::EffectControl::OffKindWork { preset_id }) =
+            edited[0].control.as_mut()
+        else {
+            panic!("first source call should be the typed off-kind control");
+        };
+        *preset_id = "cloud_sword_flare_tt".into();
+        edited[1].offset[0] = 3.5;
+
+        let (after, report) =
+            rewrite_effect_calls(source, "test/off_kind_ordinal", &pristine, &edited).unwrap();
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "closed preset writes should fail closed, while the next independent effect edit remains writable: {report:?}"
+        );
+        assert!(report.skipped[0].contains("closed slot/flag tuples"));
+        assert!(after.contains("EFFECT_OFF_KIND_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, false, true);"));
+        assert!(
+            after.contains("Hash40::new(\"sys_hit_elec\"), Hash40::new(\"top\"), 3.5, 0, 0"),
+            "{after}"
+        );
+        let reparsed = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert_eq!(reparsed.len(), 2);
+        assert!(
+            matches!(reparsed[0].control.as_ref(), Some(crate::data::EffectControl::OffKindWork { preset_id }) if preset_id == "cloud_sword_flare_ft")
+        );
+        assert_eq!(reparsed[1].offset[0], 3.5);
     }
 
     /// The source editor and the editor panels drive each other, so a value written into the
@@ -12845,8 +14854,10 @@ visionary_set_speed(agent, 9, 10);
         );
     }
 
+    /// A spawn added between two `wait` points lands on its own frame: the wait is split around
+    /// it, so the later spawn still runs on the frame it did.
     #[test]
-    fn adding_an_effect_between_wait_points_is_refused_before_it_can_rewind_timeline() {
+    fn adding_an_effect_between_wait_points_splits_the_wait() {
         let text = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if macros::is_excute(agent) {
@@ -12869,17 +14880,14 @@ visionary_set_speed(agent, 9, 10);
         edited.push(added);
 
         let (updated, report) = rewrite_effect_calls(text, "test", &pristine, &edited).unwrap();
-        assert_eq!(
-            updated, text,
-            "a wait cannot safely be split by a new frame block"
-        );
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|message| message.contains("wait")),
-            "the unsafe insertion must be explained: {report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}
+{updated}");
+        assert_eq!(updated.matches("wait(agent.lua_state_agent, 1.0);").count(), 2, "{updated}");
+        let calls = crate::acmd::parse_effect_script(&updated).to_effect_calls();
+        let frame_of = |name: &str| calls.iter().find(|c| c.effect_name == name).map(|c| c.active_start);
+        assert_eq!(frame_of("sys_first"), Some(5));
+        assert_eq!(frame_of("sys_between"), Some(6));
+        assert_eq!(frame_of("sys_second"), Some(7));
     }
 
     #[test]
@@ -14440,7 +16448,7 @@ pub fn install(agent: &mut smashline::Agent) {
     }
 
     #[test]
-    fn effect_timing_moves_refuse_nonflat_blocks_collisions_and_unrelated_lines() {
+    fn effect_timing_moves_refuse_branches_and_loops_but_move_a_spawn_on_its_own() {
         let branch = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 {
@@ -14498,16 +16506,14 @@ pub fn install(agent: &mut smashline::Agent) {
         let pristine = crate::acmd::parse_effect_script(collision).to_effect_calls();
         let mut edited = pristine.clone();
         edited[0].active_start = 10;
+        // A frame that already has a block is no longer a refusal: the line mover appends the
+        // spawn to it, after what that frame already spawns.
         let (after, report) =
             rewrite_effect_calls(collision, "collision", &pristine, &edited).unwrap();
-        assert_eq!(after, collision);
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|note| note.contains("occupied frame block")),
-            "{report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let moved = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert!(moved.iter().all(|call| call.active_start == 10), "{after}");
+        assert!(after.find("sys_late") < after.find("sys_attack"), "{after}");
 
         let unrelated = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
@@ -14521,15 +16527,13 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(pristine.len(), 1);
         let mut edited = pristine.clone();
         edited[0].active_start = 8;
+        // The spawn moves on its own; the unrelated line keeps the frame it runs on.
         let (after, report) =
             rewrite_effect_calls(unrelated, "unrelated", &pristine, &edited).unwrap();
-        assert_eq!(after, unrelated);
-        assert!(
-            report.skipped.iter().any(|note| {
-                note.contains("unrelated source lines") || note.contains("opaque source statement")
-            }),
-            "{report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let frame_eight = after.find("frame(agent.lua_state_agent, 8.0);").expect("a frame-8 block");
+        assert!(after.find("COL_PRI").unwrap() < frame_eight, "{after}");
+        assert!(after.find("sys_attack").unwrap() > frame_eight, "{after}");
     }
 
     #[test]
@@ -14692,9 +16696,10 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(after, text.replace("10.0, 361", "12.5, 361"));
     }
 
-    /// A hitbox's frames are the block it sits in, not arguments of its call.
+    /// A hitbox's frames are the block it sits in, not arguments of its call: a retime moves
+    /// the call to the block on its new frame, carrying the values edited with it.
     #[test]
-    fn retiming_a_hitbox_is_reported_rather_than_written() {
+    fn retiming_a_hitbox_moves_its_call_with_its_new_values() {
         let text = r#"unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if macros::is_excute(agent) {
@@ -14708,10 +16713,25 @@ pub fn install(agent: &mut smashline::Agent) {
         edited[0].damage = 12.0;
 
         let (after, report) = rewrite_hitboxes(text, "t", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let moved = crate::acmd::parse_acmd_script(&after).to_hitboxes();
+        assert_eq!((moved[0].active_start, moved[0].damage), (9, 12.0), "{after}");
+        assert!(after.contains("frame(agent.lua_state_agent, 9.0);"), "{after}");
+
+        // Timing that runs through a loop is not restructured: the retime is reported, and the
+        // damage it was bundled with still lands.
+        let looped = text
+            .replace("    frame(agent.lua_state_agent, 5.0);\n", "    for _ in 0..2 {\n    wait(agent.lua_state_agent, 5.0);\n")
+            .replace("    }\n}\n", "    }\n    }\n}\n");
+        let pristine = crate::acmd::parse_acmd_script(&looped).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].active_start += 1;
+        edited[0].damage = 12.0;
+        let (after, report) = rewrite_hitboxes(&looped, "t", &pristine, &edited).unwrap();
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].contains("retimed"), "{report:?}");
-        // The retime is refused, but the damage it was bundled with still lands.
+        assert!(report.skipped[0].contains("retimed") && report.skipped[0].contains("loop"), "{report:?}");
         assert!(after.contains("12.0, 361"), "{after}");
+        assert!(after.contains("wait(agent.lua_state_agent, 5.0);"), "{after}");
     }
 
     /// kirby/ThrowHi's `ATTACK_IGNORE_THROW`, which the archive writes without the capsule
@@ -15783,6 +17803,35 @@ pub fn install(agent: &mut smashline::Agent) {
     }
 
     #[test]
+    fn work_transition_term_source_sync_never_rewrites_or_normalizes_receivers() {
+        let text = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        WorkModule::enable_transition_term(agent.module_accessor, *FIGHTER_STATUS_TRANSITION_TERM_ID_DASH_TO_RUN);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_acmd_script(text).to_work_transition_term_events();
+        let mut receiver_changed = pristine.clone();
+        receiver_changed[0].call.receiver = crate::data::WorkTransitionTermReceiver::Boma;
+        receiver_changed[0].call.transition_term = "23".into();
+        let (after_receiver_edit, report) =
+            rewrite_work_transition_terms(text, "mario/x", &pristine, &receiver_changed).unwrap();
+        assert_eq!(after_receiver_edit, text);
+        assert_eq!(report.changed, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+
+        let changed_source = text.replace("agent.module_accessor", "boma");
+        let mut term_changed = pristine.clone();
+        term_changed[0].call.transition_term = "23".into();
+        let (after_source_receiver_edit, report) =
+            rewrite_work_transition_terms(&changed_source, "mario/x", &pristine, &term_changed)
+                .unwrap();
+        assert_eq!(after_source_receiver_edit, changed_source);
+        assert_eq!(report.changed, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+    }
+
+    #[test]
     fn work_module_set_source_sync_rewrites_value_and_slot_tokens() {
         let text = r#"unsafe extern "C" fn game_itemgrasspull(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
@@ -15819,6 +17868,85 @@ pub fn install(agent: &mut smashline::Agent) {
             crate::acmd::parse_acmd_script(&after).to_work_module_set_events(),
             edited
         );
+    }
+
+    #[test]
+    fn item_grass_pull_source_sync_changes_one_step_value_and_preserves_order_and_receiver() {
+        let text = r#"unsafe extern "C" fn game_itemgrasspull(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_PICKUP, *FIGHTER_STATUS_ITEM_GRASS_PULL_WORK_INT_NEXT_STEP);
+    }
+    frame(agent.lua_state_agent, 12.0);
+    if macros::is_excute(agent) {
+        WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_PULL, *FIGHTER_STATUS_ITEM_GRASS_PULL_WORK_INT_NEXT_STEP);
+    }
+    frame(agent.lua_state_agent, 15.0);
+    if macros::is_excute(agent) {
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ITEM_GRASS_PULL_FLAG_STTUS_END_IF_PICKUP_FAILED);
+        WorkModule::set_int(agent.module_accessor, 4, *FIGHTER_STATUS_ITEM_GRASS_PULL_WORK_INT_THROW_N_OFFSET_ANIM_FRAME_COUNT_MAX);
+    }
+    frame(agent.lua_state_agent, 18.0);
+    if macros::is_excute(agent) {
+        WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_HOIST, *FIGHTER_STATUS_ITEM_GRASS_PULL_WORK_INT_NEXT_STEP);
+    }
+    frame(agent.lua_state_agent, 30.0);
+    if macros::is_excute(agent) {
+        WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_END, *FIGHTER_STATUS_ITEM_GRASS_PULL_WORK_INT_NEXT_STEP);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_acmd_script(text).to_work_module_set_events();
+        assert_eq!(
+            pristine.iter().map(|event| event.frame).collect::<Vec<_>>(),
+            vec![5, 12, 15, 18, 30]
+        );
+        assert!(pristine
+            .iter()
+            .all(|event| event.call.receiver == "agent.module_accessor"));
+        let mut edited = pristine.clone();
+        edited[1].call.value =
+            crate::move_nodes::native_work::ITEM_GRASS_PULL_STEP_VALUES[0].into();
+
+        let (after, report) =
+            rewrite_work_module_sets(text, "cloud/item_grass_pull", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(
+            after,
+            text.replace(
+                "WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_PULL",
+                "WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_PICKUP"
+            )
+        );
+        assert!(after.contains(
+            "WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ITEM_GRASS_PULL_FLAG_STTUS_END_IF_PICKUP_FAILED);"
+        ));
+        assert_eq!(
+            crate::acmd::parse_acmd_script(&after).to_work_module_set_events(),
+            edited
+        );
+
+        let mut edited_receiver = pristine.clone();
+        edited_receiver[1].call.receiver = "boma".into();
+        let (unchanged, report) =
+            rewrite_work_module_sets(text, "cloud/item_grass_pull", &pristine, &edited_receiver)
+                .unwrap();
+        assert_eq!(unchanged, text);
+        assert_eq!(report.changed, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].contains("changed receiver"), "{report:?}");
+
+        let receiver_drift = text.replace(
+            "WorkModule::set_int(agent.module_accessor, *FIGHTER_ITEM_GRASS_PULL_STEP_PULL",
+            "WorkModule::set_int(boma, *FIGHTER_ITEM_GRASS_PULL_STEP_PULL",
+        );
+        let (unchanged, report) =
+            rewrite_work_module_sets(&receiver_drift, "cloud/item_grass_pull", &pristine, &edited)
+                .unwrap();
+        assert_eq!(unchanged, receiver_drift);
+        assert_eq!(report.changed, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
     }
 
     #[test]
@@ -16492,6 +18620,308 @@ pub fn install(agent: &mut smashline::Agent) {
         assert!(report.skipped.iter().any(|note| note.contains("retimed")));
         assert_eq!(motion_module_set_helper_calculation_sites(text).len(), 1);
     }
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A status registered on a chained `Agent::new`, whose body holds the article's motion. The
+    /// chain form is synthetic; the status body shape (`sv_kinetic_energy!` in a `Main` status) is
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/status.rs:49 (tier 1). The parameter-agent
+    /// layout King Boo really uses is `indexes_parameter_agent_status_through_install_module`.
+    #[test]
+    fn indexes_weapon_status_on_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "status.rs",
+            r#"unsafe extern "C" fn shoot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 1.5, 0.0);
+    0.into()
+}
+pub fn install() {
+    Agent::new("dedede_fireball").status(Main, *WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT, shoot_main).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let bodies = index.status_bodies("dedede_fireball");
+        assert_eq!(bodies.len(), 1, "{:?}", index.statuses);
+        let (site, body) = &bodies[0];
+        assert_eq!(site.phase, "Main");
+        assert_eq!(site.kind_expr, "*WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT");
+        assert_eq!(site.function, "shoot_main");
+        assert!(body.contains("sv_kinetic_energy!"), "{body}");
+    }
+
+    /// A bound agent, a function in another file reached by path, the long phase spelling and
+    /// `on_start`.
+    /// Shy-Guy-Moveset · plugin/src/shyguy/articles/trampoline/status/mod.rs:16 and mod.rs:46 (tier 1)
+    #[test]
+    fn indexes_bound_agent_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "jackbox.rs",
+            "pub unsafe extern \"C\" fn jackbox_main(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+",
+        );
+        put(
+            root,
+            "install.rs",
+            r#"unsafe extern "C" fn trampoline_start(weapon: &mut L2CWeaponCommon) {}
+unsafe extern "C" fn trampoline_init(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+pub fn install() {
+    let agent = &mut Agent::new("pacman_trampoline");
+    agent.status(Init, 0, trampoline_init);
+    agent.status(smashline::Main, *WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_JACKBOX, jackbox::jackbox_main);
+    agent.on_start(trampoline_start);
+    agent.install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let sites = &index.statuses["pacman_trampoline"];
+        assert_eq!(sites.len(), 3, "{sites:?}");
+        assert!(sites.iter().any(|s| s.phase == "Init" && s.kind_expr == "0" && s.function == "trampoline_init"));
+        assert!(sites.iter().any(|s| s.phase == "Main" && s.function == "jackbox_main"));
+        assert!(sites.iter().any(|s| s.phase == "Start" && s.kind_expr.is_empty()));
+        assert_eq!(index.status_bodies("pacman_trampoline").len(), 3);
+    }
+
+    /// King Boo's real layout: `mod.rs` builds the agent and hands it to `status::install(agent)`;
+    /// `status.rs` registers on the parameter. `start.rs` does the same with `on_start`.
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/mod.rs:5-11, status.rs:103-111;
+    /// weapon/portrait/start.rs:26 (tier 1)
+    #[test]
+    fn indexes_parameter_agent_status_through_install_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "weapon/fireball/mod.rs",
+            r#"mod status;
+mod start;
+pub fn install() {
+    let agent = &mut smashline::Agent::new("dedede_fireball");
+    status::install(agent);
+    start::install(agent);
+    agent.install();
+}
+"#,
+        );
+        put(
+            root,
+            "weapon/fireball/status.rs",
+            r#"unsafe extern "C" fn shoot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 1.5, 0.0);
+    0.into()
+}
+pub fn install(agent: &mut smashline::Agent) {
+    agent.status(Main, FIREBALL_STATUS_KIND_SHOOT, shoot_main);
+}
+"#,
+        );
+        put(
+            root,
+            "weapon/fireball/start.rs",
+            r#"unsafe extern "C" fn fireball_start(weapon: &mut L2CWeaponCommon) {}
+pub fn install(agent: &mut smashline::Agent) {
+    agent.on_start(fireball_start);
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let bodies = index.status_bodies("dedede_fireball");
+        assert_eq!(bodies.len(), 2, "{:?} / {:?}", index.statuses, index.unresolved_statuses);
+        assert!(bodies.iter().any(|(site, body)| site.phase == "Main" && body.contains("sv_kinetic_energy!")));
+        assert!(bodies.iter().any(|(site, _)| site.phase == "Start" && site.function == "fireball_start"));
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+    }
+
+    /// King-Boo-Moveset · src/kingteresa/mod.rs:47-52 hands `Agent::new("dedede")` to
+    /// `status::install(agent)`, and src/kingteresa/status/status_catched_portrait.rs:75 in that
+    /// module builds `Agent::new("fighter")` for a status every fighter gets (tier 1, smashline2).
+    /// The module's parameter registrations are still dedede's; the generic agent keeps its own.
+    #[test]
+    fn a_generic_fighter_agent_does_not_claim_the_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "kingteresa/mod.rs",
+            "mod status;\npub fn do_install() {\n    let agent = &mut smashline::Agent::new(\"dedede\");\n    status::install(agent);\n    agent.install();\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/mod.rs",
+            "mod status_attack_air;\nmod status_catched_portrait;\npub fn install(agent: &mut smashline::Agent) {\n    status_attack_air::install(agent);\n    status_catched_portrait::install(agent);\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/status_attack_air.rs",
+            "unsafe extern \"C\" fn kingteresa_attack_air_status_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(agent: &mut smashline::Agent) {\n    agent.status(Pre, *FIGHTER_STATUS_KIND_ATTACK_AIR, kingteresa_attack_air_status_pre);\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/status_catched_portrait.rs",
+            "unsafe extern \"C\" fn catched_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(_agent: &mut smashline::Agent) {\n    Agent::new(\"fighter\")\n        .status(Pre, FIGHTER_STATUS_KIND_CATCHED_KINGTERESA_PORTRAIT, catched_pre)\n        .install();\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        let dedede = index.status_bodies("dedede");
+        assert_eq!(dedede.len(), 1, "{:?}", index.statuses);
+        assert_eq!(dedede[0].0.function, "kingteresa_attack_air_status_pre");
+        assert_eq!(index.status_bodies("fighter")[0].0.function, "catched_pre");
+    }
+
+    /// Sceptile-Moveset · plugin/src/sceptile/articles/bullet_seed/status/mod.rs:19 registers
+    /// `.status(End, *WEAPON_SIMON_AXE_STATUS_KIND_FLY, fly::bullet_seed_end)`, and
+    /// `bullet_seed_end` is defined both in `status/fly.rs:248` and in `bullet_seed/mod.rs:24`
+    /// (tier 1, smashline2). The path names the one in `fly`.
+    #[test]
+    fn a_module_path_picks_the_function_in_that_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "bullet_seed/mod.rs",
+            "mod status;\nunsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) {}\n",
+        );
+        put(
+            root,
+            "bullet_seed/status/mod.rs",
+            "mod fly;\npub fn install() {\n    Agent::new(\"mario_bulletseed\")\n        .status(End,  *WEAPON_SIMON_AXE_STATUS_KIND_FLY, fly::bullet_seed_end)\n        .install();\n}\n",
+        );
+        put(
+            root,
+            "bullet_seed/status/fly.rs",
+            "pub(super) unsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        let bodies = index.status_bodies("mario_bulletseed");
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].0.file.ends_with("fly.rs"), "{:?}", bodies[0].0.file);
+        assert!(bodies[0].1.contains("-> L2CValue"));
+    }
+
+    /// I-3: a path that names no module beside the registering file still finds a function
+    /// defined once: `super::status::f`, and a `pub use` re-export.
+    #[test]
+    fn a_path_naming_no_module_beside_the_file_keeps_the_unique_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "orb/mod.rs", "mod status;\nmod install;\n");
+        put(
+            root,
+            "orb/status.rs",
+            "pub unsafe extern \"C\" fn orb_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
+        );
+        put(
+            root,
+            "orb/install.rs",
+            "pub fn install() {\n    Agent::new(\"mario_orb\")\n        .status(Main, *WEAPON_KIND_X, super::status::orb_main)\n        .install();\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert_eq!(index.status_bodies("mario_orb").len(), 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "shot/mod.rs", "mod imp;\nmod fly { pub use super::imp::shot_main; }\npub fn install() {\n    Agent::new(\"mario_shot\").status(Main, 0, fly::shot_main).install();\n}\n");
+        put(root, "shot/imp.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n");
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(index.status_bodies("mario_shot")[0].1.contains("shot_main"));
+
+        // Defined twice and the path names neither: refused, with a reason that says so.
+        put(root, "shot/other.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    1.into()\n}\n");
+        let index = SourceIndex::build(root).unwrap();
+        let reason = &index.unresolved_statuses[0].reason;
+        assert!(reason.contains("defined in 2 places") && reason.contains("path doesn't say which"), "{reason}");
+    }
+
+    /// Sceptile-Moveset · plugin/src/common/util.rs:1187-1191 defines `noop_status!` as
+    /// `$( $agent.status($phase, $kind, $crate::empty_status_weapon); )+` (tier 1, smashline2).
+    /// The template is not a registration; each invocation is listed as a no-op.
+    #[test]
+    fn a_macro_rules_body_is_not_a_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "util.rs",
+            "#[macro_export]\nmacro_rules! noop_status {\n    ($agent:expr, $kind:expr, [$($phase:expr),+ $(,)?]) => {\n        $( $agent.status($phase, $kind, $crate::empty_status_weapon); )+\n    };\n}\npub fn install() {\n    let agent = &mut Agent::new(\"mario_bulletseed\");\n    noop_status!(agent, *WEAPON_SIMON_AXE_STATUS_KIND_HAVED, [Pre, Main]);\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let unresolved = &index.unresolved_statuses;
+        assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+        assert!(unresolved.iter().all(|u| u.reason.contains("noop_status!") && u.kind_expr.starts_with('*')));
+    }
+
+    /// Closures, `noop_status!` (Shy Guy has eight) and a parameter nobody installs are not
+    /// sites, but they are listed with a reason rather than dropped.
+    /// Shy-Guy-Moveset · plugin/src/shyguy/articles/trampoline/status/mod.rs:13-14 (tier 1)
+    #[test]
+    fn indexes_unresolved_statuses_are_listed_with_reasons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "tramp/install.rs",
+            r#"pub fn install() {
+    let agent = &mut Agent::new("pacman_trampoline");
+    noop_status!(agent, *WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_START, [Pre, Main, End]);
+    agent.status(Main, 0, |weapon| 0.into());
+    agent.status(End, 0, missing_function);
+}
+"#,
+        );
+        put(
+            root,
+            "orphan.rs",
+            "pub fn install(agent: &mut Agent) {\n    agent.status(Main, 1, orphan_main);\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let unresolved = &index.unresolved_statuses;
+        let noops = unresolved.iter().filter(|u| u.reason.contains("noop_status!")).collect::<Vec<_>>();
+        assert_eq!(noops.len(), 3, "{unresolved:?}");
+        assert!(noops.iter().all(|u| u.agent_hint.as_deref() == Some("pacman_trampoline")));
+        assert!(unresolved.iter().any(|u| u.reason.contains("closure") && u.phase == "Main" && u.line == 4));
+        assert!(unresolved.iter().any(|u| u.reason.contains("not defined") && u.phase == "End"));
+        assert!(unresolved.iter().any(|u| u.kind_expr == "1" && u.reason.contains("parameter")), "{unresolved:?}");
+        assert!(index.statuses.is_empty(), "{:?}", index.statuses);
+    }
+
+    /// The fighter's own status registrations never leak onto its article, or the reverse.
+    #[test]
+    fn indexes_fighter_status_not_on_article() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "status.rs",
+            r#"unsafe extern "C" fn fighter_main(fighter: &mut L2CFighterCommon) -> L2CValue { 0.into() }
+unsafe extern "C" fn article_main(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+pub fn install() {
+    Agent::new("pacman").status(Main, *FIGHTER_STATUS_KIND_ATTACK, fighter_main).install();
+    Agent::new("pacman_trampoline").status(Main, 0, article_main).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let article = &index.statuses["pacman_trampoline"];
+        assert_eq!(article.len(), 1);
+        assert_eq!(article[0].function, "article_main");
+        let fighter = &index.statuses["pacman"];
+        assert_eq!(fighter.len(), 1);
+        assert_eq!(fighter[0].function, "fighter_main");
+    }
 }
 
 /// Layouts and spellings taken from real movesets (see `moveset_survey`), each of which the
@@ -16597,7 +19027,7 @@ pub fn install() {
         let Some(root) = std::env::var_os("VISIONARY_PROBE_SOURCE") else {
             return;
         };
-        crate::cargo_project::tests::enable();
+        //NOCARGO
         let index = SourceIndex::build(Path::new(&root)).unwrap();
         let mut fighters: Vec<_> = index.fighters.iter().map(|(name, f)| (name.clone(), f.scripts.len())).collect();
         fighters.sort();
@@ -16963,5 +19393,520 @@ pub fn install() {
         assert_eq!(script.to_hitboxes()[0].active_start, 4);
         let effect = source.replace("game_x", "effect_x");
         let _ = crate::acmd::parse_effect_script(&effect);
+    }
+}
+
+#[cfg(test)]
+mod rewrite_article_tests {
+    use super::*;
+    use crate::data::{ArticleCall, ArticleTarget};
+
+    /// A charge-shot spawn and its shoot, each in its own frame block, in the shape the vanilla
+    /// dump and the corpus write them (`samus/game_specialn`).
+    const SPECIAL_N: &str = "unsafe extern \"C\" fn game_specialn(agent: &mut L2CAgentBase) {\n\
+        \x20   frame(agent.lua_state_agent, 10.0);\n\
+        \x20   if macros::is_excute(agent) {\n\
+        \x20       ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n\
+        \x20   }\n\
+        \x20   frame(agent.lua_state_agent, 20.0);\n\
+        \x20   if macros::is_excute(agent) {\n\
+        \x20       ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);\n\
+        \x20   }\n\
+        }\n";
+
+    fn calls(text: &str) -> Vec<(u32, ArticleCall)> {
+        crate::acmd::parse_acmd_script(text).to_article_calls()
+    }
+
+    fn rewrite(text: &str, edit: impl FnOnce(&mut Vec<(u32, ArticleCall)>)) -> (String, SyncReport) {
+        let pristine = calls(text);
+        let mut edited = pristine.clone();
+        edit(&mut edited);
+        rewrite_article_calls(text, "samus/specialn", &pristine, &edited).unwrap()
+    }
+
+    #[test]
+    fn edits_target_only() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| {
+            assert_eq!(calls.len(), 2, "{calls:#?}");
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        assert_eq!(report.changed, 1);
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(calls(&out)[1].1.target, ArticleTarget::All);
+    }
+
+    /// A bare `*ARTICLE_OPE_TARGET_X` is the timeline's canonical form wrapped; the file keeps
+    /// its own bare spelling, and compact commas stay compact, because only the target's bytes
+    /// are replaced.
+    #[test]
+    fn edits_keep_the_file_spelling() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::shoot(agent.module_accessor,*FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT,*ARTICLE_OPE_TARGET_LAST,false);",
+        );
+        let (out, report) = rewrite(&text, |calls| {
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, text.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        // The receiver path, the binding and an argument edit.
+        let text = SPECIAL_N.replace(
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+            "let id = smash::app::lua_bind::ArticleModule::generate_article(boma,  *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+        );
+        let (out, report) = rewrite(&text, |calls| {
+            calls[0].1.args[0] = "true".into();
+            calls[0].1.edited = true;
+        });
+        assert_eq!(out, text.replace("CSHOT, false, -1", "CSHOT, true, -1"), "{report:?}");
+    }
+
+    /// The only call in its frame block: the block is retimed and placed in frame order, the way
+    /// effect blocks move.
+    #[test]
+    fn moves_spawn_to_new_frame() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| calls[0].0 = 14);
+        assert_eq!(out, SPECIAL_N.replace("10.0", "14.0"), "{report:?}");
+        assert!(out.contains("frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article("));
+        assert_eq!(calls(&out)[0].0, 14);
+        assert_eq!(report.changed, 1);
+
+        // Past the shoot: the block lands after frame 20, so the calls swap order.
+        let (out, report) = rewrite(SPECIAL_N, |calls| calls[0].0 = 25);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out}\n{report:?}");
+        assert_eq!(moved[1].1.op, crate::data::ArticleOp::Generate);
+        assert_eq!(out.len(), SPECIAL_N.len());
+    }
+
+    /// A call sharing its block moves alone: into the target frame's block when there is one,
+    /// else into a new block built like the one it left.
+    #[test]
+    fn moves_one_line_between_blocks() {
+        let shared = SPECIAL_N.replace(
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n",
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n        macros::ATTACK(agent, 0, 0, Hash40::new(\"top\"), 1.0, 361, 100, 0, 0, 3.0, 0.0, 8.0, 8.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_NONE);\n",
+        );
+        // Into frame 20's existing block, after its own call.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 20);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 20), "{out}\n{report:?}");
+        assert_eq!(moved[1].1.op, crate::data::ArticleOp::Generate);
+        assert!(out.contains("frame(agent.lua_state_agent, 10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        // Into a new frame 14 block.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 14);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (14, 20), "{out}\n{report:?}");
+        assert!(out.contains("    }\n    frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n    }\n    frame(agent.lua_state_agent, 20.0);"), "{out}");
+        assert!(out.contains("10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        assert_eq!(crate::acmd::parse_acmd_script(&out).to_hitboxes().len(), 1);
+        // Earlier than the block it leaves: the new block goes before that block's frame line.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 5);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (5, 20), "{out}\n{report:?}");
+        let (five, ten) = (out.find("5.0);").unwrap(), out.find("10.0);").unwrap());
+        assert!(five < ten, "{out}");
+    }
+
+    /// Comments, a `let` binding and an `if` condition around the calls: the statements are
+    /// counted as the parser types them.
+    #[test]
+    fn statement_sites_skip_comments_and_conditions() {
+        let text = SPECIAL_N
+            .replace(
+                "        ArticleModule::generate_article(",
+                "        // spawn the shot\n        /* charged */ \n        ArticleModule::generate_article(",
+            )
+            .replace(
+                "    frame(agent.lua_state_agent, 20.0);\n",
+                "    frame(agent.lua_state_agent, 20.0); // fire\n",
+            );
+        let sites = article_call_sites(&text);
+        assert_eq!(sites.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["generate_article", "shoot"]);
+        let condition = "    if ArticleModule::is_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT) {\n    }\n";
+        let with_condition = format!("{}{condition}}}\n", &SPECIAL_N[..SPECIAL_N.len() - 2]);
+        assert_eq!(article_call_sites(&with_condition).len(), 2, "{with_condition}");
+        assert_eq!(calls(&with_condition).len(), 2);
+        let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
+        assert_eq!(out, text.replace("10.0", "14.0"), "{report:?}");
+    }
+
+    #[test]
+    fn count_mismatch_skips_with_reason() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[1].1.target = ArticleTarget::All;
+        // A third call the editor does not model by position (inside a condition).
+        let text = SPECIAL_N.replace(
+            "    frame(agent.lua_state_agent, 20.0);\n",
+            "    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_SAMUS_STATUS_SPECIAL_N_FLAG_CHARGE) {\n        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));\n    }\n    frame(agent.lua_state_agent, 20.0);\n",
+        );
+        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!(out, text);
+        assert_eq!(report.changed, 0);
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].contains("3 `ArticleModule` call(s)"), "{report:?}");
+        assert!(report.skipped[0].contains("models 2"), "{report:?}");
+
+        // Added or removed calls are structural too.
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited[..1]).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("added or removed"), "{report:?}");
+
+        // Nothing edited: nothing reported, even where the counts disagree.
+        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &pristine).unwrap();
+        assert_eq!((out.as_str(), report), (text.as_str(), SyncReport::default()));
+    }
+
+    /// Paired by position, but the call at that position is a different one: refused.
+    #[test]
+    fn mispaired_calls_are_refused() {
+        let pristine = calls(SPECIAL_N);
+        let mut other = pristine.clone();
+        other[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let mut edited = other.clone();
+        edited[1].1.target = ArticleTarget::All;
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("is not what the source holds there"), "{report:?}");
+        assert!(report.skipped[0].contains("SUPERMISSILE"), "{report:?}");
+        // An argument that differs is a different call too, not only the function or article.
+        let mut other = pristine.clone();
+        other[0].1.args[0] = "true".into();
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &other).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped.is_empty(), "nothing edited: {report:?}");
+        let mut edited = other.clone();
+        edited[0].1.args[1] = "0".into();
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("passes `false` where the list has `true`"), "{report:?}");
+        // The editor's list in another order than the file's pairs each call with its own.
+        let swapped = vec![pristine[1].clone(), pristine[0].clone()];
+        let mut edited = swapped.clone();
+        edited[0].1.target = ArticleTarget::All;
+        let (out, report) = rewrite_editor_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+    }
+
+    /// One editor session, synced after every edit: `pristine` stays the list loaded at the start,
+    /// as the editor keeps it; the baseline is the file each time.
+    fn sync_each(text: &str, pristine: &[(u32, ArticleCall)], edited: &[(u32, ArticleCall)]) -> String {
+        let (out, report) = rewrite_editor_article_calls(text, "samus/specialn", pristine, edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{out}");
+        out
+    }
+
+    /// I1: a written move carries a call past another; the next sync still pairs and writes.
+    #[test]
+    fn second_sync_after_a_carry_past_move() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(sync_each(&first, &pristine, &edited), first, "re-running writes nothing");
+        edited[1].1.target = ArticleTarget::All;
+        edited[0].1.args[0] = "true".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(
+            second,
+            first.replace("TARGET_LAST", "TARGET_ALL").replace("CSHOT, false, -1", "CSHOT, true, -1")
+        );
+    }
+
+    /// Important B: the same call retimed twice, 10→25 then 25→30, without a reload.
+    #[test]
+    fn a_call_retimed_twice() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        edited[0].0 = 30;
+        let second = sync_each(&first, &pristine, &edited);
+        let now = calls(&second);
+        assert_eq!((now[0].0, now[1].0), (20, 30), "{second}");
+        assert_eq!(second.len(), SPECIAL_N.len(), "only the block moved and its frame changed: {second}");
+        assert!(second.ends_with("    frame(agent.lua_state_agent, 30.0);
+    if macros::is_excute(agent) {
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);
+    }
+}
+"), "{second}");
+    }
+
+    /// Important B: the same call's article changed twice, A→B then B→C, without a reload.
+    #[test]
+    fn an_article_changed_twice() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(first, SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1));
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_MISSILE".into();
+        edited[0].1.args[1] = "0".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, SPECIAL_N.replacen("ARTICLE_CSHOT, false, -1", "ARTICLE_MISSILE, false, 0", 1));
+    }
+
+    /// Important A: two `generate_article` calls of the same article with different arguments.
+    /// The first moves onto the second's frame and lands after it, so the file lists them the other
+    /// way round; a later edit to the first changes only the first's bytes.
+    #[test]
+    fn same_article_calls_keep_their_own_edits() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, true, 7);",
+        );
+        let pristine = calls(&text);
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        edited[0].0 = 20;
+        let first = sync_each(&text, &pristine, &edited);
+        let lines: Vec<&str> = first.lines().filter(|line| line.contains("generate_article")).collect();
+        assert!(lines[0].contains("true, 7") && lines[1].contains("false, -1"), "{first}");
+        edited[0].1.args[1] = "3".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, first.replace("CSHOT, false, -1", "CSHOT, false, 3"), "{second}");
+        assert!(second.contains("CSHOT, true, 7"), "the other call is untouched: {second}");
+    }
+
+    /// Cuphead-Moveset · src/buddy/acmd/specials.rs:78-96 (`game_specialn2`, tier 1, smashline2)
+    /// spawns `*FIGHTER_BUDDY_GENERATE_ARTICLE_BULLET` four times at frame 14 with the same
+    /// arguments. While the file still holds the calls as loaded, an edit to one of them writes
+    /// that one, and putting it back restores every byte.
+    #[test]
+    fn identical_calls_as_loaded_pair_by_position() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_BUDDY_GENERATE_ARTICLE_BULLET, false, -1);";
+        let text = format!(
+            "unsafe extern \"C\" fn game_specialn2(agent: &mut L2CAgentBase) {{\r\n    frame(agent.lua_state_agent, 14.0);\r\n    if macros::is_excute(agent) {{\r\n            {line}\r\n            {line}\r\n    }}\r\n}}\r\n"
+        );
+        let pristine = calls(&text);
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        edited[1].1.args[1] = "0".into();
+        let (out, report) = rewrite_editor_article_calls(&text, "buddy/specialn2", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let second = text.rfind("false, -1").unwrap();
+        assert_eq!(out, format!("{}false, 0{}", &text[..second], &text[second + "false, -1".len()..]));
+        let (back, report) = rewrite_editor_article_calls(&out, "buddy/specialn2", &edited, &pristine).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(back, text);
+    }
+
+    /// Calls the mapping cannot tell apart are refused with the reason, and nothing is written.
+    #[test]
+    fn ambiguous_mapping_is_refused() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);";
+        let call = ArticleCall::parse(line).unwrap();
+        // The editor retimed both identical calls; the file holds them at frames neither had.
+        let pristine = vec![(10, call.clone()), (20, call.clone())];
+        let edited = vec![(30, call.clone()), (40, call.clone())];
+        let source = vec![(25, call.clone()), (35, call.clone())];
+        let error = article_calls_in_source_order(&source, &pristine, &edited).unwrap_err();
+        assert!(error.contains("could be more than one of the editor's article calls"), "{error}");
+        assert!(!error.contains("  "), "one sentence, no stray spacing: {error}");
+        // Told apart by frame, the same lists pair.
+        let source = vec![(20, call.clone()), (30, call.clone())];
+        let ordered = article_calls_in_source_order(&source, &pristine, &edited).unwrap();
+        assert_eq!((ordered[0].0, ordered[1].0), (40, 30));
+        // Identical calls edited identically are interchangeable.
+        let same = vec![(10, call.clone()), (10, call.clone())];
+        assert!(article_calls_in_source_order(&same, &same, &same).is_ok());
+        // Through the writer: the reason is reported and the text is unchanged.
+        let text = format!(
+            "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 25.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n    frame(agent.lua_state_agent, 35.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+        );
+        let (out, report) = rewrite_editor_article_calls(&text, "samus/x", &pristine, &edited).unwrap();
+        assert_eq!(out, text);
+        assert!(report.skipped[0].contains("could be more than one"), "{report:?}");
+        // A different number of calls is refused too.
+        let error = article_calls_in_source_order(&source[..1], &pristine, &edited).unwrap_err();
+        assert!(error.contains("1 article call(s) where the editor has 2"), "{error}");
+    }
+
+    /// N1: an argument edited twice without a reload. The file holds a value from the first edit
+    /// that neither the call's original nor its new edit has; it must not be taken for the other
+    /// call that happens to hold that value. Refused, with nothing written.
+    #[test]
+    fn an_in_between_value_is_not_taken_for_another_call() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, true, 5);",
+        );
+        let pristine = calls(&text);
+        let mut edited = pristine.clone();
+        edited[0].1.args = vec!["true".into(), "5".into()];
+        let first = sync_each(&text, &pristine, &edited);
+        assert_eq!(first, text.replacen("CSHOT, false, -1", "CSHOT, true, 5", 1));
+        edited[0].1.args = vec!["false".into(), "3".into()];
+        let (second, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!(second, first, "nothing is written");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].contains("matches none of the editor's article calls"), "{report:?}");
+    }
+
+    /// N2: an edit that sets only `target` (its argument text still the old spelling) is kept
+    /// through later syncs instead of being written back.
+    #[test]
+    fn a_target_edit_survives_later_syncs() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[1].1.target = ArticleTarget::All;
+        assert!(edited[1].1.args[0].contains("LAST"), "the argument text is stale on purpose");
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(first, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"));
+        for _ in 0..2 {
+            let (again, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+            assert_eq!((again.as_str(), report.changed), (first.as_str(), 0), "{report:?}");
+            assert!(report.skipped.is_empty(), "{report:?}");
+        }
+    }
+
+    /// N3: a synced edit put back to its original in the editor is never dropped silently: the
+    /// file returns to the original, or the refusal is reported.
+    #[test]
+    fn restoring_a_synced_value_is_written_or_reported() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.args[0] = "true".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_ne!(first, SPECIAL_N);
+        let (second, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &pristine).unwrap();
+        assert!(second == SPECIAL_N || !report.skipped.is_empty(), "silent: {report:?}\n{second}");
+        assert!(second == SPECIAL_N || second == first, "{second}");
+        // A file that already holds the edited calls, in any order, has nothing to report.
+        let (_, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+    }
+
+    /// I1: a written article change renames the call; a later edit to it still lands.
+    #[test]
+    fn second_edit_after_an_article_change() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        edited[0].1.args[1] = "0".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, first.replace("SUPERMISSILE, false, -1", "SUPERMISSILE, false, 0"));
+    }
+
+    /// The same two syncs through the project on disk, as the editor runs them.
+    #[test]
+    fn two_syncs_on_disk_after_a_carry_past_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("src/samus/acmd.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, SPECIAL_N).unwrap();
+        std::fs::write(
+            tmp.path().join("src/samus/mod.rs"),
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"samus\"); }",
+        )
+        .unwrap();
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let report = sync_article_calls(&index, "samus", "special_n", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{report:?}");
+        edited[1].1.target = ArticleTarget::All;
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let report = sync_article_calls(&index, "samus", "special_n", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.changed, 1, "{report:?}");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let moved = calls(&on_disk);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{on_disk}");
+        assert_eq!(moved[0].1.target, ArticleTarget::All, "{on_disk}");
+    }
+
+    #[test]
+    fn changing_the_function_is_reported() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| {
+            calls[1].1.op = crate::data::ArticleOp::ShootExist;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("`shoot` to `shoot_exist`"), "{report:?}");
+    }
+
+    #[test]
+    fn crlf_preserved() {
+        let text = SPECIAL_N.replace('\n', "\r\n");
+        let (out, report) = rewrite(&text, |calls| {
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+            calls[0].0 = 25;
+        });
+        assert_eq!(report.changed, 2, "{report:?}");
+        assert!(out.contains("TARGET_ALL"));
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(out.len(), text.len() - "LAST".len() + "ALL".len());
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out:?}");
+
+        let shared = text.replace(
+            "-1);\r\n",
+            "-1);\r\n        macros::FT_MOTION_RATE(agent, 0.5);\r\n",
+        );
+        let (out, _) = rewrite(&shared, |calls| calls[0].0 = 14);
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(calls(&out)[0].0, 14, "{out:?}");
+    }
+
+    /// A move is refused, with the reason, where frame blocks do not say when a line runs.
+    #[test]
+    fn move_refused_after_a_wait() {
+        let text = SPECIAL_N.replace(
+            "    frame(agent.lua_state_agent, 20.0);\n",
+            "    wait(agent.lua_state_agent, 2.0);\n    frame(agent.lua_state_agent, 20.0);\n",
+        );
+        let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
+        assert_eq!(out, text);
+        assert_eq!(report.changed, 0);
+        assert!(report.skipped[0].contains("wait"), "{report:?}");
+    }
+
+    #[test]
+    fn effect_helper_with_string_array_loop_expands_both_trails() {
+        let file = r#"
+unsafe fn stilt_trails_on(agent: &mut L2CAgentBase) {
+    for shoe in ["stiltshoel", "stiltshoer"] {
+        macros::AFTER_IMAGE4_ON_arg29(agent, Hash40::new("tex_shyguy_stilt1"), Hash40::new("tex_shyguy_stilt2"), 4, Hash40::new(shoe), -3.0, 0.0, 0.0, Hash40::new(shoe), 4.0, -0.0, -0.0, true, Hash40::new("marth_sword_blue"), Hash40::new(shoe), 0, 0, 0, 0, 0, 0, 0.65, 0, *EFFECT_AXIS_X, 0, *TRAIL_BLEND_ALPHA, 101, *TRAIL_CULL_NONE, 1.4, 0.2);
+    }
+}
+
+unsafe extern "C" fn effect_special_air_lw(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 14.0);
+    if macros::is_excute(agent) {
+        stilt_trails_on(agent);
+    }
+    frame(agent.lua_state_agent, 23.0);
+    if macros::is_excute(agent) {
+        macros::AFTER_IMAGE_OFF(agent, 3);
+    }
+}
+"#;
+        let start = file.find("unsafe extern \"C\" fn effect_special_air_lw").unwrap();
+        let source = &file[start..];
+        let expanded =
+            super::unroll_string_array_loops(&super::expand_same_file_effect_helpers(source, file));
+        let calls = crate::acmd::parse_effect_script(&expanded).to_effect_calls();
+        assert_eq!(calls.len(), 2, "expected 2 trail calls, got {calls:?}\n{expanded}");
+        assert_eq!(calls[0].bone_name, "stiltshoel");
+        assert_eq!(calls[1].bone_name, "stiltshoer");
+        assert_eq!((calls[0].active_start, calls[0].active_end), (14, 23));
+        assert_eq!((calls[1].active_start, calls[1].active_end), (14, 23));
+        assert!(crate::trail_preview::trail_geometry(&calls[0]).is_some());
+        assert!(
+            calls[0]
+                .raw_line
+                .as_deref()
+                .and_then(crate::preview_trail::parse)
+                .is_some()
+        );
     }
 }

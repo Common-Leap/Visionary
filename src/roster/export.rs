@@ -77,12 +77,7 @@ pub fn resolve_names(index: &RosterIndex, project: &RosterMod) -> (Vec<NameOverr
         match index.by_key(key) {
             Some(entry) => match &entry.name_id {
                 Some(name_id) => {
-                    let slots = entry.backing.all_slots();
-                    let slots = if slots.is_empty() {
-                        vec![entry.backing.slot().unwrap_or(0)]
-                    } else {
-                        slots
-                    };
+                    let slots = name_colours(entry);
                     for slot in slots {
                         overrides.push(NameOverride {
                             name_id: name_id.clone(),
@@ -100,6 +95,19 @@ pub fn resolve_names(index: &RosterIndex, project: &RosterMod) -> (Vec<NameOverr
     unwritable.sort();
     unwritable.dedup();
     (overrides, unwritable)
+}
+
+/// The colour numbers an entry's name is written for: a whole fighter's first, and every
+/// colour of a character of its own (which counts them from 0).
+fn name_colours(entry: &crate::roster::RosterEntry) -> Vec<u8> {
+    let slots = entry.backing.all_slots();
+    if slots.is_empty() {
+        return vec![0];
+    }
+    slots
+        .iter()
+        .map(|slot| entry.backing.colour_of(*slot))
+        .collect()
 }
 
 /// Resolve per-label name variants (`chr0`/`chr1`/`chr2` independently) into detailed overrides.
@@ -122,12 +130,7 @@ pub fn resolve_detailed_names(
                         .get(key)
                         .cloned()
                         .or_else(|| Some(entry.display_name.clone()));
-                    let slots = entry.backing.all_slots();
-                    let slots = if slots.is_empty() {
-                        vec![entry.backing.slot().unwrap_or(0)]
-                    } else {
-                        slots
-                    };
+                    let slots = name_colours(entry);
                     for slot in slots {
                         overrides.push(DetailedNameOverride {
                             name_id: name_id.clone(),
@@ -198,7 +201,24 @@ pub fn resolve_all_names(
     index: &RosterIndex,
     project: &RosterMod,
 ) -> (Vec<(String, String)>, Vec<String>) {
-    let (simple, mut unwritable) = resolve_names(index, project);
+    let (mut simple, mut unwritable) = resolve_names(index, project);
+    // A character of its own has no name in the game to fall back on.
+    for entry in &index.entries {
+        let (crate::roster::EntryOrigin::Authored, Some(name_id)) = (entry.origin, &entry.name_id)
+        else {
+            continue;
+        };
+        if project.names.contains_key(&entry.key) {
+            continue;
+        }
+        for slot in name_colours(entry) {
+            simple.push(NameOverride {
+                name_id: name_id.clone(),
+                slot,
+                display: entry.display_name.clone(),
+            });
+        }
+    }
     let (detailed, unw2) = resolve_detailed_names(index, project);
     unwritable.extend(unw2);
     let (per_costume, unw3) = resolve_per_costume_names(index, project);
@@ -334,6 +354,7 @@ pub fn export_roster(
     ui_root: Option<&Path>,
     index: &RosterIndex,
     project: &RosterMod,
+    labels: &std::collections::HashMap<u64, String>,
 ) -> Result<RosterExport> {
     let mut report = RosterExport::default();
 
@@ -352,7 +373,12 @@ pub fn export_roster(
         ));
     }
 
-    let needs_db = !order.is_empty() || !chara_patches.is_empty();
+    let added: Vec<&crate::mod_project::AuthoredEntry> = project
+        .authored
+        .iter()
+        .filter(|entry| !entry.name_id.is_empty())
+        .collect();
+    let needs_db = !order.is_empty() || !chara_patches.is_empty() || !added.is_empty();
 
     if needs_db {
         match ui_root {
@@ -360,6 +386,57 @@ pub fn export_roster(
                 let source = root.join(css::CHARA_DB_PATH);
                 let mut db = CharaDb::open(&source)
                     .with_context(|| "reading the base character select database")?;
+                let untouched = db.tree().clone();
+                // The new characters' own ids, so the patch names them instead of their hashes.
+                let mut labels = labels.clone();
+                for entry in &added {
+                    for name in std::iter::once(format!("ui_chara_{}", entry.name_id)).chain((0..8).map(|colour| format!("ui_chara_{}_{colour:02}", entry.name_id))) {
+                        labels.insert(hash40::hash40(&name).0, name);
+                    }
+                }
+                labels.insert(hash40::hash40(css::COLOR_START_FIELD).0, css::COLOR_START_FIELD.to_owned());
+                let labels = &labels;
+                let patch_path = |file: &str| Path::new(file).with_extension(css::PATCH_EXTENSION).to_string_lossy().replace('\\', "/");
+                let write_patch = |file: &str, xml: String, report: &mut RosterExport| -> Result<()> {
+                    let relative = patch_path(file);
+                    let destination = mod_root.join(&relative);
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&destination, xml)?;
+                    report.files.push(relative);
+                    Ok(())
+                };
+                // Each new character gets an entry of its own, after the last one until the
+                // project places it.
+                let mut layouts = Vec::new();
+                let mut layout_entries = Vec::new();
+                let mut place = db.last_position();
+                for entry in &added {
+                    if db.row(&entry.name_id).is_some() {
+                        continue;
+                    }
+                    let kind = css::fighter_kind_hash(&entry.donor);
+                    let base = db.entries().iter().find(|row| row.fighter_kind == kind).map(|row| row.ui_chara_id);
+                    place += 1;
+                    if place == css::RANDOM_SLOT_ORDER {
+                        place += 1;
+                    }
+                    match db.add_character(&entry.donor, &entry.name_id, &entry.all_slots(), place) {
+                        Ok(()) => layouts.extend(base.map(|base| (base, entry.name_id.clone()))),
+                        Err(error) => report.warnings.push(format!("{}: {error:#}", entry.display_name)),
+                    }
+                }
+                if !layouts.is_empty() {
+                    let layout = root.join(css::LAYOUT_DB_PATH);
+                    if layout.is_file() {
+                        let (before, after) = css::add_layouts(&layout, &layouts)?;
+                        if let Some(xml) = css::patch_xml(&before, &after, labels) {
+                            write_patch(css::LAYOUT_DB_PATH, xml, &mut report)?;
+                        }
+                        layout_entries = css::csk_entries(&before, &after, labels, "ui_layout_id");
+                    }
+                }
                 if !order.is_empty() {
                     let missing = db.apply_order(&order);
                     for name_id in missing {
@@ -378,9 +455,23 @@ pub fn export_roster(
                         ));
                     }
                 }
-                let destination = mod_root.join(css::CHARA_DB_PATH);
-                db.save(&destination)?;
-                report.files.push(css::CHARA_DB_PATH.to_string());
+                if let Some(xml) = css::patch_xml(&untouched, db.tree(), labels) {
+                    write_patch(css::CHARA_DB_PATH, xml, &mut report)?;
+                }
+                // The same changes for the CSK Collection, which builds the select screen
+                // from its own database files and not from patches to the game's.
+                let entries = css::csk_entries(&untouched, db.tree(), labels, "ui_chara_id");
+                if !entries.is_empty() {
+                    let name = mod_root.file_name().map_or("visionary".into(), |name| name.to_string_lossy().into_owned());
+                    let relative = format!("database/{name}.json");
+                    let file = serde_json::json!({
+                        "character_database_entries": entries,
+                        "layout_database_entries": layout_entries,
+                    });
+                    std::fs::create_dir_all(mod_root.join("database"))?;
+                    std::fs::write(mod_root.join(&relative), serde_json::to_vec_pretty(&file)?)?;
+                    report.files.push(relative);
+                }
             }
             None => report.warnings.push(format!(
                 "{} position/visibility/ui_chara_db change(s) were not written: no character select \
@@ -418,33 +509,63 @@ pub fn export_roster(
 /// A character with no files yet is reported rather than skipped, because a mod containing a
 /// costume-gated moveset and no model is a character that appears as the donor wearing the
 /// donor's clothes, running the wrong moveset — which looks like the gate being broken.
+///
+/// Runs after the rest of the export has written its files, and never replaces one: a file the
+/// export generated (a costume's own effect file rebuilt with its edits, say) is newer than the
+/// copy made with the character, so the generated one ships and the clash is reported.
+/// `project_dir` resolves folders stored relative to the project.
 pub fn export_authored_files(
     mod_root: &Path,
     roots: &[PathBuf],
+    project_dir: Option<&Path>,
     authored: &[crate::mod_project::AuthoredEntry],
     report: &mut RosterExport,
 ) -> Result<()> {
+    let mut copy = Copier {
+        written: Default::default(),
+        kept: Vec::new(),
+        mod_root,
+    };
+    // A made character's costume effect files, each with the file the export rebuilds them all
+    // from: its first costume's, in its own folder.
+    let mut effect_sources: std::collections::HashMap<String, PathBuf> = Default::default();
     for entry in authored {
         // Every skin ships, not just the primary slot: a multi-skin character
         // whose extra costumes are missing plays the donor's files (or
         // nothing) under a moveset gated to slots that do not exist.
         let all = entry.all_slots();
         let mut copied = 0;
-        for relative in super::scaffold::directories_for_slots(&entry.donor, &all) {
+        // Everything in the character's own folder is the character: the other model parts,
+        // sounds and portraits copied in when it was made, as well as what is listed below.
+        let own = entry.files_root.as_deref().map(|root| match project_dir {
+            Some(dir) => crate::project_parts::project_absolute(dir, root),
+            None => root.to_path_buf(),
+        });
+        if let Some(own) = own.as_deref().filter(|own| own.is_dir()) {
+            if let Some(first) = all.first() {
+                let source = own.join(super::scaffold::effect_file(&entry.donor, *first));
+                for effect in super::scaffold::effect_files(&entry.donor, &all) {
+                    effect_sources.insert(effect, source.clone());
+                }
+            }
+            copied += copy.tree(own, mod_root)?;
+        }
+        // From the other roots, only the character's own costumes: the donor's effect folder
+        // holds the donor's own file (and the editor's scratch files), which are not this
+        // character's. Its own effect files are taken one by one below.
+        for relative in super::scaffold::directories_for_slots(&entry.donor, &all)
+            .into_iter()
+            .filter(|relative| !relative.starts_with("effect/"))
+        {
             for root in roots {
-                copied += copy_tree(&root.join(&relative), &mod_root.join(&relative))?;
+                copied += copy.tree(&root.join(&relative), &mod_root.join(&relative))?;
             }
         }
         for effect in super::scaffold::effect_files(&entry.donor, &all) {
             for root in roots {
                 let source = root.join(&effect);
                 if source.is_file() {
-                    let destination = mod_root.join(&effect);
-                    if let Some(parent) = destination.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::copy(&source, &destination)?;
-                    copied += 1;
+                    copied += copy.file(&source, &mod_root.join(&effect))?;
                 }
             }
         }
@@ -462,6 +583,69 @@ pub fn export_authored_files(
                 .push(format!("{} ({copied} file(s))", entry.display_name));
         }
     }
+    for (kept, source) in copy.kept {
+        // The export rebuilds every costume's effect file from the character's own one. A
+        // costume file that is a copy of that one loses nothing; only one the author changed
+        // is worth saying.
+        let same = |a: &Path, b: &Path| a == b || std::fs::read(a).ok() == std::fs::read(b).ok();
+        if effect_sources
+            .get(&kept)
+            .is_some_and(|own| same(own, &source))
+        {
+            continue;
+        }
+        report.warnings.push(format!(
+            "{kept}: the export built its own version, so the copy in the character's folder was not shipped."
+        ));
+    }
+    Ok(())
+}
+
+/// Write the `config.json` that makes the game load each new character's costumes (see
+/// [`costume_config`](super::costume_config)), keeping whatever the mod's config already says.
+pub fn export_costume_config(
+    mod_root: &Path,
+    authored: &[crate::mod_project::AuthoredEntry],
+    report: &mut RosterExport,
+) -> Result<()> {
+    if authored.is_empty() {
+        return Ok(());
+    }
+    fn walk(dir: &Path, root: &Path, found: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, found);
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                found.insert(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut provided = std::collections::BTreeSet::new();
+    walk(mod_root, mod_root, &mut provided);
+    let path = mod_root.join("config.json");
+    let mut config = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    for entry in authored {
+        if !super::costume_config::known(&entry.donor) {
+            report.warnings.push(format!(
+                "{}: the game has no costume table for {}, so its costumes were not described to the game and will not load.",
+                entry.display_name, entry.donor
+            ));
+            continue;
+        }
+        let costumes: Vec<(u8, u8)> = entry
+            .all_slots()
+            .iter()
+            .enumerate()
+            .map(|(colour, slot)| (*slot, (colour % 8) as u8))
+            .collect();
+        super::costume_config::add(&mut config, &entry.donor, &costumes, &provided);
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    report.files.push("config.json".to_string());
     Ok(())
 }
 
@@ -480,33 +664,67 @@ fn slot_span(slots: &[u8]) -> String {
     }
 }
 
-/// Copy a directory's files, returning how many were copied.
-///
-/// Visionary's own placement note is skipped: it is a hint for the author, not content, and
-/// shipping it inside a released mod would be noise.
-fn copy_tree(source: &Path, destination: &Path) -> Result<usize> {
-    let Ok(entries) = std::fs::read_dir(source) else {
-        return Ok(0);
-    };
-    let mut copied = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        if path.is_dir() {
-            copied += copy_tree(&path, &destination.join(&name))?;
-            continue;
+/// Copies characters' files into an export without replacing what the export wrote.
+struct Copier<'a> {
+    /// Files this copy wrote: a later root offering the same file is skipped quietly.
+    written: std::collections::HashSet<PathBuf>,
+    /// Files the export had already written, kept, by path in the mod, with the file that was
+    /// not copied over them.
+    kept: Vec<(String, PathBuf)>,
+    mod_root: &'a Path,
+}
+
+impl Copier<'_> {
+    /// Copy one file unless the export already has it. Returns how many were copied.
+    fn file(&mut self, source: &Path, destination: &Path) -> Result<usize> {
+        if self.written.contains(destination) {
+            return Ok(0);
         }
-        if name
-            .to_string_lossy()
-            .eq_ignore_ascii_case("PUT_YOUR_MODEL_HERE.txt")
-        {
-            continue;
+        if destination.exists() {
+            let shown = destination
+                .strip_prefix(self.mod_root)
+                .unwrap_or(destination)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !self.kept.iter().any(|(kept, _)| *kept == shown) {
+                self.kept.push((shown, source.to_path_buf()));
+            }
+            return Ok(0);
         }
-        std::fs::create_dir_all(destination)?;
-        std::fs::copy(&path, destination.join(&name))?;
-        copied += 1;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, destination)?;
+        self.written.insert(destination.to_path_buf());
+        Ok(1)
     }
-    Ok(copied)
+
+    /// Copy a directory's files, returning how many were copied.
+    ///
+    /// Visionary's own placement note is skipped: it is a hint for the author, not content,
+    /// and shipping it inside a released mod would be noise.
+    fn tree(&mut self, source: &Path, destination: &Path) -> Result<usize> {
+        let Ok(entries) = std::fs::read_dir(source) else {
+            return Ok(0);
+        };
+        let mut copied = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_dir() {
+                copied += self.tree(&path, &destination.join(&name))?;
+                continue;
+            }
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case("PUT_YOUR_MODEL_HERE.txt")
+            {
+                continue;
+            }
+            copied += self.file(&path, &destination.join(&name))?;
+        }
+        Ok(copied)
+    }
 }
 
 #[cfg(test)]
@@ -635,7 +853,7 @@ mod tests {
     /// A slot-backed character's name is written against its own slot, or it would rename the
     /// donor's default costume instead of itself.
     #[test]
-    fn a_slot_backed_entrys_name_is_written_against_its_slot() {
+    fn a_new_character_s_name_is_written_against_its_own_colours() {
         let db = test_db(&[
             ("mario", 0, fighter_kind_hash("mario"), true),
             ("vision", 87, fighter_kind_hash("mario"), true),
@@ -664,18 +882,19 @@ mod tests {
         assert!(unwritable.is_empty());
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides[0].name_id, "vision");
-        assert_eq!(overrides[0].slot, 8);
+        // Its own first colour, though that is Mario's ninth costume.
+        assert_eq!(overrides[0].slot, 0);
     }
 
     /// Rebuilding from base + overrides is what keeps a project correct when the mods
     /// underneath it change. A stored copy would pin whatever base file was installed when the
     /// edit was made.
     #[test]
-    fn the_written_database_is_the_base_file_with_only_the_overrides_applied() {
+    fn the_database_patch_holds_only_what_the_project_changes_and_adds() {
         let dir = tempfile::tempdir().unwrap();
         let ui_root = dir.path().join("ui_root");
         let mod_root = dir.path().join("mod");
-        let (index, db) = setup();
+        let (_, db) = setup();
         let source = ui_root.join(css::CHARA_DB_PATH);
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         db.save(&source).unwrap();
@@ -683,14 +902,89 @@ mod tests {
         let mut project = RosterMod::default();
         project.order.insert(RosterKey::fighter("mario"), 5);
 
-        let report = export_roster(&mod_root, Some(&ui_root), &index, &project).unwrap();
-        assert_eq!(report.files, vec![css::CHARA_DB_PATH]);
-        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // A new character on Link, too: it is added whole, after the last entry.
+        project.authored.push(AuthoredEntry {
+            key: RosterKey::slot("link", 8),
+            donor: "link".into(),
+            slot: 8,
+            slots: vec![9],
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let index = RosterIndex::build(
+            &[fighter("mario"), fighter("link")],
+            &ModLibrary::default(),
+            &project,
+            Some(&db),
+        );
+        let labels: std::collections::HashMap<u64, String> = [
+            "disp_order",
+            "can_select",
+            "name_id",
+            "color_num",
+            "ui_chara_id",
+            "ui_chara_mario",
+            "ui_chara_link",
+            css::COLOR_START_FIELD,
+        ]
+        .iter()
+        .map(|name| (hash40::hash40(name).0, (*name).to_owned()))
+        .collect();
 
-        let written = CharaDb::open(&mod_root.join(css::CHARA_DB_PATH)).unwrap();
-        assert_eq!(written.row("mario").unwrap().disp_order, 5);
-        // Untouched entries keep exactly what the base file had.
-        assert_eq!(written.row("link").unwrap().disp_order, 2);
+        let report = export_roster(&mod_root, Some(&ui_root), &index, &project, &labels).unwrap();
+        assert!(
+            report
+                .files
+                .contains(&"ui/param/database/ui_chara_db.prcxml".to_owned()),
+            "{:?}",
+            report.files
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // A patch, not the whole file: the game's own file is left for other mods to patch too.
+        assert!(!mod_root.join(css::CHARA_DB_PATH).exists());
+
+        let xml =
+            std::fs::read_to_string(mod_root.join("ui/param/database/ui_chara_db.prcxml")).unwrap();
+        // Mario's entry carries only what changed; Link's, untouched, is not in the patch.
+        let mario = db.row("mario").unwrap().index;
+        assert!(xml.contains(&format!("<struct index=\"{mario}\">\n      <sbyte hash=\"disp_order\">5</sbyte>\n    </struct>")), "{xml}");
+        assert!(!xml.contains(&format!(
+            "<struct index=\"{}\">",
+            db.row("link").unwrap().index
+        )));
+        // The new character is a whole entry past the end, in costumes c08 and c09.
+        let added = db.entries().len();
+        assert!(
+            xml.contains(&format!("<struct index=\"{added}\">")),
+            "{xml}"
+        );
+        assert!(xml.contains("<string hash=\"name_id\">vision</string>"));
+        assert!(xml.contains("<byte hash=\"color_num\">2</byte>"));
+        assert!(xml.contains("<byte hash=\"color_start_index\">8</byte>"));
+
+        // And the same for the CSK Collection: the moved entry by its id, the new one as a
+        // copy of Link's with what differs.
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mod_root.join("database/mod.json")).unwrap())
+                .unwrap();
+        let entries = file["character_database_entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"ui_chara_id": "ui_chara_mario", "disp_order": 5})
+        );
+        assert_eq!(entries[1]["ui_chara_id"], "ui_chara_vision");
+        assert_eq!(entries[1]["clone_from_ui_chara_id"], "ui_chara_link");
+        assert_eq!(entries[1]["name_id"], "vision");
+        assert_eq!(entries[1]["extra_index_maps"]["color_start_index"], 8);
+        assert!(entries[1].get("color_start_index").is_none());
+        assert_eq!(entries[1]["color_num"], 2);
+        assert!(
+            entries[1].get("c00_index").is_none(),
+            "per-colour fields are left to color_start_index"
+        );
     }
 
     /// Without a `ui/` dump there is no file to apply positions to. Treating that as "nothing
@@ -702,7 +996,8 @@ mod tests {
         let mut project = RosterMod::default();
         project.order.insert(RosterKey::fighter("mario"), 5);
 
-        let report = export_roster(dir.path(), None, &index, &project).unwrap();
+        let report =
+            export_roster(dir.path(), None, &index, &project, &Default::default()).unwrap();
         assert!(report.files.is_empty());
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("no character select database"));
@@ -712,7 +1007,14 @@ mod tests {
     fn a_project_with_no_roster_edits_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (index, _) = setup();
-        let report = export_roster(dir.path(), None, &index, &RosterMod::default()).unwrap();
+        let report = export_roster(
+            dir.path(),
+            None,
+            &index,
+            &RosterMod::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(report.files.is_empty());
         assert!(report.warnings.is_empty());
     }
@@ -745,6 +1047,7 @@ mod authored_file_tests {
         export_authored_files(
             &mod_root,
             std::slice::from_ref(&source),
+            None,
             &[authored_entry_multi("mario", &[8], "Vision", "vision")],
             &mut report,
         )
@@ -785,6 +1088,7 @@ mod authored_file_tests {
         export_authored_files(
             &dir.path().join("mod"),
             &[source],
+            None,
             &[authored_entry_multi(
                 "mario",
                 &[8, 9, 10, 11, 12, 13, 14, 15],
@@ -807,6 +1111,103 @@ mod authored_file_tests {
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
+    /// The export rebuilds a costume's own effect file with its edits before the character's
+    /// folder is copied in. The copy made when the character was created is older; replacing
+    /// the built file with it shipped the character without its effect edits.
+    #[test]
+    fn a_file_the_export_built_is_kept_and_the_clash_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let own = project.join("characters/vision");
+        scaffold::create_many(&own, "mario", &[8]).unwrap();
+        std::fs::write(own.join(scaffold::effect_file("mario", 8)), b"created").unwrap();
+        std::fs::write(
+            own.join("fighter/mario/model/body/c08/model.numdlb"),
+            b"model",
+        )
+        .unwrap();
+        // c09 is a copy of c08, as made with the character; c10 the author changed.
+        scaffold::create_many(&own, "mario", &[9, 10]).unwrap();
+        std::fs::write(own.join(scaffold::effect_file("mario", 9)), b"created").unwrap();
+        std::fs::write(own.join(scaffold::effect_file("mario", 10)), b"author's").unwrap();
+        let mut entry = authored_entry_multi("mario", &[8, 9, 10], "Vision", "vision");
+        // Stored relative to the project, as new projects store it.
+        entry.files_root = Some(PathBuf::from("characters/vision"));
+        let export = |built: bool| {
+            let mod_root = dir.path().join(if built { "built" } else { "plain" });
+            if built {
+                for slot in [8, 9, 10] {
+                    let eff = mod_root.join(scaffold::effect_file("mario", slot));
+                    std::fs::create_dir_all(eff.parent().unwrap()).unwrap();
+                    std::fs::write(&eff, b"built").unwrap();
+                }
+            }
+            let mut report = RosterExport::default();
+            // The folder is also one of the roots, as it is while the project is open.
+            export_authored_files(
+                &mod_root,
+                std::slice::from_ref(&own),
+                Some(&project),
+                std::slice::from_ref(&entry),
+                &mut report,
+            )
+            .unwrap();
+            (mod_root, report)
+        };
+        let (mod_root, report) = export(true);
+        assert_eq!(
+            std::fs::read(mod_root.join(scaffold::effect_file("mario", 8))).unwrap(),
+            b"built"
+        );
+        assert!(mod_root
+            .join("fighter/mario/model/body/c08/model.numdlb")
+            .is_file());
+        // Only the costume file the author changed is a loss worth saying; the copies of the
+        // file the export rebuilt from are not.
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("ef_mario_c10.eff"));
+        // Paired: with nothing built, the character's own copy ships, and the same file
+        // offered by its folder and by the roots is not a clash.
+        let (mod_root, report) = export(false);
+        assert_eq!(
+            std::fs::read(mod_root.join(scaffold::effect_file("mario", 8))).unwrap(),
+            b"created"
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    /// A root's effect folder for the donor holds the donor's own file and the editor's scratch
+    /// files: none of them is the character's. Paired with the character's own costume effect
+    /// file from the same root, which ships.
+    #[test]
+    fn only_a_characters_own_effect_files_ship_from_the_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("game");
+        let effects = root.join("effect/fighter/mario");
+        std::fs::create_dir_all(&effects).unwrap();
+        for name in [
+            "ef_mario.eff",
+            "_transplant_preview.eff",
+            "ef_mario_c08.eff",
+        ] {
+            std::fs::write(effects.join(name), name).unwrap();
+        }
+        let mod_root = dir.path().join("mod");
+        let mut report = RosterExport::default();
+        export_authored_files(
+            &mod_root,
+            &[root],
+            None,
+            &[authored_entry_multi("mario", &[8], "Vision", "vision")],
+            &mut report,
+        )
+        .unwrap();
+        let shipped = mod_root.join("effect/fighter/mario");
+        assert!(shipped.join("ef_mario_c08.eff").is_file());
+        assert!(!shipped.join("ef_mario.eff").exists());
+        assert!(!shipped.join("_transplant_preview.eff").exists());
+    }
+
     /// A mod with the moveset and no model is a character that appears as the donor running
     /// the wrong moveset, which looks like the costume gate being broken.
     #[test]
@@ -818,6 +1219,7 @@ mod authored_file_tests {
         export_authored_files(
             &dir.path().join("mod"),
             &[source],
+            None,
             &[authored_entry_multi("mario", &[8], "Vision", "vision")],
             &mut report,
         )

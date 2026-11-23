@@ -17,7 +17,10 @@ impl Facade for DebuggableServerFacade {
     }
     fn install(&mut self) {
         skyline::println!("[SLight] Installing facade Debuggable Server");
-        crate::rust_extender::debuggable_server::init();
+        // A mod's copy plays its saved edits and never talks to the editor.
+        if !cfg!(feature = "exported") {
+            crate::rust_extender::debuggable_server::init();
+        }
     }
     fn global_only(&self) -> bool {
         true
@@ -57,6 +60,13 @@ impl Facade for DebuggableServerFacade {
             // is empty — the editor treats one as "this move's script is fully streamed".
             for end in crate::slight::hitbox_viewer::take_pending_ends(MAX_NOTIFY_PER_TICK) {
                 crate::rust_extender::debuggable_server::notify_acmd_capture_end(&end);
+            }
+            for line in crate::slight::hitbox_viewer::take_pending_article(MAX_NOTIFY_PER_TICK) {
+                crate::rust_extender::debuggable_server::notify_article_acmd_capture(&line);
+            }
+            for end in crate::slight::hitbox_viewer::take_pending_article_ends(MAX_NOTIFY_PER_TICK)
+            {
+                crate::rust_extender::debuggable_server::notify_article_acmd_capture_end(&end);
             }
             for snapshot in crate::slight::hitbox_viewer::take_capture_debug(MAX_NOTIFY_PER_TICK) {
                 crate::rust_extender::debuggable_server::notify_acmd_capture_debug(&snapshot);

@@ -2,17 +2,20 @@
 
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
-This is joobert's fork of Visionary. See [CHANGELOG.md](CHANGELOG.md) for everything it adds on top of upstream `v0.1.2`.
+What changed is written up three ways: [CHANGELOG.md](CHANGELOG.md) (patch notes for every release), [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md) (features and fixes in more depth) and [CHANGELOG_fr.md](CHANGELOG_fr.md) (the full technical list for the latest release).
 
 ## Components
 
 - `src/` contains the desktop application.
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
-- The `ssbh_wgpu` crate provides character model, animation, skeleton, and
-  weapon rendering. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu),
-  which adds loading a model from files in different folders (costumes that
-  share files through `config.json`) and the skeleton edit used to place a
-  thrown fighter.
+- [`ssbh_wgpu`](https://github.com/Common-Leap/ssbh_wgpu) (a fork of
+  ScanMountGoat's, with two additions for effects) draws the fighters, their
+  objects and the stage. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu)
+  of it, which adds loading a model from files in different folders (costumes
+  that share files through `config.json`) and the skeleton edit that scales a
+  fighter at its root.
+- [`eff_wgpu`](https://github.com/Common-Leap/eff_wgpu) simulates and draws the
+  effects in the preview the way the game does.
 - The [`effect_library`](https://crates.io/crates/effect_library) crate on
   crates.io provides `.eff` parsing, editing, and export.
 - The effect editor exposes the documented emitter, particle, animation,
@@ -21,13 +24,13 @@ This is joobert's fork of Visionary. See [CHANGELOG.md](CHANGELOG.md) for everyt
 
 ## Prerequisites
 
-- A recent Rust toolchain
+- Rust, through rustup: `rust-toolchain.toml` picks the version (1.97.1)
 - The `cargo-skyline` toolchain for building the in-game plugin, and for
   **Build & Deploy** of a linked moveset (see [Building and deploying your
   plugin](#building-and-deploying-your-plugin))
 
-Cargo downloads the pinned `ssbh_wgpu` revision, `effect_library`, and the other
-Rust dependencies automatically during the build.
+Cargo downloads `ssbh_wgpu`, `eff_wgpu`, `effect_library`, and the other Rust
+dependencies automatically during the build.
 
 ## Game data
 
@@ -40,14 +43,52 @@ Keep the dumped folders beneath the same export root:
 ArcExplorer export/
 ├── fighter/
 ├── effect/
-└── ui/        (optional — needed for the Roster window)
+├── ui/        (optional — needed for the Characters page)
+├── stage/     (optional — stages to preview moves on)
+└── item/      (optional — items fighters hold in their moves)
 ```
 
-Open this export root in Visionary when prompted. The `fighter` folder provides
-character models, motion data, and parameters; the `effect` folder provides the
-`.eff` files used by the effect editor.
+On first run Visionary asks for this folder (the **ArcExplorer dump**) before anything
+else, then shows the Project Hub (the hub waits until a dump is set). It checks the folder: one without `fighter/` and `effect/`
+is refused with the reason, one that looks like a mod (an `info.toml`, a `.nro`, a `romfs/`
+wrapper or only a handful of fighters) is warned about, and a folder that holds a valid dump
+one level down offers that folder instead. The `fighter` folder provides character models,
+motion data, and parameters; the `effect` folder provides the `.eff` files used by the
+effect editor.
 
-The `ui` folder is optional and only the Roster window needs it. Dump it if you
+### Sources window
+
+**File → Sources…** is the one place that shows every input, top to bottom in load order,
+with what each is for and whether it is OK, missing or has a problem:
+
+1. **Base game — ArcExplorer dump.** Global: the same game for every project.
+2. **Reference mods.** Global: the enabled Mod Library entries, opened from this row.
+3. **This project's files.** The open project's `romfs/`.
+4. **Moveset code.** The Rust crate linked to the open project.
+
+The precedence rule: a file in the project's `romfs/` wins over everything else, in the
+fighter list and in previews (models, motions, params and icons), so a copied and edited
+model previews from `romfs/` and not from the dump. Effects are the exception: they still
+come from the dump and the reference mods, so exporting an edited effect can never write
+over a file in `romfs/`. Between the dump and the reference mods nothing changes: the dump stays
+authoritative for a fighter's model, motion and parameter paths, and mods add fighters and
+slots. The dump and the Mod Library belong to the machine; the project's files and moveset
+link belong to the project. The moveset link is saved per project in `modproject.json`
+(relative to the project folder when the crate is inside it), so opening a project re-links
+its crate. Without a project open, the link is the global one, as before.
+
+### Project fighters
+
+With a project open, the fighter list has two groups: **In this project** (expanded) and
+**Everything else** (collapsed, for effect donors and comparisons); search filters both.
+A fighter is in the project when it was added to it, has files in the project's
+`romfs/fighter/<name>/`, has scripts in the linked moveset crate, or has saved edits (an
+edited fighter is never hidden). Editing a fighter adds it to the project, and it stays
+after the edit is undone. Right-click a fighter to **Add to project** or **Remove from
+project**; the menu says why a fighter stays listed after removal (for example, it still has
+edits). Without a project the list is the flat list it always was.
+
+The `ui` folder is optional and only the Characters page needs it. Dump it if you
 want to edit the character select screen: it provides
 `ui/param/database/ui_chara_db.prc` (the roster database, which decides who
 appears on the select screen and in what order), `ui/message/` (display names),
@@ -62,12 +103,47 @@ motion parts. This includes Kirby copy-ability animations stored in donor body
 directories, so copied specials preview with their intended animation when the
 corresponding files are present in the export.
 
-## Roster
+## Making moves and gimmicks with nodes
 
-The **Roster** window (Windows → Roster, or File → Mod Library) covers everything about a
-fighter that is not one move.
+The node system is not finished. Some blocks don't update live yet, many fighter mechanics aren't
+supported as gimmicks, and most fighters have barely been tested.
 
-### Mod library
+Open the **Move nodes** tab, or start from **Gimmicks** to work on a whole character.
+
+**Make a move**
+
+1. Pick the fighter and the move slot to replace, such as Mario's `special_n`.
+2. Under **Start a new move**, click a starter such as *Quick strike* or *Shoot a projectile*.
+   *Empty move* starts from nothing. Undo brings back what was there.
+3. Click a block to change it. Each block explains itself at the top of the panel.
+4. Add more from the list on the left. Clicking one adds it after the selected block.
+
+Blocks run left to right, and the frame ruler along the top shows when. With nothing selected,
+**What this move does** reads the whole move back in sentences. Click a line to find its block.
+An **If** block has three outputs: **Yes** and **No** say what runs for each answer, and
+**After** runs either way.
+
+**Everything updates live.** With the game connected, each finished edit reaches the match by
+itself, with no restart and no export. **● Updates live** at the top confirms it; if a block
+can't go live yet, that label names it. To keep a move, use **Project → Export Mod Folder**. The
+folder it makes is a complete mod: drop it in your mods folder and it works without the editor,
+exactly as you tested it. You don't need Rust. Keep only one copy of the plugin installed, so remove
+any other copy from Skyline's plugins folder.
+
+**Make a gimmick**
+
+The **Gimmick** section of the block list adds rules that run all the time: *When: deals damage*,
+*When: takes damage*, timers and meters. Ready-made gimmicks such as extra jumps are in the same
+section, and **Tell a gimmick** lets a move talk to one. The **Gimmicks** tab also edits a
+fighter's personal parameters. Custom characters inherit their donor's controls, and costumes of
+one donor share its gimmick state.
+
+## Characters
+
+The **Characters** page manages imported mods, character select entries, new donor-backed
+characters, and shared fighter traits.
+
+### Installed mods
 
 Import compiled mods — folders, or `.zip` and `.7z` archives, many at once. Visionary finds
 the game folders inside whatever wrapper a mod ships with (`romfs/`, a folder named after the
@@ -98,8 +174,7 @@ Visionary does not read. What the preview is authoritative about is the order.
 
 Adds a character as a **costume of an existing fighter**. It gets its own model, animations,
 effects, display name, and moveset, and you select it by choosing that fighter and then its
-costume. It does not get its own square on the select screen; see `docs/roster/PLAN.md` for the
-measurement behind that.
+costume. It does not get its own square on the select screen.
 
 Creating one makes the folders your model and animations go in and adds them to the mod
 library, so the slot is editable immediately. The panel reports what is still missing —
@@ -111,7 +186,7 @@ version of everything you change. If Visionary does not have the fighter's origi
 a move you scoped, the export stops and says so rather than shipping a plugin that removes that
 move from every other costume.
 
-### Traits
+### Fighter values
 
 Weight, gravity, walk and run speeds, jump heights, landing lag, shield size, and the rest, from
 `fighter/common/param/fighter_param.prc`. Grouped and explained, with every field reachable
@@ -153,6 +228,10 @@ the executable for native window decorations on Windows and X11.
 
 Visionary reads the dumped data from its existing location and remembers the
 selected export root for future sessions.
+
+When managing a plugin build or a separate test installation manually, set
+`VISIONARY_DISABLE_PLUGIN_AUTO_DEPLOY=1` before starting the editor. This disables
+the startup plugin rebuild/deployment check without disabling live editing.
 
 ### Editing a move
 
@@ -214,8 +293,29 @@ expression edits and reloads the loaded source or capture baseline.
 
 ### Viewport
 
-The camera works like SSBH Editor's: left drag orbits the model, right or middle
-drag pans so the model follows the pointer, and scroll zooms.
+The camera works like SSBH Studio's. It turns about whatever is centred in the
+view, so something you pan to stays centred while you orbit. With the default
+**SSBH** navigation, left drag orbits, right or middle drag pans so the model
+follows the pointer, and scroll zooms. **Blender** navigation (in Settings) orbits
+with middle drag, pans with Shift + middle drag and zooms with Ctrl + middle drag;
+**Emulate 3 button mouse** lets Alt + left drag stand in for the middle button.
+Double-click turns back to the default angle.
+
+With the pointer over the viewport:
+
+- Numpad **1**, **3** and **7** look from the front, right and top; with **Ctrl**,
+  from the opposite side. Numpad **9** turns to the opposite of the current view.
+- **Home** frames the fighter, and **Period** the selected hitbox (or the fighter
+  when none is selected).
+- The arrow keys pan.
+
+The orientation widget in the top-right corner shows which way the camera looks:
+click an axis ball (or a cube face) to look along it, again to look from the other
+side, or drag it to orbit. The cube's arrows turn a quarter turn. Settings picks
+the axes, the cube, or neither.
+
+A red X line and a blue Z line on the ground mark the world axes through the
+origin, where the fighter starts.
 
 The toolbar in the viewport's top-left corner holds the display options:
 
@@ -225,16 +325,23 @@ The toolbar in the viewport's top-left corner holds the display options:
     a terminal it logs there; otherwise a console opens only while this is on.
     Its close button is removed, since closing it would end Visionary.
   - **Interface scale**, kept in step with **Ctrl +/-**.
-  - **Background** colour (SSBH Editor's dark grey by default), **Floor grid**
-    and **Bloom**.
+  - **Background** colour (SSBH Editor's dark grey by default), **Floor grid**,
+    **World axes** and **Bloom**.
   - **Enable helper bones**, which applies the model's `model.nuhlpb`, as the
     game does. Helper bones (`H_` elbow, knee and similar helpers) then move
     the mesh and any hitbox, hurtbox or effect placed on them. It is on by
     default. A move's material animations (glows, colour changes, eye swaps)
     always play.
-  - **Camera**: translation, rotation and field of view, with **⟲ Reset view**.
-- **⟲** beside the gear returns the camera to the default side view. It is
-  disabled while the camera is already there.
+  - **Camera**: mouse navigation, the orientation widget, translation, rotation,
+    field of view, near and far clip, **⟲ Reset view**, **Save as default** (the
+    view the camera starts at and resets to) and **Reset default** (back to the
+    built-in side view).
+  - **Camera animation**: a `.nuanmb` with a camera in it (a Final Smash or stage
+    camera, from the fighter's `camera/` folder) that the viewport camera plays
+    along the timeline. **Play camera animation** turns it off without clearing
+    the file. It isn't saved between sessions.
+- **⟲** beside the gear returns the camera to the default view. It is disabled
+  while the camera is already there.
 - **Scale** appears when the fighter isn't drawn at 1.0. The fighter starts at
   its `fighter_param` `scale` (or the moveset's `param_config` override of it).
   A linked moveset's frame callback (`on_line`) wins over that:
@@ -244,14 +351,14 @@ The toolbar in the viewport's top-left corner holds the display options:
   wraps them in, so a helper that leaves one out leaves that scale alone.
   Branches that only run on the results screen or on entry are skipped. Hover
   the label to see each value and the line it came from.
-- **Thrown fighter** appears on throws. It shows a second fighter (Mario by
-  default; any indexed fighter or any fighter in the vanilla dump) whose `rot`
-  bone sits on the thrower's `throw` bone, playing its own thrown animation.
+- **Thrown fighter** picks the opponent the preview holds in grabs and throws
+  (on by default). Choose any indexed fighter or any fighter in the vanilla dump,
+  and its costume slot. On throws it plays that costume's own thrown animation:
   **Auto** matches the throw's direction (`throw_f` → `thrown_f`), or the
   thrower's own set when the victim has one (`shizue_special_s_thrown_f`). The
   game also picks a `_dx`, `_big` or `_girl` variant depending on the thrower.
-  Visionary doesn't detect that yet, so choose it from the list. The victim
-  copies the throw bone's full transform, scale included.
+  Visionary doesn't detect that yet, so choose it from the list. Turning it off
+  hides the opponent.
 - **Model** and **Motion** notes appear when the shown costume borrows files.
   Visionary loads each costume the way ARCropolis does: the folder's own file
   first, then a `config.json` share (`share-to-vanilla` or `share-to-added`),
@@ -261,7 +368,7 @@ The toolbar in the viewport's top-left corner holds the display options:
 
 ### Motion List
 
-**Windows → Motion List** (ported from SSBH Editor) edits every field of the
+**Tools → Motion list** (ported from SSBH Editor) edits every field of the
 selected fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game
 and other scripts, up to three animations picked from the folder's `.nuanmb`
 files, flags, blend frames, cancel frames and intangibility frames. Motions can
@@ -282,6 +389,24 @@ fighter**. Visionary removes that fighter's cached scripts, saved edits, and
 live effect previews while leaving the dumped and mod files unchanged. Use the
 **Restore** button beside the Fighters heading to show forgotten fighters
 again.
+
+## Effects page
+
+The **Effects** page (Ctrl+Shift+E) changes how the fighter's effects look.
+
+- The list on the left is every effect in the open file. Hover one to see the moves that spawn
+  it; effects no move script spawns are greyed. Search finds effects by name or by move.
+- The switch over the view plays the selected effect **Alone**, looping with the fighter
+  hidden, or **In a move** that spawns it. Picking a move there opens it.
+- The right side edits the selected effect: **Look** for one part's brightness, size, colours
+  and texture, **Parts & timing** for when each part starts and how long it lasts. Colours take
+  a picker, a colour code like `#FF8800`, or exact numbers, which may go above 1 as the game's
+  do.
+- Every edit shows in the view as you make it. **Send edits** hands them to the running game;
+  do the move again there to see them.
+
+The stage picker over the view shows moves on a stage from the dumped `stage/` folder:
+aerials in the air above it and ledge moves on its ledge.
 
 ## Eden emulator setup
 
@@ -343,7 +468,7 @@ built, the send indicator stops at once and says which file is missing.
 By default Visionary reads ACMD scripts from an online archive of the *vanilla*
 scripts. If you have already modded a move, that is not the code your game runs.
 
-Open **Windows → ACMD Source** and link the Rust project that builds your
+Open **File → Your source code** and link the Rust project that builds your
 plugin — the folder holding its `Cargo.toml`. Visionary recursively scans its
 Rust source files, so scripts can stay in their existing modules and filenames;
 you do not need to create a specially named aggregate file. It joins
@@ -954,7 +1079,7 @@ installs looks exactly like one that does nothing.
 
 ## Projects and mod exports
 
-The **Project Hub** appears on launch — **Resume last / New / Open
+The **Project Hub** appears on launch once a game dump is set — **Resume last / New / Open
 (`modproject.json`) / Import mod / Recent / Browse without project** — and
 reopens from **File → Project Hub** mid-session. One current project holds
 every edit: its path is remembered, edits autosave to it about a second after
@@ -971,9 +1096,7 @@ transplant edits together:
 - **Export Project** writes a portable `modproject.json` and adopts its path.
   These editable files are exported separately from mod and developer files.
 - **Load Project** replaces the current project, restores every edit, and sends
-  the available live rules and effects to a connected game. Added or retimed
-  move events may ask you to perform that move once so the plugin can capture
-  the original arguments safely.
+  the available live rules and effects to a connected game.
 - **Import Mod as Project** adopts any mod folder: `ui_chara_db` diffs
   (order/visibility/row fields), `.xmsbt` names, BNTX portraits→PNG assets, and
   `fighter_param` diffs become editable; source text is copied as reference and
@@ -1063,8 +1186,3 @@ VISIONARY_MOVESETS="/path/to/Movesets" cargo test --bin visionary moveset_survey
 `VISIONARY_SURVEY_ONLY=<folder name>` limits it to one project, and
 `VISIONARY_SURVEY_PLAN=1` also prints the Build & Deploy plan each project would
 use (without building or copying anything).
-
-
-Reusable game-analysis utilities are available in `research/decomp/ssbu-re/`.
-Each tool reads its inputs from the external directory selected through
-`SSBU_DUMP_DIR`.

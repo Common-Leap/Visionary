@@ -8,6 +8,27 @@ use serde::{Deserialize, Serialize};
 /// SSBH Editor's viewport background: its dark theme's panel colour.
 pub const DEFAULT_VIEWPORT_COLOR: [u8; 3] = [27, 27, 27];
 
+/// Which mouse buttons move the viewport camera (SSBH Studio's two schemes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NavigationScheme {
+    /// Left drag orbits; right or middle drag pans.
+    #[default]
+    Ssbh,
+    /// Middle drag orbits, Shift + middle pans and Ctrl + middle zooms.
+    Blender,
+}
+
+/// The orientation widget in the viewport's top right corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NavigationWidget {
+    /// Coloured axis balls, like Blender's navigation gizmo.
+    #[default]
+    Axes,
+    /// A labelled cube with turn arrows.
+    Cube,
+    Hidden,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -19,7 +40,15 @@ pub struct Preferences {
     /// sRGB colour behind the model.
     pub viewport_color: [u8; 3],
     pub floor_grid: bool,
+    /// Red X and blue Z lines through the origin on the ground.
+    pub world_axes: bool,
     pub bloom: bool,
+    pub navigation_scheme: NavigationScheme,
+    /// With Blender navigation, Alt + left drag stands in for the middle button.
+    pub emulate_three_button_mouse: bool,
+    pub navigation_widget: NavigationWidget,
+    /// The view the camera starts at and resets to. `None` is the built-in side view.
+    pub default_camera: Option<crate::renderer::CameraView>,
 }
 
 impl Default for Preferences {
@@ -29,13 +58,23 @@ impl Default for Preferences {
             ui_scale: 1.0,
             viewport_color: DEFAULT_VIEWPORT_COLOR,
             floor_grid: true,
+            world_axes: true,
             bloom: false,
+            navigation_scheme: NavigationScheme::default(),
+            emulate_three_button_mouse: false,
+            navigation_widget: NavigationWidget::default(),
+            default_camera: None,
         }
     }
 }
 
 impl Preferences {
     pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.5;
+
+    /// The view the camera starts at and resets to.
+    pub fn home_camera(&self) -> crate::renderer::CameraView {
+        self.default_camera.unwrap_or_default()
+    }
 
     fn path() -> Option<std::path::PathBuf> {
         dirs::config_dir().map(|base| base.join("visionary").join("preferences.json"))
@@ -96,6 +135,28 @@ mod tests {
         assert_eq!(preferences.viewport_color, [1, 2, 3]);
         assert_eq!(preferences.ui_scale, 1.0);
         assert!(preferences.floor_grid);
+        // Fields newer than the file take their defaults too.
+        assert!(preferences.world_axes);
+        assert_eq!(preferences.navigation_scheme, NavigationScheme::Ssbh);
+        assert_eq!(preferences.navigation_widget, NavigationWidget::Axes);
+        assert_eq!(preferences.home_camera(), crate::renderer::CameraView::default());
+    }
+
+    #[test]
+    fn camera_settings_round_trip() {
+        let preferences = Preferences {
+            navigation_scheme: NavigationScheme::Blender,
+            emulate_three_button_mouse: true,
+            navigation_widget: NavigationWidget::Cube,
+            world_axes: false,
+            default_camera: Some(crate::renderer::CameraView {
+                translation: [1.0, -3.0, -90.0],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_vec(&preferences).unwrap();
+        assert_eq!(Preferences::parse(&json), preferences);
     }
 
     #[test]

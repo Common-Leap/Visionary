@@ -13,8 +13,12 @@ echo "[watch] Monitoring $PLUGIN/src for changes (poll 2s). Ctrl-C to stop."
 # Touch a marker so the first iteration always builds if NRO is missing or stale.
 LAST=""
 while true; do
-  # Hash all plugin sources + Cargo.toml
-  CUR=$(find "$PLUGIN/src" "$PLUGIN/Cargo.toml" -type f -exec sha1sum {} \; 2>/dev/null | sha1sum | cut -d' ' -f1)
+  # Shared registry/protocol modules are compiled into the same plugin.
+  CUR=$(find "$PLUGIN/src" "$PLUGIN/Cargo.toml" "$PLUGIN/Cargo.lock" \
+    "$ROOT/src/gimmicks/registry_data.rs" "$ROOT/src/gimmicks/live_model.rs" \
+    "$ROOT/src/gimmicks/live_params.rs" "$ROOT/src/gimmicks/native_inputs.rs" \
+    "$ROOT/src/gimmicks/controller_runtime.rs" "$ROOT/src/gimmicks/controller_protocol.rs" \
+    -type f -exec sha1sum {} \; 2>/dev/null | sha1sum | cut -d' ' -f1)
   if [[ "$CUR" != "$LAST" ]]; then
     echo "[watch] Change detected ($CUR) — rebuilding..."
     if bash "$PLUGIN/scripts/build.sh" 2>&1 | tail -n 30; then

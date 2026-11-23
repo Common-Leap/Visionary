@@ -50,12 +50,17 @@ static EDITS_FAIL: AtomicU64 = AtomicU64::new(0);
 /// Start a bounded diagnostic session. This file used to append across every game boot and grew
 /// into hundreds of megabytes, turning routine effect edits into emulator filesystem work.
 pub fn start_session() {
+    // A mod's plugin writes nothing to the SD card.
+    if cfg!(feature = "mod_plugin") {
+        return;
+    }
     if let Some(mut buffer) = BUF.try_lock() {
         buffer.clear();
     }
     // Stamp the build into the session header. Without this there is no way to tell from
     // on-device logs WHICH .nro actually loaded, which turns "did my fix ship?" into
     // guesswork about file timestamps.
+    #[cfg(not(feature = "mod_plugin"))]
     let _ = std::fs::write(
         DIAG_FILE,
         format!(
@@ -66,6 +71,9 @@ pub fn start_session() {
 }
 
 fn push(line: String) {
+    if cfg!(feature = "mod_plugin") {
+        return;
+    }
     // try_lock, never park: this buffer is written from BOTH the game thread and the
     // server/sender threads, and parked lock-waiters never wake in this environment
     // (the std::thread::sleep bug class). Dropping a diag line under contention is fine;

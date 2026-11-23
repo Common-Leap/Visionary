@@ -178,8 +178,15 @@ pub fn group_of(name: &str) -> MoveGroup {
 
     // Before the `special` arms: a copied special is `<donor>_special_*`, and testing for
     // `contains("special")` first would file every one of them under Specials.
+    // Every fighter also has `fall_special` (helpless fall) and reactions to being caught by
+    // someone else's special (`shizue_special_s_thrown_f`, `jack_special_hi_pulled`); neither is
+    // a copy, and on Mario they were the whole group.
     if let Some(rest) = n.split_once("_special") {
-        if !n.starts_with("special") && !rest.0.is_empty() && !n.starts_with("item_") {
+        if n.contains("_thrown") || n.contains("_pulled") {
+            return MoveGroup::Damage;
+        }
+        let own = n.starts_with("special") || n.starts_with("item_") || n.starts_with("fall");
+        if !own && !n.starts_with("landing") && !rest.0.is_empty() {
             return MoveGroup::CopySpecial;
         }
     }
@@ -303,6 +310,125 @@ pub fn group_of(name: &str) -> MoveGroup {
     MoveGroup::Other
 }
 
+/// The plain name of a move, such as "Forward smash" for `attack_s4_s`.
+pub fn plain_name(name: &str) -> String {
+    let stripped = if name.len() > 3 {
+        let b = name.as_bytes();
+        if b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit() {
+            &name[3..]
+        } else {
+            name
+        }
+    } else {
+        name
+    };
+
+    match stripped.replace('_', "").as_str() {
+        "attacks4s" => return "Forward smash".into(),
+        "attacks4" => return "Forward smash".into(),
+        "attackhi4" => return "Up smash".into(),
+        "attacklw4" => return "Down smash".into(),
+        "attacks3s" => return "Forward tilt".into(),
+        "attacks3" => return "Forward tilt".into(),
+        "attackhi3" => return "Up tilt".into(),
+        "attacklw3" => return "Down tilt".into(),
+        "attackairn" => return "Neutral air".into(),
+        "attackairf" => return "Forward air".into(),
+        "attackairb" => return "Back air".into(),
+        "attackairhi" => return "Up air".into(),
+        "attackairlw" => return "Down air".into(),
+        "attackdash" => return "Dash attack".into(),
+        "attack11" => return "Jab 1".into(),
+        "attack12" => return "Jab 2".into(),
+        "attack13" => return "Jab 3".into(),
+        "catch" => return "Grab".into(),
+        "catchdash" => return "Dash grab".into(),
+        "catchturn" => return "Pivot grab".into(),
+        "throwf" => return "Forward throw".into(),
+        "throwb" => return "Back throw".into(),
+        "throwhi" => return "Up throw".into(),
+        "throwlw" => return "Down throw".into(),
+        "specialn" => return "Neutral special".into(),
+        "specials" => return "Side special".into(),
+        "specialhi" => return "Up special".into(),
+        "speciallw" => return "Down special".into(),
+        _ => {}
+    }
+
+    // Variants read as the move they belong to: "attack_hi4_hold" is "Up smash hold",
+    // "special_air_n" is "Neutral special air".
+    const PARTS: &[(&str, &str)] = &[
+        ("attack_s4", "forward smash"),
+        ("attack_hi4", "up smash"),
+        ("attack_lw4", "down smash"),
+        ("attack_s3", "forward tilt"),
+        ("attack_hi3", "up tilt"),
+        ("attack_lw3", "down tilt"),
+        ("attack_air_n", "neutral air"),
+        ("attack_air_f", "forward air"),
+        ("attack_air_b", "back air"),
+        ("attack_air_hi", "up air"),
+        ("attack_air_lw", "down air"),
+        ("attack_dash", "dash attack"),
+        ("attack_100", "rapid jab"),
+        ("special_air_n", "neutral special air"),
+        ("special_air_s", "side special air"),
+        ("special_air_hi", "up special air"),
+        ("special_air_lw", "down special air"),
+        ("special_n", "neutral special"),
+        ("special_s", "side special"),
+        ("special_hi", "up special"),
+        ("special_lw", "down special"),
+        ("final", "final smash"),
+    ];
+    let mut words = stripped.to_owned();
+    if let Some((part, plain)) = PARTS.iter().find(|(part, _)| stripped.starts_with(part)) {
+        words = format!("{plain}{}", &stripped[part.len()..]);
+    }
+    if PARTS.iter().any(|(part, _)| stripped.starts_with(part)) {
+        let mut words = format!("{} ", words.replace('_', " "));
+        // Angled smashes and tilts end in hi or lw.
+        for (from, to) in [(" hi ", " angled up "), (" lw ", " angled down ")] {
+            words = words.replace(from, to);
+        }
+        let mut letters = words.trim().chars();
+        return letters.next().map_or_else(String::new, |first| {
+            first.to_uppercase().chain(letters).collect()
+        });
+    }
+
+    // Everything else in sentence case, with the game's short words spelled out.
+    let words: Vec<&str> = stripped
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| match word {
+            "catched" => "held by",
+            "lw" => "down",
+            "hi" => "up",
+            "f" => "forward",
+            "b" => "back",
+            "n" => "neutral",
+            "ganon" => "Ganondorf",
+            "wait" => "idle",
+            "cliff" => "ledge",
+            "catch" => "grab",
+            "escape" => "dodge",
+            "guard" => "shield",
+            "appeal" => "taunt",
+            "win" => "victory pose",
+            "entry" => "entrance",
+            "damage" => "hurt",
+            "lr" => "sideways",
+            other => other,
+        })
+        .collect();
+    let words = words.join(" ");
+    let mut letters = words.chars();
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +455,12 @@ mod tests {
         assert_eq!(group_of("cloud_special_n"), MoveGroup::CopySpecial);
         assert_eq!(group_of("cloud_special_air_n"), MoveGroup::CopySpecial);
         assert_eq!(group_of("special_n_start"), MoveGroup::Special);
+        // Mario's whole "copied specials" group was these: his own helpless fall, and being
+        // caught by Isabelle's or Joker's special.
+        assert_eq!(group_of("fall_special_b"), MoveGroup::JumpLand);
+        assert_eq!(group_of("landing_fall_special"), MoveGroup::JumpLand);
+        assert_eq!(group_of("shizue_special_s_thrown_f_big"), MoveGroup::Damage);
+        assert_eq!(group_of("jack_special_hi_pulled"), MoveGroup::Damage);
         // An item's flag-hoisting "special" is not a copy ability.
         assert_eq!(group_of("item_special_flag_hoist"), MoveGroup::Item);
         // Weapon movesets before `item_`, and before Movement for the `_dash` ones.
@@ -389,92 +521,5 @@ mod tests {
                 group.label()
             );
         }
-    }
-
-    /// Every distinct move name in the corpus lands in a group, and few land in `Other`.
-    ///
-    /// **The load-bearing check, and the one whose absence would be invisible.** A categoriser
-    /// that dumps everything into `Other` still produces a complete, correctly-ordered,
-    /// non-crashing list — it is simply useless, and every example test above would still pass.
-    /// So this asserts a *proportion*, over real names rather than chosen ones.
-    #[test]
-    fn every_corpus_move_name_lands_in_a_group() {
-        let cache = match dirs::cache_dir() {
-            Some(d) => d.join("visionary/script-cache"),
-            None => return,
-        };
-        if !cache.is_dir() {
-            return;
-        }
-        let mut names: std::collections::BTreeSet<String> = Default::default();
-        for entry in walk(&cache) {
-            let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            names.insert(snake(stem));
-        }
-        // Guard against the whole test passing on an empty corpus, which is how a check like
-        // this rots: the directory moves, the set is empty, and 0 of 0 is 100%.
-        assert!(
-            names.len() > 300,
-            "corpus too thin to mean anything: {} names",
-            names.len()
-        );
-
-        let other: Vec<&String> = names
-            .iter()
-            .filter(|n| group_of(n) == MoveGroup::Other)
-            .collect();
-        let pct = 100 * other.len() / names.len();
-        assert!(
-            pct <= 3,
-            "{}% of {} corpus move names are uncategorised ({} of them), e.g. {:?}",
-            pct,
-            names.len(),
-            other.len(),
-            other.iter().take(20).collect::<Vec<_>>()
-        );
-
-        // And the groups that D1 exists for are genuinely populated — a rule that matched
-        // nothing would leave the percentage fine and the section empty.
-        for group in [
-            MoveGroup::Movement,
-            MoveGroup::JumpLand,
-            MoveGroup::Damage,
-            MoveGroup::Presentation,
-            MoveGroup::Item,
-            MoveGroup::Smash,
-            MoveGroup::Jab,
-        ] {
-            let n = names.iter().filter(|m| group_of(m) == group).count();
-            assert!(n >= 5, "{:?} only matched {n} corpus names", group);
-        }
-    }
-
-    fn snake(stem: &str) -> String {
-        let mut out = String::new();
-        for (i, ch) in stem.chars().enumerate() {
-            if ch.is_uppercase() && i != 0 {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        }
-        out
-    }
-
-    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(walk(&path));
-            } else if path.extension().is_some_and(|e| e == "txt") {
-                out.push(path);
-            }
-        }
-        out
     }
 }

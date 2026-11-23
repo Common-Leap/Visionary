@@ -10,7 +10,13 @@ use std::sync::LazyLock;
 pub enum InitAction {
     None,
     FirstInit,
-    Reinit,
+    /// The init gate changes for ordinary motions and statuses too. Keep the
+    /// signed status pair so consumers which own stock-scoped state can
+    /// distinguish a normal action refresh from death and respawn.
+    Reinit {
+        previous_status: i32,
+        status: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,9 +73,13 @@ pub fn poll(boid: u32) -> InitAction {
         return InitAction::FirstInit;
     }
     if entry.motion != motion || entry.status != status {
+        let previous_status = entry.status;
         entry.motion = motion;
         entry.status = status;
-        return InitAction::Reinit;
+        return InitAction::Reinit {
+            previous_status,
+            status,
+        };
     }
     InitAction::None
 }
@@ -86,6 +96,7 @@ pub fn install() {
 pub fn on_frame() {
     // Stage 2 hook: refresh the CSS roster data when a pin set has changed so the game
     // sees the authored slot map without waiting for a full menu reboot.
+    #[cfg(not(feature = "mod_plugin"))]
     crate::slight::roster_pin::enforce_pins();
 }
 
@@ -102,14 +113,6 @@ pub fn set_facade_gate(facade: &'static str, motion: u64, status: i32) {
     FACADE_GATES
         .lock()
         .insert(facade, FacadeGate { motion, status });
-}
-
-pub fn register_pre_init(facade: &'static str, hook: InitHook) {
-    PRE_INIT_HOOKS.lock().entry(facade).or_default().push(hook);
-}
-
-pub fn register_post_init(facade: &'static str, hook: InitHook) {
-    POST_INIT_HOOKS.lock().entry(facade).or_default().push(hook);
 }
 
 pub fn facade_allowed(facade: &str, boid: u32) -> bool {

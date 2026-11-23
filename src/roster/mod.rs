@@ -2,8 +2,7 @@
 //!
 //! The move editor in `app.rs` answers "what does this attack do". This module answers
 //! "who is on the character select screen, where do they sit, what are they made of, and
-//! what are their fighter-wide values". See `docs/roster/PLAN.md` for the design and
-//! `docs/roster/TODO.md` for the task board.
+//! what are their fighter-wide values".
 //!
 //! Two rules hold this module together, and both exist because the alternative drifts
 //! silently:
@@ -18,6 +17,7 @@
 //!    editing the CSS or trait editors.
 
 pub mod archive;
+pub mod costume_config;
 pub mod css;
 pub mod css_view;
 pub mod export;
@@ -42,7 +42,7 @@ pub mod window;
 pub const GESTURE_AREA_SCROLL: egui::containers::scroll_area::ScrollSource =
     egui::containers::scroll_area::ScrollSource {
         scroll_bar: true,
-        drag: false,
+        drag: egui::containers::scroll_area::DragScroll::Never,
         mouse_wheel: true,
     };
 
@@ -118,7 +118,6 @@ pub enum RosterBacking {
         /// Additional slots beyond `slot` for a multi-skin character (c08–c15
         /// owns 8 costumes under one entry). Empty for every single-slot
         /// entry, so all existing construction sites keep meaning primary-only.
-        #[allow(dead_code)]
         slots: Vec<u8>,
     },
 }
@@ -146,6 +145,20 @@ impl RosterBacking {
         }
     }
 
+    /// The colour number the select screen knows costume `slot` by. A character of its own
+    /// counts its colours from 0 whatever costumes of the base fighter they are, and its names
+    /// and portraits are filed under those numbers.
+    pub fn colour_of(&self, slot: u8) -> u8 {
+        match self {
+            Self::Fighter => slot,
+            Self::SlotClone { .. } => self
+                .all_slots()
+                .iter()
+                .position(|own| *own == slot)
+                .unwrap_or(0) as u8,
+        }
+    }
+
     /// Every costume slot this entry owns, ascending. Single-slot entries
     /// return exactly [`RosterBacking::slot`]; a multi-skin character returns
     /// its primary plus all additional slots.
@@ -160,23 +173,6 @@ impl RosterBacking {
                 out.dedup();
                 out
             }
-        }
-    }
-
-    /// True when this entry owns `slot` (primary or additional).
-    ///
-    /// No callers yet — `all_slots().contains()` covers today's checks — but
-    /// the multi-skin ownership semantics below are pinned by tests, so the
-    /// predicate stays as their subject rather than being re-derived later.
-    #[allow(dead_code)]
-    pub fn owns_slot(&self, slot: u8) -> bool {
-        match self {
-            Self::Fighter => false,
-            Self::SlotClone {
-                slot: primary,
-                slots,
-                ..
-            } => *primary == slot || slots.contains(&slot),
         }
     }
 }
@@ -333,5 +329,24 @@ mod backing_agnostic_tests {
         assert!(backing.owns_slot(9));
         assert!(!backing.owns_slot(11));
         assert!(RosterBacking::Fighter.all_slots().is_empty());
+    }
+}
+
+#[cfg(test)]
+impl RosterBacking {
+    /// True when this entry owns `slot` (primary or additional).
+    ///
+    /// No callers yet — `all_slots().contains()` covers today's checks — but
+    /// the multi-skin ownership semantics below are pinned by tests, so the
+    /// predicate stays as their subject rather than being re-derived later.
+    pub fn owns_slot(&self, slot: u8) -> bool {
+        match self {
+            Self::Fighter => false,
+            Self::SlotClone {
+                slot: primary,
+                slots,
+                ..
+            } => *primary == slot || slots.contains(&slot),
+        }
     }
 }

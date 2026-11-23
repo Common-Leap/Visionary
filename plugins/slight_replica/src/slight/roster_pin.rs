@@ -51,20 +51,9 @@ pub fn set_pins(m: BTreeMap<u64, u8>) {
     LAST_ENFORCED_FINGERPRINT.store(fingerprint ^ 0xffff_ffff_ffff_ffff, Ordering::Release);
 }
 
-/// Clear all pins.
-pub fn clear_pins() {
-    PINS.lock().clear();
-    LAST_ENFORCED_FINGERPRINT.store(0, Ordering::Release);
-}
-
 /// Get the pinned slot for a ui_chara_id, if any.
 pub fn get_pin(id: u64) -> Option<u8> {
     PINS.lock().get(&id).copied()
-}
-
-/// Snapshot of all pins.
-pub fn all_pins() -> BTreeMap<u64, u8> {
-    PINS.lock().clone()
 }
 
 /// R-82 / R-86 probe: dump the resident ui_chara_db's size + head bytes.
@@ -155,11 +144,6 @@ fn validate_live_disp(v: i8) -> Result<(), String> {
     }
 }
 
-/// Snapshot of live CSS state for diagnostics.
-pub fn live_css_snapshot() -> (BTreeMap<String, i8>, BTreeSet<String>) {
-    (LIVE_ORDER.lock().clone(), LIVE_HIDDEN.lock().clone())
-}
-
 /// R-85: resolve the slot that should be used for a selected ui_chara_id.
 /// Properly scoped: only the pinned ui_chara_id is affected; all others
 /// pass through the game's requested `slot` unchanged. This is the single
@@ -168,21 +152,6 @@ pub fn live_css_snapshot() -> (BTreeMap<String, i8>, BTreeSet<String>) {
 /// scoping is already testable without a hook address.
 pub fn resolve_slot(ui_chara_id: u64, requested_slot: u8) -> u8 {
     get_pin(ui_chara_id).unwrap_or(requested_slot)
-}
-
-/// Hook placeholder for R-85: to be called from the game's selection resolver
-/// once its address is measured (R-80).  Until then this is a no-op that
-/// just logs, so adding it does not change behavior.  The signature mirrors
-/// what the game passes: ui_chara_id + game-chosen slot → final slot.
-pub fn on_fighter_select(ui_chara_id: u64, game_slot: u8) -> u8 {
-    let resolved = resolve_slot(ui_chara_id, game_slot);
-    if resolved != game_slot {
-        crate::slight::diag::note(format!(
-            "roster_pin: pinned selection ui_chara_id={} game_slot={} -> pinned_slot={}",
-            ui_chara_id, game_slot, resolved
-        ));
-    }
-    resolved
 }
 
 /// Heap-only pin enforcement: no file fallback.

@@ -32,14 +32,11 @@ fn documented_fields(magic: &str) -> &'static [Field] {
         "FMAG" => fields![
             0x00,U8,"follow emitter"; 0x01,U8,"affect X"; 0x02,U8,"affect Y"; 0x03,U8,"affect Z";
             0x04,F32,"magnetic force"; 0x08,F32,"position X"; 0x0c,F32,"position Y";
-            0x10,F32,"position Z"; 0x14,F32,"animation enabled"; 0x18,F32,"animation loop";
-            0x1c,F32,"random start"; 0x20,U32,"key count"; 0x24,U32,"loop count"
+            0x10,F32,"position Z"
         ],
         "FCOV" => fields![
             0x00,U8,"convergence type"; 0x04,F32,"position X"; 0x08,F32,"position Y";
-            0x0c,F32,"position Z"; 0x10,F32,"ratio"; 0x14,F32,"animation enabled";
-            0x18,F32,"animation loop"; 0x1c,F32,"random start"; 0x20,U32,"key count";
-            0x24,U32,"loop count"
+            0x0c,F32,"position Z"; 0x10,F32,"ratio"
         ],
         "FCOL" => fields![
             0x00,U8,"collision type"; 0x01,U8,"process in world"; 0x02,U8,"common plane";
@@ -53,12 +50,7 @@ fn documented_fields(magic: &str) -> &'static [Field] {
             0x20,F32,"table scale"; 0x24,F32,"noise offset"
         ],
         "FSPN" => fields![
-            0x00,F32,"rotation force"; 0x04,U32,"axis"; 0x08,F32,"outer velocity";
-            0x0c,F32,"rotation animation enabled"; 0x10,F32,"rotation loop";
-            0x14,F32,"rotation random start"; 0x18,U32,"rotation key count";
-            0x1c,U32,"rotation loop count"; 0xa0,F32,"diffusion animation enabled";
-            0xa4,F32,"diffusion loop"; 0xa8,F32,"diffusion random start";
-            0xac,U32,"diffusion key count"; 0xb0,U32,"diffusion loop count"
+            0x00,F32,"rotation force"; 0x04,U32,"axis"; 0x08,F32,"outer velocity"
         ],
         "FRND" => fields![
             0x00,U8,"fixed random seed"; 0x01,U8,"detailed options"; 0x02,U8,"air resistance";
@@ -66,19 +58,15 @@ fn documented_fields(magic: &str) -> &'static [Field] {
             0x10,U32,"apply timing"; 0x14,F32,"phase speed"; 0x18,F32,"phase width";
             0x1c,F32,"wave weight 0"; 0x20,F32,"wave weight 1"; 0x24,F32,"wave weight 2";
             0x28,F32,"wave weight 3"; 0x2c,F32,"frequency ratio 0"; 0x30,F32,"frequency ratio 1";
-            0x34,F32,"frequency ratio 2"; 0x38,F32,"frequency ratio 3";
-            0x3c,F32,"animation enabled"; 0x40,F32,"animation loop"; 0x44,F32,"random start";
-            0x48,U32,"key count"; 0x4c,U32,"loop count"
+            0x34,F32,"frequency ratio 2"; 0x38,F32,"frequency ratio 3"
         ],
         "FRN1" => fields![
             0x00,F32,"random width X"; 0x04,F32,"random width Y"; 0x08,F32,"random width Z";
-            0x0c,U32,"interval"; 0x10,F32,"animation enabled"; 0x14,F32,"animation loop";
-            0x18,F32,"random start"; 0x1c,U32,"key count"; 0x20,U32,"loop count"
+            0x0c,U32,"interval"
         ],
         "FPAD" => fields![
             0x00,U8,"world coordinates"; 0x04,F32,"position X"; 0x08,F32,"position Y";
-            0x0c,F32,"position Z"; 0x10,F32,"animation enabled"; 0x14,F32,"animation loop";
-            0x18,F32,"random start"; 0x1c,U32,"key count"; 0x20,U32,"loop count"
+            0x0c,F32,"position Z"
         ],
         "FCSF" => fields![
             0x00,U32,"flag"; 0x04,F32,"value 0"; 0x08,F32,"value 1"; 0x0c,F32,"value 2";
@@ -118,6 +106,183 @@ fn documented_fields(magic: &str) -> &'static [Field] {
         ],
         _ => &[],
     }
+}
+
+/// A field value animated over each particle's life (ResAnim8KeyParamSet): enabled, loop and
+/// random-start words, the key count, the loop length in frames, then up to eight keys of X, Y,
+/// Z and time. Time runs 0 to 1 over the particle's life, or over the loop when it loops. Field
+/// sections keep room for all eight keys and zero the unused ones.
+#[derive(Clone, Copy)]
+struct KeyedSet {
+    offset: usize,
+    label: &'static str,
+}
+
+const MAX_FIELD_KEYS: usize = 8;
+const KEY_STRIDE: usize = 0x10;
+const KEYS_AT: usize = 0x14;
+
+fn keyed_sets(magic: &str) -> &'static [KeyedSet] {
+    match magic {
+        "FMAG" => &[KeyedSet {
+            offset: 0x14,
+            label: "magnetic force keys",
+        }],
+        "FCOV" => &[KeyedSet {
+            offset: 0x14,
+            label: "ratio keys",
+        }],
+        "FSPN" => &[
+            KeyedSet {
+                offset: 0x0c,
+                label: "rotation force keys",
+            },
+            KeyedSet {
+                offset: 0xa0,
+                label: "outer velocity keys",
+            },
+        ],
+        "FRND" => &[KeyedSet {
+            offset: 0x3c,
+            label: "velocity keys",
+        }],
+        "FRN1" => &[KeyedSet {
+            offset: 0x10,
+            label: "random width keys",
+        }],
+        "FPAD" => &[KeyedSet {
+            offset: 0x10,
+            label: "position keys",
+        }],
+        _ => &[],
+    }
+}
+
+/// How many keys a set uses: its count word, capped at eight and at the keys the section holds.
+fn key_count(data: &[u8], set: KeyedSet) -> usize {
+    let stored = read_u32(data, set.offset + 0xc).unwrap_or(0) as usize;
+    let room = data.len().saturating_sub(set.offset + KEYS_AT) / KEY_STRIDE;
+    stored.min(MAX_FIELD_KEYS).min(room)
+}
+
+fn key_offset(set: KeyedSet, key: usize) -> usize {
+    set.offset + KEYS_AT + key * KEY_STRIDE
+}
+
+/// Append a key copied from the last one, placed at the end of the life. Returns false when the
+/// set is full.
+fn add_key(data: &mut [u8], set: KeyedSet) -> bool {
+    let count = key_count(data, set);
+    let room = data.len().saturating_sub(set.offset + KEYS_AT) / KEY_STRIDE;
+    if count >= MAX_FIELD_KEYS.min(room) {
+        return false;
+    }
+    let new = key_offset(set, count);
+    if count > 0 {
+        let last = key_offset(set, count - 1);
+        data.copy_within(last..last + KEY_STRIDE, new);
+        write_f32(data, new + 12, 1.0);
+    } else {
+        data[new..new + KEY_STRIDE].fill(0);
+    }
+    write_u32(data, set.offset + 0xc, count as u32 + 1)
+}
+
+/// Remove one key, moving the later keys up and zeroing the freed slot as the game's files do.
+fn remove_key(data: &mut [u8], set: KeyedSet, key: usize) -> bool {
+    let count = key_count(data, set);
+    if key >= count {
+        return false;
+    }
+    let from = key_offset(set, key + 1);
+    let end = key_offset(set, count);
+    data.copy_within(from..end, key_offset(set, key));
+    data[end - KEY_STRIDE..end].fill(0);
+    write_u32(data, set.offset + 0xc, count as u32 - 1)
+}
+
+fn draw_keyed_set(ui: &mut Ui, section: &mut EmitterSubsectionDef, set: KeyedSet) -> bool {
+    if section.data.len() < set.offset + KEYS_AT {
+        return false;
+    }
+    let mut changed = false;
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(set.label).strong());
+    let id = (section.magic.clone(), set.offset);
+    egui::Grid::new(("field_keys_header", id.clone()))
+        .num_columns(2)
+        .show(ui, |ui| {
+            for (offset, label, hover) in [
+                (
+                    set.offset,
+                    "animated",
+                    "Use the keys below instead of the fixed value",
+                ),
+                (set.offset + 4, "loop", "Repeat the keys every loop length"),
+                (
+                    set.offset + 8,
+                    "random start",
+                    "Start each particle at a random point in the loop",
+                ),
+            ] {
+                let mut on = read_u32(&section.data, offset).unwrap_or(0) != 0;
+                ui.label(label).on_hover_text(hover);
+                if ui.checkbox(&mut on, "").changed() {
+                    changed |= write_f32(&mut section.data, offset, if on { 1.0 } else { 0.0 });
+                }
+                ui.end_row();
+            }
+            ui.label("loop length").on_hover_text("Frames in one loop");
+            let mut frames = read_u32(&section.data, set.offset + 0x10).unwrap_or(0);
+            if ui.add(egui::DragValue::new(&mut frames)).changed() {
+                changed |= write_u32(&mut section.data, set.offset + 0x10, frames);
+            }
+            ui.end_row();
+        });
+    let count = key_count(&section.data, set);
+    let mut remove = None;
+    if count > 0 {
+        egui::Grid::new(("field_keys", id))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("key");
+                ui.label("X");
+                ui.label("Y");
+                ui.label("Z");
+                ui.label("time").on_hover_text(
+                    "0 is the particle's birth and 1 its end, or the start and end of the loop",
+                );
+                ui.end_row();
+                for key in 0..count {
+                    ui.label((key + 1).to_string());
+                    for component in 0..4 {
+                        let offset = key_offset(set, key) + component * 4;
+                        let mut value = read_f32(&section.data, offset).unwrap_or(0.0);
+                        let drag = egui::DragValue::new(&mut value).speed(0.01);
+                        let drag = if component == 3 {
+                            drag.range(0.0..=1.0)
+                        } else {
+                            drag
+                        };
+                        if ui.add(drag).changed() && value.is_finite() {
+                            changed |= write_f32(&mut section.data, offset, value);
+                        }
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(key);
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+    if let Some(key) = remove {
+        changed |= remove_key(&mut section.data, set, key);
+    }
+    let room = section.data.len().saturating_sub(set.offset + KEYS_AT) / KEY_STRIDE;
+    if count < MAX_FIELD_KEYS.min(room) && ui.small_button("Add key").clicked() {
+        changed |= add_key(&mut section.data, set);
+    }
+    changed
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
@@ -273,11 +438,6 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new("Emitter animations & fields").strong());
-    ui.label(
-        egui::RichText::new("EMTR child sections; edits export and ride the live carrier.")
-            .small()
-            .color(egui::Color32::GRAY),
-    );
     for index in 0..emitter.subsections.len() {
         let magic = emitter.subsections[index].magic.clone();
         let was_edited = pristine
@@ -311,26 +471,18 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
                                     }
                                 }
                             });
-                    } else {
-                        ui.label(
-                            egui::RichText::new("This layout is not yet named by EffectResearch.")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
+                    }
+                    for &set in keyed_sets(&magic) {
+                        changed |= draw_keyed_set(ui, section, set);
                     }
                 }
-                egui::CollapsingHeader::new("Advanced raw bytes")
+                egui::CollapsingHeader::new("Raw bytes")
                     .id_salt(("raw", index))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Change only values whose binary meaning you know.",
-                            )
-                            .small()
-                            .color(egui::Color32::YELLOW),
-                        );
                         changed |= raw_editor(ui, section);
-                    });
+                    })
+                    .header_response
+                    .on_hover_text("Change only values whose binary meaning you know");
                 if was_edited && ui.small_button("Reset section").clicked() {
                     if let Some(original) =
                         pristine.subsections.get(index).filter(|p| p.magic == magic)
@@ -361,6 +513,145 @@ mod tests {
         assert_eq!(read_f32(&data, 16), Some(-2.5));
         assert!(write_f32(&mut data, 16, 6.5));
         assert_eq!(read_f32(&data, 16), Some(6.5));
+    }
+
+    fn fspn(keys: &[[f32; 4]]) -> Vec<u8> {
+        let mut data = vec![0u8; 0x134];
+        write_f32(&mut data, 0x0c, 1.0);
+        write_u32(&mut data, 0x18, keys.len() as u32);
+        for (k, key) in keys.iter().enumerate() {
+            for (c, v) in key.iter().enumerate() {
+                write_f32(&mut data, 0x20 + k * 0x10 + c * 4, *v);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn field_keys_sit_where_the_count_says() {
+        let rotation = keyed_sets("FSPN")[0];
+        let outer = keyed_sets("FSPN")[1];
+        let data = fspn(&[[0.1, 0.0, 0.0, 0.0], [0.5, 0.0, 0.0, 1.0]]);
+        assert_eq!(key_count(&data, rotation), 2);
+        assert_eq!(read_f32(&data, key_offset(rotation, 1)), Some(0.5));
+        assert_eq!(read_f32(&data, key_offset(rotation, 1) + 12), Some(1.0));
+        // The second set's keys follow its own header at 0xa0, not the first set's.
+        assert_eq!(key_offset(outer, 0), 0xb4);
+        assert_eq!(key_count(&data, outer), 0);
+    }
+
+    #[test]
+    fn adding_and_removing_keys_keeps_the_unused_slots_zero() {
+        let set = keyed_sets("FSPN")[0];
+        let mut data = fspn(&[[0.1, 0.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.6]]);
+        assert!(add_key(&mut data, set));
+        assert_eq!(key_count(&data, set), 3);
+        assert_eq!(read_f32(&data, key_offset(set, 2)), Some(0.5));
+        assert_eq!(read_f32(&data, key_offset(set, 2) + 12), Some(1.0));
+        assert!(remove_key(&mut data, set, 0));
+        assert_eq!(key_count(&data, set), 2);
+        assert_eq!(read_f32(&data, key_offset(set, 0)), Some(0.5));
+        assert!(data[key_offset(set, 2)..key_offset(set, 3)]
+            .iter()
+            .all(|&b| b == 0));
+        // A key past the count is not removed.
+        assert!(!remove_key(&mut data, set, 2));
+        assert_eq!(key_count(&data, set), 2);
+        // Eight is the most a set holds.
+        while add_key(&mut data, set) {}
+        assert_eq!(key_count(&data, set), MAX_FIELD_KEYS);
+        assert!(!add_key(&mut data, set));
+        // The outer velocity set right after it is untouched.
+        assert!(data[0xa0..].iter().all(|&b| b == 0));
+    }
+
+    /// The layout above is checked against the game's own field sections: every used key has a
+    /// time from 0 to 1 in order, no count runs past eight, and every slot past the count is
+    /// zero. Point `VISIONARY_EFF_ROOT` at the parent of an extracted `effect/` tree.
+    #[test]
+    fn game_field_sections_match_the_key_layout() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "eff")
+                    && !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('_'))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root.join("effect"), &mut files);
+        assert!(files.len() > 300, "only {} corpus files", files.len());
+        let (mut sets, mut keyed, mut multi) = (0usize, 0usize, 0usize);
+        let mut bad = Vec::new();
+        for path in &files {
+            let Ok(effect) = crate::effects::load_effect(path) else {
+                continue;
+            };
+            for emitter in effect.ptcl.emitter_sets.iter().flat_map(|s| &s.emitters) {
+                for section in &emitter.subsections {
+                    for &set in keyed_sets(&section.magic) {
+                        if section.data.len() < set.offset + KEYS_AT {
+                            continue;
+                        }
+                        sets += 1;
+                        let stored = read_u32(&section.data, set.offset + 0xc).unwrap_or(0);
+                        let count = key_count(&section.data, set);
+                        let mut why = None;
+                        if stored as usize > MAX_FIELD_KEYS {
+                            why = Some(format!("count {stored}"));
+                        }
+                        let times: Vec<f32> = (0..count)
+                            .map(|k| read_f32(&section.data, key_offset(set, k) + 12).unwrap())
+                            .collect();
+                        if times.iter().any(|t| !(0.0..=1.0).contains(t))
+                            || times.windows(2).any(|w| w[1] < w[0])
+                        {
+                            why = Some(format!("times {times:?}"));
+                        }
+                        let room = (section.data.len() - set.offset - KEYS_AT) / KEY_STRIDE;
+                        let tail =
+                            key_offset(set, count)..key_offset(set, room.min(MAX_FIELD_KEYS));
+                        if section.data[tail].iter().any(|&b| b != 0) {
+                            why = Some("bytes past the count".into());
+                        }
+                        if count > 0 {
+                            keyed += 1;
+                        }
+                        if count > 1 {
+                            multi += 1;
+                        }
+                        if let Some(why) = why {
+                            bad.push(format!(
+                                "{} {} {}: {why}",
+                                path.display(),
+                                section.magic,
+                                set.label
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{sets} keyed sets, {keyed} with keys, {multi} with more than one");
+        assert!(multi > 0, "no multi-key set found; the walk read nothing");
+        assert!(
+            bad.is_empty(),
+            "{} mismatches:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 
     #[test]

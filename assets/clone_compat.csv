@@ -1,0 +1,69 @@
+"NOTE: We're not charting every single article:fighter combination, so please make educated guesses before cloning articles. A good rule of thumb is that any article that would need to communicate with the owner in a unique way (pkthunder, gordo, blade beam), utilizes level geometry (hydrant), comes from a DLC fighter (ray of punishment), or comes from a semiclone character (young link arrows) is most likely not going to work. Self-destruct behavior can often be changed by either hooking the common weapon on hit vtable (0x33bdc30 [13.0.3]), common weapon on shield vtable (0x346c8d0 [13.0.3]) or the weapon's specific vtable entries.",,,,,
+Weapon Kind Const,Can Clone,Verified By,Self-destructs upon hitting opponent?,Self-destructs upon hitting shield?,Notes
+BAYONETTA_WICKEDWEAVEARM,Yes,dbs,,,
+BAYONETTA_WICKEDWEAVELEG,Yes,Moy,No (keeps status),No (keeps status),
+BRAVE_CRASH,No,Hudson6CO,,,
+BRAVE_DEATHBALL,Yes,Hudson6CO,,,
+BRAVE_EXPLOSION,Yes,Sambo,,,
+BRAVE_SLEEP,Yes,Kartoffel,,,
+BUDDY_PAD,Yes,C#,No (keeps status),No (changes status),
+CLOUD_WAVE,Yes,Kite,,,
+DAISY_KINOPIO,Yes,Moy,,,
+DEDEDE_GORDO,Yes,Hotbox,,,
+DIDDY_GUN,Yes,Hudson6CO,,,
+DOLLY_WAVE,Yes,zrksyd,No (changes status),,
+DOLLY_CAP,Yes,C#,,,Has physics on status 1
+EFLAME_ESWORD,No,leiadog,,,"Tested with Roy, did not spawn, used same code with fireball, Roy was able to take a clone, could have been param issue"
+FOX_BLASTER,Yes,Hudson6CO,,,
+FOX_BLASTER_BULLET,Yes,Yolarr,,,
+FALCO_BLASTER_BULLET,Yes,Yolarr,,,
+GAMEWATCH_PARACHUTE,Yes,Hudson6CO,Yes,Yes,
+GAMEWATCH_RESCUE,Yes,Hudson6CO,Yes,Yes,
+GANON_SWORD,Yes,PhazoGanon,No (keeps status),No (keeps status),
+INKLING_BRUSH,Yes,Hudson6CO,,,
+KIRBY_FINALCUTTERSHOT,Yes,mRama,,,
+KOOPA_BREATH,Yes,Okso,No (keeps status),No (keeps status),
+KOOPA_KOOPAG,Yes,leiadog,No (keeps status),No (keeps status),
+KOOPAJR_CANNONBALL,Yes,LilyLambda,No (changes status),No (changes status),Has weird interactions with gravity and stage collision if certain lua_consts related to it are not assigned to it
+KROOL_IRONBALL,Yes,dbs,No (changes status),No (changes status),
+LINK_BOOMERANG,Yes,Moy,No (keeps status),No (keeps status),
+LINK_BOWARROW,Yes,mRama,Yes,,"C#: If using original code, picking it up during the stick status will crash because link's arrow item can't be created"
+LINK_SWORD_BEAM,Yes,LilyLambda,No (keeps status),,
+LUCARIO_AURABALL,No,Mr. E,,,
+LUIGI_FIREBALL,Yes,mRama,,,
+MARIO_FIREBALL,Yes,C#,Depends on vl.prc,,Horizontal Speed will always be controlled via vl parameters
+MARIOD_DRCAPSULE,Yes,mRama,,,
+MASTER_ARROW1,Yes,mRama,,,
+MIIGUNNER_GRENADELAUNCHER,Yes,zrksyd,,,
+MIISWORDSMAN_CHAKRAM,Yes,C#,Depends on vl.prc,Check Comment,Status change on shield depends on current status. If status is 2 then it will automatically transition to 3
+MIISWORDSMAN_WAVE,Yes,C#,,,
+MURABITO_BOWLING_BALL,Yes,Hudson6CO,Yes,Yes,
+MURABITO_BULLET,No,zrksyd,,,Failed to append article vtable
+MURABITO_UMBRELLA,Yes,C#,,,
+NESS_PK_STARSTORM,Yes,Moy,No (keeps status),No (keeps status),Doesn't call the common weapon on-hit vtable (its equivalent function just returns 0)
+PACMAN_FIREHYDRANT,No,PhazoGanon,,,
+PALUTENA_AUTOAIMBULLET,Yes,Moy,Yes,Yes,"Always spawns with the ""palutena_bullet"" effect applied"
+PALUTENA_REFLECTIONBOARD,Yes,Moy,,,
+PEACH_KINOPIO,Yes,C#,Yes,,"Comes with a flip.prc, can even be given physics. Magic stuff"
+PICKEL_MELT,No,,,,
+REFLET_CHROM,Yes,Moy,No (changes status),,"Status 1 will transition into status 3 on hit, other statuses are unaffected"
+RICHTER_AXE,Yes,Hudson6CO,No (keeps status),,
+RIDLEY_BREATH,Yes,Hudson6CO,,,
+ROBOT_BEAM,Yes,zrksyd,,,
+ROCKMAN_HARDKNUCKLE,Yes,mRama,,,
+ROCKMAN_ROCKBUSTER,Yes,mRama,,,
+ROCKMAN_ROCKMANX,Yes,AnuGamer,,,
+RYU_HADOKEN,Yes,mRama,,,
+SAMUS_BOMB,Yes,zrksyd,No (changes status),,ArticleModule::get_active_num doesn't work
+SAMUS_MISSILE,Yes,Hudson6CO,,,
+SAMUSD_BOMB,Yes,zrksyd,No (changes status),,ArticleModule::get_active_num doesn't work
+SAMUSD_MISSILE,Yes,Hudson6CO,,,
+SIMON_AXE,Yes,Hudson6CO,No (keeps status),,
+SZEROSUIT_LASER,No,C#,,,
+TOONLINK_BOOMERANG,Yes,Moy,No (keeps status),No (keeps status),
+TOONLINK_BOWARROW,Yes,mRama,,,
+WIIFIT_HULAHOOP,Yes,C#,Yes,Yes,
+WIIFIT_TOWEL,Yes,Hudson6CO,,,No hitbox?
+YOUNGLINK_BOOMERANG,Yes,Moy,No (keeps status),No (keeps status),
+YOUNGLINK_BOWARROW,Yes,mRama,,,
+YOSHI_TAMAGO,Yes,C#,Depends on vl.prc,Depends on vl.prc,"Status 0 doesnt change on shield, Status 1 can't be Grav Pulled, Statuses 2+ don't reflect speed"

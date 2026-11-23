@@ -16,7 +16,8 @@ use ssbh_data::matl_data::{
 };
 use ssbh_data::mesh_data::{MeshData, VectorData};
 use ssbh_data::modl_data::ModlData;
-use ssbh_wgpu::{ModelFolder, ShaderDatabase};
+use ssbh_wgpu::shader_database::ShaderDatabase;
+use ssbh_wgpu::ModelFolder;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -59,6 +60,7 @@ impl ModelReport {
         self.blocking().next().is_some()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.issues.is_empty()
     }
@@ -489,9 +491,9 @@ fn wrap_mode_tiling(
 fn uv_outside_first_quadrant(data: &VectorData) -> bool {
     let outside = |u: f32, v: f32| !(-0.2..=1.2).contains(&u) || !(-0.2..=1.2).contains(&v);
     match data {
-        VectorData::Vector2(values) => values.iter().any(|[u, v]| outside(*u, *v)),
-        VectorData::Vector3(values) => values.iter().any(|[u, v, _]| outside(*u, *v)),
-        VectorData::Vector4(values) => values.iter().any(|[u, v, _, _]| outside(*u, *v)),
+        VectorData::Vector2(values) => values.iter().any(|uv| outside(uv.x, uv.y)),
+        VectorData::Vector3(values) => values.iter().any(|uv| outside(uv.x, uv.y)),
+        VectorData::Vector4(values) => values.iter().any(|uv| outside(uv.x, uv.y)),
     }
 }
 

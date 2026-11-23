@@ -1,4 +1,4 @@
-//! The Roster window: mod library, character select screen, new characters, and traits.
+//! The Roster window: mod library, character select, new characters, and traits.
 //!
 //! A separate viewport rather than a panel in the main window, for the same reason the Eff
 //! Editor is one: it is a whole workspace, and the main window's space belongs to the move
@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use egui::{Color32, RichText, Ui};
+
+use crate::ui::{act, look};
 
 use super::css_view::CssView;
 use super::index::RosterIndex;
@@ -21,6 +23,7 @@ use crate::mod_project::{ParamMod, RosterMod};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterTab {
+    Project,
     Library,
     CharacterSelect,
     NewCharacter,
@@ -28,54 +31,27 @@ pub enum RosterTab {
 }
 
 impl RosterTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
+        Self::Project,
         Self::Library,
         Self::CharacterSelect,
         Self::NewCharacter,
         Self::Traits,
     ];
 
-    fn icon(self) -> &'static str {
-        match self {
-            Self::Library => "▦",
-            Self::CharacterSelect => "⧉",
-            Self::NewCharacter => "＋",
-            Self::Traits => "◈",
-        }
-    }
-
     fn title(self) -> &'static str {
         match self {
-            Self::Library => "Mod library",
-            Self::CharacterSelect => "Character select",
+            Self::Project => "Characters",
+            Self::Library => "Installed mods",
+            Self::CharacterSelect => "Select screen",
             Self::NewCharacter => "New character",
-            Self::Traits => "Traits",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Library => {
-                "Compiled mods Visionary reads fighters, skins, and effects from. Later mods in \
-                 the list win any file two mods both provide."
-            }
-            Self::CharacterSelect => {
-                "The character select screen as the game will build it. Drag a portrait to reorder — \
-                 changes are saved with your project and included when you export a mod."
-            }
-            Self::NewCharacter => {
-                "Add a character to the roster as a costume slot on a donor fighter, and get a \
-                 place to put your own model, animations, and moveset."
-            }
-            Self::Traits => {
-                "Fighter-wide values stored in the character's parameter files — weight, \
-                 gravity, run speed, air acceleration, jumps, shield, and the rest."
-            }
+            Self::Traits => "Fighter values",
         }
     }
 
     fn badge_count(self, window: &RosterWindow) -> Option<usize> {
         match self {
+            Self::Project => None,
             Self::Library => {
                 let conflicts = window
                     .library
@@ -90,7 +66,7 @@ impl RosterTab {
             Self::CharacterSelect => {
                 let n = window.project.order.len()
                     + window.project.hidden.len()
-                    + window.project.names.len()
+                    + window.renamed_count()
                     + window.project.name_variants.len()
                     + window
                         .project
@@ -112,7 +88,11 @@ impl RosterTab {
                 (n > 0).then_some(n)
             }
             Self::Traits => {
-                let n: usize = window.params.values().map(|p| p.field_count()).sum();
+                let n: usize = window
+                    .params
+                    .keys()
+                    .map(|fighter| window.fighter_value_count(fighter))
+                    .sum();
                 (n > 0).then_some(n)
             }
         }
@@ -168,22 +148,28 @@ pub struct RosterWindow {
     traits: TraitsView,
     /// The new-character tab.
     new_character: NewCharacterView,
-    /// Moves the project has replaced for each character you added, supplied by `app.rs` from
-    /// the edit log. Without it the readiness panel would report every character as having
-    /// replaced nothing.
-    pub authored_moves: std::collections::BTreeMap<RosterKey, std::collections::BTreeSet<String>>,
-    /// The character you added whose moveset is currently being edited, if any. Moves saved
-    /// while this is set are scoped to that character's costume.
-    edit_target: Option<RosterKey>,
     /// Sparse fighter-value edits, fighter name → edits. Read by `app.rs` when it builds the
     /// project file and replaced wholesale when a project is loaded, exactly like `project`.
     pub params: std::collections::BTreeMap<String, ParamMod>,
+    /// Persisted constrained behavior graphs authored in the main editor.
+    /// Keeping them here makes the project file and the visible editor share
+    /// one session-owned source of truth.
+    pub behaviors: std::collections::BTreeMap<String, crate::gimmicks::behavior::BehaviorGraph>,
+    pub behavior_layouts:
+        std::collections::BTreeMap<String, crate::gimmicks::field_canvas::FieldLayout>,
+    /// Independent authored controllers, retained even while their field is closed.
+    pub controller_charts: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::mod_project::ControllerChart>,
+    >,
+    /// Persisted meter bindings, retained independently of whether their
+    /// editor is currently open.
+    pub meters: std::collections::BTreeMap<String, Vec<crate::gimmicks::meter::MeterBinding>>,
     tab: RosterTab,
+    /// Portraits for the Characters cards.
+    card_portraits: super::icons::PortraitCache,
     status: String,
     import: Option<ImportJob>,
-    /// Set when Deploy stages files: `app.rs` polls it after the window
-    /// draws and saves the project (roster edits included) alongside.
-    pub save_requested: bool,
     notes: Vec<ImportNote>,
     /// Set once the saved library has been loaded and pre-library mod roots adopted.
     initialized: bool,
@@ -198,6 +184,20 @@ pub struct RosterWindow {
     /// Game roots in lookup order: the data root, then enabled mod roots in load order.
     /// Refreshed each frame from the library so a disabled mod stops providing files.
     roots: Vec<PathBuf>,
+    /// ArcExplorer's export folder, which may contain parameter files absent
+    /// from the main data root.
+    export_root: Option<PathBuf>,
+    /// The open project's made characters' folders, on disk. Roots of this project only: they
+    /// join the lookup roots while it is open and leave with it.
+    project_roots: Vec<PathBuf>,
+    /// Whether the page was shown last frame, so coming back to it from another page starts
+    /// on the Project tab.
+    was_open: bool,
+    /// A page asked for a tab this frame; coming back keeps that one.
+    tab_requested: bool,
+    /// See [`RosterWindow::take_settled_status`]: what to say, and whether the change that
+    /// rebuilds the fighter list has been seen yet.
+    settled_status: Option<(String, bool)>,
     /// hash40 → parameter field name, supplied by `app.rs` from the label download. The
     /// parameter files store hashes, and the full-field view has nothing to show without them.
     labels: std::collections::HashMap<u64, String>,
@@ -213,13 +213,15 @@ impl Default for RosterWindow {
             css: CssView::default(),
             traits: TraitsView::default(),
             new_character: NewCharacterView::default(),
-            authored_moves: Default::default(),
-            edit_target: None,
             params: Default::default(),
-            tab: RosterTab::Library,
+            behaviors: Default::default(),
+            behavior_layouts: Default::default(),
+            controller_charts: Default::default(),
+            meters: Default::default(),
+            tab: RosterTab::Project,
+            card_portraits: Default::default(),
             status: String::new(),
             import: None,
-            save_requested: false,
             notes: Vec::new(),
             initialized: false,
             library_dirty: false,
@@ -227,12 +229,62 @@ impl Default for RosterWindow {
             expanded_conflict: None,
             rename: None,
             roots: Vec::new(),
+            export_root: None,
+            project_roots: Vec::new(),
+            was_open: false,
+            tab_requested: false,
+            settled_status: None,
             labels: Default::default(),
         }
     }
 }
 
 impl RosterWindow {
+    /// Supply ArcExplorer's export folder as a read-only fallback for base
+    /// game files. The main data root still wins when both contain a path.
+    pub fn set_export_root(&mut self, root: Option<PathBuf>) {
+        self.export_root = root;
+    }
+
+    pub fn set_parameter_labels(&mut self, labels: &std::collections::HashMap<u64, String>) {
+        if self.labels != *labels {
+            self.labels = labels.clone();
+            self.traits.invalidate();
+        }
+    }
+
+    /// Personal files resolve the winning enabled mod first, followed by base dumps.
+    /// Main-editor controls and personal-file export must use the same baseline.
+    pub fn gimmick_roots(&self, data_root: Option<&PathBuf>) -> Vec<PathBuf> {
+        self.library
+            .enabled()
+            .rev()
+            .map(|entry| entry.root.clone())
+            .chain(data_root.into_iter().cloned())
+            .chain(self.export_root.iter().cloned())
+            .fold(Vec::new(), |mut roots, root| {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+                roots
+            })
+    }
+
+    /// Preserve the existing shared roster/CSS lookup order independently.
+    fn content_roots(&self, data_root: Option<&PathBuf>) -> Vec<PathBuf> {
+        data_root
+            .into_iter()
+            .cloned()
+            .chain(self.export_root.iter().cloned())
+            .chain(self.enabled_roots())
+            .fold(Vec::new(), |mut roots, root| {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+                roots
+            })
+    }
+
     /// Load the saved library and adopt any pre-library `mod_roots` entries.
     ///
     /// Deferred to first use rather than done at construction: it walks every mod's files, and
@@ -242,10 +294,13 @@ impl RosterWindow {
             return;
         }
         self.initialized = true;
-        self.library = library::load();
+        let (loaded, tidied) = library::load();
+        self.library = loaded;
         let adopted = library::adopt_legacy_roots(&mut self.library, legacy_roots);
         if !adopted.is_empty() {
             self.status = format!("Adopted {} existing mod root(s).", adopted.len());
+        }
+        if tidied || !adopted.is_empty() {
             self.library_dirty = true;
             library::save(&self.library);
         }
@@ -258,11 +313,7 @@ impl RosterWindow {
     /// user who never opened this window would otherwise export with an empty index and
     /// report every one of its own edits as unwritable.
     fn refresh(&mut self, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
-        self.roots = data_root
-            .into_iter()
-            .cloned()
-            .chain(self.library.enabled_roots())
-            .collect();
+        self.roots = self.content_roots(data_root);
         self.css.ensure_loaded(&self.roots);
         self.index = RosterIndex::build(fighters, &self.library, &self.project, self.css.db());
     }
@@ -289,8 +340,13 @@ impl RosterWindow {
         self.ensure_initialized(&[]);
         self.refresh(fighters, data_root);
         let ui_root = self.ui_root();
-        let mut report =
-            super::export::export_roster(mod_root, ui_root.as_deref(), &self.index, roster)?;
+        let mut report = super::export::export_roster(
+            mod_root,
+            ui_root.as_deref(),
+            &self.index,
+            roster,
+            &self.labels,
+        )?;
         super::export::export_params(
             mod_root,
             self.param_root().as_deref(),
@@ -298,7 +354,22 @@ impl RosterWindow {
             &self.labels,
             &mut report,
         )?;
-        super::export::export_authored_files(mod_root, &self.roots, &roster.authored, &mut report)?;
+        // Personal files are one per fighter rather than one shared file, so
+        // this walks the same roots and patches each fighter's own clone.
+        crate::gimmicks::export::export_personal(
+            mod_root,
+            &self.gimmick_roots(data_root),
+            &self.params,
+            &mut report,
+        )?;
+        super::export::export_authored_files(
+            mod_root,
+            &self.roots,
+            self.new_character.project_dir.as_deref(),
+            &roster.authored,
+            &mut report,
+        )?;
+        super::export::export_costume_config(mod_root, &roster.authored, &mut report)?;
         Ok(report)
     }
 
@@ -318,81 +389,207 @@ impl RosterWindow {
         super::css::locate_ui_root(&self.roots)
     }
 
-    /// The costume slots new edits to `fighter` should belong to, if the user set one of their
-    /// own characters as the edit target.
-    ///
-    /// Empty — the normal case — means an edit applies to every costume, which is what an
-    /// ACMD replacement does. This is read on every edit save rather than latched, so turning
-    /// the target off immediately stops scoping without a stale flag surviving anywhere.
-    /// A multi-skin character returns all its slots, so one moveset covers c08–c15.
-    pub fn slot_scopes_for(&self, fighter: &str) -> Vec<u8> {
-        let Some(target) = self.edit_target.as_ref() else {
-            return Vec::new();
-        };
-        let Some(entry) = self
-            .project
-            .authored
-            .iter()
-            .find(|authored| &authored.key == target)
-        else {
-            return Vec::new();
-        };
-        if !entry.donor.eq_ignore_ascii_case(fighter) {
-            return Vec::new();
-        }
-        entry.all_slots()
-    }
-
-    /// The moves each added character has replaced, read out of the edit log.
-    ///
-    /// An edit belongs to a character when it is scoped to one of that character's
-    /// costumes — the same fields the export gates on — so this cannot drift from
-    /// what actually ships.
-    pub fn replaced_moves(
-        &self,
-        log: &crate::data::EditLog,
-    ) -> std::collections::BTreeMap<RosterKey, std::collections::BTreeSet<String>> {
-        let mut out: std::collections::BTreeMap<RosterKey, std::collections::BTreeSet<String>> =
-            Default::default();
-        for authored in &self.project.authored {
-            let Some(moves) = log.entries.get(&authored.donor) else {
-                continue;
-            };
-            let owned = authored.all_slots();
-            let replaced: std::collections::BTreeSet<String> = moves
-                .iter()
-                .filter(|(_, record)| {
-                    let scopes = record.effective_scopes();
-                    !scopes.is_empty() && scopes.iter().any(|slot| owned.contains(slot))
-                })
-                .map(|(move_name, _)| move_name.clone())
-                .collect();
-            if !replaced.is_empty() {
-                out.insert(authored.key.clone(), replaced);
-            }
-        }
-        out
+    fn show_tab(&mut self, tab: RosterTab) {
+        self.tab = tab;
+        self.tab_requested = true;
     }
 
     /// Show the trait tab next time the window draws.
     pub fn focus_traits(&mut self) {
-        self.tab = RosterTab::Traits;
+        self.show_tab(RosterTab::Traits);
+    }
+
+    /// Show one fighter's values.
+    pub fn focus_traits_for(&mut self, fighter: &str) {
+        self.show_tab(RosterTab::Traits);
+        self.traits.select(super::RosterKey::fighter(fighter));
+    }
+
+    /// Show the installed mods.
+    pub fn focus_library(&mut self) {
+        self.show_tab(RosterTab::Library);
+    }
+
+    /// How many of `fighter`'s values in its fighter values file the project changes: the
+    /// count the Fighter values page shows. Gimmick values files are not counted here.
+    pub fn fighter_value_count(&self, fighter: &str) -> usize {
+        self.params.get(fighter).map_or(0, |params| {
+            params
+                .files
+                .get(super::traits::FIGHTER_PARAM_PATH)
+                .map_or(0, std::collections::BTreeMap::len)
+        })
+    }
+
+    /// The select screen cell that stands for one of `fighters`, earliest on the screen
+    /// first: the Pokémon Trainer cell for the Trainer and the three Pokémon, for example.
+    pub fn select_screen_cell(&self, fighters: &[&str]) -> Option<RosterKey> {
+        let member = |name: Option<&String>| {
+            name.is_some_and(|name| fighters.iter().any(|f| f.eq_ignore_ascii_case(name)))
+        };
+        self.index
+            .sorted()
+            .into_iter()
+            .filter(|entry| entry.on_roster && !entry.backing.shares_engine_fighter())
+            .find(|entry| member(entry.fighter.as_ref()) || member(entry.name_id.as_ref()))
+            .map(|entry| entry.key.clone())
+    }
+
+    /// Select screen names the project changes. A made character's own name is recorded as a
+    /// name too, so the game reads it, but it is not a rename.
+    fn renamed_count(&self) -> usize {
+        self.project
+            .names
+            .iter()
+            .filter(|(key, name)| {
+                !self
+                    .project
+                    .authored
+                    .iter()
+                    .any(|made| &made.key == *key && made.display_name == **name)
+            })
+            .count()
+    }
+
+    /// What to tell the author once the fighter list has been rebuilt, for a change that
+    /// rebuilds it (the rebuild says what it found, over anything said before it).
+    pub fn take_settled_status(&mut self) -> Option<String> {
+        match &self.settled_status {
+            Some((_, true)) if !self.library_dirty => {
+                self.settled_status.take().map(|(said, _)| said)
+            }
+            _ => None,
+        }
+    }
+
+    /// The name a character shows on the select screen: a rename, else its own name.
+    pub fn shown_name(&self, key: &RosterKey) -> Option<String> {
+        self.project.names.get(key).cloned().or_else(|| {
+            self.project
+                .authored
+                .iter()
+                .find(|entry| &entry.key == key)
+                .map(|entry| entry.display_name.clone())
+        })
+    }
+
+    /// The made characters' folders, as the project page's `parts.json` records them.
+    pub fn made_folders(&self) -> Vec<crate::project_parts::MadeFolder> {
+        self.project
+            .authored
+            .iter()
+            .filter_map(|entry| {
+                Some(crate::project_parts::MadeFolder {
+                    key: entry.key.to_string(),
+                    fighter: entry.donor.clone(),
+                    slots: entry.all_slots(),
+                    root: entry.files_root.clone()?,
+                })
+            })
+            .collect()
+    }
+
+    /// A made character's folder on disk.
+    pub fn made_root(&self, key: &RosterKey) -> Option<PathBuf> {
+        let entry = self
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)?;
+        let root = entry.files_root.as_deref()?;
+        Some(match &self.new_character.project_dir {
+            Some(dir) => crate::project_parts::project_absolute(dir, root),
+            None => root.to_path_buf(),
+        })
+    }
+
+    /// A character's select screen portrait for `slot`, with any picture the project gives it.
+    pub fn portrait(
+        &mut self,
+        ctx: &egui::Context,
+        key: &super::RosterKey,
+        fighter: &str,
+        slot: u8,
+    ) -> Option<egui::TextureHandle> {
+        let name_id = self
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)
+            .map(|entry| entry.name_id.clone())
+            .or_else(|| self.index.by_key(key)?.name_id.clone())
+            .or_else(|| {
+                let entries = self.index.sorted();
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.fighter.as_deref() == Some(fighter))?;
+                entry.name_id.clone()
+            })
+            // The Ice Climbers' select screen row is named for the pair, not either climber.
+            .unwrap_or_else(|| match fighter {
+                "popo" | "nana" => "ice_climber".to_owned(),
+                _ => fighter.to_owned(),
+            });
+        let picked = self
+            .project
+            .ui_images
+            .get(key)
+            .and_then(|images| super::ui_images::find_override(images, "chara_1", slot, slot))
+            .map(|picked| PathBuf::from(&picked.png_path));
+        // A character made here files its portraits under its own colour numbers.
+        let colour = self
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)
+            .map_or(slot, |entry| {
+                entry
+                    .all_slots()
+                    .iter()
+                    .position(|own| *own == slot)
+                    .unwrap_or(0) as u8
+            });
+        let roots = self.roots.clone();
+        self.card_portraits
+            .get_with_gamma(ctx, &roots, &name_id, colour, true, picked.as_deref())?
+            .ok()
+            .cloned()
+    }
+
+    /// Every fighter's first portrait, by fighter name.
+    fn faces(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> std::collections::HashMap<String, egui::TextureHandle> {
+        let fighters: Vec<String> = self
+            .index
+            .entries
+            .iter()
+            .filter_map(|entry| entry.fighter.clone())
+            .collect();
+        fighters
+            .into_iter()
+            .filter_map(|fighter| {
+                let face = self.portrait(ctx, &RosterKey::fighter(&fighter), &fighter, 0)?;
+                Some((fighter, face))
+            })
+            .collect()
     }
 
     /// Show the character select tab next time the window draws.
     pub fn focus_character_select(&mut self) {
-        self.tab = RosterTab::CharacterSelect;
+        self.show_tab(RosterTab::CharacterSelect);
     }
 
     /// Show the new-character tab next time the window draws.
     pub fn focus_new_character(&mut self) {
-        self.tab = RosterTab::NewCharacter;
+        self.show_tab(RosterTab::NewCharacter);
     }
 
     /// Jump to Character Select with one entry selected and its editor
     /// scrolled into view — the landing end of cross-tab "finish look" jumps.
     pub fn select_css(&mut self, key: crate::roster::RosterKey) {
-        self.tab = RosterTab::CharacterSelect;
+        self.show_tab(RosterTab::CharacterSelect);
         self.css.select_key(key);
     }
 
@@ -403,16 +600,23 @@ impl RosterWindow {
         self.css.clear_order_drafts();
     }
 
-    /// Enabled mod roots in load order — what the fighter scan consumes.
+    /// Enabled mod roots in load order, then the open project's made characters' folders —
+    /// what the fighter scan consumes.
     pub fn enabled_roots(&self) -> Vec<PathBuf> {
-        self.library.enabled_roots()
+        let mut roots = self.library.enabled_roots();
+        for root in &self.project_roots {
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+        }
+        roots
     }
 
     /// Summary for the export tree: how many roster edits this project holds.
     pub fn export_summary(&self) -> RosterExportSummary {
         let order = self.project.order.len();
         let hidden = self.project.hidden.len();
-        let names = self.project.names.len()
+        let names = self.renamed_count()
             + self.project.name_variants.len()
             + self
                 .project
@@ -446,7 +650,8 @@ impl RosterWindow {
         summary.order + summary.hidden + summary.names + summary.authored + summary.params > 0
     }
 
-    pub fn show(
+    /// Keep the page's data current; call every frame the page may be shown.
+    pub fn prepare(
         &mut self,
         ctx: &egui::Context,
         fighters: &[FighterEntry],
@@ -454,41 +659,69 @@ impl RosterWindow {
         labels: &std::collections::HashMap<u64, String>,
     ) {
         if !self.open {
+            self.was_open = false;
             return;
         }
+        // Coming back to the page from another one starts on the Project tab, unless whatever
+        // brought it back asked for a tab of its own.
+        if !self.was_open && !self.tab_requested {
+            self.tab = RosterTab::Project;
+        }
+        self.was_open = true;
+        self.tab_requested = false;
         // Labels arrive asynchronously and grow; clone when contents differ rather
         // than only on length – two maps of the same length with different keys
         // would otherwise keep showing stale names.
-        if self.labels != *labels {
-            self.labels = labels.clone();
-            self.traits.invalidate();
-        }
+        self.set_parameter_labels(labels);
         self.ensure_initialized(&[]);
         self.poll_import(ctx);
         self.refresh(fighters, data_root);
-
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("roster"),
-            egui::ViewportBuilder::default()
-                .with_app_id(crate::app_icon::APP_ID)
-                .with_icon(crate::app_icon::viewport_icon())
-                .with_title("Roster — Visionary")
-                .with_inner_size([1240.0, 800.0])
-                .with_min_inner_size([860.0, 520.0]),
-            |ui, class| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
-                    self.ui_contents(ui, fighters, data_root);
-                });
-                if class != egui::ViewportClass::EmbeddedWindow
-                    && ui.ctx().input(|i| i.viewport().close_requested())
-                {
-                    self.open = false;
-                }
-            },
-        );
     }
 
-    fn ui_contents(&mut self, ui: &mut Ui, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
+    /// Called every frame with the open project's folder. Keeps the made characters' folders
+    /// stored relative to it, and registers those folders as this project's roots: added when
+    /// the project opens or makes a character, dropped when it closes or removes one. Only a
+    /// change touches the disk.
+    pub fn set_project_dir(&mut self, dir: Option<PathBuf>) {
+        if let Some(dir) = &dir {
+            for entry in &mut self.project.authored {
+                if let Some(root) = &entry.files_root {
+                    let relative = crate::project_parts::project_relative(dir, root);
+                    if relative != *root {
+                        entry.files_root = Some(relative);
+                    }
+                }
+            }
+        }
+        self.new_character.project_dir = dir;
+        let roots: Vec<PathBuf> = self
+            .project
+            .authored
+            .iter()
+            .filter_map(|entry| self.made_root(&entry.key))
+            .collect();
+        if roots == self.project_roots {
+            return;
+        }
+        if self.initialized && self.library.release_project_folders(&roots) {
+            library::save(&self.library);
+        }
+        self.project_roots = roots;
+        self.library_dirty = true;
+        if let Some((_, seen)) = &mut self.settled_status {
+            *seen = true;
+        }
+    }
+
+    /// The Characters page, drawn in the main window.
+    /// Draw the page; true when "This project" is showing, which the app draws below.
+    pub fn page(&mut self, ui: &mut Ui) -> bool {
+        self.card_portraits.begin_frame();
+        self.ui_contents(ui);
+        self.tab == RosterTab::Project
+    }
+
+    fn ui_contents(&mut self, ui: &mut Ui) {
         // Larger type for the whole roster workspace, applied once here so
         // every tab inherits it without touching each label. `.small()` stays
         // relative — it still reads as secondary text, just legibly so.
@@ -499,22 +732,39 @@ impl RosterWindow {
                 font.size *= 1.18;
             }
             style.spacing.item_spacing.y = (style.spacing.item_spacing.y + 1.0).max(5.0);
+            // Small and faint text stay readable: no hint-grey, nothing under 13 px.
+            if let Some(small) = style.text_styles.get_mut(&egui::TextStyle::Small) {
+                small.size = small.size.max(13.0);
+            }
+            let look = look(ui);
+            let style = ui.style_mut();
+            style.visuals.weak_text_color = Some(look.dim);
+            style.visuals.widgets.noninteractive.fg_stroke.color = look.text;
         }
         // One slim top bar: tabs with badges, edit count, and (only when
         // there is something to ship) what an export will contain. The old
         // layout stacked a title card, a metrics row, and a tab-description
         // line above the actual workspace — the grid and the editor below
         // are the focus, not this.
-        self.draw_top_bar(ui, fighters, data_root);
-        ui.add_space(8.0);
+        if self.tab == RosterTab::Project {
+            return;
+        }
+        let look = look(ui);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, look.page);
+        ui.add_space(4.0);
+        self.draw_top_bar(ui, look);
+        ui.add_space(10.0);
 
         // Content — one outer vertical scroll. Horizontal scrolling lives
         // inside the CSS grid only; the traits tab draws into this scroll
         // directly so two nested vertical scrollers never fight. Content-drag
         // scrolling is off here: the CSS tab owns reorder and marquee drags,
         // and a panning scroll area eats those (and sloppy clicks with them).
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 8))
+        egui::Frame::new()
+            .fill(look.card)
+            .stroke(egui::Stroke::new(1.5, look.edge))
+            .corner_radius(14.0)
+            .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("roster_main_scroll")
@@ -523,6 +773,7 @@ impl RosterWindow {
                     .show(ui, |ui| {
                         ui.set_max_width((ui.available_width() - 4.0).max(400.0));
                         match self.tab {
+                            RosterTab::Project => {}
                             RosterTab::Library => self.draw_library(ui),
                             RosterTab::CharacterSelect => {
                                 let roots = self.roots.clone();
@@ -533,31 +784,45 @@ impl RosterWindow {
                             }
                             RosterTab::NewCharacter => {
                                 let roots = self.roots.clone();
-                                let action = {
-                                    let mut view = std::mem::take(&mut self.new_character);
-                                    let action = view.ui(
-                                        ui,
-                                        &roots,
-                                        &self.index,
-                                        &self.project,
-                                        self.edit_target.as_ref(),
-                                        &self.labels,
-                                        &self.authored_moves,
-                                    );
-                                    let goto_css = view.take_goto_character_select();
-                                    self.new_character = view;
-                                    if let Some(key) = goto_css {
-                                        self.select_css(key);
-                                    }
-                                    action
-                                };
-                                self.handle_new_character(action);
+                                let fighters: Vec<String> = self
+                                    .index
+                                    .entries
+                                    .iter()
+                                    .filter_map(|entry| entry.fighter.clone())
+                                    .collect();
+                                let faces: std::collections::HashMap<String, egui::TextureHandle> =
+                                    fighters
+                                        .into_iter()
+                                        .filter_map(|fighter| {
+                                            let face = self.portrait(
+                                                ui.ctx(),
+                                                &RosterKey::fighter(&fighter),
+                                                &fighter,
+                                                0,
+                                            )?;
+                                            Some((fighter, face))
+                                        })
+                                        .collect();
+                                let mut view = std::mem::take(&mut self.new_character);
+                                let action =
+                                    view.ui(ui, &roots, &self.index, &self.project, &faces);
+                                self.new_character = view;
+                                if let Some(status) = self.handle_new_character(action) {
+                                    self.status = status;
+                                }
                             }
                             RosterTab::Traits => {
                                 let roots = self.roots.clone();
                                 let labels = std::mem::take(&mut self.labels);
-                                self.traits
-                                    .ui(ui, &roots, &labels, &self.index, &mut self.params);
+                                let faces = self.faces(ui.ctx());
+                                self.traits.ui(
+                                    ui,
+                                    &roots,
+                                    &labels,
+                                    &self.index,
+                                    &mut self.params,
+                                    &faces,
+                                );
                                 self.labels = labels;
                             }
                         }
@@ -566,188 +831,37 @@ impl RosterWindow {
 
         if !self.status.is_empty() {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(120, 185, 235), "●");
-                ui.label(RichText::new(&self.status).small().weak());
-            });
+            ui.label(RichText::new(&self.status).color(look.text));
         }
     }
 
-    /// Take a pending "persist the project as part of deploying" request.
-    ///
-    /// Deploy stages from in-memory state; without a write alongside it, the
-    /// staged files can run ahead of the project file on disk, and a crash
-    /// loses everything since the last autosave. `app.rs` polls this after the
-    /// window draws and flushes the project when it has a path.
-    pub fn take_save_request(&mut self) -> bool {
-        std::mem::replace(&mut self.save_requested, false)
-    }
-
-    /// Note the outcome of the write `app.rs` performed for a deploy, so the
-    /// status line reads as one story: what was persisted, then staged.
-    /// `false` covers both "no path yet" and a failed write — the latter is
-    /// already reported in the main window's own status line.
-    pub fn note_deploy_saved(&mut self, saved: bool) {
-        if saved {
-            self.status = format!("Autosaved project. {}", self.status);
-        } else {
-            self.status = format!(
-                "{}. Project isn't saved — use File → Save As… to keep these edits.",
-                self.status
-            );
-        }
-    }
-
-    /// Stage the roster edits onto the emulator SD, for the edits no live
-    /// path can carry (slots, models, order, names, traits). Reboot the
-    /// emulator yourself afterwards — these files are read at boot.
-    ///
-    /// Synchronous: the staging is a few small files. Also raises
-    /// `save_requested` so `app.rs` flushes the project (roster edits
-    /// included) alongside the staged files.
-    fn deploy_to_emulator(&mut self, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
-        let summary = self.export_summary();
-        if summary.order + summary.hidden + summary.names + summary.authored + summary.params == 0 {
-            self.status = "No roster or trait edits to deploy yet.".into();
-            return;
-        }
-        let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
-            self.status = "Emulator SD card not found. Set VISIONARY_SD_DIR to the folder \
-                 containing your emulator's `ultimate` directory."
-                .into();
-            return;
-        };
-        let roster = self.project.clone();
-        let fighters_owned: Vec<FighterEntry> = fighters.to_vec();
-        let data_root_owned = data_root.cloned();
-        let staged = crate::emulator::stage_dev_mod(&sd, |dest| {
-            self.export_into(dest, &roster, &fighters_owned, data_root_owned.as_ref())
-                .map(|report| (report.files, report.warnings))
-        });
-        let (_dest, (files, warnings)) = match staged {
-            Ok(done) => done,
-            Err(error) => {
-                self.status = format!("Deploy failed: {error:#}");
-                return;
+    /// The page title, a way back to the project, and the other pages.
+    fn draw_top_bar(&mut self, ui: &mut Ui, look: crate::ui::Look) {
+        ui.horizontal_wrapped(|ui| {
+            if act(ui, look, "Project", None).clicked() {
+                self.tab = RosterTab::Project;
             }
-        };
-        if files.is_empty() {
-            // Warnings explain *why* nothing staged (a missing ui/ dump, a
-            // character with no files yet) — dropping them here is how a
-            // no-op deploy used to read as a success.
-            self.status = match warnings.first() {
-                Some(first) => format!("Nothing staged: {first}"),
-                None => "Nothing staged — the export reported no files.".into(),
-            };
-            return;
-        }
-        // The status line fits one line; the full list lives in the manual
-        // export tree. Name the count and the first warning, if any.
-        let warn_note = match warnings.as_slice() {
-            [] => String::new(),
-            [first] => format!(" Note: {first}"),
-            [first, rest @ ..] => format!(" Note: {first} (+{} more)", rest.len()),
-        };
-        let count = files.len();
-        self.save_requested = true;
-        self.status = format!(
-            "Staged {count} file(s) to visionary_dev.{warn_note} Reboot the emulator to see them."
-        );
-    }
-
-    fn draw_top_bar(
-        &mut self,
-        ui: &mut Ui,
-        fighters: &[FighterEntry],
-        data_root: Option<&PathBuf>,
-    ) {
-        let summary = self.export_summary();
-        let total_edits =
-            summary.order + summary.hidden + summary.names + summary.params + summary.authored;
-        let lib_mods = self.library.mods.len();
-        let enabled = self.library.mods.iter().filter(|m| m.enabled).count();
-
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for tab in RosterTab::ALL {
-                        let badge = tab.badge_count(self);
-                        let mut text = format!("{}  {}", tab.icon(), tab.title());
-                        if let Some(n) = badge {
-                            text.push_str(&format!("  • {n}"));
-                        }
-                        // Full descriptions live on hover; the bar itself
-                        // stays one row so the workspace below owns the view.
-                        let resp = ui.selectable_value(&mut self.tab, tab, text);
-                        resp.on_hover_text(tab.description());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                total_edits > 0,
-                                egui::Button::new(RichText::new("Deploy")),
-                            )
-                            .on_hover_text(
-                                "Roster edits need a reboot to take effect: saves the project, \
-                                 stages the edits to the visionary_dev mod on the emulator SD. \
-                                 Reboot the emulator yourself to see them.",
-                            )
-                            .clicked()
-                        {
-                            let owned: Vec<FighterEntry> = fighters.to_vec();
-                            let root = data_root.cloned();
-                            self.deploy_to_emulator(&owned, root.as_ref());
-                        }
-                        ui.label(
-                            RichText::new(if total_edits == 0 {
-                                "No edits".to_string()
-                            } else {
-                                format!(
-                                    "{total_edits} edit{}",
-                                    if total_edits == 1 { "" } else { "s" }
-                                )
-                            })
-                            .small()
-                            .strong()
-                            .color(if total_edits == 0 {
-                                ui.visuals().weak_text_color()
-                            } else {
-                                Color32::from_rgb(240, 210, 130)
-                            }),
-                        );
-                    });
-                });
-                // One context line: roster size, library state, and what an
-                // export would carry. Only the export part is conditional.
-                let mut context =
-                    format!("{} fighters · {enabled}/{lib_mods} mods", fighters.len());
-                if total_edits > 0 {
-                    let mut parts = Vec::new();
-                    if summary.order + summary.hidden > 0 {
-                        parts.push(format!(
-                            "{} position/visibility",
-                            summary.order + summary.hidden
-                        ));
-                    }
-                    if summary.names > 0 {
-                        parts.push(format!(
-                            "{} name{}",
-                            summary.names,
-                            if summary.names == 1 { "" } else { "s" }
-                        ));
-                    }
-                    if summary.authored > 0 {
-                        parts.push(format!("{} new", summary.authored));
-                    }
-                    if summary.params > 0 {
-                        parts.push(format!("{} traits", summary.params));
-                    }
-                    context.push_str(&format!(" · will export {}", parts.join(" · ")));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(self.tab.title())
+                    .size(30.0)
+                    .strong()
+                    .color(look.text),
+            );
+            ui.add_space(12.0);
+            for tab in RosterTab::ALL {
+                if tab == RosterTab::Project || tab == self.tab {
+                    continue;
                 }
-                ui.label(RichText::new(context).small().weak());
-            });
-        ui.add_space(8.0);
+                let mut text = tab.title().to_string();
+                if let Some(n) = tab.badge_count(self) {
+                    text.push_str(&format!(" ({n})"));
+                }
+                if act(ui, look, &text, None).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
     }
 
     /// Carry out what the new-character tab asked for.
@@ -756,9 +870,10 @@ impl RosterWindow {
     /// the project goes through one place — the library has to be saved and the fighter index
     /// invalidated on any change, and a second path that forgot either would leave the new
     /// character invisible until the next restart.
-    fn handle_new_character(&mut self, action: NewCharacterAction) {
+    /// Returns what to tell the author, for a page that shows it.
+    pub fn handle_new_character(&mut self, action: NewCharacterAction) -> Option<String> {
         match action {
-            NewCharacterAction::None => {}
+            NewCharacterAction::None => None,
             NewCharacterAction::Create {
                 donor,
                 slots,
@@ -766,26 +881,37 @@ impl RosterWindow {
                 name_id,
                 destination,
             } => {
-                let create_res = new_character::create_and_import_range(
-                    &mut self.library,
+                // The new character starts as a full copy of the fighter it plays as.
+                let root = destination.join(crate::mod_export::slugify(&display_name));
+                let ui_name = self
+                    .index
+                    .by_key(&RosterKey::fighter(&donor))
+                    .and_then(|entry| entry.name_id.clone())
+                    .unwrap_or_else(|| donor.to_ascii_lowercase());
+                let create_res = new_character::create_range(
                     &destination,
+                    &self.roots,
                     &donor,
+                    &ui_name,
                     &slots,
                     &display_name,
+                    &name_id,
                 );
                 match create_res {
-                    Ok(scaffolded) => {
+                    Ok((scaffolded, copied)) => {
                         let mut entry = new_character::authored_entry_multi(
                             &donor,
                             &slots,
                             &display_name,
                             &name_id,
                         );
-                        // Remember where the files went: the panels reveal
-                        // this folder and report on its contents. Computed the
-                        // same way `create_and_import` computes it.
-                        entry.files_root =
-                            Some(destination.join(crate::mod_export::slugify(&display_name)));
+                        // Remember where the files went, relative to the project when inside
+                        // it so the project still finds them after it moves. Its folder joins
+                        // this project's roots on the next frame (see `set_project_dir`).
+                        entry.files_root = Some(match &self.new_character.project_dir {
+                            Some(dir) => crate::project_parts::project_relative(dir, &root),
+                            None => root,
+                        });
                         // The name is recorded as a roster edit as well as on the entry, so it
                         // reaches the .xmsbt the export writes. The entry's own field is what
                         // the panel shows; the override is what the game reads.
@@ -796,25 +922,23 @@ impl RosterWindow {
                             .authored
                             .retain(|existing| existing.key != entry.key);
                         self.project.authored.push(entry);
-                        self.new_character.note_created(&display_name, &scaffolded);
-                        self.commit_library_change();
+                        self.new_character
+                            .note_created(&display_name, &scaffolded, copied);
                     }
                     Err(error) => self.new_character.note_error(format!("{error:#}")),
                 }
-            }
-            NewCharacterAction::SetEditTarget(target) => {
-                self.status = match &target {
-                    Some(key) => format!(
-                        "Moves you edit now belong to {key}. The donor's other costumes keep \
-                         their own version of anything you change."
-                    ),
-                    None => "Moves you edit now apply to every costume again.".to_string(),
-                };
-                self.edit_target = target;
+                None
             }
             NewCharacterAction::Remove(key) => {
-                if self.edit_target.as_ref() == Some(&key) {
-                    self.edit_target = None;
+                let name = self.shown_name(&key).unwrap_or_else(|| key.to_string());
+                // Older versions installed its folder as a mod; that goes too, or the
+                // character's files would still load and ship, and so does the library's note
+                // that the folder is the project's. Its place among this project's roots goes
+                // on the next frame (see `set_project_dir`).
+                if let Some(folder) = self.made_root(&key) {
+                    if self.library.forget_project_folder(&folder) {
+                        self.commit_library_change();
+                    }
                 }
                 self.project.authored.retain(|entry| entry.key != key);
                 self.project.names.remove(&key);
@@ -823,8 +947,9 @@ impl RosterWindow {
                 self.project.hidden.remove(&key);
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
-                self.status =
-                    format!("Removed {key} from the project. Its files are still on disk.");
+                let said = format!("Removed {name}. Its files are still in its folder.");
+                self.settled_status = Some((said.clone(), false));
+                Some(said)
             }
         }
     }
@@ -832,125 +957,67 @@ impl RosterWindow {
     // ── Library tab ─────────────────────────────────────────────────────────
 
     fn draw_library(&mut self, ui: &mut Ui) {
-        // Header with import actions — uses Frame::group like the main sidebar headings
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new("Rescan"))
-                            .on_hover_text("Re-read every imported mod's files from disk")
-                            .clicked()
-                        {
-                            self.rescan();
-                        }
-                        ui.add_space(4.0);
-                        if ui
-                            .add(egui::Button::new("Import folder…"))
-                            .on_hover_text(
-                                "Pick a folder containing fighter/, effect/, or ui/ — or a folder that \
-                                 wraps one.",
-                            )
-                            .clicked()
-                        {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_title("Import mod folder")
-                                .pick_folder()
-                            {
-                                self.start_import(vec![path]);
-                            }
-                        }
-                        if ui
-                            .add(egui::Button::new("Import archives…"))
-                            .on_hover_text(
-                                "Pick any number of .zip / .7z mod archives. Archives are extracted for you; \
-                                 folders are used in place, so your own edits stay visible.",
-                            )
-                            .clicked()
-                        {
-                            if let Some(paths) = rfd::FileDialog::new()
-                                .set_title("Import mod archives")
-                                .add_filter("Mod archive", super::archive::SUPPORTED)
-                                .pick_files()
-                            {
-                                self.start_import(paths);
-                            }
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Later mods take priority when files overlap.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
+        let look = look(ui);
+        ui.horizontal(|ui| {
+            if act(ui, look, "Add mod folder", Some(look.accent))
+                .on_hover_text(
+                    "A folder with fighter, effect or ui in it, or one that holds such a folder",
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Add mod folder")
+                    .pick_folder()
+                {
+                    self.start_import(vec![path]);
+                }
+            }
+            if act(ui, look, "Add mod archives", None)
+                .on_hover_text(".zip or .7z files; Visionary unpacks them for you")
+                .clicked()
+            {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Add mod archives")
+                    .add_filter("Mod archive", super::archive::SUPPORTED)
+                    .pick_files()
+                {
+                    self.start_import(paths);
+                }
+            }
+        });
         ui.add_space(8.0);
 
         if let Some(job) = &self.import {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Importing {} of {} — {}",
-                                    job.done + 1,
-                                    job.total,
-                                    job.current
-                                ))
-                                .small()
-                                .strong(),
-                            );
-                            let frac = if job.total > 0 {
-                                (job.done as f32) / job.total as f32
-                            } else {
-                                0.0
-                            };
-                            ui.add(
-                                egui::ProgressBar::new(frac.clamp(0.0, 1.0))
-                                    .desired_width(ui.available_width().min(320.0))
-                                    .desired_height(4.0),
-                            );
-                        });
-                    });
-                });
-            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(format!(
+                        "Adding {} of {}: {}",
+                        job.done + 1,
+                        job.total,
+                        job.current
+                    ))
+                    .strong()
+                    .color(look.text),
+                );
+            });
+            let frac = if job.total > 0 {
+                job.done as f32 / job.total as f32
+            } else {
+                0.0
+            };
+            ui.add(
+                egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                    .desired_width(ui.available_width().min(360.0))
+                    .desired_height(6.0),
+            );
+            ui.add_space(8.0);
         }
 
         self.draw_notes(ui);
 
         if self.library.is_empty() {
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(16, 14))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("◇  No mods imported").size(13.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
-                                "Visionary reads fighters, skins, and effects from your game data — mods \
-                                 add or replace them. Import a mod folder or archive above to get started.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("Tip: your own authored characters appear here as imported mods, so load order and conflicts stay visible.")
-                                .small()
-                                .weak(),
-                        );
-                    });
-                });
-            // Still surface stale overrides even with empty library so hidden project state is not invisible
+            ui.label(RichText::new("No mods added").color(look.dim));
             self.draw_stale_overrides(ui);
             return;
         }
@@ -958,216 +1025,123 @@ impl RosterWindow {
         self.draw_stale_overrides(ui);
         self.draw_conflicts(ui);
         ui.add_space(6.0);
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("⇅  Load order").small().strong());
-            ui.label(
-                RichText::new(
-                    "— later mods win any file an earlier one also provides. Use ▲ / ▼ to reorder.",
-                )
-                .small()
-                .weak(),
-            );
-        });
-        ui.add_space(6.0);
-
         self.draw_mod_rows(ui);
     }
 
     fn draw_mod_rows(&mut self, ui: &mut Ui) {
+        let look = look(ui);
         let ids: Vec<ProviderId> = self.library.mods.iter().map(|entry| entry.id).collect();
+        let count = ids.len();
         let mut changed = false;
         let mut remove: Option<ProviderId> = None;
         let mut move_later: Option<ProviderId> = None;
         let mut move_earlier: Option<ProviderId> = None;
 
-        for id in ids {
+        for (place, id) in ids.into_iter().enumerate() {
             let Some(index) = self.library.mods.iter().position(|entry| entry.id == id) else {
                 continue;
             };
             let is_enabled = self.library.mods[index].enabled;
-            // Disabled mods use the theme's faint background so they read as muted
-            // without a custom grey; enabled uses the standard group frame.
-            let mut frame = egui::Frame::group(ui.style());
-            if !is_enabled {
-                frame = frame.fill(ui.visuals().faint_bg_color.gamma_multiply(0.6));
-            }
-            frame
-                .inner_margin(egui::Margin::symmetric(10, 8))
+            egui::Frame::new()
+                .fill(if is_enabled { look.card } else { look.sunk })
+                .stroke(egui::Stroke::new(1.5, if is_enabled { look.accent } else { look.edge }))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        let entry = &mut self.library.mods[index];
-                        let mut enabled = entry.enabled;
-                        if ui.checkbox(&mut enabled, "").on_hover_text("Enable / disable this mod").changed() {
-                            entry.enabled = enabled;
+                        ui.label(RichText::new(format!("{}", place + 1)).size(20.0).strong().color(look.dim));
+                        ui.add_space(6.0);
+                        let (word, colour) = if is_enabled { ("On", Some(Color32::from_rgb(80, 220, 120))) } else { ("Off", None) };
+                        if act(ui, look, word, colour).on_hover_text("Turn this mod on or off").clicked() {
+                            self.library.mods[index].enabled = !is_enabled;
                             changed = true;
                         }
-
+                        ui.add_space(6.0);
                         let renaming = matches!(&self.rename, Some((rid, _)) if *rid == id);
-                        if renaming {
-                            if let Some((_, buffer)) = &mut self.rename {
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(buffer)
-                                        .desired_width(160.0)
-                                        .hint_text("mod name"),
-                                );
-                                if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    let name = buffer.trim().to_string();
-                                    if !name.is_empty() {
-                                        self.library.mods[index].name = name;
-                                        changed = true;
+                        ui.vertical(|ui| {
+                            if renaming {
+                                if let Some((_, buffer)) = &mut self.rename {
+                                    let response = ui.add(egui::TextEdit::singleline(buffer).desired_width(260.0).hint_text("Mod name"));
+                                    if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        let name = buffer.trim().to_string();
+                                        if !name.is_empty() {
+                                            self.library.mods[index].name = name;
+                                            changed = true;
+                                        }
+                                        self.rename = None;
                                     }
-                                    self.rename = None;
+                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                        self.rename = None;
+                                    }
                                 }
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                    self.rename = None;
+                            } else {
+                                let entry = &self.library.mods[index];
+                                let name = ui.add(egui::Label::new(RichText::new(&entry.name).size(17.0).strong().color(look.text)).sense(egui::Sense::click()));
+                                if name.on_hover_text("Click to rename").clicked() {
+                                    self.rename = Some((id, entry.name.clone()));
                                 }
                             }
-                        } else {
-                            let entry = &self.library.mods[index];
-                            let label = ui.selectable_label(false, RichText::new(&entry.name).strong());
-                            if label.on_hover_text("Click to rename").clicked() {
-                                self.rename = Some((id, entry.name.clone()));
-                            }
-                        }
-
-                        let entry = &self.library.mods[index];
-                        ui.label(
-                            RichText::new(entry.summary())
-                                .small()
-                                .weak(),
-                        );
-
+                            ui.label(RichText::new(self.library.mods[index].summary()).color(look.dim));
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button(RichText::new(" ✕ ").small())
-                                .on_hover_text("Remove this mod from the library")
-                                .clicked()
-                            {
+                            if act(ui, look, "Remove", None).on_hover_text("Take this mod out of the list").clicked() {
                                 remove = Some(id);
                             }
-                            ui.add_space(4.0);
-                            if ui
-                                .add_enabled(
-                                    index + 1 < self.library.mods.len(),
-                                    egui::Button::new(RichText::new(" ▼ ").small()),
-                                )
-                                .on_hover_text("Later in load order — wins more conflicts")
-                                .clicked()
-                            {
+                            let expanded = self.expanded == Some(id);
+                            if act(ui, look, if expanded { "Hide files" } else { "Files" }, None).clicked() {
+                                self.expanded = (!expanded).then_some(id);
+                            }
+                            if place + 1 < count && act(ui, look, "Down", None).on_hover_text("Later in the load order: wins more").clicked() {
                                 move_later = Some(id);
                             }
-                            if ui
-                                .add_enabled(index > 0, egui::Button::new(RichText::new(" ▲ ").small()))
-                                .on_hover_text("Earlier in load order — wins fewer conflicts")
-                                .clicked()
-                            {
+                            if place > 0 && act(ui, look, "Up", None).on_hover_text("Earlier in the load order: wins less").clicked() {
                                 move_earlier = Some(id);
-                            }
-                            if !is_enabled {
-                                ui.colored_label(Color32::from_rgb(180, 160, 120), RichText::new("disabled").small());
                             }
                         });
                     });
 
                     let entry = &self.library.mods[index];
-
-                    // Safety-critical and always visible: a shipped plugin
-                    // means its movesets read as vanilla in the editor.
+                    // Always visible: a shipped plugin means its movesets read as the game's.
                     if entry.ships_plugin() {
-                        ui.add_space(2.0);
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Has a compiled plugin ({}). The editor cannot read it, so its moves show as the game's.",
+                                entry.manifest.plugins.join(", ")
+                            ))
+                            .color(Color32::from_rgb(240, 190, 90)),
+                        );
+                    }
+                    if self.expanded != Some(id) {
+                        return;
+                    }
+                    ui.add_space(6.0);
+                    if !matches!(entry.detection, library::RootDetection::AsGiven) {
+                        ui.label(RichText::new(format!("Mod folder: {}", entry.detection.describe())).color(look.dim));
+                    }
+                    for (fighter, provision) in &entry.manifest.fighters {
+                        let slots = provision.slots.iter().map(|slot| format!("c{slot:02}")).collect::<Vec<_>>().join(", ");
                         ui.horizontal(|ui| {
-                            ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
-                            ui.label(
-                                RichText::new(format!(
-                                    "Ships a compiled plugin ({}). The editor cannot read it, so its movesets appear as vanilla.",
-                                    entry.manifest.plugins.join(", ")
-                                ))
-                                .small()
-                                .weak(),
-                            );
+                            ui.label(RichText::new(fighter).strong().color(look.text));
+                            ui.label(RichText::new(slots).color(look.dim));
                         });
                     }
-
-                    // Everything else about the mod — root guess, fighter
-                    // list, ignored files, file list — lives behind one
-                    // expander so the load-order list scans as one row per
-                    // mod instead of a paragraph each.
+                    if entry.manifest.unrecognized > 0 {
+                        ui.label(RichText::new(format!("{} files outside the game's folders were left out (readmes, pictures).", entry.manifest.unrecognized)).color(look.dim));
+                    }
                     ui.add_space(4.0);
-                    let expanded = self.expanded == Some(id);
-                    if ui
-                        .small_button(if expanded { "▾ Hide details" } else { "▸ Details & files" })
-                        .on_hover_text("Root detection, fighters, and the file list")
-                        .clicked()
-                    {
-                        self.expanded = (!expanded).then_some(id);
-                    }
-                    if expanded {
-                        ui.add_space(4.0);
-                        let entry = &self.library.mods[index];
-                        // A mod whose root was guessed one level too high provides nothing and looks
-                        // identical to a mod that contains no fighters. Say which happened.
-                        if !matches!(entry.detection, library::RootDetection::AsGiven) {
-                            ui.label(
-                                RichText::new(format!("↳ Root: {}", entry.detection.describe()))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                        if !entry.manifest.fighters.is_empty() {
-                            let summary = entry
-                                .manifest
-                                .fighters
-                                .iter()
-                                .map(|(fighter, provision)| {
-                                    if provision.slots.is_empty() {
-                                        fighter.clone()
-                                    } else {
-                                        let slots = provision
-                                            .slots
-                                            .iter()
-                                            .map(|slot| format!("c{slot:02}"))
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        format!("{fighter} ({slots})")
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("  ·  ");
-                            ui.label(RichText::new(summary).small().weak());
-                        }
-                        if entry.manifest.unrecognized > 0 {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} file(s) outside game folders were ignored (readmes, screenshots, etc.).",
-                                    entry.manifest.unrecognized
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                        }
-                        ui.add_space(4.0);
-                        let paths: Vec<String> = self.library.mods[index]
-                            .manifest
-                            .paths
-                            .iter()
-                            .cloned()
-                            .collect();
-                        egui::Frame::group(ui.style())
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt(("roster_mod_files", id.0))
-                                    .max_height(180.0)
-                                    .show(ui, |ui| {
-                                        for path in paths {
-                                            ui.label(RichText::new(path).small().monospace().weak());
-                                        }
-                                    });
-                            });
-                    }
+                    let paths: Vec<String> = entry.manifest.paths.iter().cloned().collect();
+                    egui::Frame::new().fill(look.sunk).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical().id_salt(("roster_mod_files", id.0)).max_height(200.0).show(ui, |ui| {
+                            for path in paths {
+                                ui.label(RichText::new(path).monospace().color(look.text));
+                            }
+                        });
+                    });
                 });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
 
         if let Some(id) = move_later {
@@ -1191,14 +1165,6 @@ impl RosterWindow {
         let by_fighter = self.library.conflicts_by_fighter();
         let total: usize = by_fighter.values().map(|list| list.len()).sum();
         if total == 0 {
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(130, 225, 150), "✓");
-                ui.label(
-                    RichText::new("No file conflicts between enabled mods.")
-                        .small()
-                        .weak(),
-                );
-            });
             return;
         }
         egui::Frame::group(ui.style())
@@ -1208,11 +1174,12 @@ impl RosterWindow {
                     ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{total} file(s) provided by more than one enabled mod — later in load order wins."
+                            "{total} file(s) provided by more than one enabled mod"
                         ))
                         .small()
                         .strong(),
-                    );
+                    )
+                    .on_hover_text("Later in load order wins.");
                 });
                 ui.add_space(4.0);
                 for (fighter, conflicts) in by_fighter {
@@ -1252,10 +1219,13 @@ impl RosterWindow {
                                                 .collect::<Vec<_>>()
                                                 .join(" → ");
                                             ui.label(
-                                                RichText::new(format!("{}  [{}]", conflict.game_path, chain))
-                                                    .small()
-                                                    .monospace()
-                                                    .weak(),
+                                                RichText::new(format!(
+                                                    "{}  [{}]",
+                                                    conflict.game_path, chain
+                                                ))
+                                                .small()
+                                                .monospace()
+                                                .weak(),
                                             );
                                         }
                                     });
@@ -1281,7 +1251,7 @@ impl RosterWindow {
                     ui.colored_label(Color32::from_rgb(240, 140, 140), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{} project edit(s) with no matching character — kept, not discarded. Re-enable the mod that provided it to restore them.",
+                            "{} project edit(s) with no matching character. Kept, not discarded. Re-enable the mod that provided it to restore them.",
                             self.index.stale_overrides.len()
                         ))
                         .small()
@@ -1293,7 +1263,7 @@ impl RosterWindow {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("•").small().weak());
                         ui.label(
-                            RichText::new(format!("{} — {}", stale.key, stale.kind.describe()))
+                            RichText::new(format!("{}. {}", stale.key, stale.kind.describe()))
                                 .small()
                                 .weak(),
                         );
@@ -1355,7 +1325,7 @@ impl RosterWindow {
                         Ok(detail) => ui.horizontal(|ui| {
                             ui.colored_label(Color32::from_rgb(130, 225, 150), "✔");
                             ui.label(
-                                RichText::new(format!("{} — {detail}", note.source))
+                                RichText::new(format!("{}. {detail}", note.source))
                                     .small()
                                     .weak(),
                             );
@@ -1363,7 +1333,7 @@ impl RosterWindow {
                         Err(error) => ui.horizontal(|ui| {
                             ui.colored_label(Color32::from_rgb(240, 140, 140), "✘");
                             ui.label(
-                                RichText::new(format!("{} — {error}", note.source))
+                                RichText::new(format!("{}. {error}", note.source))
                                     .small()
                                     .weak(),
                             );
@@ -1378,7 +1348,7 @@ impl RosterWindow {
 
     fn start_import(&mut self, paths: Vec<PathBuf>) {
         if self.import.is_some() {
-            self.status = "An import is already running — wait for it to finish.".into();
+            self.status = "An import is already running. Wait for it to finish.".into();
             return;
         }
         if paths.is_empty() {
@@ -1456,6 +1426,10 @@ impl RosterWindow {
             );
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    pub fn request_rescan(&mut self) {
+        self.rescan();
     }
 
     fn rescan(&mut self) {
@@ -1570,4 +1544,282 @@ fn import_worker(paths: Vec<PathBuf>, sender: Sender<ImportMsg>) {
         }
     }
     let _ = sender.send(ImportMsg::Finished);
+}
+
+#[cfg(test)]
+mod gimmick_root_tests {
+    use super::*;
+
+    fn add_mod(window: &mut RosterWindow, root: &std::path::Path, enabled: bool) {
+        window.library.insert(library::PreparedMod {
+            name: root.display().to_string(),
+            source: ModSource::Folder(root.to_path_buf()),
+            root: root.to_path_buf(),
+            detection: library::RootDetection::AsGiven,
+            manifest: Default::default(),
+        });
+        window.library.mods.last_mut().unwrap().enabled = enabled;
+    }
+
+    #[test]
+    fn personal_baselines_follow_enabled_mod_priority_and_deduplicate() {
+        let mut window = RosterWindow::default();
+        let data = PathBuf::from("base");
+        window.set_export_root(Some(PathBuf::from("dump")));
+        add_mod(&mut window, std::path::Path::new("early"), true);
+        add_mod(&mut window, std::path::Path::new("late"), true);
+        add_mod(&mut window, std::path::Path::new("disabled"), false);
+        add_mod(&mut window, &data, true);
+        assert_eq!(
+            window.gimmick_roots(Some(&data)),
+            ["base", "late", "early", "dump"].map(PathBuf::from)
+        );
+        assert_eq!(
+            window.content_roots(Some(&data)),
+            ["base", "dump", "early", "late"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn personal_lookup_falls_back_without_writing_source_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("base");
+        let early = fixture.path().join("early");
+        let late = fixture.path().join("late");
+        let relative = "fighter/mario/param/vl.prc";
+        for (root, bytes) in [
+            (&base, b"base".as_slice()),
+            (&early, b"early".as_slice()),
+            (&late, b"late".as_slice()),
+        ] {
+            std::fs::create_dir_all(root.join("fighter/mario/param")).unwrap();
+            std::fs::write(root.join(relative), bytes).unwrap();
+        }
+        let mut window = RosterWindow::default();
+        add_mod(&mut window, &early, true);
+        add_mod(&mut window, &late, true);
+        let locate = |window: &RosterWindow| {
+            crate::gimmicks::params::locate_personal(&window.gimmick_roots(Some(&base)), "mario")
+                .unwrap()
+        };
+        assert_eq!(locate(&window), late.join(relative));
+        window.library.mods[1].enabled = false;
+        assert_eq!(locate(&window), early.join(relative));
+        window.library.mods[0].enabled = false;
+        assert_eq!(locate(&window), base.join(relative));
+        for (root, bytes) in [
+            (&base, b"base".as_slice()),
+            (&early, b"early".as_slice()),
+            (&late, b"late".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(root.join(relative)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn personal_export_patches_the_winning_mod_and_preserves_its_other_values() {
+        use crate::gimmicks::{params, paths::NestedPath};
+        use crate::mod_project::ParamValue;
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("base");
+        let custom = fixture.path().join("custom");
+        let output = fixture.path().join("output");
+        let relative = "fighter/mario/param/vl.prc";
+        for (root, untouched) in [(&base, 1.0), (&custom, 7.0)] {
+            std::fs::create_dir_all(root.join("fighter/mario/param")).unwrap();
+            let tree = prc::ParamStruct(vec![
+                (
+                    prc::hash40::Hash40(hash40::hash40("charge_rate").0),
+                    prc::ParamKind::Float(2.0),
+                ),
+                (
+                    prc::hash40::Hash40(hash40::hash40("untouched").0),
+                    prc::ParamKind::Float(untouched),
+                ),
+            ]);
+            params::save_personal(&tree, &root.join(relative), "mario").unwrap();
+        }
+        let source_before = std::fs::read(custom.join(relative)).unwrap();
+        let mut window = RosterWindow {
+            initialized: true,
+            ..Default::default()
+        };
+        add_mod(&mut window, &custom, true);
+        params::record_personal_edit(
+            window.params.entry("mario".into()).or_default(),
+            "mario",
+            &NestedPath::parse("charge_rate").unwrap(),
+            ParamValue::Float(4.0),
+            Some(ParamValue::Float(2.0)),
+        )
+        .unwrap();
+        window
+            .export_into(&output, &RosterMod::default(), &[], Some(&base))
+            .unwrap();
+        let exported = params::open_personal(&output.join(relative), "mario").unwrap();
+        assert_eq!(
+            params::read_leaf(
+                &exported,
+                "mario",
+                &NestedPath::parse("charge_rate").unwrap()
+            )
+            .unwrap(),
+            ParamValue::Float(4.0)
+        );
+        assert_eq!(
+            params::read_leaf(&exported, "mario", &NestedPath::parse("untouched").unwrap())
+                .unwrap(),
+            ParamValue::Float(7.0)
+        );
+        assert_eq!(std::fs::read(custom.join(relative)).unwrap(), source_before);
+    }
+}
+
+#[cfg(test)]
+mod project_root_tests {
+    use super::*;
+    use crate::mod_project::ParamValue;
+
+    fn vision(files_root: PathBuf) -> crate::mod_project::AuthoredEntry {
+        let mut entry = new_character::authored_entry_multi(
+            "mario",
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "Vision",
+            "vision",
+        );
+        entry.files_root = Some(files_root);
+        entry
+    }
+
+    /// A made character's folder is a root of its project while that project is open, never an
+    /// installed mod: another project must not see Mario with its costumes.
+    #[test]
+    fn a_made_characters_folder_is_a_root_of_its_project_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let own = project.join("characters/vision");
+        std::fs::create_dir_all(&own).unwrap();
+        let mut window = RosterWindow::default();
+        // Written by an older version: absolute.
+        window.project.authored.push(vision(own.clone()));
+        window.set_project_dir(Some(project.clone()));
+        assert_eq!(
+            window.project.authored[0].files_root,
+            Some(PathBuf::from("characters/vision")),
+            "stored relative to the project"
+        );
+        assert_eq!(
+            window.made_root(&RosterKey::slot("mario", 8)),
+            Some(own.clone())
+        );
+        assert!(window.enabled_roots().contains(&own));
+        assert!(window.library.enabled_roots().is_empty());
+        assert!(std::mem::take(&mut window.library_dirty));
+        // Nothing changed: nothing to rescan.
+        window.set_project_dir(Some(project.clone()));
+        assert!(!window.library_dirty);
+        // Closing the project drops its roots.
+        window.project = RosterMod::default();
+        window.set_project_dir(None);
+        assert!(window.enabled_roots().is_empty());
+        assert!(window.library_dirty);
+        // Paired: with the character back, so is its root.
+        window
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        window.set_project_dir(Some(project));
+        assert_eq!(window.enabled_roots(), vec![own]);
+    }
+
+    #[test]
+    fn removing_a_made_character_says_so_and_takes_its_root_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = RosterWindow::default();
+        window
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        let key = RosterKey::slot("mario", 8);
+        window.project.names.insert(key.clone(), "Vision X".into());
+        window.set_project_dir(Some(dir.path().to_path_buf()));
+        assert_eq!(window.shown_name(&key).as_deref(), Some("Vision X"));
+        assert_eq!(window.made_folders().len(), 1);
+        let said = window.handle_new_character(NewCharacterAction::Remove(key.clone()));
+        assert_eq!(
+            said.as_deref(),
+            Some("Removed Vision X. Its files are still in its folder.")
+        );
+        assert!(window.project.authored.is_empty());
+        assert!(!window.project.names.contains_key(&key));
+        window.set_project_dir(Some(dir.path().to_path_buf()));
+        assert!(window.enabled_roots().is_empty());
+        assert!(window.made_folders().is_empty());
+        // The fighter list is rebuilt first, and that says what it found; the removal is said
+        // after it, or it is never seen. Before the change reaches the roots it is not said...
+        let mut fresh = RosterWindow::default();
+        fresh
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        fresh.set_project_dir(Some(dir.path().to_path_buf()));
+        fresh.library_dirty = false;
+        fresh.handle_new_character(NewCharacterAction::Remove(key.clone()));
+        assert_eq!(fresh.take_settled_status(), None);
+        // ...nor while the list is being rebuilt...
+        assert!(window.library_dirty);
+        assert_eq!(window.take_settled_status(), None);
+        // ...only once it has been.
+        window.library_dirty = false;
+        assert_eq!(
+            window.take_settled_status().as_deref(),
+            Some("Removed Vision X. Its files are still in its folder.")
+        );
+        assert_eq!(window.take_settled_status(), None);
+    }
+
+    /// A made character's own name is written as a name so the game shows it; the Select
+    /// screen tile and tab must not call that a rename.
+    #[test]
+    fn a_made_characters_own_name_is_not_a_rename() {
+        let mut window = RosterWindow::default();
+        window
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        let key = RosterKey::slot("mario", 8);
+        window.project.names.insert(key.clone(), "Vision".into());
+        assert_eq!(window.export_summary().names, 0);
+        assert_eq!(RosterTab::CharacterSelect.badge_count(&window), None);
+        window.project.names.insert(key, "Nova".into());
+        assert_eq!(window.export_summary().names, 1);
+        window
+            .project
+            .names
+            .insert(RosterKey::fighter("luigi"), "Weegee".into());
+        assert_eq!(window.export_summary().names, 2);
+        assert_eq!(RosterTab::CharacterSelect.badge_count(&window), Some(2));
+    }
+
+    /// The Fighter values badge, the card's count and the tile all count one way: values of the
+    /// fighter values file, not a gimmick's own values file.
+    #[test]
+    fn fighter_values_are_counted_one_way() {
+        let mut window = RosterWindow::default();
+        let params = window.params.entry("mario".into()).or_default();
+        for (file, field) in [
+            (super::super::traits::FIGHTER_PARAM_PATH, "weight"),
+            (super::super::traits::FIGHTER_PARAM_PATH, "walk_speed_max"),
+            ("fighter/mario/param/vl.prc", "gimmick_power"),
+        ] {
+            params
+                .files
+                .entry(file.into())
+                .or_default()
+                .insert(field.into(), ParamValue::Float(1.0));
+        }
+        assert_eq!(window.fighter_value_count("mario"), 2);
+        assert_eq!(RosterTab::Traits.badge_count(&window), Some(2));
+        assert_eq!(window.fighter_value_count("luigi"), 0);
+    }
 }

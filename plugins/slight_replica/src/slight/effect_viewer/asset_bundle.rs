@@ -291,7 +291,18 @@ extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut u
         ));
         return false;
     }
-    let Ok(mut file) = std::fs::File::open(&entry.sd_path) else {
+    // A Windows sharing conflict with the editor is momentary; try again before giving up,
+    // since ARCropolis panics on a false return for files the game has no copy of.
+    let Some(mut file) = (0..20).find_map(|attempt| {
+        if attempt > 0 {
+            unsafe {
+                nnsdk::nn::os::SleepThread(nnsdk::nn::TimeSpan {
+                    nanoseconds: 5_000_000,
+                });
+            }
+        }
+        std::fs::File::open(&entry.sd_path).ok()
+    }) else {
         crate::slight::diag::note(format!(
             "asset bundle payload disappeared: {}",
             entry.sd_path

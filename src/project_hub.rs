@@ -4,9 +4,6 @@
 //! blank, and there was no notion of "the project I have open". This module gives
 //! that notion a shape that can be tested without a GUI:
 //!
-//! * [`CurrentProject`] tracks the open project's path (persisted) and whether it
-//!   holds edits autosave has not written yet. Edits autosave when a path is
-//!   known; Save As relocates; Export/Load adopt the path they touched.
 //! * [`HubState`] models the cold-start hub — Resume last / New / Open
 //!   (`modproject.json`) / Import mod / Recent / Browse without project — and the
 //!   mid-session reopen with its not-yet-autosaved guard.
@@ -34,80 +31,6 @@ pub const LAST_PROJECT_KEY: &str = "project_path";
 /// Config file holding recent project paths (one absolute path per line).
 pub const RECENT_PROJECTS_KEY: &str = "recent_projects";
 
-/// One current project holds every edit.
-#[derive(Debug, Clone, Default)]
-pub struct CurrentProject {
-    /// Where edits autosave. `None` means "never saved yet".
-    pub path: Option<PathBuf>,
-    /// True once any edit lands after the last autosave/load.
-    pub dirty: bool,
-    /// Display name (`modproject.json`'s `name`), for the hub and title bar.
-    pub name: String,
-}
-
-/// Dirty-tracking model for the hub window. The app still tracks saves with
-/// its own snapshot comparison; this model and its tests are the staged
-/// replacement — wire the hub UI to it (or remove it) rather than letting the
-/// two trackers drift.
-#[allow(dead_code)]
-impl CurrentProject {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_path(path: PathBuf, name: String) -> Self {
-        Self {
-            path: Some(path),
-            dirty: false,
-            name,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn has_path(&self) -> bool {
-        self.path.is_some()
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Any edit lands here. Called by every mutation path (or, failing that,
-    /// derived by comparing against the last autosaved snapshot).
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// A successful autosave/load/export-adopt clears the flag and records the path.
-    pub fn mark_saved(&mut self, path: PathBuf) {
-        self.path = Some(path);
-        self.dirty = false;
-    }
-
-    /// Loading a project (or New) replaces the current one clean.
-    #[allow(dead_code)]
-    pub fn mark_loaded(&mut self, path: Option<PathBuf>, name: String) {
-        self.path = path;
-        self.name = name;
-        self.dirty = false;
-    }
-
-    #[allow(dead_code)]
-    pub fn mark_clean(&mut self) {
-        self.dirty = false;
-    }
-
-    /// Autosave needs Save As when there is no path yet.
-    pub fn needs_save_as(&self) -> bool {
-        self.path.is_none()
-    }
-
-    /// Switching projects with edits autosave has not written must warn first.
-    pub fn needs_warning(&self) -> bool {
-        self.dirty
-    }
-}
-
 /// What the hub can do. Pure so the cold-start matrix is testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubAction {
@@ -133,18 +56,6 @@ impl HubAction {
     pub fn discards_edits(&self) -> bool {
         !matches!(self, HubAction::BrowseWithoutProject)
     }
-
-    #[allow(dead_code)]
-    pub fn label(&self) -> String {
-        match self {
-            HubAction::ResumeLast(path) => format!("Resume {}", path.display()),
-            HubAction::New(path) => format!("New project at {}", path.display()),
-            HubAction::Open(path) => format!("Open {}", path.display()),
-            HubAction::ImportMod(path) => format!("Import {}", path.display()),
-            HubAction::OpenRecent(path) => format!("Open {}", path.display()),
-            HubAction::BrowseWithoutProject => "Browse without project".to_string(),
-        }
-    }
 }
 
 /// True when choosing `action` with `dirty` edits autosave has not written must warn first.
@@ -155,6 +66,7 @@ pub fn needs_hub_warning(dirty: bool, action: &HubAction) -> bool {
 /// The hub's cold-start state, derived from persisted config.
 #[derive(Debug, Clone, Default)]
 pub struct HubState {
+    pub new_workspace: Option<String>,
     /// Whether the hub window is currently shown.
     pub show: bool,
     /// Last project path that still exists on disk, if any.
@@ -175,56 +87,7 @@ impl HubState {
             show: true,
             last,
             recent,
-        }
-    }
-
-    /// The actions the hub offers right now, in display order.
-    /// Same staged-model note as [`CurrentProject`]: tested, not yet wired.
-    #[allow(dead_code)]
-    pub fn choices(&self) -> Vec<HubChoice> {
-        let mut out = Vec::new();
-        if let Some(last) = &self.last {
-            out.push(HubChoice::ResumeLast(last.clone()));
-        }
-        out.push(HubChoice::New);
-        out.push(HubChoice::Open);
-        out.push(HubChoice::ImportMod);
-        for path in &self.recent {
-            // Resume already covers the most recent path; listing it twice
-            // invites opening it twice.
-            if Some(path) != self.last.as_ref() {
-                out.push(HubChoice::Recent(path.clone()));
-            }
-        }
-        out.push(HubChoice::BrowseWithoutProject);
-        out
-    }
-}
-
-/// One row in the hub window. `Open`/`ImportMod` without a path mean "pick via
-/// dialog"; the `HubAction` variants carry the picked path.
-/// Same staged-model note as [`CurrentProject`]: tested, not yet wired.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HubChoice {
-    ResumeLast(PathBuf),
-    New,
-    Open,
-    ImportMod,
-    Recent(PathBuf),
-    BrowseWithoutProject,
-}
-
-#[allow(dead_code)]
-impl HubChoice {
-    pub fn title(&self) -> &'static str {
-        match self {
-            HubChoice::ResumeLast(_) => "Resume last",
-            HubChoice::New => "New",
-            HubChoice::Open => "Open",
-            HubChoice::ImportMod => "Import mod",
-            HubChoice::Recent(_) => "Recent",
-            HubChoice::BrowseWithoutProject => "Browse without project",
+            new_workspace: None,
         }
     }
 }
@@ -251,11 +114,6 @@ pub fn load_last_project(config_dir: &Path) -> Option<PathBuf> {
 pub fn save_last_project(config_dir: &Path, path: &Path) {
     let _ = std::fs::create_dir_all(config_dir);
     let _ = std::fs::write(last_path(config_dir), path.to_string_lossy().as_bytes());
-}
-
-#[allow(dead_code)]
-pub fn clear_last_project(config_dir: &Path) {
-    let _ = std::fs::remove_file(last_path(config_dir));
 }
 
 pub fn load_recent_projects(config_dir: &Path) -> Vec<PathBuf> {
@@ -291,13 +149,6 @@ pub fn push_recent(config_dir: &Path, path: &Path) -> Vec<PathBuf> {
     recent
 }
 
-/// Starting fresh (New / Browse without project) clears the last-project resume
-/// but keeps recents: the user may still want to go back.
-#[allow(dead_code)]
-pub fn clear_current(config_dir: &Path) {
-    clear_last_project(config_dir);
-}
-
 // ── Workspace: one folder that holds every edit ──────────────────────────
 //
 // A project is a folder, not just a file:
@@ -321,10 +172,12 @@ pub fn workspace_romfs(workspace: &Path) -> PathBuf {
 }
 
 /// Copy selected dump files into their game-relative editing paths. Existing edits win.
+/// A file under a game folder in `picked` goes to the folder picked for it instead.
 pub fn copy_base_files(
     workspace: &Path,
     data_root: &Path,
     sources: &[PathBuf],
+    picked: &[(PathBuf, PathBuf)],
 ) -> anyhow::Result<(usize, usize)> {
     let root = data_root.canonicalize()?;
     let mut files = Vec::new();
@@ -332,7 +185,7 @@ pub fn copy_base_files(
         let source = source.canonicalize()?;
         let relative = source
             .strip_prefix(&root)
-            .context("Choose files inside the base game folder")?
+            .context("Choose files inside the game dump")?
             .to_path_buf();
         anyhow::ensure!(source.is_file(), "Choose files, not folders");
         files.push((source, relative));
@@ -348,8 +201,18 @@ pub fn copy_base_files(
     let mut copied = 0;
     let mut skipped = 0;
     for (source, relative) in files {
-        let destination = overlay.join(&relative);
-        let mut parent = overlay.clone();
+        let (base, relative) = picked
+            .iter()
+            .find_map(|(game_dir, folder)| {
+                Some((
+                    folder.clone(),
+                    relative.strip_prefix(game_dir).ok()?.to_path_buf(),
+                ))
+            })
+            .unwrap_or((overlay.clone(), relative));
+        std::fs::create_dir_all(&base)?;
+        let destination = base.join(&relative);
+        let mut parent = base;
         for component in relative.parent().unwrap_or(Path::new("")).components() {
             parent.push(component);
             if parent.exists() {
@@ -438,6 +301,13 @@ pub fn collect_base_character_files(
 
 /// Files that make up one fighter model folder. A model edit normally needs more than the
 /// `.numdlb`: material, skeleton, shader, helper, and texture files all travel together.
+/// A file sent to the game and the game path it replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceAssetFile {
+    pub workspace_path: PathBuf,
+    pub game_path: String,
+}
+
 pub const MODEL_ASSET_EXTENSIONS: &[&str] = &[
     "adjb",
     "lvd",
@@ -454,31 +324,6 @@ pub const MODEL_ASSET_EXTENSIONS: &[&str] = &[
     "nutexb",
     "xmb",
 ];
-
-/// A canonical file in the workspace overlay and the game path it will replace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceAssetFile {
-    pub workspace_path: PathBuf,
-    pub game_path: String,
-}
-
-/// Compact inventory shown in Project Files for the selected fighter/costume.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorkspaceAssetInventory {
-    pub model_files: Vec<String>,
-    pub animations: Vec<String>,
-    pub swing_prc: bool,
-    pub motion_list: bool,
-}
-
-impl WorkspaceAssetInventory {
-    pub fn total_files(&self) -> usize {
-        self.model_files.len()
-            + self.animations.len()
-            + usize::from(self.swing_prc)
-            + usize::from(self.motion_list)
-    }
-}
 
 fn fighter_component(fighter: &str) -> anyhow::Result<String> {
     let fighter = fighter.trim().to_ascii_lowercase();
@@ -549,12 +394,100 @@ pub fn workspace_fighter_slot_dirs(
     slot: u8,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let fighter = fighter_component(fighter)?;
-    let slot = format!("c{slot:02}");
-    let base = workspace_romfs(workspace).join("fighter").join(fighter);
+    // A folder the author picked for the model or the animations stands in for the project's
+    // own copy, and a made character's costumes are in its own folder, so adding, previewing
+    // and sending all use the same place.
+    let parts = crate::project_parts::ProjectParts::load(workspace);
+    let dir = |part: crate::project_parts::Part| {
+        parts
+            .dir(workspace, &fighter, part, slot)
+            .ok_or_else(|| anyhow::anyhow!("{} has no folder", part.title()))
+    };
     Ok((
-        base.join("model").join("body").join(&slot),
-        base.join("motion").join("body").join(slot),
+        dir(crate::project_parts::Part::Model)?,
+        dir(crate::project_parts::Part::Animations)?,
     ))
+}
+
+/// Copy base costume `base` of `fighter` into costume `own` of the same fighter, under
+/// `dest_root` (a made character's folder), for one kind: `"model"` or `"motion"`. Every part
+/// (`body`, and any others) comes across; a part's `body` files go to `body_dir` when given
+/// (a folder picked for that costume). Later `roots` win, as in the game. Files already there
+/// are kept. Returns (copied, kept).
+pub fn copy_base_costume(
+    roots: &[PathBuf],
+    fighter: &str,
+    kind: &str,
+    base: u8,
+    own: u8,
+    dest_root: &Path,
+    body_dir: Option<&Path>,
+) -> anyhow::Result<(usize, usize)> {
+    let fighter = fighter_component(fighter)?;
+    anyhow::ensure!(
+        kind == "model" || kind == "motion",
+        "unknown costume part {kind}"
+    );
+    let (base, own) = (format!("c{base:02}"), format!("c{own:02}"));
+    let mut copied = 0;
+    let mut kept = 0;
+    let mut found = false;
+    let mut written = std::collections::HashSet::new();
+    for root in roots.iter().rev() {
+        let kind_dir = root.join("fighter").join(&fighter).join(kind);
+        let Ok(parts) = std::fs::read_dir(&kind_dir) else {
+            continue;
+        };
+        for part in parts.flatten() {
+            let from = part.path().join(&base);
+            if !from.is_dir() {
+                continue;
+            }
+            let name = part.file_name();
+            let to = match body_dir {
+                Some(dir) if name == "body" => dir.to_path_buf(),
+                _ => dest_root
+                    .join("fighter")
+                    .join(&fighter)
+                    .join(kind)
+                    .join(&name)
+                    .join(&own),
+            };
+            let mut stack = vec![(from, to)];
+            while let Some((from, to)) = stack.pop() {
+                for entry in std::fs::read_dir(&from)?.flatten() {
+                    let path = entry.path();
+                    let meta = std::fs::symlink_metadata(&path)?;
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    let out = to.join(entry.file_name());
+                    if meta.is_dir() {
+                        stack.push((path, out));
+                        continue;
+                    }
+                    found = true;
+                    if written.contains(&out) {
+                        continue;
+                    }
+                    if out.exists() {
+                        kept += 1;
+                        written.insert(out);
+                        continue;
+                    }
+                    std::fs::create_dir_all(&to)?;
+                    std::fs::copy(&path, &out)?;
+                    written.insert(out);
+                    copied += 1;
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        found,
+        "no {kind} files of {fighter} {base} were found in the game or mod folders"
+    );
+    Ok((copied, kept))
 }
 
 fn regular_asset_files(directory: &Path, kind: &str) -> anyhow::Result<BTreeMap<String, PathBuf>> {
@@ -862,6 +795,8 @@ pub fn carrier_model_sources(
 #[derive(Debug, Clone)]
 pub struct CarrierBundle {
     pub files: Vec<WorkspaceAssetFile>,
+    /// Animations the game files lack, played still in the preview.
+    pub still_animations: usize,
     pub vanilla_motion_used: Vec<String>,
     pub omitted_swing: bool,
     pub stripped_lod_meshes: usize,
@@ -1092,7 +1027,17 @@ pub fn prepare_carrier_assets(
         validate_animation_bones(model_animation, &skeleton_bones, "model.nuanmb")?;
     }
 
-    let prepared_motions = crate::carrier_motion::prepare(&motion_files)?;
+    std::fs::create_dir_all(output_dir)?;
+    let still = output_dir.join("visionary_still.nuanmb");
+    AnimData {
+        major_version: 2,
+        minor_version: 1,
+        final_frame_index: 0.0,
+        groups: Vec::new(),
+    }
+    .write_to_file(&still)
+    .map_err(|error| anyhow::anyhow!("writing a still animation: {error}"))?;
+    let prepared_motions = crate::carrier_motion::prepare(&motion_files, Some(&still))?;
     for (name, path) in &prepared_motions.files {
         checked_asset_size(path, name)?;
         if workspace_motion.values().any(|source| source == path) {
@@ -1310,6 +1255,7 @@ pub fn prepare_carrier_assets(
     outputs.sort_by(|left, right| left.game_path.cmp(&right.game_path));
     Ok(CarrierBundle {
         files: outputs,
+        still_animations: prepared_motions.stand_ins,
         vanilla_motion_used,
         omitted_swing,
         stripped_lod_meshes,
@@ -1488,73 +1434,6 @@ pub fn import_swing_prc(
     Ok(destination)
 }
 
-/// Scan the canonical model/motion folders. This is deliberately derived from files instead of
-/// serialized state: editing a file in Blender or an animation tool is visible immediately.
-pub fn workspace_asset_inventory(
-    workspace: &Path,
-    fighter: &str,
-    slot: u8,
-) -> anyhow::Result<WorkspaceAssetInventory> {
-    let mut inventory = WorkspaceAssetInventory::default();
-    for file in workspace_asset_files(workspace, fighter, slot)? {
-        let name = file.game_path.rsplit('/').next().unwrap_or_default();
-        if file.game_path.contains("/model/") {
-            inventory.model_files.push(name.to_owned());
-        } else {
-            match name {
-                "swing.prc" => inventory.swing_prc = true,
-                "motion_list.bin" => inventory.motion_list = true,
-                name if name.ends_with(".nuanmb") => inventory.animations.push(name.to_owned()),
-                _ => {}
-            }
-        }
-    }
-    Ok(inventory)
-}
-
-/// Every imported asset plus the lowercase game path the plugin/export consumes.
-pub fn workspace_asset_files(
-    workspace: &Path,
-    fighter: &str,
-    slot: u8,
-) -> anyhow::Result<Vec<WorkspaceAssetFile>> {
-    let fighter = fighter_component(fighter)?;
-    let (model_dir, motion_dir) = workspace_fighter_slot_dirs(workspace, &fighter, slot)?;
-    let mut files = Vec::new();
-    for (directory, area, accepts) in [
-        (&model_dir, "model", is_model_asset as fn(&Path) -> bool),
-        (&motion_dir, "motion", |path: &Path| {
-            is_animation_asset(path)
-                || path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.eq_ignore_ascii_case("swing.prc")
-                            || name.eq_ignore_ascii_case("motion_list.bin")
-                    })
-        }),
-    ] {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-            if !accepts(&path)
-                || !std::fs::symlink_metadata(&path)
-                    .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
-            {
-                continue;
-            }
-            let name = asset_file_name(&path)?;
-            files.push(WorkspaceAssetFile {
-                workspace_path: path,
-                game_path: format!("fighter/{fighter}/{area}/body/c{slot:02}/{name}"),
-            });
-        }
-    }
-    files.sort_by(|left, right| left.game_path.cmp(&right.game_path));
-    Ok(files)
-}
-
 /// Whether an overlay contains at least one regular, non-symlink file.
 pub fn workspace_romfs_has_files(workspace: &Path) -> bool {
     let overlay = workspace_romfs(workspace);
@@ -1583,11 +1462,16 @@ pub fn workspace_romfs_has_files(workspace: &Path) -> bool {
     false
 }
 
-/// Carry the manual overlay when Save As or Export Project adopts a new workspace. Existing
-/// files in the destination win and are reported, matching normal mod export behavior.
-pub fn preserve_workspace_romfs(
+/// Carry the files a project keeps beside it when Save As adopts a new workspace: the manual
+/// `romfs/` overlay, the folder of every made character stored inside the old workspace
+/// (`made_roots` as the project stores them; absolute ones are outside it and stay put), and
+/// `parts.json`. Existing files in the destination win and are reported, matching normal mod
+/// export behavior. Page links to folders inside the old workspace that are not copied are
+/// rewritten to their absolute paths so they keep pointing at the same files.
+pub fn preserve_workspace_files(
     old_project_file: &Path,
     new_project_file: &Path,
+    made_roots: &[PathBuf],
 ) -> anyhow::Result<(usize, Vec<String>)> {
     let old_workspace = old_project_file.parent().unwrap_or_else(|| Path::new("."));
     let new_workspace = new_project_file.parent().unwrap_or_else(|| Path::new("."));
@@ -1597,10 +1481,43 @@ pub fn preserve_workspace_romfs(
     {
         return Ok((0, Vec::new()));
     }
-    merge_romfs_overlay(
+    let (mut copied, mut skipped) = merge_romfs_overlay(
         &workspace_romfs(old_workspace),
         &workspace_romfs(new_workspace),
-    )
+    )?;
+    let inside: Vec<&PathBuf> = made_roots
+        .iter()
+        .filter(|root| root.is_relative())
+        .collect();
+    for root in &inside {
+        let (made_copied, made_skipped) =
+            merge_romfs_overlay(&old_workspace.join(root), &new_workspace.join(root))?;
+        copied += made_copied;
+        let shown = root.to_string_lossy().replace('\\', "/");
+        skipped.extend(
+            made_skipped
+                .into_iter()
+                .map(|path| format!("{shown}/{path}")),
+        );
+    }
+    let parts_file = new_workspace.join(crate::project_parts::PARTS_FILE);
+    let mut parts = crate::project_parts::ProjectParts::load(old_workspace);
+    if parts != crate::project_parts::ProjectParts::default() {
+        if parts_file.exists() {
+            skipped.push(crate::project_parts::PARTS_FILE.to_owned());
+        } else {
+            for link in &mut parts.links {
+                let carried = link.folder.starts_with("romfs")
+                    || inside.iter().any(|root| link.folder.starts_with(root));
+                if link.folder.is_relative() && !carried {
+                    link.folder = old_workspace.join(&link.folder);
+                }
+            }
+            parts.save(new_workspace)?;
+            copied += 1;
+        }
+    }
+    Ok((copied, skipped))
 }
 
 const WORKSPACE_README: &str = "\
@@ -1643,6 +1560,15 @@ pub fn scaffold_workspace(workspace: &Path, name: &str) -> anyhow::Result<PathBu
     Ok(file)
 }
 
+/// `a` and `b` hold the same bytes.
+pub fn same_file_contents(a: &Path, b: &Path) -> bool {
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    meta_a.len() == meta_b.len()
+        && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 /// Merge a workspace `romfs/` overlay into an exported mod folder.
 ///
 /// Copies every file under `overlay` into `dest` preserving arc-relative
@@ -1682,6 +1608,10 @@ pub fn merge_romfs_overlay(overlay: &Path, dest: &Path) -> anyhow::Result<(usize
             };
             let out = dest.join(rel);
             if out.exists() {
+                // The same file already there is no conflict: what ships is what was meant.
+                if same_file_contents(&path, &out) {
+                    continue;
+                }
                 skipped.push(
                     rel.components()
                         .map(|c| c.as_os_str().to_string_lossy())
@@ -1729,42 +1659,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_with_no_config_offers_new_open_import_and_browse() {
+    fn cold_start_with_no_config_shows_the_hub_with_nothing_to_resume() {
         let dir = config();
         let hub = HubState::cold_start(dir.path());
         assert!(hub.show, "the hub must appear on launch");
         assert!(hub.last.is_none());
         assert!(hub.recent.is_empty());
-        let titles: Vec<&str> = hub.choices().iter().map(|c| c.title()).collect();
-        assert_eq!(
-            titles,
-            vec!["New", "Open", "Import mod", "Browse without project"]
-        );
-    }
-
-    #[test]
-    fn resume_leads_and_recent_skips_the_duplicate() {
-        let dir = config();
-        let a = dir.path().join("a/modproject.json");
-        let b = dir.path().join("b/modproject.json");
-        touch(&a);
-        touch(&b);
-        save_last_project(dir.path(), &a);
-        save_recent_projects(dir.path(), &[a.clone(), b.clone()]);
-
-        let hub = HubState::cold_start(dir.path());
-        assert_eq!(hub.last.as_deref(), Some(a.as_path()));
-        // Recent still holds both, but the choices list Resume once.
-        let choices = hub.choices();
-        assert!(matches!(&choices[0], HubChoice::ResumeLast(p) if p == &a));
-        let recents: Vec<&PathBuf> = choices
-            .iter()
-            .filter_map(|c| match c {
-                HubChoice::Recent(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(recents, vec![&b], "Resume must not duplicate its path");
     }
 
     #[test]
@@ -1779,21 +1679,6 @@ mod tests {
             "a missing Resume target must not linger"
         );
         assert!(hub.recent.is_empty());
-    }
-
-    #[test]
-    fn save_clears_dirty_and_save_as_is_needed_only_without_a_path() {
-        let mut current = CurrentProject::new();
-        assert!(current.needs_save_as());
-        assert!(!current.is_dirty());
-        current.mark_dirty();
-        assert!(current.needs_warning());
-        let dir = config();
-        let path = dir.path().join("modproject.json");
-        current.mark_saved(path.clone());
-        assert!(!current.is_dirty());
-        assert!(!current.needs_save_as());
-        assert_eq!(current.path.as_deref(), Some(path.as_path()));
     }
 
     #[test]
@@ -1847,23 +1732,6 @@ mod tests {
     }
 
     #[test]
-    fn save_round_trip_persists_path_and_recent() {
-        let dir = config();
-        let path = dir.path().join("my_mod/modproject.json");
-        touch(&path);
-        let mut current = CurrentProject::with_path(path.clone(), "my_mod".into());
-        current.mark_dirty();
-        // Save adopts the path and clears dirty; hub records it.
-        current.mark_saved(path.clone());
-        push_recent(dir.path(), &path);
-        assert!(!current.is_dirty());
-
-        let hub = HubState::cold_start(dir.path());
-        assert_eq!(hub.last.as_deref(), Some(path.as_path()));
-        assert!(hub.recent.contains(&path));
-    }
-
-    #[test]
     fn new_scaffolds_a_workspace_where_every_edit_has_a_home() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("my_mod");
@@ -1891,13 +1759,13 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, b"base model").unwrap();
         assert_eq!(
-            copy_base_files(&workspace, &dump, std::slice::from_ref(&source)).unwrap(),
+            copy_base_files(&workspace, &dump, std::slice::from_ref(&source), &[]).unwrap(),
             (1, 0)
         );
         let edited = workspace_romfs(&workspace).join(relative);
         std::fs::write(&edited, b"edited model").unwrap();
         assert_eq!(
-            copy_base_files(&workspace, &dump, &[source]).unwrap(),
+            copy_base_files(&workspace, &dump, &[source], &[]).unwrap(),
             (0, 1)
         );
         let export = dir.path().join("export");
@@ -1921,7 +1789,7 @@ mod tests {
         std::fs::write(&inside, b"inside").unwrap();
         std::fs::write(&outside, b"outside").unwrap();
         let workspace = dir.path().join("project");
-        assert!(copy_base_files(&workspace, &dump, &[inside, outside]).is_err());
+        assert!(copy_base_files(&workspace, &dump, &[inside, outside], &[]).is_err());
         assert!(!workspace.exists());
     }
 
@@ -1961,7 +1829,7 @@ mod tests {
         // The collected set round-trips through the existing copy path.
         let workspace = dir.path().join("project");
         assert_eq!(
-            copy_base_files(&workspace, &dump, &files).unwrap(),
+            copy_base_files(&workspace, &dump, &files, &[]).unwrap(),
             (wanted.len(), 0)
         );
         for rel in wanted {
@@ -1990,7 +1858,7 @@ mod tests {
         let source = dump.join("fighter/model.bin");
         std::fs::write(&source, b"model").unwrap();
         std::os::unix::fs::symlink(&outside, workspace_romfs(&workspace).join("fighter")).unwrap();
-        assert!(copy_base_files(&workspace, &dump, &[source]).is_err());
+        assert!(copy_base_files(&workspace, &dump, &[source], &[]).is_err());
         assert!(!outside.join("model.bin").exists());
     }
 
@@ -2042,6 +1910,99 @@ mod tests {
     }
 
     #[test]
+    fn a_made_characters_costume_folders_are_its_own_and_imports_land_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.set_made(vec![crate::project_parts::MadeFolder {
+            key: "mario#c08".into(),
+            fighter: "mario".into(),
+            slots: (8..=15).collect(),
+            root: PathBuf::from("characters/vision"),
+        }]);
+        parts.save(workspace).unwrap();
+        let (model, motion) = workspace_fighter_slot_dirs(workspace, "mario", 9).unwrap();
+        let own = workspace.join("characters/vision/fighter/mario");
+        assert_eq!(model, own.join("model/body/c09"));
+        assert_eq!(motion, own.join("motion/body/c09"));
+        // The base fighter's costumes stay in the project's copy of the game folders.
+        let (model, _) = workspace_fighter_slot_dirs(workspace, "mario", 1).unwrap();
+        assert_eq!(model, workspace.join("romfs/fighter/mario/model/body/c01"));
+        // What the Model button adds goes where the export reads the character from.
+        let source = workspace.join("in/model.numdlb");
+        touch(&source);
+        let added = import_model_files(workspace, "mario", 9, &[source]).unwrap();
+        assert_eq!(added, vec![own.join("model/body/c09/model.numdlb")]);
+        assert!(!workspace
+            .join("romfs/fighter/mario/model/body/c09")
+            .exists());
+    }
+
+    #[test]
+    fn copying_a_base_costume_maps_its_colour_onto_the_made_costume_and_keeps_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let skins = dir.path().join("skins");
+        for (root, file, body) in [
+            (
+                &game,
+                "fighter/mario/model/body/c01/model.numdlb",
+                "game c01",
+            ),
+            (
+                &game,
+                "fighter/mario/model/body/c01/def_mario_001_col.nutexb",
+                "game tex",
+            ),
+            (&game, "fighter/mario/model/cappy/c01/model.numdlb", "cap"),
+            (
+                &game,
+                "fighter/mario/model/body/c00/model.numdlb",
+                "game c00",
+            ),
+            (
+                &game,
+                "fighter/mario/motion/body/c01/a00wait1.nuanmb",
+                "wait",
+            ),
+            (
+                &skins,
+                "fighter/mario/model/body/c01/model.numdlb",
+                "mod c01",
+            ),
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let own = dir.path().join("vision");
+        let edited = own.join("fighter/mario/model/body/c09/def_mario_001_col.nutexb");
+        std::fs::create_dir_all(edited.parent().unwrap()).unwrap();
+        std::fs::write(&edited, "mine").unwrap();
+        let roots = vec![game.clone(), skins.clone()];
+        let (copied, kept) = copy_base_costume(&roots, "mario", "model", 1, 9, &own, None).unwrap();
+        assert_eq!((copied, kept), (2, 1));
+        let read = |rel: &str| std::fs::read_to_string(own.join(rel)).unwrap();
+        // The later root wins, as in the game; the author's own file is kept.
+        assert_eq!(read("fighter/mario/model/body/c09/model.numdlb"), "mod c01");
+        assert_eq!(
+            read("fighter/mario/model/body/c09/def_mario_001_col.nutexb"),
+            "mine"
+        );
+        assert_eq!(read("fighter/mario/model/cappy/c09/model.numdlb"), "cap");
+        // Only the model came across.
+        assert!(!own.join("fighter/mario/motion").exists());
+        // A costume picked into another folder gets its body files there.
+        let picked = dir.path().join("picked");
+        let (copied, _) =
+            copy_base_costume(&roots, "mario", "motion", 1, 9, &own, Some(&picked)).unwrap();
+        assert_eq!(copied, 1);
+        assert!(picked.join("a00wait1.nuanmb").is_file());
+        // Nothing to copy is an error, not a silent zero.
+        assert!(copy_base_costume(&roots, "mario", "model", 5, 9, &own, None).is_err());
+    }
+
+    #[test]
     fn overlay_only_workspace_is_exportable_without_serialized_edits() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -2070,6 +2031,26 @@ mod tests {
         ] {
             assert!(destination.join(path).is_file(), "missing {path}");
         }
+    }
+
+    /// A file the mod already has with the same bytes is no conflict.
+    #[test]
+    fn romfs_overlay_does_not_report_a_file_the_mod_already_has_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("workspace/romfs");
+        let dest = dir.path().join("mod");
+        for root in [&overlay, &dest] {
+            std::fs::create_dir_all(root.join("fighter/pickel/model/body/c07")).unwrap();
+            std::fs::write(
+                root.join("fighter/pickel/model/body/c07/model.numdlb"),
+                b"mesh",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            merge_romfs_overlay(&overlay, &dest).unwrap(),
+            (0, Vec::new())
+        );
     }
 
     #[cfg(unix)]
@@ -2127,40 +2108,6 @@ mod tests {
             b"animation"
         );
         assert_eq!(std::fs::read(motion.join("swing.prc")).unwrap(), b"swing");
-        let inventory = workspace_asset_inventory(&workspace, "pickel", 12).unwrap();
-        assert_eq!(inventory.model_files.len(), 3);
-        assert_eq!(inventory.animations, vec!["attackairn.nuanmb"]);
-        assert!(inventory.swing_prc);
-        assert_eq!(inventory.total_files(), 5);
-    }
-
-    #[test]
-    fn workspace_asset_manifest_uses_lowercase_canonical_game_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        let source_model = dir.path().join("MODEL.NUMSHB");
-        let source_anim = dir.path().join("Run.NUANMB");
-        let source_swing = dir.path().join("physics.prc");
-        std::fs::write(&source_model, b"shader").unwrap();
-        std::fs::write(&source_anim, b"run").unwrap();
-        std::fs::write(&source_swing, b"physics").unwrap();
-        import_model_files(&workspace, "Kirby", 3, &[source_model]).unwrap();
-        import_animation_files(&workspace, "Kirby", 3, &[source_anim]).unwrap();
-        import_swing_prc(&workspace, "Kirby", 3, &source_swing).unwrap();
-
-        let paths: Vec<String> = workspace_asset_files(&workspace, "KIRBY", 3)
-            .unwrap()
-            .into_iter()
-            .map(|file| file.game_path)
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "fighter/kirby/model/body/c03/model.numshb",
-                "fighter/kirby/motion/body/c03/run.nuanmb",
-                "fighter/kirby/motion/body/c03/swing.prc",
-            ]
-        );
     }
 
     fn write_carrier_fixture(workspace: &Path) {
@@ -2180,12 +2127,7 @@ mod tests {
             minor_version: 0,
             bones: vec![BoneData {
                 name: "root".into(),
-                transform: [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
+                transform: glam::Mat4::IDENTITY,
                 parent_index: None,
                 billboard_type: BillboardType::Disabled,
             }],
@@ -2603,52 +2545,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a local asset workspace and vanilla dump"]
-    fn carrier_local_asset_smoke() {
-        let workspace = PathBuf::from(std::env::var_os("VISIONARY_ASSET_WORKSPACE").unwrap());
-        let vanilla = PathBuf::from(std::env::var_os("VISIONARY_ASSET_VANILLA").unwrap());
-        let output = PathBuf::from(std::env::var_os("VISIONARY_ASSET_OUTPUT").unwrap());
-        let fighter = std::env::var("VISIONARY_ASSET_FIGHTER").unwrap();
-        let slot: u8 = std::env::var("VISIONARY_ASSET_SLOT")
-            .unwrap_or_else(|_| "0".into())
-            .parse()
-            .unwrap();
-        let slot_component = format!("c{slot:02}");
-        let bundle = prepare_carrier_assets(
-            &workspace,
-            &fighter,
-            slot,
-            None,
-            Some(&vanilla.join("motion/body").join(&slot_component)),
-            Some(&vanilla.join("model/body").join(&slot_component)),
-            &output,
-        )
-        .unwrap();
-        let textures: Vec<_> = bundle
-            .files
-            .iter()
-            .filter(|f| f.game_path.ends_with(".nutexb"))
-            .collect();
-        for file in &textures {
-            let texture = nutexb::NutexbFile::read_from_file(&file.workspace_path).unwrap();
-            assert!(!texture.data.is_empty());
-        }
-        let list_file = bundle
-            .files
-            .iter()
-            .find(|f| f.game_path.ends_with("/motion_list.bin"))
-            .unwrap();
-        let list = motion_lib::open(&list_file.workspace_path).unwrap();
-        assert!(!list.list.is_empty());
-        eprintln!(
-            "prepared {} files, {} textures, {} motions",
-            bundle.files.len(),
-            textures.len(),
-            list.list.len()
-        );
-    }
-
-    #[test]
     fn carrier_preparation_rejects_partial_models_and_unknown_animation_bones() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -2876,12 +2772,7 @@ mod tests {
                     .iter()
                     .map(|name| BoneData {
                         name: (*name).into(),
-                        transform: [
-                            [1.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ],
+                        transform: glam::Mat4::IDENTITY,
                         parent_index: None,
                         billboard_type: BillboardType::Disabled,
                     })
@@ -3088,7 +2979,7 @@ mod tests {
         std::fs::write(&new_conflict, b"new").unwrap();
 
         assert!(workspace_romfs_has_files(old_project.parent().unwrap()));
-        let (copied, skipped) = preserve_workspace_romfs(&old_project, &new_project).unwrap();
+        let (copied, skipped) = preserve_workspace_files(&old_project, &new_project, &[]).unwrap();
         assert_eq!(copied, 1);
         assert_eq!(skipped, vec!["fighter/kirby/motion/body/c00/swing.prc"]);
         assert!(dir
@@ -3096,5 +2987,93 @@ mod tests {
             .join("new/romfs/fighter/kirby/motion/body/c00/run.nuanmb")
             .is_file());
         assert_eq!(std::fs::read(new_conflict).unwrap(), b"new");
+    }
+
+    /// Review finding 2: a made character's folder sits inside the project and is stored
+    /// relative to it, so Save As to another folder must bring the folder and the page's
+    /// parts.json along, or the saved copy points at nothing.
+    #[test]
+    fn save_as_brings_made_characters_folders_and_the_page_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_project = dir.path().join("old/modproject.json");
+        let new_project = dir.path().join("new/modproject.json");
+        touch(&old_project);
+        touch(&new_project);
+        let model = "fighter/mario/model/body/c08/model.numdlb";
+        touch(&dir.path().join("old/characters/vision").join(model));
+        let outside = dir.path().join("elsewhere/vision");
+        touch(&outside.join(model));
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.characters.insert("mario#c08".into(), 8);
+        for folder in [
+            "romfs/effect/fighter/mario",
+            "characters/vision",
+            "my folder",
+        ] {
+            parts.links.push(crate::project_parts::PartLink {
+                fighter: "mario".into(),
+                part: crate::project_parts::Part::Effects,
+                slot: None,
+                folder: folder.into(),
+            });
+        }
+        parts.save(old_project.parent().unwrap()).unwrap();
+
+        let (copied, skipped) = preserve_workspace_files(
+            &old_project,
+            &new_project,
+            &["characters/vision".into(), outside.clone()],
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(copied, 2);
+        assert!(dir
+            .path()
+            .join("new/characters/vision")
+            .join(model)
+            .is_file());
+        let saved = crate::project_parts::ProjectParts::load(new_project.parent().unwrap());
+        assert_eq!(saved.characters, parts.characters);
+        let folders: Vec<PathBuf> = saved.links.iter().map(|link| link.folder.clone()).collect();
+        assert_eq!(
+            folders,
+            vec![
+                PathBuf::from("romfs/effect/fighter/mario"),
+                PathBuf::from("characters/vision"),
+                dir.path().join("old/my folder"),
+            ]
+        );
+    }
+
+    /// The paired negative: saving into the same folder copies nothing, and a page file already
+    /// at the destination is kept and reported rather than replaced.
+    #[test]
+    fn save_as_keeps_a_destination_page_file_and_skips_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_project = dir.path().join("old/modproject.json");
+        touch(&old_project);
+        touch(&dir.path().join("old/characters/vision/a.bin"));
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.characters.insert("mario#c08".into(), 8);
+        parts.save(old_project.parent().unwrap()).unwrap();
+        let roots = [PathBuf::from("characters/vision")];
+        assert_eq!(
+            preserve_workspace_files(&old_project, &old_project, &roots).unwrap(),
+            (0, Vec::new())
+        );
+
+        let new_project = dir.path().join("new/modproject.json");
+        touch(&new_project);
+        let mut theirs = crate::project_parts::ProjectParts::default();
+        theirs.characters.insert("luigi".into(), 0);
+        theirs.save(new_project.parent().unwrap()).unwrap();
+        let (copied, skipped) =
+            preserve_workspace_files(&old_project, &new_project, &roots).unwrap();
+        assert_eq!(copied, 1);
+        assert_eq!(skipped, vec![crate::project_parts::PARTS_FILE.to_owned()]);
+        assert_eq!(
+            crate::project_parts::ProjectParts::load(new_project.parent().unwrap()),
+            theirs
+        );
     }
 }

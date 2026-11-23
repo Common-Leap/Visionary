@@ -15,20 +15,24 @@ fn synthetic_top_matrix(bones: &std::collections::HashMap<String, glam::Mat4>) -
         .unwrap_or(glam::Mat4::IDENTITY)
 }
 
-#[allow(dead_code)]
-pub struct Camera {
-    pub translation: Vec3,
-    pub rotation: Vec3,
+/// A camera placement as Settings edits it and saves it as the default view. The view matrix
+/// is translation * rotation (XYZ Euler angles), as in SSBH Editor and SSBH Studio.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CameraView {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 3],
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
 }
 
-impl Default for Camera {
+impl Default for CameraView {
+    /// The side view of a fighter standing at the origin.
     fn default() -> Self {
         Self {
-            translation: Vec3::new(0.0, -8.0, -60.0),
-            rotation: Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0),
+            translation: [0.0, -8.0, -60.0],
+            rotation: [0.0, std::f32::consts::FRAC_PI_2, 0.0],
             fov_y: 30f32.to_radians(),
             near: 1.0,
             far: 400_000.0,
@@ -36,48 +40,144 @@ impl Default for Camera {
     }
 }
 
+pub struct Camera {
+    pub translation: Vec3,
+    pub rotation: Vec3,
+    /// The point the camera keeps centred: the fighter's position over the ground, so a move
+    /// that carries the fighter forward (a dash attack, a slide) stays in view.
+    pub follow: Vec3,
+    /// The point orbiting and view snaps turn about, relative to `follow`. Panning and
+    /// framing move it, so whatever is centred stays centred while turning (SSBH Studio).
+    pub target: Vec3,
+    pub fov_y: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self::from_view(&CameraView::default())
+    }
+}
+
+/// The camera's rotation matrix for XYZ Euler angles.
+pub fn camera_rotation(rotation: Vec3) -> Mat4 {
+    Mat4::from_euler(glam::EulerRot::XYZ, rotation.x, rotation.y, rotation.z)
+}
+
 impl Camera {
-    /// Orbit the model, as SSBH Editor's left drag does: horizontal drags turn about the
-    /// vertical axis, vertical drags tilt.
-    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
-        self.rotation.x += delta_y * 0.01;
-        self.rotation.y += delta_x * 0.01;
+    pub fn from_view(view: &CameraView) -> Self {
+        let mut camera = Self {
+            translation: Vec3::from(view.translation),
+            rotation: Vec3::from(view.rotation),
+            follow: Vec3::ZERO,
+            target: Vec3::ZERO,
+            fov_y: view.fov_y,
+            near: view.near,
+            far: view.far,
+        };
+        camera.target = camera.centred_point();
+        camera
     }
 
-    /// Pan in the view plane so the model follows the pointer, as SSBH Editor's right drag
-    /// does. The viewport height and vertical field of view convert pixels to world units at
-    /// the model's distance.
+    /// This placement, without the fighter it follows.
+    pub fn view(&self) -> CameraView {
+        CameraView {
+            translation: self.translation.to_array(),
+            rotation: self.rotation.to_array(),
+            fov_y: self.fov_y,
+            near: self.near,
+            far: self.far,
+        }
+    }
+
+    /// The point straight ahead at the depth of the view origin, relative to `follow`.
+    fn centred_point(&self) -> Vec3 {
+        camera_rotation(self.rotation)
+            .inverse()
+            .transform_vector3(Vec3::new(-self.translation.x, -self.translation.y, 0.0))
+    }
+
+    /// Turns to `rotation` while keeping `target` where it appears on screen.
+    pub fn turn_to(&mut self, rotation: Vec3) {
+        let view = camera_rotation(self.rotation).transform_vector3(self.target) + self.translation;
+        self.rotation = rotation;
+        self.translation = view - camera_rotation(rotation).transform_vector3(self.target);
+    }
+
+    /// Orbit like dragging the scene: right turns right, up tilts up.
+    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
+        self.turn_to(self.rotation + Vec3::new(delta_y * 0.01, delta_x * 0.01, 0.0));
+    }
+
+    /// Moves the view by `shift` in view space, keeping `target` at the view centre.
+    pub fn pan_view(&mut self, shift: Vec3) {
+        self.translation += shift;
+        self.target -= camera_rotation(self.rotation)
+            .inverse()
+            .transform_vector3(shift);
+    }
+
+    /// Pan in the view plane so the model follows the pointer. The viewport height and
+    /// vertical field of view convert pixels to world units at the model's distance.
     pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
         let factor = self.fov_y.sin() * self.translation.z.abs() / viewport_height.max(1.0);
-        self.translation.x += delta_x * factor;
-        self.translation.y -= delta_y * factor;
+        self.pan_view(Vec3::new(delta_x * factor, -delta_y * factor, 0.0));
     }
 
-    /// Whether the camera has moved away from the default side view.
-    pub fn is_default(&self) -> bool {
-        let default = Self::default();
-        self.translation.abs_diff_eq(default.translation, 1e-4)
-            && self.rotation.abs_diff_eq(default.rotation, 1e-4)
-            && (self.fov_y - default.fov_y).abs() < 1e-4
+    /// Zooms in by `amount`, scaled by distance so far views zoom as quickly as near ones.
+    /// Never zooms through the point being looked at.
+    pub fn zoom(&mut self, amount: f32) {
+        let delta = amount * self.translation.z.abs();
+        self.translation.z = (self.translation.z + delta).min(-1.0);
     }
 
-    /// Zoom: move along Z axis.
-    pub fn zoom(&mut self, delta: f32) {
-        let speed = self.translation.z.abs() * 0.1;
-        self.translation.z += delta * speed;
-        self.translation.z = self.translation.z.min(-1.0);
+    /// Points the camera at a sphere (in world space) without changing its angle.
+    pub fn frame(&mut self, center: Vec3, radius: f32) {
+        let center = center - self.follow;
+        let half_fov = (self.fov_y * 0.5).max(0.05);
+        let distance = radius.max(1.0) / half_fov.sin() * 1.1;
+        self.translation =
+            Vec3::new(0.0, 0.0, -distance) - camera_rotation(self.rotation).transform_vector3(center);
+        self.target = center;
+    }
+
+    /// Whether the camera sits at `view`.
+    pub fn is_at(&self, view: &CameraView) -> bool {
+        self.translation.abs_diff_eq(Vec3::from(view.translation), 1e-4)
+            && self.rotation.abs_diff_eq(Vec3::from(view.rotation), 1e-4)
+            && (self.fov_y - view.fov_y).abs() < 1e-4
+    }
+
+    /// Back to `view`'s angle, keeping the zoom and what is centred.
+    pub fn reset_turn(&mut self, view: &CameraView) {
+        self.turn_to(Vec3::from(view.rotation));
+    }
+
+    /// Takes one frame of a camera animation. Its view matrix is rotation * translation *
+    /// scale; it is decomposed into this camera's translation * rotation, as SSBH Studio does,
+    /// so the overlays and effects project through the same camera.
+    pub fn apply_animation(&mut self, values: &ssbh_wgpu::animation::camera::CameraAnimValues) {
+        let model_view = Mat4::from_quat(values.rotation)
+            * Mat4::from_translation(values.translation)
+            * Mat4::from_scale(values.scale);
+        let (_, rotation, translation) = model_view.to_scale_rotation_translation();
+        self.translation = translation;
+        self.rotation = rotation.to_euler(glam::EulerRot::XYZ).into();
+        self.fov_y = values.fov_y_radians;
+        self.near = values.near_clip;
+        self.far = values.far_clip;
+        self.follow = Vec3::ZERO;
+        self.target = self.centred_point();
     }
 
     pub fn transforms(&self, width: f32, height: f32) -> CameraTransforms {
         let aspect = if height > 0.0 { width / height } else { 1.0 };
-        let rotation = Mat4::from_euler(
-            glam::EulerRot::XYZ,
-            self.rotation.x,
-            self.rotation.y,
-            self.rotation.z,
-        );
-        let model_view = Mat4::from_translation(self.translation) * rotation;
-        let projection = Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far);
+        let model_view = Mat4::from_translation(self.translation)
+            * camera_rotation(self.rotation)
+            * Mat4::from_translation(-self.follow);
+        let projection =
+            glam::camera::rh::proj::directx::perspective(self.fov_y, aspect, self.near, self.far);
         let mvp = projection * model_view;
         CameraTransforms {
             model_view_matrix: model_view,
@@ -93,9 +193,10 @@ impl Camera {
 /// All wgpu rendering resources stored in egui's callback_resources.
 pub struct HitboxRenderState {
     pub renderer: SsbhRenderer,
+    /// What the renderer draws with (bloom on, shadows off); models are built for it.
+    render_settings: RenderSettings,
     pub shared_data: SharedRenderData,
     pub render_models: Vec<RenderModel>,
-    pub render_settings: RenderSettings,
     pub model_render_options: ModelRenderOptions,
     pub camera: Camera,
     pub current_width: u32,
@@ -123,8 +224,6 @@ pub struct HitboxRenderState {
     /// the moveset's frame callback sets. Applied at the skeleton's root, so the mesh and every
     /// bone the overlay reads grow together. Set through [`Self::set_model_scale`].
     model_scale: f32,
-    /// A second fighter held by this one's `throw` bone, drawn as `render_models[1]`.
-    victim: Option<ThrownVictim>,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
     /// attach_bone_name is the character bone the weapon root attaches to (e.g. "haver")
     weapon_skels: Vec<(String, ssbh_data::skel_data::SkelData, String)>,
@@ -133,6 +232,32 @@ pub struct HitboxRenderState {
     last_anim_path: Option<std::path::PathBuf>,
     last_default_anim_path: Option<std::path::PathBuf>,
     last_skel_path: Option<std::path::PathBuf>,
+    /// Model folder of each object model after the body in `render_models`.
+    object_dirs: Vec<std::path::PathBuf>,
+    /// Effects drawn with the game's shaders, after the models.
+    pub vfx: crate::vfx_preview::VfxPreview,
+    /// Weapon swing trails.
+    trails: crate::preview_trail::PreviewTrails,
+    /// The data folder and stage (`None`: no stage, training lighting) the preview shows.
+    stage_root: Option<(std::path::PathBuf, Option<String>)>,
+    /// The picked stage's models, drawn after the fighter and its objects.
+    stage_models: Vec<RenderModel>,
+    /// What each stage model was placed from, to place it again when the stage shifts.
+    stage_parts: Vec<StageModelLoad>,
+    /// How far the stage is shifted under the fighter, in game space.
+    stage_shift: glam::Vec3,
+    /// Stage model folders being read on a thread, arriving one at a time.
+    stage_loading: Option<std::sync::Mutex<std::sync::mpsc::Receiver<StageModelLoad>>>,
+    /// The stage floor under grounded moves, and its colour as stored in the scene.
+    floor: crate::preview_floor::PreviewFloor,
+    floor_color: [f32; 4],
+    /// The X and Z lines through the origin on the ground, while Settings shows them.
+    axes: crate::preview_axes::PreviewAxes,
+    world_axes: bool,
+    /// Body meshes hidden for a visibility set, to show again when the set switches back.
+    set_hidden: std::collections::HashSet<usize>,
+    /// Where the models and effects are drawn before going on screen.
+    pub target: crate::viewport_target::ViewportTarget,
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
@@ -144,28 +269,49 @@ impl HitboxRenderState {
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
+        /// The viewport's backdrop, linear, as it appears on screen.
+        const VIEWPORT_BACKDROP_LINEAR: [f32; 3] = [0.05, 0.05, 0.1];
+        /// The floor under grounded moves, a shade darker than the backdrop.
+        const FLOOR_LINEAR: [f32; 3] = [0.028, 0.028, 0.055];
         let mut renderer = SsbhRenderer::new(
             device,
             queue,
             1,
             1,
             1.0,
-            [0.05, 0.05, 0.1, 1.0],
+            [
+                VIEWPORT_BACKDROP_LINEAR[0] as f64,
+                VIEWPORT_BACKDROP_LINEAR[1] as f64,
+                VIEWPORT_BACKDROP_LINEAR[2] as f64,
+                1.0,
+            ],
             surface_format,
         );
         let shared_data = SharedRenderData::new(device, queue);
+        // The game's post pass: bloom, then the stage's colour grading. Effects draw into the
+        // scene before it (see `prepare`), so they glow as they do in game. The backdrop is
+        // part of the scene, as a stage is, so it is cleared opaque at the value the post pass
+        // turns into the backdrop colour.
+        renderer.update_color_lut_rgba(device, queue, &crate::post_grading::training_lut());
+        let scene_backdrop = crate::post_grading::scene_value_for(VIEWPORT_BACKDROP_LINEAR);
+        renderer.set_scene_clear_color(wgpu::Color {
+            r: scene_backdrop[0] as f64,
+            g: scene_backdrop[1] as f64,
+            b: scene_backdrop[2] as f64,
+            a: 1.0,
+        });
         // Use Shaded mode for full PBR rendering with textures
         let render_settings = RenderSettings {
-            render_bloom: false,
+            render_bloom: true,
             render_shadows: false,
             ..RenderSettings::default()
         };
         renderer.update_render_settings(queue, &render_settings);
         Self {
             renderer,
+            render_settings,
             shared_data,
             render_models: Vec::new(),
-            render_settings,
             model_render_options: ModelRenderOptions::default(),
             camera: Camera::default(),
             current_width: 0,
@@ -178,26 +324,77 @@ impl HitboxRenderState {
             model_matl: None,
             helper_bones: true,
             model_scale: 1.0,
-            victim: None,
             weapon_skels: Vec::new(),
             last_frame: -1.0,
             last_anim_path: None,
             last_default_anim_path: None,
             last_skel_path: None,
+            object_dirs: Vec::new(),
+            vfx: {
+                let mut vfx = crate::vfx_preview::VfxPreview::new(
+                    ssbh_wgpu::RGBA_COLOR_FORMAT,
+                    Some(ssbh_wgpu::DEPTH_FORMAT),
+                    ssbh_wgpu::MSAA_SAMPLE_COUNT,
+                );
+                let [r, g, b] = scene_backdrop.map(|c| (c * 255.0).round() as u8);
+                vfx.set_backdrop([r, g, b, 255]);
+                vfx
+            },
+            stage_root: None,
+            stage_models: Vec::new(),
+            stage_parts: Vec::new(),
+            stage_shift: glam::Vec3::ZERO,
+            stage_loading: None,
+            trails: crate::preview_trail::PreviewTrails::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            floor: crate::preview_floor::PreviewFloor::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            axes: crate::preview_axes::PreviewAxes::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            world_axes: true,
+            set_hidden: std::collections::HashSet::new(),
+            floor_color: {
+                let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
+                [r, g, b, 1.0]
+            },
+            target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
         }
     }
 
-    /// Viewport preferences from the Settings window: background, floor grid, and bloom.
+    /// Viewport preferences from the Settings window: background, floor grid, world axes and
+    /// bloom.
     pub fn apply_preferences(
         &mut self,
         queue: &wgpu::Queue,
         preferences: &crate::preferences::Preferences,
     ) {
-        self.renderer
-            .set_clear_color(preferences.viewport_clear_color());
+        let [r, g, b, a] = preferences.viewport_clear_color();
+        self.renderer.set_clear_color([r, g, b, a]);
+        // The backdrop is part of the scene and goes through the post pass, so clear it at the
+        // value that comes out as the chosen colour (see `new`).
+        let scene = crate::post_grading::scene_value_for([r as f32, g as f32, b as f32]);
+        self.renderer.set_scene_clear_color(wgpu::Color {
+            r: scene[0] as f64,
+            g: scene[1] as f64,
+            b: scene[2] as f64,
+            a,
+        });
         self.model_render_options.draw_floor_grid = preferences.floor_grid;
+        self.world_axes = preferences.world_axes;
         if self.render_settings.render_bloom != preferences.bloom {
             self.render_settings.render_bloom = preferences.bloom;
             self.renderer
@@ -205,44 +402,48 @@ impl HitboxRenderState {
         }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
         if width == self.current_width && height == self.current_height {
             return;
         }
-        self.renderer.resize(device, width, height, 1.0);
+        self.renderer.resize(device, queue, width, height, 1.0);
+        self.target.resize(device, width, height);
         self.current_width = width;
         self.current_height = height;
     }
 
-    pub fn load_model(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, model_dir: &Path) {
+    /// Upload a model already read from `model_dir` (reading it is slow, so callers do that
+    /// off the GUI thread).
+    pub fn load_model(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        model_dir: &Path,
+        folder: ModelFolder,
+    ) {
         self.render_models.clear();
+        self.set_hidden.clear();
+        self.object_dirs.clear();
         self.weapon_skels.clear();
-        // The files ARCropolis would load here: the folder's own, its config.json shares, and
-        // the game's files for a vanilla slot.
-        let costume = crate::costume_files::CostumeFolder::resolve(model_dir);
-        if costume.is_empty() {
+        // `folder` holds the files ARCropolis would load here (see `read_costume_model`).
+        if folder.meshes.is_empty() && folder.skels.is_empty() {
             eprintln!("[MODEL] no model files for {:?}", model_dir);
             return;
         }
-        let folder = ModelFolder::load_files(costume.model_files());
-        let render_model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
+        let render_model = RenderModel::from_folder(
+            device,
+            queue,
+            &folder,
+            &self.shared_data,
+            &self.render_settings,
+        );
         eprintln!("[MODEL] loaded from {:?}", model_dir);
         self.model_hlpb = folder.find_hlpb().cloned();
         self.model_matl = folder.find_matl().cloned();
         self.render_models.push(render_model);
-        // `clear()` above dropped the victim's render model with the body's.
-        if let Some(victim) = &self.victim {
-            let folder = ModelFolder::load_files(victim.files.clone());
-            self.render_models.push(RenderModel::from_folder(
-                device,
-                queue,
-                &folder,
-                &self.shared_data,
-            ));
-        }
 
         // Scan sibling directories for weapon skeletons.
         // model_dir is e.g. fighter/link/model/body/c00
@@ -352,6 +553,7 @@ impl HitboxRenderState {
         let hlpb = self.model_hlpb.as_ref().filter(|_| self.helper_bones);
         let matl = self.model_matl.as_ref();
 
+        // Only the body; object models after it are animated in `update_objects`.
         if let Some(render_model) = self.render_models.first_mut() {
             // RenderModel applies animations in iterator order. Put the default eyelid layer
             // first so a selected move's visibility tracks take precedence over the baseline.
@@ -367,6 +569,9 @@ impl HitboxRenderState {
                 animations.iter().copied(),
                 skel,
                 matl,
+                None,
+                None,
+                None,
                 hlpb,
                 &self.shared_data,
                 frame,
@@ -377,94 +582,185 @@ impl HitboxRenderState {
                 },
             );
         }
-        self.pose_victim(queue, frame);
     }
 
-    /// Show `victim` held by this fighter's `throw` bone, or stop showing one.
-    pub fn set_victim(
+    /// Light the models as the training stage does, from `data_root`'s
+    /// `stage/training/normal`: its light set (the directional light, ambient and colours the
+    /// fighter shaders read) and its colour grading LUT. Without the stage files the renderer's
+    /// default lighting and the LUT read from a GPU capture stay.
+    pub fn use_stage(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        victim: Option<VictimSpec>,
+        data_root: Option<&Path>,
+        stage: Option<&str>,
     ) {
-        let Some(spec) = victim else {
-            if self.victim.take().is_some() {
-                self.render_models.truncate(1);
-                self.last_frame = -1.0;
-            }
+        let key = data_root.map(|root| (root.to_path_buf(), stage.map(str::to_owned)));
+        if self.stage_root == key {
+            return;
+        }
+        self.stage_root = key;
+        self.stage_models.clear();
+        self.stage_parts.clear();
+        self.stage_loading = None;
+        let Some(root) = data_root else {
             return;
         };
-        let same_model = self
-            .victim
+        // Lit by the picked stage, or by the training stage with no stage shown.
+        let picked = stage.map(|name| crate::preview_stage::files(root, name));
+        let training = crate::preview_stage::files(root, "training");
+        let light = picked
             .as_ref()
-            .is_some_and(|current| current.files == spec.model_files);
-        if !same_model {
-            let folder = ModelFolder::load_files(spec.model_files.clone());
-            let render_model =
-                RenderModel::from_folder(device, queue, &folder, &self.shared_data);
-            self.render_models.truncate(1);
-            self.render_models.push(render_model);
-            self.victim = Some(ThrownVictim {
-                files: spec.model_files,
-                scale: spec.scale,
-                skel: folder.find_skel().cloned(),
-                hlpb: folder.find_hlpb().cloned(),
-                matl: folder.find_matl().cloned(),
-                anim: None,
-            });
-            self.last_frame = -1.0;
+            .and_then(|f| f.light.clone())
+            .or(training.light.clone());
+        match light.and_then(|path| ssbh_data::anim_data::AnimData::from_file(path).ok()) {
+            Some(light) => self.renderer.update_stage_uniforms(queue, &light, 0.0),
+            None => self.renderer.reset_stage_uniforms(queue),
         }
-        let victim = self.victim.as_mut().expect("set above");
-        if victim.scale != spec.scale {
-            victim.scale = spec.scale;
-            self.last_frame = -1.0;
+        let lut = picked.as_ref().and_then(|f| f.lut.clone()).or(training.lut);
+        if let Some(lut) = lut.and_then(|path| nutexb::NutexbFile::read_from_file(path).ok()) {
+            self.renderer.update_color_lut(device, queue, &lut);
         }
-        if victim.anim.as_ref().map(|(path, _)| path) != spec.anim_path.as_ref() {
-            victim.anim = spec.anim_path.and_then(|path| {
-                let anim = ssbh_data::anim_data::AnimData::from_file(&path).ok()?;
-                Some((path, anim))
+        // The models are large (tens of megabytes of textures): read them off the GUI thread.
+        if let Some(picked) = picked {
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for (dir, anim) in picked.models {
+                    let mut folder = ModelFolder::load_folder(&dir);
+                    crate::preview_stage::turn_to_preview(&mut folder);
+                    let anim =
+                        anim.and_then(|path| ssbh_data::anim_data::AnimData::from_file(path).ok());
+                    if send.send(StageModelLoad { folder, anim }).is_err() {
+                        return;
+                    }
+                }
             });
-            self.last_frame = -1.0;
+            self.stage_loading = Some(std::sync::Mutex::new(receive));
         }
     }
 
-    /// Pose the victim for `frame`: its own thrown animation, with its `rot` bone placed on
-    /// this fighter's `throw` bone, which is how the game carries a thrown fighter.
-    fn pose_victim(&mut self, queue: &wgpu::Queue, frame: f32) {
-        // The throw bone carries this fighter's model scale; the victim keeps its own.
-        let target = self.victim.as_ref().and_then(|victim| {
-            let throw = self.bone_world_matrices_at(frame).get("throw").copied()?;
-            Some(throw * glam::Mat4::from_scale(glam::Vec3::splat(victim.scale / self.model_scale)))
-        });
-        let (Some(victim), Some(render_model)) = (&self.victim, self.render_models.get_mut(1))
-        else {
-            return;
+    /// Upload the stage models read since the last frame. Returns whether more are coming.
+    fn collect_stage_models(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        let Some(loading) = &self.stage_loading else {
+            return false;
         };
-        let Some(skel) = victim.skel.as_ref() else {
-            return;
+        let loading = loading.lock().unwrap_or_else(|e| e.into_inner());
+        let mut arrived = Vec::new();
+        let more = loop {
+            match loading.try_recv() {
+                Ok(load) => arrived.push(load),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
+            }
         };
-        let rot = skel
-            .bones
-            .iter()
-            .position(|bone| bone.name.eq_ignore_ascii_case("rot"));
-        let hlpb = victim.hlpb.as_ref().filter(|_| self.helper_bones);
-        render_model.apply_anims_with_skel_edit(
-            queue,
-            victim.anim.iter().map(|(_, anim)| anim),
-            Some(skel),
-            victim.matl.as_ref(),
-            hlpb,
-            &self.shared_data,
-            frame,
-            |bones| {
-                if let (Some(rot), Some(target)) = (rot, target) {
-                    constrain_bone_to_world(bones, skel, rot, target);
+        drop(loading);
+        if !more {
+            self.stage_loading = None;
+        }
+        for load in arrived {
+            let mut model = RenderModel::from_folder(
+                device,
+                queue,
+                &load.folder,
+                &self.shared_data,
+                &self.render_settings,
+            );
+            Self::place_stage_model(
+                &mut model,
+                &load,
+                self.stage_shift,
+                queue,
+                &self.shared_data,
+            );
+            // The layer Inkling's ink paints onto the stage draws black with no ink on it.
+            for mesh in model.meshes.iter_mut() {
+                if mesh.name.to_ascii_lowercase().starts_with("inkmesh") {
+                    mesh.is_visible = false;
                 }
-            },
+            }
+            self.stage_models.push(model);
+            // Only what placing needs is kept; the meshes and textures are on the GPU.
+            self.stage_parts.push(StageModelLoad {
+                folder: ModelFolder {
+                    skels: load.folder.skels,
+                    matls: load.folder.matls,
+                    hlpbs: load.folder.hlpbs,
+                    meshes: Vec::new(),
+                    meshexes: Vec::new(),
+                    modls: Vec::new(),
+                    adjs: Vec::new(),
+                    anims: Vec::new(),
+                    nutexbs: Vec::new(),
+                    xmbs: Vec::new(),
+                },
+                anim: load.anim,
+            });
+        }
+        more
+    }
+
+    /// Place a stage model: its own placing animation, with its root holding the turn into
+    /// preview space and the shift for the move.
+    fn place_stage_model(
+        model: &mut RenderModel,
+        parts: &StageModelLoad,
+        shift: glam::Vec3,
+        queue: &wgpu::Queue,
+        shared_data: &SharedRenderData,
+    ) {
+        let root = crate::preview_stage::root_anim(crate::preview_stage::root_transform(shift));
+        model.apply_anims(
+            queue,
+            parts.anim.iter().chain(std::iter::once(&root)),
+            parts.folder.find_skel(),
+            parts.folder.find_matl(),
+            None,
+            None,
+            None,
+            parts.folder.find_hlpb(),
+            shared_data,
+            0.0,
         );
     }
 
-    /// Every mesh name of the fighter's own model. The victim's visibility tracks are its own.
+    /// Shift the stage under the fighter (game space), placing its models again if it moved.
+    fn shift_stage(&mut self, shift: glam::Vec3, queue: &wgpu::Queue) {
+        if (shift - self.stage_shift).length() < 1e-4 {
+            return;
+        }
+        self.stage_shift = shift;
+        for (model, parts) in self.stage_models.iter_mut().zip(&self.stage_parts) {
+            Self::place_stage_model(model, parts, shift, queue, &self.shared_data);
+        }
+    }
+
+    /// Whether a stage is shown, so the preview's own floor stays away.
+    pub fn shows_stage(&self) -> bool {
+        self.stage_root
+            .as_ref()
+            .is_some_and(|(_, stage)| stage.is_some())
+    }
+
+    /// Hide the body meshes of the visibility groups not showing, and show again the ones
+    /// hidden earlier whose group is back. Runs after the animation, which sets visibility
+    /// only for the meshes it has tracks for.
+    fn apply_hidden_nodes(&mut self, hidden: &std::collections::HashSet<u64>) {
+        let Some(model) = self.render_models.first_mut() else {
+            return;
+        };
+        for (index, mesh) in model.meshes.iter_mut().enumerate() {
+            if hidden.contains(&crate::preview_visibility::mesh_node(&mesh.name)) {
+                if mesh.is_visible || self.set_hidden.contains(&index) {
+                    mesh.is_visible = false;
+                    self.set_hidden.insert(index);
+                }
+            } else if self.set_hidden.remove(&index) {
+                mesh.is_visible = true;
+            }
+        }
+    }
+
+    /// Every mesh name of the fighter's own model.
     fn mesh_names(&self) -> Vec<String> {
         self.render_models
             .iter()
@@ -502,13 +798,75 @@ impl HitboxRenderState {
         self.renderer.update_camera(queue, transforms);
     }
 
-    /// Returns all bone names from the cached skeleton.
-    #[allow(dead_code)]
-    pub fn bone_names(&self) -> Vec<String> {
-        self.cached_skel
-            .as_ref()
-            .map(|(_, s)| s.bones.iter().map(|b| b.name.clone()).collect())
-            .unwrap_or_default()
+    /// Place each mesh hung on a bone for this frame's pose and camera: the fighter's, its
+    /// objects' and the stage's. ssbh_wgpu draws such meshes from this per-mesh transform.
+    fn update_per_world(&mut self, queue: &wgpu::Queue, objects: &[ObjectDraw]) {
+        let camera = self.renderer.camera_transforms();
+        let body_skel = self.cached_skel.as_ref().map(|(_, s)| s);
+        for (index, model) in self.render_models.iter_mut().enumerate() {
+            let skel = match index {
+                0 => body_skel,
+                n => objects.get(n - 1).map(|object| object.skel.as_ref()),
+            };
+            model.update_per_world(queue, &camera, skel);
+        }
+        for (model, parts) in self.stage_models.iter_mut().zip(&self.stage_parts) {
+            model.update_per_world(queue, &camera, parts.folder.find_skel());
+        }
+    }
+
+    /// Shows the objects out this frame after the body model, loading each model once.
+    fn update_objects(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        objects: &[ObjectDraw],
+    ) {
+        if self.render_models.is_empty() {
+            return;
+        }
+        for (index, object) in objects.iter().enumerate() {
+            if self.object_dirs.get(index) != Some(&object.model_dir) {
+                let folder = ModelFolder::load_folder(&object.model_dir);
+                let model = RenderModel::from_folder(
+                    device,
+                    queue,
+                    &folder,
+                    &self.shared_data,
+                    &self.render_settings,
+                );
+                if index < self.object_dirs.len() {
+                    self.render_models[index + 1] = model;
+                    self.object_dirs[index] = object.model_dir.clone();
+                } else {
+                    self.render_models.push(model);
+                    self.object_dirs.push(object.model_dir.clone());
+                }
+            }
+            let model = &mut self.render_models[index + 1];
+            model.is_visible = true;
+            let layers: Vec<&ssbh_data::anim_data::AnimData> = object
+                .anim
+                .as_deref()
+                .into_iter()
+                .chain(std::iter::once(&object.placement))
+                .collect();
+            model.apply_anims(
+                queue,
+                layers.iter().copied(),
+                Some(&object.skel),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &self.shared_data,
+                object.frame,
+            );
+        }
+        for model in self.render_models.iter_mut().skip(objects.len() + 1) {
+            model.is_visible = false;
+        }
     }
 
     pub fn weapon_skel_count(&self) -> usize {
@@ -542,7 +900,7 @@ impl HitboxRenderState {
         self.model_hlpb.as_ref().filter(|_| self.helper_bones)
     }
 
-    /// Eagerly load skeleton data so bone_world_matrices() returns valid results
+    /// Eagerly load skeleton data so bone_world_matrices_at() returns valid results
     /// immediately, without waiting for the first prepare() call.
     pub fn load_skeleton(&mut self, skel_path: &Path) {
         self.cached_skel = ssbh_data::skel_data::SkelData::from_file(skel_path)
@@ -550,15 +908,8 @@ impl HitboxRenderState {
             .map(|s| (skel_path.to_path_buf(), s));
     }
 
-    /// Returns a map of bone name -> world matrix for the current frame.
-    /// Includes both body skeleton bones and weapon skeleton bones.
-    /// The offset from ACMD should be transformed by this matrix (not just added).
-    pub fn bone_world_matrices(&self) -> std::collections::HashMap<String, glam::Mat4> {
-        self.bone_world_matrices_at(self.last_frame.max(0.0))
-    }
-
-    /// Like `bone_world_matrices()` but evaluates animation at an explicit `frame`
-    /// instead of `self.last_frame`. Use this from the simulation code so bone
+    /// Bone name -> world matrix (body and weapon skeletons) at an explicit `frame`.
+    /// The offset from ACMD should be transformed by this matrix (not just added). Use this from the simulation code so bone
     /// positions are correct on the very first frame (no 1-frame delay).
     pub fn bone_world_matrices_at(
         &self,
@@ -589,46 +940,6 @@ impl HitboxRenderState {
     /// The model scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
     pub fn model_scale(&self) -> f32 {
         self.model_scale
-    }
-}
-
-/// What [`HitboxRenderState::set_victim`] shows.
-pub struct VictimSpec {
-    /// The victim costume's model, as [`crate::costume_files::CostumeFolder::model_files`].
-    pub model_files: Vec<(String, std::path::PathBuf)>,
-    /// The victim's thrown animation; `None` holds it in its rest pose.
-    pub anim_path: Option<std::path::PathBuf>,
-    /// The victim's own model scale, its `fighter_param` `scale`.
-    pub scale: f32,
-}
-
-struct ThrownVictim {
-    files: Vec<(String, std::path::PathBuf)>,
-    scale: f32,
-    skel: Option<ssbh_data::skel_data::SkelData>,
-    hlpb: Option<ssbh_data::hlpb_data::HlpbData>,
-    matl: Option<ssbh_data::matl_data::MatlData>,
-    anim: Option<(std::path::PathBuf, ssbh_data::anim_data::AnimData)>,
-}
-
-/// Set bone `index`'s local transform so its world transform is `target`, given the rest of
-/// the sampled pose. Ported from SSBH Editor's thrown-character link.
-fn constrain_bone_to_world(
-    bones: &mut [(usize, ssbh_wgpu::animation::AnimatedBone)],
-    skel: &ssbh_data::skel_data::SkelData,
-    index: usize,
-    target: glam::Mat4,
-) {
-    use ssbh_wgpu::animation::{animate_skel_inner, AnimationTransforms};
-    let mut sampled = Box::new(AnimationTransforms::from_skel(skel));
-    animate_skel_inner(&mut sampled, bones, &skel.bones, None);
-    let parent = skel.bones[index]
-        .parent_index
-        .map(|parent| sampled.world_transforms[parent])
-        .unwrap_or(glam::Mat4::IDENTITY);
-    let (scale, rotation, translation) = (parent.inverse() * target).to_scale_rotation_translation();
-    if let Some((_, bone)) = bones.iter_mut().find(|(i, _)| *i == index) {
-        bone.set_current_trs(translation, rotation, scale);
     }
 }
 
@@ -766,7 +1077,6 @@ fn body_world(
     for bone in &skel.bones[evaluated..] {
         world.push(
             skel.calculate_world_transform(bone)
-                .map(|m| glam::Mat4::from_cols_array_2d(&m))
                 .unwrap_or(glam::Mat4::IDENTITY),
         );
     }
@@ -817,7 +1127,7 @@ fn bone_world_map(
             let Ok(bind_world) = weapon_skel.calculate_world_transform(bone) else {
                 continue;
             };
-            let bind_mat = glam::Mat4::from_cols_array_2d(&bind_world);
+            let bind_mat = bind_world;
             let final_mat = attach_world * bind_mat;
             // Only insert if this bone name isn't already in the body skeleton —
             // body skeleton bones always take priority over weapon skeleton bones.
@@ -830,15 +1140,6 @@ fn bone_world_map(
 }
 
 impl HitboxRenderState {
-    /// Returns a map of bone name -> world position (convenience wrapper).
-    #[allow(dead_code)]
-    pub fn bone_world_positions(&self) -> std::collections::HashMap<String, glam::Vec3> {
-        self.bone_world_matrices()
-            .into_iter()
-            .map(|(k, m)| (k, m.col(3).truncate()))
-            .collect()
-    }
-
     /// Projects a 3D world position to normalized device coordinates (NDC),
     /// then to pixel coordinates within the given viewport rect.
     pub fn world_to_screen(
@@ -898,7 +1199,7 @@ mod tests {
     ) -> ssbh_data::skel_data::BoneData {
         ssbh_data::skel_data::BoneData {
             name: name.to_string(),
-            transform: glam::Mat4::from_translation(translation).to_cols_array_2d(),
+            transform: glam::Mat4::from_translation(translation),
             parent_index: parent,
             billboard_type: ssbh_data::skel_data::BillboardType::Disabled,
         }
@@ -919,65 +1220,14 @@ mod tests {
                     frames
                         .into_iter()
                         .map(|(translation, rotation)| Transform {
-                            scale: ssbh_data::Vector3::new(1.0, 1.0, 1.0),
-                            rotation: ssbh_data::Vector4::new(
-                                rotation.x, rotation.y, rotation.z, rotation.w,
-                            ),
-                            translation: ssbh_data::Vector3::new(
-                                translation.x,
-                                translation.y,
-                                translation.z,
-                            ),
+                            scale: glam::Vec3::ONE,
+                            rotation,
+                            translation,
                         })
                         .collect(),
                 ),
             }],
         }
-    }
-
-    /// The thrown fighter's `rot` bone lands exactly on the target, whatever its animation
-    /// does to its parents.
-    #[test]
-    fn a_constrained_bone_reaches_its_world_target() {
-        use glam::{Mat4, Quat, Vec3};
-        let skel = ssbh_data::skel_data::SkelData {
-            major_version: 1,
-            minor_version: 0,
-            bones: vec![
-                bone("Trans", None, Vec3::ZERO),
-                bone("Rot", Some(0), Vec3::new(0.0, 1.0, 0.0)),
-                bone("Hip", Some(1), Vec3::new(0.0, 5.0, 0.0)),
-            ],
-        };
-        let anim = ssbh_data::anim_data::AnimData {
-            major_version: 2,
-            minor_version: 0,
-            final_frame_index: 0.0,
-            groups: vec![ssbh_data::anim_data::GroupData {
-                group_type: ssbh_data::anim_data::GroupType::Transform,
-                nodes: vec![transform_track(
-                    "Trans",
-                    vec![(Vec3::new(3.0, 0.0, 2.0), Quat::from_rotation_y(0.7))],
-                )],
-            }],
-        };
-        let target = Mat4::from_rotation_translation(
-            Quat::from_rotation_z(1.1),
-            Vec3::new(10.0, 12.0, -4.0),
-        );
-        let mut transforms = Box::new(ssbh_wgpu::animation::AnimationTransforms::identity());
-        ssbh_wgpu::animation::animate_skel_with_edit(
-            &mut transforms,
-            &skel,
-            std::iter::once(&anim),
-            None,
-            0.0,
-            |bones| super::constrain_bone_to_world(bones, &skel, 1, target),
-        );
-        assert!(transforms.world_transforms[1].abs_diff_eq(target, 1e-4));
-        // Its children follow it.
-        let hip = transforms.world_transforms[2].col(3).truncate();
-        assert!(hip.abs_diff_eq(target.transform_point3(Vec3::new(0.0, 5.0, 0.0)), 1e-4));
     }
 
     /// Bone positions are evaluated through the hierarchy, whatever order the skeleton lists
@@ -1370,6 +1620,36 @@ pub struct ViewportCallback {
     /// Optional default eyelid visibility baseline for the selected fighter/costume.
     pub default_anim_path: Option<std::path::PathBuf>,
     pub skel_path: Option<std::path::PathBuf>,
+    /// Fighter objects out this frame.
+    pub objects: Vec<ObjectDraw>,
+    /// Effect sets out this frame.
+    pub effects: Vec<crate::vfx_preview::EffectDraw>,
+    /// Effect files to have loaded and built ahead of use (the fighter's own and the shared).
+    pub effect_files: Vec<std::path::PathBuf>,
+    /// Effect files to draw from edited bytes instead of the file on disk (`None` reverts).
+    pub effect_overrides: Vec<(std::path::PathBuf, Option<std::sync::Arc<Vec<u8>>>)>,
+    /// For painting again once effects still loading are ready.
+    pub repaint: egui::Context,
+    /// Draw the stage floor: the move is done on the ground.
+    pub floor: bool,
+    /// Weapon swing trails out this frame.
+    pub trails: Vec<crate::preview_trail::TrailDraw>,
+    /// Body mesh nodes (hash40) the fighter's visibility sets hide at this frame.
+    pub hidden_nodes: std::collections::HashSet<u64>,
+    /// The fighter has turned into one of its objects (Inkling's squid): its body is not drawn.
+    pub hide_body: bool,
+    /// How far the stage moves, in game space, to put the fighter where the move is done.
+    pub stage_shift: glam::Vec3,
+}
+
+/// One object model to draw, already animated and placed.
+pub struct ObjectDraw {
+    pub model_dir: std::path::PathBuf,
+    pub skel: std::sync::Arc<ssbh_data::skel_data::SkelData>,
+    pub anim: Option<std::sync::Arc<ssbh_data::anim_data::AnimData>>,
+    pub frame: f32,
+    /// Puts the root bone in the world; layered over `anim`.
+    pub placement: ssbh_data::anim_data::AnimData,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -1399,11 +1679,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             let default_anim_changed = self.default_anim_path != state.last_default_anim_path;
             let skel_changed = self.skel_path != state.last_skel_path;
 
-            state.resize(device, w, h);
+            state.resize(device, queue, w, h);
             state.update_camera(queue, self.width, self.height);
             state.wgpu_device = Some(device.clone());
             state.wgpu_queue = Some(queue.clone());
 
+            let t_anim = std::time::Instant::now();
             // Re-skin when frame, animation, or skeleton changes
             if frame_changed || anim_changed || default_anim_changed || skel_changed {
                 state.apply_animation_with_default(
@@ -1419,13 +1700,135 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.last_skel_path = self.skel_path.clone();
             }
 
-            // Always re-render (camera may have changed, or egui needs a fresh frame)
-            state.renderer.begin_render_models(
+            state.apply_hidden_nodes(&self.hidden_nodes);
+            if let Some(body) = state.render_models.first_mut() {
+                body.is_visible = !self.hide_body;
+            }
+            let anim_ms = t_anim.elapsed().as_secs_f64() * 1000.0;
+            let t_obj = std::time::Instant::now();
+            state.update_objects(device, queue, &self.objects);
+            state.shift_stage(self.stage_shift, queue);
+            if state.collect_stage_models(device, queue) {
+                self.repaint
+                    .request_repaint_after(std::time::Duration::from_millis(30));
+            }
+            state.update_per_world(queue, &self.objects);
+            let obj_ms = t_obj.elapsed().as_secs_f64() * 1000.0;
+            if std::env::var_os("VFX_TIMING").is_some() && anim_ms + obj_ms > 8.0 {
+                eprintln!("[vfx timing] paint anim {anim_ms:.1} ms objects {obj_ms:.1} ms");
+            }
+
+            let t = state.camera.transforms(self.width, self.height);
+            let eye = t.camera_pos;
+            for (file, bytes) in &self.effect_overrides {
+                state.vfx.set_override(device, queue, file, bytes.clone());
+            }
+            for file in &self.effect_files {
+                state.vfx.preload(device, queue, file);
+            }
+            let timing = std::env::var_os("VFX_TIMING")
+                .is_some()
+                .then(std::time::Instant::now);
+            state.vfx.prepare(
+                device,
+                queue,
+                t.model_view_matrix,
+                t.projection_matrix,
+                [eye.x, eye.y, eye.z],
+                state.camera.near,
+                state.camera.far,
+                &self.effects,
+            );
+            if let Some(start) = timing {
+                eprintln!(
+                    "[vfx timing] prepare {:?} for {} draws",
+                    start.elapsed(),
+                    self.effects.len()
+                );
+            }
+            if state.vfx.waiting() {
+                self.repaint
+                    .request_repaint_after(std::time::Duration::from_millis(4));
+            }
+            // A program wgpu rejects is skipped rather than fatal; say which, once each.
+            for failure in state.vfx.take_failures() {
+                eprintln!("[vfx] effect preview skipped a shader: {failure}");
+            }
+            // Always re-render (camera may have changed, or egui needs a fresh frame). Effects
+            // draw into the scene right after the models, with the models' depth, so bloom and
+            // colour grading treat them as the game's post pass does.
+            state
+                .trails
+                .prepare(device, queue, t.mvp_matrix, &self.trails);
+            let vfx = &state.vfx;
+            let trails = &state.trails;
+            let floor = (self.floor && !state.shows_stage()).then_some(&state.floor);
+            if let Some(floor) = floor {
+                floor.update(queue, t.mvp_matrix, state.floor_color);
+            }
+            let axes = state.world_axes.then_some(&state.axes);
+            if let Some(axes) = axes {
+                axes.update(queue, t.mvp_matrix, t.camera_pos);
+            }
+            // The stage's models are drawn with the fighter's, in one list for the renderer;
+            // they go back to their own list afterwards.
+            let fighter_models = state.render_models.len();
+            state.render_models.append(&mut state.stage_models);
+            state.renderer.begin_render_models_with_scene(
                 egui_encoder,
                 &state.render_models,
                 state.shared_data.database(),
                 &state.model_render_options,
+                &mut |encoder, scene| {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("viewport effects"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: scene.color,
+                            resolve_target: Some(scene.resolve),
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: scene.depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    if let Some(floor) = floor {
+                        floor.draw(&mut pass);
+                    }
+                    if let Some(axes) = axes {
+                        axes.draw(&mut pass);
+                    }
+                    vfx.paint(&mut pass);
+                    trails.draw(&mut pass);
+                },
             );
+            state.stage_models = state.render_models.split_off(fighter_models);
+            state.target.resize(device, w.max(1), h.max(1));
+            if let Some(plain) = &state.target.plain {
+                let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("viewport models"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: plain,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                state.renderer.end_render_models(&mut pass);
+            }
         }
         Vec::new()
     }
@@ -1447,9 +1850,15 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         if let Some(state) = resources.get::<HitboxRenderState>() {
-            state.renderer.end_render_models(render_pass);
+            state.target.paint(render_pass);
         } else {
             eprintln!("[VIEWPORT] paint skipped: HitboxRenderState missing (load a model first)");
         }
     }
+}
+
+/// One stage model folder read off the GUI thread, with the animation that places it.
+struct StageModelLoad {
+    folder: ModelFolder,
+    anim: Option<ssbh_data::anim_data::AnimData>,
 }

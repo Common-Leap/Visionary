@@ -450,7 +450,7 @@ fn try_patch_disp_array(
                 // We need the full file order to know each wanted entry's index.
                 // For now, just patch the probe entries we used to find it.
                 let mut patched = 0;
-                for (i, name) in probe_names.iter().enumerate() {
+                for i in 0..probe_names.len() {
                     let new_disp = probe_new[i];
                     let addr = base + disp_off + i * stride;
                     unsafe { *(addr as *mut u8) = new_disp as u8 };

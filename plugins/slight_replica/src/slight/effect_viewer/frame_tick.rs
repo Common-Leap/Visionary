@@ -30,22 +30,6 @@ impl Default for FrameState {
 static FRAME_STATES: LazyLock<Mutex<HashMap<u64, FrameState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn set_real_range(effect_id: u64, min: f32, max: f32) {
-    FRAME_STATES.lock().entry(effect_id).or_default().real_range = (min, max);
-}
-
-pub fn set_stop_treatment(effect_id: u64, stop: bool) {
-    if let Some(s) = FRAME_STATES.lock().get_mut(&effect_id) {
-        s.stop_treatment = stop;
-    }
-}
-
-pub fn set_slow_treatment(effect_id: u64, slow: bool) {
-    if let Some(s) = FRAME_STATES.lock().get_mut(&effect_id) {
-        s.slow_treatment = slow;
-    }
-}
-
 pub fn counter(effect_id: u64) -> f32 {
     FRAME_STATES
         .lock()
