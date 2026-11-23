@@ -93,12 +93,12 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 @fragment fn fs(o: Out) -> @location(0) vec4<f32> {
     let c = textureSample(colour, smp, o.uv);
-    let f = textureSample(fade, smp, o.uv);
-    // The first texture's alpha is the sheet and its colour the bright leading streak; the
-    // second is the sheet's light body. Taking colour from the first alone drew a dark sheet.
-    let rgb = min(c.rgb + f.rgb * 0.75, vec3<f32>(1.0));
+    let f = textureSample(fade, smp, o.uv).r;
+    // The sheet is the first texture: dark body, silver edge, white leading streak, as the
+    // game draws it. The second is a grey mask that only fades it; adding its grey as light
+    // turned Sephiroth's sheet flat white.
     // The scene holds half intensity; the post pass doubles it (as for effects).
-    return vec4<f32>(rgb * 0.5, c.a * f.r * 0.85);
+    return vec4<f32>(c.rgb * 0.5, c.a * f);
 }
 ";
 
@@ -250,11 +250,10 @@ impl PreviewTrails {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         path: &Path,
-        srgb: bool,
     ) -> Option<wgpu::TextureView> {
         self.textures
             .entry(path.to_path_buf())
-            .or_insert_with(|| load_texture(device, queue, path, srgb))
+            .or_insert_with(|| load_texture(device, queue, path))
             .clone()
     }
 
@@ -279,8 +278,8 @@ impl PreviewTrails {
                 continue;
             }
             let (Some(colour), Some(fade)) = (
-                self.texture(device, queue, &trail.texture, true),
-                self.texture(device, queue, &trail.fade, true),
+                self.texture(device, queue, &trail.texture),
+                self.texture(device, queue, &trail.fade),
             ) else {
                 continue;
             };
@@ -385,22 +384,43 @@ fn load_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     path: &Path,
-    srgb: bool,
 ) -> Option<wgpu::TextureView> {
-    use wgpu::util::DeviceExt;
+    use nutexb::NutexbFormat as F;
     let nutexb = nutexb::NutexbFile::read_from_file(path).ok()?;
+    // Every fighter trail texture is stored as sRGB, the fading mask too; follow the file.
+    let srgb = matches!(
+        nutexb.footer.image_format,
+        F::R8G8B8A8Srgb | F::B8G8R8A8Srgb | F::BC1Srgb | F::BC2Srgb | F::BC3Srgb | F::BC7Srgb
+    );
     // nutexb and image_dds use different ddsfile releases; the file between them is the same.
     let mut dds = Vec::new();
     nutexb.to_dds().ok()?.write(&mut dds).ok()?;
     let dds = image_dds::ddsfile::Dds::read(dds.as_slice()).ok()?;
     let image = image_dds::image_from_dds(&dds, 0).ok()?;
+    Some(upload(
+        device,
+        queue,
+        (image.width(), image.height()),
+        srgb,
+        image.as_raw(),
+    ))
+}
+
+fn upload(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    (width, height): (u32, u32),
+    srgb: bool,
+    rgba: &[u8],
+) -> wgpu::TextureView {
+    use wgpu::util::DeviceExt;
     let texture = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some("preview trail texture"),
             size: wgpu::Extent3d {
-                width: image.width(),
-                height: image.height(),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -415,9 +435,9 @@ fn load_texture(
             view_formats: &[],
         },
         wgpu::util::TextureDataOrder::LayerMajor,
-        image.as_raw(),
+        rgba,
     );
-    Some(texture.create_view(&Default::default()))
+    texture.create_view(&Default::default())
 }
 
 #[cfg(test)]
@@ -454,6 +474,175 @@ mod tests {
         let mid = out[2][1].length();
         let chord = ((p(0.0) + p(45.0)) * 0.5).length();
         assert!(mid > chord + 0.1, "{mid} vs chord {chord}");
+    }
+
+    /// The device a GPU test draws on, `None` on a machine with no adapter. wgpu's native
+    /// requests are ready on their first poll.
+    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        fn ready<T>(f: impl std::future::Future<Output = T>) -> T {
+            let mut f = std::pin::pin!(f);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            loop {
+                if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                    return v;
+                }
+                std::thread::yield_now();
+            }
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = ready(instance.request_adapter(&Default::default())).ok()?;
+        ready(adapter.request_device(&Default::default())).ok()
+    }
+
+    /// One pixel of a ribbon that fills the view, drawn over clear black with a one-texel
+    /// sRGB colour texture and fade mask, as the game's trail textures are stored.
+    fn draw_texel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        colour: [u8; 4],
+        fade: u8,
+    ) -> [u8; 4] {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let depth_format = wgpu::TextureFormat::Depth32Float;
+        let mut trails = PreviewTrails::new(device, format, depth_format, 1);
+        let (colour_path, fade_path) = (PathBuf::from("colour"), PathBuf::from("fade"));
+        let one = |rgba: [u8; 4]| Some(upload(device, queue, (1, 1), true, &rgba));
+        trails.textures.insert(colour_path.clone(), one(colour));
+        trails
+            .textures
+            .insert(fade_path.clone(), one([fade, fade, fade, 255]));
+        let edge = |x: f32| [Vec3::new(x, -1.0, 0.5), Vec3::new(x, 1.0, 0.5)];
+        trails.prepare(
+            device,
+            queue,
+            glam::Mat4::IDENTITY,
+            &[TrailDraw {
+                texture: colour_path,
+                fade: fade_path,
+                edges: vec![edge(-1.0), edge(1.0)],
+            }],
+        );
+        let size = wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        };
+        let target = |format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let colour_target = target(format, attach | wgpu::TextureUsages::COPY_SRC);
+        let depth_target = target(depth_format, attach);
+        let (colour_view, depth_view) = (
+            colour_target.create_view(&Default::default()),
+            depth_target.create_view(&Default::default()),
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &colour_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            trails.draw(&mut pass);
+        }
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            colour_target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: None,
+                },
+            },
+            size,
+        );
+        queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let bytes = readback
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped")
+            .to_vec();
+        // A pixel away from the ribbon's diagonal seam.
+        let at = 256 + 4;
+        [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    }
+
+    #[test]
+    fn a_trail_draws_its_first_texture_s_colour_faded_by_the_second() {
+        let Some((device, queue)) = gpu() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
+        let linear = |v: u8| {
+            let c = v as f32 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        // What the scene holds over black: the first texture's colour at half intensity (the
+        // post pass doubles it), covering by its alpha times the second texture's grey.
+        let expected = |colour: [u8; 4], fade: u8| {
+            let cover = colour[3] as f32 / 255.0 * linear(fade);
+            let channel = |v: u8| (linear(v) * 0.5 * cover * 255.0).round() as i32;
+            [
+                channel(colour[0]),
+                channel(colour[1]),
+                channel(colour[2]),
+                (cover * 255.0).round() as i32,
+            ]
+        };
+        // Texels of tex_edge_sword1 (Sephiroth) with tex_edge_sword2 at the same place: the dark
+        // body of the sheet at (0.7, 0.3), the white leading streak at (0.97, 0.3), and the
+        // body again under the mask's half-faded grey from (0.4, 0.5).
+        for (colour, fade) in [
+            ([57, 64, 85, 229], 255),
+            ([213, 215, 227, 251], 255),
+            ([57, 64, 85, 229], 144),
+        ] {
+            let drawn = draw_texel(&device, &queue, colour, fade).map(i32::from);
+            let want = expected(colour, fade);
+            assert!(
+                drawn.iter().zip(want).all(|(d, w)| (d - w).abs() <= 2),
+                "colour {colour:?} fade {fade}: drew {drawn:?}, want {want:?}"
+            );
+        }
     }
 
     #[test]
