@@ -2034,45 +2034,14 @@ fn merge_donor_resources(
     }
 
     // Textures: copy missing GUIDs (descriptor + single-texture BNTX merged into ours).
-    {
-        let dest_ptcl = namco
+    copy_donor_textures(
+        namco
             .ptcl_file
             .as_mut()
-            .ok_or_else(|| anyhow!("target eff has no embedded PTCL"))?;
-        let donor_tex = donor_ptcl.texture_info.as_ref();
-        let dest_tex = dest_ptcl
-            .texture_info
-            .as_mut()
-            .ok_or_else(|| anyhow!("target eff has no texture section"))?;
-        let mut new_blobs: Vec<Vec<u8>> = Vec::new();
-        for id in &tex_ids {
-            if dest_tex.descriptors.iter().any(|d| d.id == *id) {
-                continue;
-            }
-            let donor_tex = donor_tex
-                .ok_or_else(|| anyhow!("donor eff has no texture section but emitters sample"))?;
-            let idx = donor_tex
-                .descriptors
-                .iter()
-                .position(|d| d.id == *id)
-                .ok_or_else(|| anyhow!("donor texture {id:#x} has no descriptor"))?;
-            let name = donor_tex.descriptors[idx].name.clone();
-            let donor_bin = donor_tex
-                .binary_data
-                .as_ref()
-                .ok_or_else(|| anyhow!("donor texture section has no binary"))?;
-            new_blobs.push(extract_pool_texture(donor_bin, idx, &name)?);
-            dest_tex
-                .descriptors
-                .push(effect_library::ptcl_file::TextureDescriptor { id: *id, name });
-        }
-        if !new_blobs.is_empty() {
-            dest_tex.binary_data = Some(merge_pool_textures(
-                dest_tex.binary_data.as_deref(),
-                new_blobs,
-            )?);
-        }
-    }
+            .ok_or_else(|| anyhow!("target eff has no embedded PTCL"))?,
+        donor_ptcl,
+        &tex_ids,
+    )?;
 
     // Donor shader containers are appended whole here and the copied emitters relocated onto
     // them. Narrowing to the variations actually referenced is a separate, later pass
@@ -2154,6 +2123,48 @@ fn merge_donor_resources(
     }
 
     Ok((shader_index_base, compute_index_base))
+}
+
+/// Bring the textures `ids` names into `dest` from `donor`, those it does not have yet.
+fn copy_donor_textures(
+    dest: &mut effect_library::PtclFile,
+    donor: &effect_library::PtclFile,
+    ids: &[u64],
+) -> Result<()> {
+    let donor_tex = donor.texture_info.as_ref();
+    let dest_tex = dest
+        .texture_info
+        .as_mut()
+        .ok_or_else(|| anyhow!("target eff has no texture section"))?;
+    let mut new_blobs: Vec<Vec<u8>> = Vec::new();
+    for id in ids {
+        if dest_tex.descriptors.iter().any(|d| d.id == *id) {
+            continue;
+        }
+        let donor_tex = donor_tex
+            .ok_or_else(|| anyhow!("donor eff has no texture section but emitters sample"))?;
+        let idx = donor_tex
+            .descriptors
+            .iter()
+            .position(|d| d.id == *id)
+            .ok_or_else(|| anyhow!("donor texture {id:#x} has no descriptor"))?;
+        let name = donor_tex.descriptors[idx].name.clone();
+        let donor_bin = donor_tex
+            .binary_data
+            .as_ref()
+            .ok_or_else(|| anyhow!("donor texture section has no binary"))?;
+        new_blobs.push(extract_pool_texture(donor_bin, idx, &name)?);
+        dest_tex
+            .descriptors
+            .push(effect_library::ptcl_file::TextureDescriptor { id: *id, name });
+    }
+    if !new_blobs.is_empty() {
+        dest_tex.binary_data = Some(merge_pool_textures(
+            dest_tex.binary_data.as_deref(),
+            new_blobs,
+        )?);
+    }
+    Ok(())
 }
 
 /// Move donor emitters' shader indices onto the bases their containers landed on. Shaders are
@@ -2573,44 +2584,80 @@ fn graft_foreign_parts(
             if !slot.is_foreign() {
                 continue;
             }
-            let own = !own_rel.is_empty()
-                && slot
-                    .source_file
-                    .replace('\\', "/")
-                    .eq_ignore_ascii_case(&own_rel.replace('\\', "/"));
-            let file = if own {
-                None
-            } else if slot.source_file.is_empty() {
-                home.map(str::to_owned)
-            } else {
-                Some(slot.source_file.clone())
-            };
-            let key = file.as_ref().map(|f| f.replace('\\', "/").to_lowercase());
-            let donor = match &key {
-                None => Some(&*namco),
-                Some(key) => {
-                    if !donors.iter().any(|(k, _)| k == key) {
-                        let loaded = resolve_donor(file.as_deref().unwrap_or_default())
-                            .and_then(|path| std::fs::read(path).ok())
-                            .and_then(|bytes| effect_library::NamcoEffectFile::load(&bytes).ok());
-                        if let Some(loaded) = loaded {
-                            donors.push((key.clone(), loaded));
-                        }
-                    }
-                    donors.iter().find(|(k, _)| k == key).map(|(_, d)| d)
+            // The file a name means, or None for `namco` itself.
+            let file_of = |named: &str| {
+                let own = !own_rel.is_empty()
+                    && named
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&own_rel.replace('\\', "/"));
+                if own {
+                    None
+                } else if named.is_empty() {
+                    home.map(str::to_owned)
+                } else {
+                    Some(named.to_owned())
                 }
             };
-            let found = donor.and_then(|donor| foreign_part(donor, slot));
+            let file = file_of(&slot.source_file);
+            let key = file.as_ref().map(|f| f.replace('\\', "/").to_lowercase());
+            let donor = match &file {
+                None => Some(&*namco),
+                Some(rel) => donor_at(donors, rel, resolve_donor).map(|at| &donors[at].1),
+            };
+            let mut found = donor.and_then(|donor| foreign_part(donor, slot));
+            let mut from = format!(
+                "{} of {} in {}",
+                slot.source_name,
+                slot.source_set,
+                file.as_deref().unwrap_or(own_rel)
+            );
+            // The textures it was copied with, where they are not its source's.
+            for texture in &slot.textures {
+                let file = file_of(&texture.file);
+                let id = match &file {
+                    None => texture_named(namco, &texture.name),
+                    Some(rel) => match donor_at(donors, rel, resolve_donor) {
+                        None => None,
+                        Some(at) => {
+                            let donor = &donors[at].1;
+                            let id = texture_named(donor, &texture.name);
+                            if let (Some(id), Some(dest), Some(source)) =
+                                (id, namco.ptcl_file.as_mut(), donor.ptcl_file.as_ref())
+                            {
+                                copy_donor_textures(dest, source, &[id])?;
+                            }
+                            id
+                        }
+                    },
+                };
+                let Some(id) = id else {
+                    found = None;
+                    from += &format!(
+                        " with texture {} of {}",
+                        texture.name,
+                        file.as_deref().unwrap_or(own_rel)
+                    );
+                    break;
+                };
+                if let Some(emitter) = &mut found {
+                    let data = &mut emitter.data;
+                    let sampler = match texture.slot {
+                        0 => data.sampler0.as_mut(),
+                        1 => data.sampler1.as_mut(),
+                        2 => data.sampler2.as_mut(),
+                        _ => None,
+                    };
+                    if let Some(sampler) = sampler {
+                        sampler.texture_id = id;
+                        emitter.cached_binary = None;
+                    }
+                }
+            }
             let Some(emitter) = found else {
                 missing.push(MissingPart {
                     roster: r,
                     name: slot.name.clone(),
-                    from: format!(
-                        "{} of {} in {}",
-                        slot.source_name,
-                        slot.source_set,
-                        file.as_deref().unwrap_or(own_rel)
-                    ),
+                    from,
                 });
                 continue;
             };
@@ -2644,6 +2691,29 @@ fn graft_foreign_parts(
         }
     }
     Ok(out)
+}
+
+/// Where in `donors` the file `rel` is, read from where `resolve_donor` finds it the first time.
+fn donor_at(
+    donors: &mut Vec<(String, effect_library::NamcoEffectFile)>,
+    rel: &str,
+    resolve_donor: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<usize> {
+    let key = rel.replace('\\', "/").to_lowercase();
+    if let Some(at) = donors.iter().position(|(k, _)| *k == key) {
+        return Some(at);
+    }
+    let bytes = std::fs::read(resolve_donor(rel)?).ok()?;
+    let loaded = effect_library::NamcoEffectFile::load(&bytes).ok()?;
+    donors.push((key, loaded));
+    Some(donors.len() - 1)
+}
+
+/// The id of the texture named `name` in `file`'s pool.
+fn texture_named(file: &effect_library::NamcoEffectFile, name: &str) -> Option<u64> {
+    let textures = file.ptcl_file.as_ref()?.texture_info.as_ref()?;
+    let found = textures.descriptors.iter().find(|d| d.name == name)?;
+    Some(found.id)
 }
 
 /// The part `slot` copies, out of `donor`: found in its set by the stored name at the stored
@@ -3275,7 +3345,7 @@ fn splice_sections(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         append_unique_resource_ids, destination_entry_kind, remap_shader_indices, shader_index_fits,
     };
@@ -7228,7 +7298,7 @@ mod tests {
 
     /// The program the part `name` of set `set_name` draws with, as its own file's container
     /// holds it, and the models it names that the file has.
-    fn part_program(
+    pub(crate) fn part_program(
         file: &effect_library::NamcoEffectFile,
         set_name: &str,
         name: &str,
@@ -7291,6 +7361,7 @@ mod tests {
             depth,
             source_set: set.into(),
             source_file: SHARED.into(),
+            ..Default::default()
         }
     }
 

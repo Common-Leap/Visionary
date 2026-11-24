@@ -11,8 +11,6 @@
 use super::*;
 use crate::effects::{EmitterSet, LoadedEffect};
 
-use std::sync::Arc;
-
 /// Where a part added from another effect or file came from.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PartOrigin {
@@ -23,6 +21,32 @@ pub(super) struct PartOrigin {
     /// Its name and flat index in that set, as the file has it.
     pub name: String,
     pub index: usize,
+    /// The textures it samples instead of that part's.
+    pub textures: Vec<crate::mod_project::SlotTexture>,
+}
+
+impl PartOrigin {
+    fn of(slot: &crate::mod_project::EmitterSlot) -> Self {
+        Self {
+            file: slot.source_file.clone(),
+            set_name: slot.source_set.clone(),
+            name: slot.source_name.clone(),
+            index: slot.source_idx,
+            textures: slot.textures.clone(),
+        }
+    }
+
+    /// The slot a copy of it is saved as, before it is named and placed.
+    pub fn slot(&self) -> crate::mod_project::EmitterSlot {
+        crate::mod_project::EmitterSlot {
+            source_idx: self.index,
+            source_name: self.name.clone(),
+            source_set: self.set_name.clone(),
+            source_file: self.file.clone(),
+            textures: self.textures.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 /// What adding parts from elsewhere put beside the open file's own data, kept with its undo
@@ -237,6 +261,8 @@ struct Row {
     part: usize,
     label: String,
     raw: String,
+    /// What its hover says of the parts around it.
+    around: String,
     texture: Option<usize>,
     texture_name: String,
     tint: egui::Color32,
@@ -246,6 +272,7 @@ struct Row {
 struct Group {
     label: String,
     raw: String,
+    tree: PartTree,
     rows: Vec<Row>,
 }
 
@@ -267,18 +294,23 @@ fn groups(entries: &[EffEntry], ptcl: &PtclFile) -> Vec<Group> {
         .chain(linked)
         .filter_map(|(set_idx, raw, label)| {
             let set = ptcl.emitter_sets.get(set_idx)?;
-            let names: Vec<&str> = set.emitters.iter().map(|e| e.name.as_str()).collect();
-            let part_labels = part_list_names(&names);
+            let tree = PartTree::of(&set.emitters);
             let rows = set
                 .emitters
                 .iter()
-                .zip(part_labels)
                 .enumerate()
-                .map(|(part, (em, label))| Row {
+                .map(|(part, em)| Row {
                     set_idx,
                     part,
-                    label,
+                    label: tree.name(part).to_owned(),
                     raw: em.name.clone(),
+                    around: match tree.children(part).is_empty() {
+                        true => tree.hover(part, em),
+                        false => format!(
+                            "{}, which Copy and Paste bring and this does not",
+                            tree.hover(part, em)
+                        ),
+                    },
                     texture: em
                         .texture_index
                         .map(|t| t as usize)
@@ -291,7 +323,12 @@ fn groups(entries: &[EffEntry], ptcl: &PtclFile) -> Vec<Group> {
                     tint: part_tint(em),
                 })
                 .collect();
-            Some(Group { label, raw, rows })
+            Some(Group {
+                label,
+                raw,
+                tree,
+                rows,
+            })
         })
         .collect()
 }
@@ -345,7 +382,7 @@ impl EffEditor {
     }
 
     /// Whether `rel` names the open file.
-    fn is_open_file(&self, rel: &str) -> bool {
+    pub(super) fn is_open_file(&self, rel: &str) -> bool {
         rel.is_empty()
             || self
                 .loaded_rel()
@@ -458,6 +495,12 @@ impl EffEditor {
         self.export_root.join(SHARED_FILE_REL)
     }
 
+    /// Where effect file `rel` is on disk.
+    pub(super) fn file_of(&self, rel: &str) -> PathBuf {
+        crate::app::find_effect_file(&self.effect_roots, rel)
+            .unwrap_or_else(|| self.export_root.join(rel))
+    }
+
     /// Whether the open file is the shared file, whose parts are already "this file".
     fn open_file_is_shared(&self) -> bool {
         self.loaded_path.as_deref().is_some_and(is_shared_file)
@@ -501,15 +544,46 @@ impl EffEditor {
     }
 
     /// A file a saved part comes from: the shared file (kept once read), or another read now.
-    fn part_file(&mut self, rel: &str) -> Option<Arc<PartFile>> {
+    pub(super) fn part_file(&mut self, rel: &str) -> Option<Arc<PartFile>> {
         if rel.eq_ignore_ascii_case(SHARED_FILE_REL) {
             return self.shared_file(true);
         }
         // Found as the export and the live carrier find it: a part added from a costume's own
         // effect file is in the mod's files, not in the game folder.
-        let path = crate::app::find_effect_file(&self.effect_roots, rel)
-            .unwrap_or_else(|| self.export_root.join(rel));
+        let path = self.file_of(rel);
         PartFile::read(&path, rel.to_owned()).ok().map(Arc::new)
+    }
+
+    /// The number here of the texture `info`, number `donor_at` of `pool`: brought into the pool
+    /// when this file lacks it.
+    fn carry_texture(
+        &mut self,
+        info: &TextureInfo,
+        donor_at: usize,
+        pool: Option<&[u8]>,
+    ) -> Result<usize, String> {
+        let here = self.ptcl.as_ref().and_then(|p| {
+            p.bntx_textures
+                .iter()
+                .position(|t| (info.id.is_some() && t.id == info.id) || t.tex_name == info.tex_name)
+        });
+        if let Some(at) = here {
+            return Ok(at);
+        }
+        let pool = pool.ok_or("its file's textures could not be read")?;
+        let blob = crate::eff_export::extract_pool_texture(pool, donor_at, &info.tex_name)
+            .map_err(|e| format!("{e:#}"))?;
+        let merged = crate::eff_export::merge_pool_textures(
+            self.texture_pool.as_deref(),
+            vec![blob.clone()],
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        self.carried_textures.push((info.clone(), blob));
+        self.texture_pool = Some(merged);
+        self.texture_pool_gen += 1;
+        let ptcl = self.ptcl.as_mut().ok_or("no file open")?;
+        ptcl.bntx_textures.push(info.clone());
+        Ok(ptcl.bntx_textures.len() - 1)
     }
 
     /// Make the textures `part` samples, numbered in `textures`/`pool`, ones this file has:
@@ -537,39 +611,12 @@ impl EffEditor {
             let Some(info) = textures.get(donor_at) else {
                 continue;
             };
-            let here = self.ptcl.as_ref().and_then(|p| {
-                p.bntx_textures.iter().position(|t| {
-                    (info.id.is_some() && t.id == info.id) || t.tex_name == info.tex_name
-                })
-            });
-            let here = match here {
-                Some(at) => Some(at),
-                None => match pool
-                    .ok_or_else(|| "its file's textures could not be read".to_owned())
-                    .and_then(|pool| {
-                        crate::eff_export::extract_pool_texture(pool, donor_at, &info.tex_name)
-                            .and_then(|blob| {
-                                let merged = crate::eff_export::merge_pool_textures(
-                                    self.texture_pool.as_deref(),
-                                    vec![blob.clone()],
-                                )?;
-                                Ok((merged, blob))
-                            })
-                            .map_err(|e| format!("{e:#}"))
-                    }) {
-                    Ok((merged, blob)) => {
-                        self.carried_textures.push((info.clone(), blob));
-                        self.texture_pool = Some(merged);
-                        self.texture_pool_gen += 1;
-                        let ptcl = self.ptcl.as_mut().ok_or("no file open")?;
-                        ptcl.bntx_textures.push(info.clone());
-                        Some(ptcl.bntx_textures.len() - 1)
-                    }
-                    Err(e) => {
-                        error = Some(format!("texture {}: {e}", info.tex_name));
-                        None
-                    }
-                },
+            let here = match self.carry_texture(info, donor_at, pool) {
+                Ok(at) => Some(at),
+                Err(e) => {
+                    error = Some(format!("texture {}: {e}", info.tex_name));
+                    None
+                }
             };
             renumber.push((donor_at, here));
         }
@@ -689,13 +736,31 @@ impl EffEditor {
             set_name: set.name.clone(),
             name: part.to_owned(),
             index,
+            textures: Vec::new(),
         })
+    }
+
+    /// Which part of which file a part of the open file is: where it came from when it was
+    /// itself added, else its own place.
+    pub(super) fn origin_of(&mut self, set_idx: usize, em: &EmitterDef) -> Option<PartOrigin> {
+        if let Some(origin) = self.part_origins.get(&(set_idx, em.source_idx)) {
+            return Some(origin.clone());
+        }
+        let set_name = self.ptcl.as_ref()?.emitter_sets.get(set_idx)?.name.clone();
+        let name = self.pristine.get(set_idx)?.get(em.source_idx)?.name.clone();
+        let borrowed = self.borrowed_origin(set_idx, &name, em.source_idx);
+        Some(borrowed.unwrap_or(PartOrigin {
+            file: self.loaded_rel().unwrap_or_default(),
+            set_name,
+            name,
+            index: em.source_idx,
+            textures: Vec::new(),
+        }))
     }
 
     /// A part of the open file, as a pick for the effect playing `into`.
     fn pick_here(&mut self, into: usize, set_idx: usize, part: usize) -> Option<PartPick<'static>> {
         let set = self.ptcl.as_ref()?.emitter_sets.get(set_idx)?;
-        let set_name = set.name.clone();
         let em = set.emitters.get(part)?.clone();
         let label = part_list_names(
             &set.emitters
@@ -711,19 +776,11 @@ impl EffEditor {
             .get(set_idx)?
             .get(em.source_idx)?
             .to_def(em.source_idx);
-        let origin = match self.part_origins.get(&(set_idx, em.source_idx)) {
-            // Itself added from elsewhere: from where it came from.
-            Some(origin) => Some(origin.clone()),
-            None if set_idx == into => None,
-            None => Some(
-                self.borrowed_origin(set_idx, &file_part.name, em.source_idx)
-                    .unwrap_or(PartOrigin {
-                        file: self.loaded_rel().unwrap_or_default(),
-                        set_name,
-                        name: file_part.name.clone(),
-                        index: em.source_idx,
-                    }),
-            ),
+        let added = self.part_origins.contains_key(&(set_idx, em.source_idx));
+        let origin = if added || set_idx != into {
+            Some(self.origin_of(set_idx, &em)?)
+        } else {
+            None
         };
         Some(PartPick {
             name: em.name.clone(),
@@ -768,6 +825,7 @@ impl EffEditor {
                             set_name: set.name.clone(),
                             name: em.name.clone(),
                             index: part,
+                            textures: Vec::new(),
                         }),
                         part: em,
                         textures: Some((
@@ -833,6 +891,7 @@ impl EffEditor {
                 set_name: set.name.clone(),
                 name: em.name.clone(),
                 index: starter.index,
+                textures: Vec::new(),
             }),
             part: em,
             textures: Some((
@@ -852,12 +911,7 @@ impl EffEditor {
         set_idx: usize,
         slot: &crate::mod_project::EmitterSlot,
     ) -> Option<EmitterDef> {
-        let origin = PartOrigin {
-            file: slot.source_file.clone(),
-            set_name: slot.source_set.clone(),
-            name: slot.source_name.clone(),
-            index: slot.source_idx,
-        };
+        let origin = PartOrigin::of(slot);
         if let Some((&(_, at), _)) = self
             .part_origins
             .iter()
@@ -926,6 +980,9 @@ impl EffEditor {
             }
         };
         let origin = pick.origin.take()?;
+        for texture in &origin.textures {
+            self.give_texture(&mut pick, texture)?;
+        }
         let snapshots = self.pristine.get_mut(set_idx)?;
         snapshots.push(EmitterSnapshot::of(&pick.file_part));
         let at = snapshots.len() - 1;
@@ -933,6 +990,36 @@ impl EffEditor {
         let mut em = pick.part;
         em.source_idx = at;
         Some(em)
+    }
+
+    /// Point a part being added at a texture it was copied with, brought in when it is not here.
+    fn give_texture(
+        &mut self,
+        pick: &mut PartPick,
+        texture: &crate::mod_project::SlotTexture,
+    ) -> Option<()> {
+        let named = |textures: &[TextureInfo]| {
+            let at = textures.iter().position(|t| t.tex_name == texture.name)?;
+            Some((at, textures[at].clone()))
+        };
+        let here = if self.is_open_file(&texture.file) {
+            named(&self.ptcl.as_ref()?.bntx_textures)?.0
+        } else {
+            let file = self.part_file(&texture.file)?;
+            let (at, info) = named(&file.loaded.ptcl.bntx_textures)?;
+            let pool = file.loaded.texture_pool.as_deref();
+            self.carry_texture(&info, at, pool).ok()?
+        };
+        let id = self.ptcl.as_ref()?.bntx_textures.get(here)?.id;
+        for em in [&mut pick.part, &mut pick.file_part] {
+            if texture.slot == 0 {
+                em.texture_index = Some(here as u32);
+            } else {
+                let guid = TEXTURE_SLOT_IDS.get(texture.slot)?;
+                set_attr(em, guid, AttrValue::UInt(id?));
+            }
+        }
+        Some(())
     }
 
     /// The Add part window, while it is open.
@@ -984,11 +1071,22 @@ impl EffEditor {
             .get(self.selected_entry.unwrap_or(usize::MAX))
             .map(|e| e.set_idx);
         let selected_part = ptcl.emitter_sets.get(set_idx).and_then(|set| {
-            let names: Vec<&str> = set.emitters.iter().map(|e| e.name.as_str()).collect();
-            let depths: Vec<u8> = set.emitters.iter().map(|e| e.depth).collect();
-            let i = self.selected_emitter.min(names.len().checked_sub(1)?);
-            let can = depths[i] == 0 && children_of(&depths, i) < crate::eff_validate::MAX_CHILDREN;
-            Some((part_list_names(&names)[i].clone(), can))
+            let tree = PartTree::of(&set.emitters);
+            let i = self.selected_emitter.min(tree.len().checked_sub(1)?);
+            let full = tree.children(i).len() >= crate::eff_validate::MAX_CHILDREN;
+            let cannot = match tree.parent(i) {
+                Some(parent) => Some(format!(
+                    "{} is itself made from {}, and the game plays one level of child parts",
+                    tree.name(i),
+                    tree.name(parent)
+                )),
+                None => full.then(|| "One part makes at most 16".to_owned()),
+            };
+            let shown = match tree.parent(i) {
+                Some(_) => tree.path(i),
+                None => tree.counted(i),
+            };
+            Some((shown, tree.name(i).to_owned(), cannot))
         });
 
         let replaced: Vec<(String, String)> = self
@@ -1040,25 +1138,24 @@ impl EffEditor {
                         }
                     }
                 });
-                if let Some((name, can)) = &selected_part {
+                if let Some((shown, name, cannot)) = &selected_part {
                     ui.horizontal_wrapped(|ui| {
                         ui.radio_value(&mut picker.made_from, false, "On its own")
                             .on_hover_text("A part of the effect like the others");
                         let made = ui.add_enabled(
-                            *can,
-                            egui::RadioButton::new(picker.made_from, format!("Made from {name}")),
+                            cannot.is_none(),
+                            egui::RadioButton::new(picker.made_from, format!("Made from {shown}")),
                         );
                         if made.clicked() {
                             picker.made_from = true;
                         }
                         made.on_hover_text(format!(
-                            "Its particles come out of the particles of {name}"
+                            "A child part of {name}: its particles come out of the particles of \
+                             {name}"
                         ))
-                        .on_disabled_hover_text(
-                            "Only a part on its own can make parts, and one part makes at most 16",
-                        );
+                        .on_disabled_hover_text(cannot.as_deref().unwrap_or_default());
                     });
-                    if !*can {
+                    if cannot.is_some() {
                         picker.made_from = false;
                     }
                 }
@@ -1122,13 +1219,30 @@ impl EffEditor {
                                     .id_salt(("add_part_group", shared, &group.raw))
                                     .default_open(is_open)
                                     .open((!query.trim().is_empty()).then_some(true));
+                                    let listed: Vec<usize> = rows.iter().map(|r| r.part).collect();
                                     let response = header.show(ui, |ui| {
                                         for row in rows {
                                             shown += 1;
+                                            // Under the part it is made from; a search that
+                                            // leaves that one out names it on the row.
+                                            let parent = group.tree.parent(row.part);
+                                            let under = parent.is_some_and(|p| listed.contains(&p));
+                                            let label = match (parent, under) {
+                                                (Some(_), false) => group.tree.path(row.part),
+                                                _ => group.tree.counted(row.part),
+                                            };
                                             // One row, picture and name, as the texture picker's.
                                             let background = ui.painter().add(egui::Shape::Noop);
                                             let drawn =
                                                 ui.horizontal(|ui| {
+                                                    if under {
+                                                        part_tree::listed_lines(
+                                                            ui,
+                                                            &group.tree,
+                                                            row.part,
+                                                            &listed,
+                                                        );
+                                                    }
                                                     let index = row.texture.unwrap_or(usize::MAX);
                                                     let name =
                                                         names.get(index).map_or("", String::as_str);
@@ -1157,9 +1271,16 @@ impl EffEditor {
                                                 .ok(),
                                             }
                                                     });
+                                                    // In the colour a list's names have: a
+                                                    // label's own reads as greyed out.
+                                                    let colour =
+                                                        ui.visuals().widgets.inactive.text_color();
                                                     ui.add(
-                                                        egui::Label::new(&row.label)
-                                                            .selectable(false),
+                                                        egui::Label::new(
+                                                            egui::RichText::new(label)
+                                                                .color(colour),
+                                                        )
+                                                        .selectable(false),
                                                     );
                                                 });
                                             let rect = drawn
@@ -1188,10 +1309,11 @@ impl EffEditor {
                                                 );
                                             }
                                             let response = response.on_hover_text(format!(
-                                                "{} of {}{}",
+                                                "{} of {}{}{}",
                                                 row.raw,
                                                 group.raw,
-                                                if shared { ", shared effects" } else { "" }
+                                                if shared { ", shared effects" } else { "" },
+                                                row.around,
                                             ));
                                             if response.clicked() {
                                                 picked = Some(if shared {
@@ -1519,6 +1641,67 @@ mod tests {
         }
         assert_eq!(names(&editor, 0), ["a0@0", "b0@0", "a1@0"]);
         assert!(editor.add_part.is_none());
+    }
+
+    /// The picker lists a part under the one it is made from, joined to it, in the colour a
+    /// list's names have; a search that leaves that one out names it on the row.
+    #[test]
+    fn the_picker_lists_a_child_under_its_part() {
+        use super::super::part_tree::tests::{editor_with, text_rect, texts};
+        let mut editor = editor_with(&[
+            ("dash", &[("clock1", 0), ("trace1", 1), ("flare1", 0)]),
+            ("jump", &[("ring1", 0), ("wave1", 1)]),
+        ]);
+        editor.shared_parts = SharedFile::Failed("none here".into());
+        let mut drawn = |search: &str, selected: usize| {
+            editor.selected_emitter = selected;
+            editor.open_add_part(0, egui::pos2(10.0, 10.0));
+            editor.add_part.as_mut().unwrap().search = search.into();
+            let context = egui::Context::default();
+            let mut shapes = Vec::new();
+            for _ in 0..20 {
+                let output = context.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| editor.draw_add_part(ui.ctx()),
+                );
+                shapes = output.shapes.into_iter().map(|s| s.shape).collect();
+            }
+            let colour = context
+                .style_of(egui::Theme::Dark)
+                .visuals
+                .widgets
+                .inactive
+                .text_color();
+            (shapes, colour)
+        };
+        let (shapes, colour) = drawn("", 0);
+        let parent = text_rect(&shapes, "Clock 1 (1)");
+        let child = text_rect(&shapes, "Trace 1");
+        assert!(child.left() > parent.left() + 8.0 && child.top() > parent.bottom() - 2.0);
+        fn painted(shapes: &[egui::Shape], wanted: &str) -> Option<egui::Color32> {
+            shapes.iter().find_map(|shape| match shape {
+                egui::Shape::Text(t) if t.galley.job.text == wanted => {
+                    Some(t.galley.job.sections[0].format.color)
+                }
+                egui::Shape::Vec(inner) => painted(inner, wanted),
+                _ => None,
+            })
+        }
+        assert_eq!(painted(&shapes, "Trace 1"), Some(colour));
+        // The Made from choice names the part and how many it has.
+        text_rect(&shapes, "Made from Clock 1 (1)");
+        let (shapes, _) = drawn("wave", 1);
+        text_rect(&shapes, "Ring 1 › Wave 1");
+        text_rect(&shapes, "Made from Clock 1 › Trace 1");
+        let mut all = Vec::new();
+        texts(&shapes, &mut all);
+        assert!(!all.iter().any(|(text, _)| text.starts_with("Ring 1 (")));
     }
 
     /// Made from the open part: one level down, after what it already makes; refused under a

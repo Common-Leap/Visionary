@@ -24,6 +24,7 @@
 // documented as applying to every spawn of the effect.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use egui::Ui;
@@ -37,7 +38,11 @@ use crate::game_link::GameLink;
 use crate::mod_project::{AuthoredEdit, EmitterFieldEdits, TransplantOp};
 
 mod add_part;
+mod part_clip;
+mod part_tree;
 use add_part::{AddPartPicker, AddedData, PartOrigin, SharedFile};
+use part_clip::{paste_state, PartClip};
+use part_tree::{part_lines, PartMenu, PartTree};
 
 /// A move that plays an effect, as the Effects page lists it.
 #[derive(Clone, Debug, PartialEq)]
@@ -590,6 +595,12 @@ pub struct EffEditor {
     shared_thumbs: TextureThumbs,
     /// The part being renamed in the part list, as (set, part, name typed so far).
     renaming: Option<(usize, usize, String)>,
+    /// The copied part, its text waiting to go on the system clipboard, why it cannot go to the
+    /// file it was last looked at with, and why the last paste did not go.
+    clip: Option<Arc<PartClip>>,
+    clip_publish: Option<String>,
+    clip_check: Option<(Option<PathBuf>, Option<String>)>,
+    paste_error: Option<String>,
     entries: Vec<EffEntry>,
     /// The moves that spawn each effect (hash40 of its name), and whether every move has been
     /// read yet.
@@ -794,6 +805,10 @@ impl Default for EffEditor {
             part_thumbs: TextureThumbs::default(),
             shared_thumbs: TextureThumbs::default(),
             renaming: None,
+            clip: None,
+            clip_publish: None,
+            clip_check: None,
+            paste_error: None,
             entries: Vec::new(),
             effect_uses: Default::default(),
             effect_uses_ready: false,
@@ -1038,6 +1053,99 @@ fn field_edits(em: &EmitterDef, pr: &EmitterSnapshot, tex_names: &[String]) -> E
         f.alpha0 = Some(em.alpha0_keys.iter().map(|k| [k.r, k.frame]).collect());
     }
     f
+}
+
+/// Put a part's saved edits on it. `tex_names` are the file's pool textures, in pool order.
+fn apply_field_edits(em: &mut EmitterDef, f: &EmitterFieldEdits, tex_names: &[String]) {
+    // The five named scalars predate the attribute table. Fold them in first, so a
+    // project saved by an older build lands on the same fields the table now owns and is
+    // re-recorded as `attrs` the next time the editor collects. `attrs` is applied after
+    // them and therefore wins where a project carries both.
+    if let Some(v) = f.emission_rate {
+        set_attr(em, "emission.rate", AttrValue::Float(v));
+    }
+    if let Some(v) = f.lifetime {
+        set_attr(em, "particle_data.life", AttrValue::Int(v.round() as i64));
+    }
+    if let Some(v) = f.scale {
+        // The old scalar tracked scale_x and applied its RATIO to the other two axes,
+        // which is what preserved authored anisotropy. Reproduce that here rather than
+        // writing v to all three, or reopening an old project would quietly square up
+        // every deliberately-flattened particle.
+        let base = attr_f32(em, "particle_scale.scale_x");
+        let (y, z) = (
+            attr_f32(em, "particle_scale.scale_y"),
+            attr_f32(em, "particle_scale.scale_z"),
+        );
+        let r = if base.abs() > 1e-6 { v / base } else { 1.0 };
+        set_attr(em, "particle_scale.scale_x", AttrValue::Float(v));
+        set_attr(
+            em,
+            "particle_scale.scale_y",
+            AttrValue::Float(if base.abs() > 1e-6 { y * r } else { v }),
+        );
+        set_attr(
+            em,
+            "particle_scale.scale_z",
+            AttrValue::Float(if base.abs() > 1e-6 { z * r } else { v }),
+        );
+    }
+    if let Some(v) = f.color_scale {
+        set_attr(em, "emitter_static.color_scale", AttrValue::Float(v));
+    }
+    if let Some(v) = f.emitter_scale {
+        set_attr(em, "emitter_info.scale_x", AttrValue::Float(v[0]));
+        set_attr(em, "emitter_info.scale_y", AttrValue::Float(v[1]));
+        set_attr(em, "emitter_info.scale_z", AttrValue::Float(v[2]));
+    }
+    for (id, value) in &f.attrs {
+        set_attr(em, id, *value);
+    }
+    for edit in &f.subsections {
+        let Some(section) = em.subsections.get_mut(edit.index) else {
+            continue;
+        };
+        if section.magic != edit.magic {
+            continue;
+        }
+        for (&offset, &value) in &edit.bytes {
+            if let Some(byte) = section.data.get_mut(offset) {
+                *byte = value;
+            }
+        }
+    }
+    let apply_keys = |dst: &mut Vec<ColorKey>, rows: &Vec<[f32; 4]>| {
+        for (k, row) in dst.iter_mut().zip(rows) {
+            k.r = row[0];
+            k.g = row[1];
+            k.b = row[2];
+            k.frame = row[3];
+        }
+    };
+    if let Some(rows) = &f.color0 {
+        apply_keys(&mut em.color0, rows);
+    }
+    if let Some(rows) = &f.color1 {
+        apply_keys(&mut em.color1, rows);
+    }
+    if let Some(rows) = &f.alpha0 {
+        for (k, row) in em.alpha0_keys.iter_mut().zip(rows) {
+            k.r = row[0];
+            k.frame = row[1];
+        }
+    }
+    if let Some(wanted) = &f.texture_name {
+        // A swap to a texture this file does not hold leaves the emitter showing what
+        // it actually samples, which is the truth. The edit itself is untouched — it
+        // may still resolve in the carrier, whose pool is assembled differently.
+        if let Some(i) = tex_names.iter().position(|n| n == wanted) {
+            em.texture_index = Some(i as u32);
+        }
+    }
+    // Older projects stored the friendly colour/key fields separately from the
+    // general attribute map. Fold them into the complete table so both editor views
+    // and the exporter observe the same final values.
+    effective_keys_to_attrs(em);
 }
 
 /// The half-open range covering an emitter and everything nested under it.
@@ -2290,6 +2398,7 @@ fn draw_attribute_groups(
     filter: &mut String,
     textures: &[TextureInfo],
     part: egui::Id,
+    parent: Option<&str>,
 ) -> bool {
     let table = crate::eff_attrs::table();
     ui.horizontal(|ui| {
@@ -2370,6 +2479,17 @@ fn draw_attribute_groups(
             (rows + r.len(), edited + e)
         })
     };
+    // What a part takes from the one it is made from means nothing on a part on its own: there
+    // its header says so, and how many of its switches are on.
+    let taken_on = part_tree::switches_on(em, &part_tree::taken_rows(em)).len();
+    let section_heading = |section: &str, taken: bool, rows: usize, edited: usize| match parent {
+        _ if !taken => heading(section, rows, edited),
+        Some(parent) => heading(&format!("Taken from {parent}"), rows, edited),
+        None if edited == 0 && taken_on > 0 => {
+            egui::RichText::new(format!("Only for a child part  ({rows}, {taken_on} on)"))
+        }
+        None => heading("Only for a child part", rows, edited),
+    };
     let mut draw_group = |ui: &mut Ui, group: &str, shown: &str, rows: &[usize], edited: usize| {
         // A filter opens every group holding a match: `default_open` alone only applied the
         // first time a group was seen, so groups closed before stayed closed.
@@ -2410,9 +2530,10 @@ fn draw_attribute_groups(
                 continue;
             }
             let (rows, edited) = totals(&present);
-            egui::CollapsingHeader::new(wrapped_header(
+            let taken = members.contains(&crate::eff_attrs::G_INHERIT);
+            let drawn = egui::CollapsingHeader::new(wrapped_header(
                 ui,
-                heading(section, rows, edited).strong(),
+                section_heading(section, taken, rows, edited).strong(),
             ))
             .id_salt(("attr_section", section, salt(edited)))
             .default_open(edited > 0)
@@ -2492,6 +2613,12 @@ fn draw_attribute_groups(
                              They are kept as the file has them.",
                 );
             });
+            if taken && parent.is_none() {
+                drawn.header_response.on_hover_text(
+                    "This part is not made from another, so the game reads none of these. They \
+                     are kept as the file has them.",
+                );
+            }
         }
     });
     if !needle.is_empty() && !changed {
@@ -2546,6 +2673,8 @@ impl EffEditor {
         self.missing_edits.clear();
         self.add_part = None;
         self.renaming = None;
+        self.paste_error = None;
+        self.clip_check = None;
         self.entries.clear();
         self.selected_entry = None;
         self.selected_emitter = 0;
@@ -3058,12 +3187,9 @@ impl EffEditor {
                         |em| match self.part_origins.get(&(set_idx, em.source_idx)) {
                             // Added from another effect or file: named as its file has it.
                             Some(origin) => crate::mod_project::EmitterSlot {
-                                source_idx: origin.index,
-                                source_name: origin.name.clone(),
                                 name: em.name.clone(),
                                 depth: em.depth,
-                                source_set: origin.set_name.clone(),
-                                source_file: origin.file.clone(),
+                                ..origin.slot()
                             },
                             None => crate::mod_project::EmitterSlot {
                                 source_idx: em.source_idx,
@@ -3318,96 +3444,7 @@ impl EffEditor {
                 continue;
             };
 
-            let f = &edit.fields;
-            // The five named scalars predate the attribute table. Fold them in first, so a
-            // project saved by an older build lands on the same fields the table now owns and is
-            // re-recorded as `attrs` the next time the editor collects. `attrs` is applied after
-            // them and therefore wins where a project carries both.
-            if let Some(v) = f.emission_rate {
-                set_attr(em, "emission.rate", AttrValue::Float(v));
-            }
-            if let Some(v) = f.lifetime {
-                set_attr(em, "particle_data.life", AttrValue::Int(v.round() as i64));
-            }
-            if let Some(v) = f.scale {
-                // The old scalar tracked scale_x and applied its RATIO to the other two axes,
-                // which is what preserved authored anisotropy. Reproduce that here rather than
-                // writing v to all three, or reopening an old project would quietly square up
-                // every deliberately-flattened particle.
-                let base = attr_f32(em, "particle_scale.scale_x");
-                let (y, z) = (
-                    attr_f32(em, "particle_scale.scale_y"),
-                    attr_f32(em, "particle_scale.scale_z"),
-                );
-                let r = if base.abs() > 1e-6 { v / base } else { 1.0 };
-                set_attr(em, "particle_scale.scale_x", AttrValue::Float(v));
-                set_attr(
-                    em,
-                    "particle_scale.scale_y",
-                    AttrValue::Float(if base.abs() > 1e-6 { y * r } else { v }),
-                );
-                set_attr(
-                    em,
-                    "particle_scale.scale_z",
-                    AttrValue::Float(if base.abs() > 1e-6 { z * r } else { v }),
-                );
-            }
-            if let Some(v) = f.color_scale {
-                set_attr(em, "emitter_static.color_scale", AttrValue::Float(v));
-            }
-            if let Some(v) = f.emitter_scale {
-                set_attr(em, "emitter_info.scale_x", AttrValue::Float(v[0]));
-                set_attr(em, "emitter_info.scale_y", AttrValue::Float(v[1]));
-                set_attr(em, "emitter_info.scale_z", AttrValue::Float(v[2]));
-            }
-            for (id, value) in &f.attrs {
-                set_attr(em, id, *value);
-            }
-            for edit in &f.subsections {
-                let Some(section) = em.subsections.get_mut(edit.index) else {
-                    continue;
-                };
-                if section.magic != edit.magic {
-                    continue;
-                }
-                for (&offset, &value) in &edit.bytes {
-                    if let Some(byte) = section.data.get_mut(offset) {
-                        *byte = value;
-                    }
-                }
-            }
-            let apply_keys = |dst: &mut Vec<ColorKey>, rows: &Vec<[f32; 4]>| {
-                for (k, row) in dst.iter_mut().zip(rows) {
-                    k.r = row[0];
-                    k.g = row[1];
-                    k.b = row[2];
-                    k.frame = row[3];
-                }
-            };
-            if let Some(rows) = &f.color0 {
-                apply_keys(&mut em.color0, rows);
-            }
-            if let Some(rows) = &f.color1 {
-                apply_keys(&mut em.color1, rows);
-            }
-            if let Some(rows) = &f.alpha0 {
-                for (k, row) in em.alpha0_keys.iter_mut().zip(rows) {
-                    k.r = row[0];
-                    k.frame = row[1];
-                }
-            }
-            if let Some(wanted) = &f.texture_name {
-                // A swap to a texture this file does not hold leaves the emitter showing what
-                // it actually samples, which is the truth. The edit itself is untouched — it
-                // may still resolve in the carrier, whose pool is assembled differently.
-                if let Some(i) = tex_names.iter().position(|n| n == wanted) {
-                    em.texture_index = Some(i as u32);
-                }
-            }
-            // Older projects stored the friendly colour/key fields separately from the
-            // general attribute map. Fold them into the complete table so both editor views
-            // and the exporter observe the same final values.
-            effective_keys_to_attrs(em);
+            apply_field_edits(em, &edit.fields, &tex_names);
         }
     }
 
@@ -3908,10 +3945,7 @@ impl EffEditor {
         } else {
             ("an edit".to_owned(), None)
         };
-        let part = part.and_then(|i| {
-            let names: Vec<&str> = after.emitters.iter().map(|e| e.name.as_str()).collect();
-            part_list_names(&names).get(i).cloned()
-        });
+        let part = part.map(|i| PartTree::of(&after.emitters).path(i));
         let effect = before
             .selected_entry
             .filter(|i| {
@@ -4190,10 +4224,7 @@ impl EffEditor {
             .ptcl
             .as_ref()
             .and_then(|p| p.emitter_sets.get(set_idx))
-            .and_then(|set| {
-                let names: Vec<&str> = set.emitters.iter().map(|e| e.name.as_str()).collect();
-                part_list_names(&names).get(part).cloned()
-            })
+            .map(|set| PartTree::of(&set.emitters).path(part))
             .unwrap_or_else(|| "part".to_owned());
         let effect = self
             .selected_entry
@@ -4478,8 +4509,10 @@ impl EffEditor {
         let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
         self.history_begin_frame(pointer_down, Instant::now());
         let rev = self.edit_rev;
+        self.part_keys(ui.ctx());
         self.draw_page_right(ui, link);
         self.draw_add_part(ui.ctx());
+        self.publish_clip(ui.ctx());
         if self.edit_rev != rev {
             self.history_note_edit(Instant::now());
         }
@@ -5375,6 +5408,7 @@ impl EffEditor {
         }
         // Each effect keeps the part last picked in it for the session.
         self.remember_picks();
+        self.paste_error = None;
         self.selected_entry = Some(i);
         self.selected_emitter = self
             .entries
@@ -5653,6 +5687,8 @@ impl EffEditor {
             })
             .unwrap_or_default();
         let mut open_add: Option<egui::Pos2> = None;
+        let clip = self.clip.clone();
+        let clip_blocked = self.clip_blocked();
         let Some(ptcl) = self.ptcl.as_mut() else {
             return;
         };
@@ -5665,80 +5701,116 @@ impl EffEditor {
         if self.pristine.get(set_idx).is_none() {
             return;
         }
-        let part_names: Vec<&str> = set.emitters.iter().map(|em| em.name.as_str()).collect();
-        let part_names = part_list_names(&part_names);
+        let tree = PartTree::of(&set.emitters);
+        let file_names: Vec<String> = set.emitters.iter().map(|em| em.name.clone()).collect();
         // Emitter tabs. Edited ones carry a dot and are tinted: a set can have twenty
         // emitters, and without a marker the only way to find the two you changed was to
         // click through all of them.
-        let tab = |i: usize, em: &EmitterDef| {
-            let name = &part_names[i];
-            let moved = moved.get(i).copied().unwrap_or(false);
-            let text = if edited.contains(&i) || moved {
+        let marked = |i: usize| edited.contains(&i) || moved.get(i).copied().unwrap_or(false);
+        let tab_text = |i: usize, name: String| {
+            if marked(i) {
                 egui::RichText::new(format!("{name} •"))
                     .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
             } else {
                 egui::RichText::new(name)
-            };
+            }
+        };
+        let tab = |i: usize, em: &EmitterDef| {
             let hover = format!(
-                "{}{}\n\nOne part of the effect. Tick \"Show only this part\" to see which.",
+                "{}{}{}\n\nOne part of the effect. Tick \"Show only this part\" to see which.",
                 em.name,
+                tree.hover(i, em),
                 notes.get(i).map(String::as_str).unwrap_or_default(),
             );
-            (text, hover)
+            (tab_text(i, tree.counted(i)), hover)
         };
-        // At most two rows of tabs; more parts than that are picked from a list, so the settings
-        // below keep their room in a small window.
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        let tabs_width: f32 = part_names
-            .iter()
-            .map(|name| {
-                ui.painter()
-                    .layout_no_wrap(format!("{name} •"), font.clone(), egui::Color32::WHITE)
-                    .size()
-                    .x
-                    + 2.0 * ui.spacing().button_padding.x
-                    + ui.spacing().item_spacing.x
+        // At most two rows of tabs, and few lines of parts under parts; more parts than that are
+        // picked from a list, so the settings below keep their room in a small window.
+        let button = egui::TextStyle::Button;
+        let mut widths: Vec<f32> = (0..tree.len())
+            .map(|i| {
+                let text = format!("{} •", tree.counted(i));
+                part_tree::button_width(ui, &text, button.clone())
             })
-            .sum();
-        if tabs_width <= 2.0 * ui.available_width() {
-            ui.horizontal_wrapped(|ui| {
-                for (i, em) in set.emitters.iter().enumerate() {
-                    let (text, hover) = tab(i, em);
-                    if ui
-                        .selectable_label(self.selected_emitter == i, text)
-                        .on_hover_text(hover)
-                        .clicked()
-                    {
-                        self.selected_emitter = i;
-                    }
+            .collect();
+        let mut depths: Vec<u8> = (0..tree.len()).map(|i| tree.depth(i)).collect();
+        for label in ["Add part", "Paste"] {
+            widths.push(part_tree::button_width(ui, label, button.clone()));
+            depths.push(0);
+        }
+        let gap = ui.spacing().item_spacing;
+        let line = ui.spacing().interact_size.y + gap.y;
+        let places = part_tree::tab_places(&widths, &depths, ui.available_width(), gap.x);
+        let mut picked: Option<usize> = None;
+        let mut action: Option<(usize, part_tree::PartAction)> = None;
+        let menu = |part: usize| PartMenu {
+            set_idx,
+            part,
+            tree: &tree,
+            file_name: file_names.get(part).map_or("", String::as_str),
+            edited: edited.contains(&part),
+            clip: clip.as_deref(),
+            clip_blocked: clip_blocked.as_deref(),
+        };
+        let paste = paste_state(
+            clip.as_deref(),
+            clip_blocked.as_deref(),
+            &tree,
+            self.selected_emitter,
+            false,
+        );
+        let (add, paste_button) = if places.rows <= 2
+            && places.lines <= part_tree::tab_lines_allowed(ui.available_height(), line)
+        {
+            let tabs = set.emitters.iter().enumerate();
+            let tabs = tabs.map(|(i, em)| tab(i, em)).collect();
+            let (tabs, [add, paste]) = part_tree::draw_tabs(
+                ui,
+                &tree,
+                &places,
+                &widths,
+                tabs,
+                self.selected_emitter,
+                [("Add part", true), ("Paste", paste.is_ok())],
+            );
+            for (i, response) in tabs.iter().enumerate() {
+                if response.clicked() || response.secondary_clicked() {
+                    picked = Some(i);
                 }
-                let add = ui.small_button("Add part").on_hover_text(ADD_PART_HOVER);
-                if add.clicked() {
-                    open_add = Some(add.rect.left_bottom());
-                }
-            });
+                egui::Popup::context_menu(response)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        if let Some(does) = menu(i).show(ui, &mut self.renaming) {
+                            action = Some((i, does));
+                        }
+                    });
+            }
+            (add, paste)
         } else {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Part")
                     .on_hover_text(format!("{} parts", set.emitters.len()));
-                let current = set
-                    .emitters
-                    .get(self.selected_emitter)
-                    .map(|em| tab(self.selected_emitter, em).0)
-                    .unwrap_or_default();
+                let open = self.selected_emitter;
+                let current = match tree.parent(open) {
+                    Some(_) => tree.path(open),
+                    None => tree.counted(open),
+                };
                 egui::ComboBox::from_id_salt(("part_picker", set_idx))
-                    .selected_text(current)
+                    .selected_text(tab_text(open, current))
                     .height(420.0)
                     .show_ui(ui, |ui| {
                         for (i, em) in set.emitters.iter().enumerate() {
                             let (text, hover) = tab(i, em);
-                            if ui
-                                .selectable_label(self.selected_emitter == i, text)
-                                .on_hover_text(hover)
-                                .clicked()
-                            {
-                                self.selected_emitter = i;
-                            }
+                            ui.horizontal(|ui| {
+                                part_lines(ui, &tree, i);
+                                if ui
+                                    .selectable_label(self.selected_emitter == i, text)
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    picked = Some(i);
+                                }
+                            });
                         }
                     });
                 let count = set.emitters.len();
@@ -5747,7 +5819,7 @@ impl EffEditor {
                     .on_hover_text("The part before")
                     .clicked()
                 {
-                    self.selected_emitter -= 1;
+                    picked = Some(self.selected_emitter - 1);
                 }
                 if ui
                     .add_enabled(
@@ -5757,13 +5829,31 @@ impl EffEditor {
                     .on_hover_text("The next part")
                     .clicked()
                 {
-                    self.selected_emitter += 1;
+                    picked = Some(self.selected_emitter + 1);
                 }
-                let add = ui.small_button("Add part").on_hover_text(ADD_PART_HOVER);
-                if add.clicked() {
-                    open_add = Some(add.rect.left_bottom());
-                }
-            });
+                let add = ui.small_button("Add part");
+                let paste = ui.add_enabled(paste.is_ok(), egui::Button::new("Paste").small());
+                (add, paste)
+            })
+            .inner
+        };
+        let add = add.on_hover_text(ADD_PART_HOVER);
+        if add.clicked() {
+            open_add = Some(add.rect.left_bottom());
+        }
+        let pasting = match &paste {
+            Ok(hover) => paste_button.on_hover_text(hover),
+            Err(why) => paste_button.on_disabled_hover_text(why),
+        };
+        if pasting.clicked() {
+            action = Some((self.selected_emitter, part_tree::PartAction::Paste));
+        }
+        if let Some(i) = picked {
+            self.selected_emitter = i;
+            self.paste_error = None;
+        }
+        if let Some(error) = &self.paste_error {
+            ui.colored_label(egui::Color32::from_rgb(230, 110, 110), error);
         }
         if let Some(at) = open_add {
             self.open_add_part(set_idx, at);
@@ -5776,7 +5866,7 @@ impl EffEditor {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .checkbox(&mut solo, "Show only this part")
-                .on_hover_text("Hide the effect's other parts in the view while you edit this one.")
+                .on_hover_text(tree.solo_hover(self.selected_emitter))
                 .changed()
             {
                 self.solo_selected = solo.then(|| entry_name.clone());
@@ -5793,10 +5883,30 @@ impl EffEditor {
             {
                 reset_part = true;
             }
+            if tree.len() > 0 {
+                let part = self.selected_emitter;
+                let config = egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+                egui::containers::menu::MenuButton::from_button(egui::Button::new("⋯").small())
+                    .config(config)
+                    .ui(ui, |ui| {
+                        if let Some(does) = menu(part).show(ui, &mut self.renaming) {
+                            action = Some((part, does));
+                        }
+                    })
+                    .0
+                    .on_hover_text("Copy, paste, duplicate, remove or move this part");
+            }
         });
+        if let Some((part, does)) = action {
+            self.part_action(set_idx, part, does);
+        }
         ui.separator();
 
         let ei = self.selected_emitter;
+        // Read again: the part menu may have changed the list.
+        let tree = self.part_tree(set_idx);
+        let parent = tree.parent(ei).map(|parent| tree.name(parent).to_owned());
         if part_mut(&mut self.ptcl, &self.pristine, set_idx, ei).is_none() {
             ui.colored_label(egui::Color32::GRAY, "This effect has no parts.");
             return;
@@ -5971,6 +6081,12 @@ impl EffEditor {
                         }
                     });
 
+                // What it takes from the part it is made from, over the colours it may take in
+                // place of its own.
+                if let Some(parent) = &parent {
+                    changed |= part_tree::draw_taken(ui, em, pr, parent, &textures);
+                }
+
                 let mut key_table = |ui: &mut Ui,
                                      label: &str,
                                      hover: &str,
@@ -6115,8 +6231,15 @@ impl EffEditor {
                 ui.add_space(10.0);
                 ui.separator();
                 let part = egui::Id::unique((self.loaded_path.clone(), set_idx, em.source_idx));
-                let attributes_changed =
-                    draw_attribute_groups(ui, em, pr, &mut self.attr_filter, &textures, part);
+                let attributes_changed = draw_attribute_groups(
+                    ui,
+                    em,
+                    pr,
+                    &mut self.attr_filter,
+                    &textures,
+                    part,
+                    parent.as_deref(),
+                );
                 if attributes_changed {
                     attrs_to_effective_keys(em);
                     changed = true;
@@ -6361,6 +6484,8 @@ impl EffEditor {
                     .collect()
             })
             .unwrap_or_default();
+        let clip = self.clip.clone();
+        let clip_blocked = self.clip_blocked();
         let pristine_set: &[EmitterSnapshot] = self.pristine.get(set_idx).map_or(&[], |p| p);
         let Some(set) = self
             .ptcl
@@ -6370,15 +6495,8 @@ impl EffEditor {
             return;
         };
         let renaming = &mut self.renaming;
-        let mut rename: Option<(usize, String)> = None;
-
-        // Collected and applied after the loop: every one of these changes the list being
-        // iterated.
-        let mut duplicate: Option<usize> = None;
-        let mut remove: Option<usize> = None;
-        let mut move_by: Option<(usize, isize)> = None;
-        let mut nest: Option<(usize, i8)> = None;
-        let mut reset: Option<usize> = None;
+        // Done after the loop: it changes the list being drawn.
+        let mut action: Option<(usize, part_tree::PartAction)> = None;
         let mut changed = false;
 
         let table = crate::eff_attrs::table();
@@ -6415,8 +6533,7 @@ impl EffEditor {
         ];
         let selected = self.selected_emitter;
         let mut select: Option<usize> = None;
-        let part_names: Vec<&str> = set.emitters.iter().map(|em| em.name.as_str()).collect();
-        let part_names = part_list_names(&part_names);
+        let tree = PartTree::of(&set.emitters);
         egui::Grid::new(("parts_table", set_idx))
             .num_columns(COLUMNS.len() + 2)
             .striped(true)
@@ -6461,111 +6578,27 @@ impl EffEditor {
                     title(ui, title_text).on_hover_text(doc);
                 }
                 ui.end_row();
-                let count = set.emitters.len();
-                let depths: Vec<u8> = set.emitters.iter().map(|e| e.depth).collect();
-                let copy_room: Vec<bool> = (0..count).map(|i| room_to_copy(&depths, i)).collect();
-                let nest_room: Vec<bool> = (0..count).map(|i| room_to_nest(&depths, i)).collect();
                 // The name field has to keep the menu open while it is typed in; every command
                 // closes the menu itself.
                 let menu_config = egui::containers::menu::MenuConfig::new()
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
                 for (i, em) in set.emitters.iter_mut().enumerate() {
+                    let menu = PartMenu {
+                        set_idx,
+                        part: i,
+                        tree: &tree,
+                        file_name: &em.name,
+                        edited: edited.contains(&i),
+                        clip: clip.as_deref(),
+                        clip_blocked: clip_blocked.as_deref(),
+                    };
+                    let mut asked = None;
                     egui::containers::menu::MenuButton::new("⋯")
                         .config(menu_config.clone())
-                        .ui(ui, |ui| {
-                            // The name in words, typed over in place: kept from the frame the menu
-                            // opened.
-                            if !matches!(renaming, Some((s, p, _)) if *s == set_idx && *p == i) {
-                                *renaming = Some((set_idx, i, part_words(&em.name)));
-                            }
-                            if let Some((_, _, typed)) = renaming.as_mut() {
-                                let field = ui
-                                    .add(egui::TextEdit::singleline(typed).desired_width(160.0))
-                                    .on_hover_text(format!(
-                                        "The part's name. Enter to keep it.\n\nIn the file: {}",
-                                        em.name
-                                    ));
-                                if field.lost_focus() && typed.trim() != part_words(&em.name) {
-                                    rename = Some((i, typed.clone()));
-                                    if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                                        ui.close();
-                                    }
-                                }
-                            }
-                            ui.separator();
-                            if ui
-                                .add_enabled(
-                                    edited.contains(&i),
-                                    egui::Button::new("Reset this part"),
-                                )
-                                .on_hover_text("Put this part back as the game has it")
-                                .clicked()
-                            {
-                                reset = Some(i);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui
-                                .add_enabled(copy_room[i], egui::Button::new("Copy"))
-                                .on_hover_text("Add another part just like this one")
-                                .on_disabled_hover_text(format!(
-                                    "The game holds at most {} parts made from one part",
-                                    crate::eff_validate::MAX_CHILDREN
-                                ))
-                                .clicked()
-                            {
-                                duplicate = Some(i);
-                                ui.close();
-                            }
-                            if ui
-                                .button("Remove")
-                                .on_hover_text("Stop this part from playing")
-                                .clicked()
-                            {
-                                remove = Some(i);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui
-                                .add_enabled(i > 0, egui::Button::new("Draw earlier"))
-                                .clicked()
-                            {
-                                move_by = Some((i, -1));
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(i + 1 < count, egui::Button::new("Draw later"))
-                                .clicked()
-                            {
-                                move_by = Some((i, 1));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui
-                            .add_enabled(
-                                nest_room[i],
-                                egui::Button::new("Make from the part above"),
-                            )
-                            .on_hover_text(
-                                "Its particles come out of the particles of the part above",
-                            )
-                            .on_disabled_hover_text(
-                                "Only a part on its own, with nothing made from it, can be made \
-                                 from another, and one part makes at most 16",
-                            )
-                            .clicked()
-                        {
-                            nest = Some((i, 1));
-                            ui.close();
-                        }
-                            if em.depth > 0 && ui.button("Make on its own").clicked() {
-                                nest = Some((i, -1));
-                                ui.close();
-                            }
-                        });
+                        .ui(ui, |ui| asked = menu.show(ui, renaming));
                     ui.horizontal(|ui| {
-                        ui.add_space(em.depth as f32 * 12.0);
-                        let name = &part_names[i];
+                        part_lines(ui, &tree, i);
+                        let name = tree.counted(i);
                         // Marked as on the Look tab's part tabs.
                         let moved = moved.get(i).copied().unwrap_or(false);
                         let label = if edited.contains(&i) || moved {
@@ -6575,22 +6608,27 @@ impl EffEditor {
                             egui::RichText::new(name)
                         };
                         let place = notes.get(i).map(String::as_str).unwrap_or_default();
-                        let hover = if em.depth > 0 {
-                            format!(
-                                "{}{place}\n\nMade from the particles of the part above it",
-                                em.name
-                            )
-                        } else {
-                            format!("{}{place}", em.name)
-                        };
-                        if ui
+                        let hover = format!("{}{}{place}", em.name, tree.hover(i, em));
+                        let name = ui
                             .selectable_label(selected == i, label)
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
+                            .on_hover_text(hover);
+                        if name.clicked() {
                             select = Some(i);
                         }
+                        egui::Popup::context_menu(&name)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| asked = menu.show(ui, renaming).or(asked.take()));
                     });
+                    if let Some(does) = asked {
+                        action = Some((i, does));
+                    }
+                    // What it is made from, for a part made from another: the game reads its
+                    // timing by that part's particles, not by the effect's frames.
+                    let parent = tree.parent(i).map(|parent| tree.name(parent));
+                    let until = match parent {
+                        Some(parent) => format!("as long as each particle of {parent} lives"),
+                        None => "until the effect is removed".to_owned(),
+                    };
                     let once = attr(em, "emission.is_one_time").is_some_and(|v| v.as_bool());
                     // Whether the part stops is part of its Runs cell, and edited with it.
                     let once_was = pristine_set.get(em.source_idx).and_then(|p| {
@@ -6599,6 +6637,10 @@ impl EffEditor {
                     });
                     let stop_edited = once_was.is_some_and(|was| was != once);
                     for (id, _, _) in COLUMNS {
+                        let id = match (*id, parent) {
+                            ("emission.start", Some(_)) => &"emission.timing",
+                            _ => id,
+                        };
                         let index = crate::eff_attrs::index_of(id);
                         let current = index.and_then(|at| em.attrs.get(at).copied().flatten());
                         match (index, current) {
@@ -6611,6 +6653,7 @@ impl EffEditor {
                                     .filter(|was| !was.same(value));
                                 let runs = *id == "emission.duration";
                                 let start = *id == "emission.start";
+                                let timing = *id == "emission.timing";
                                 ui.push_id((i, *id), |ui| {
                                     if was.is_some() || (runs && stop_edited) {
                                         let tint = egui::Color32::from_rgb(0x60, 0x50, 0x20);
@@ -6631,6 +6674,25 @@ impl EffEditor {
                                             value = AttrValue::Int(shown - spawn);
                                         }
                                         (response.changed(), response)
+                                    } else if timing {
+                                        let mut shown = value.as_i64();
+                                        let response = ui
+                                            .add(
+                                                egui::DragValue::new(&mut shown)
+                                                    .speed(0.5)
+                                                    .range(0..=100)
+                                                    .clamp_existing_to_range(false)
+                                                    .suffix("%"),
+                                            )
+                                            .on_hover_text(format!(
+                                                "How far into the life of each particle of {} it \
+                                                 starts",
+                                                parent.unwrap_or_default()
+                                            ));
+                                        if response.changed() {
+                                            value = AttrValue::Int(shown);
+                                        }
+                                        (response.changed(), response)
                                     } else {
                                         attr_control(ui, &table[at], &mut value)
                                     };
@@ -6641,6 +6703,8 @@ impl EffEditor {
                                     let was_text = |was: AttrValue| {
                                         if start {
                                             (was.as_i64() + spawn).to_string()
+                                        } else if timing {
+                                            format!("{}%", was.as_i64())
                                         } else {
                                             attr_text(&table[at], was)
                                         }
@@ -6678,10 +6742,9 @@ impl EffEditor {
                                             if runs
                                                 && ui
                                                     .button("Keep running")
-                                                    .on_hover_text(
-                                                        "Keep making particles until the effect \
-                                                         is removed",
-                                                    )
+                                                    .on_hover_text(format!(
+                                                        "Keep making particles {until}"
+                                                    ))
                                                     .clicked()
                                             {
                                                 set_attr(
@@ -6709,15 +6772,15 @@ impl EffEditor {
                                         .add(egui::Label::new(text).sense(egui::Sense::click()))
                                         .on_hover_text(if stop_edited {
                                             format!(
-                                                "was {}. Keeps making particles until the effect \
-                                                 is removed. Right-click to reset or give it a \
-                                                 length.",
+                                                "was {}. Keeps making particles {until}. \
+                                                 Right-click to reset or give it a length.",
                                                 attr_text(&table[at], duration)
                                             )
                                         } else {
-                                            "Keeps making particles until the effect is removed. \
-                                             Right-click to give it a length."
-                                                .to_owned()
+                                            format!(
+                                                "Keeps making particles {until}. Right-click to \
+                                                 give it a length."
+                                            )
                                         });
                                     response.context_menu(|ui| {
                                         if stop_edited
@@ -6767,134 +6830,38 @@ impl EffEditor {
                 slot.source_name, slot.source_set, slot.source_file
             ));
         }
-        let add = ui.button("Add part").on_hover_text(ADD_PART_HOVER);
-        let open_add = add.clicked().then(|| add.rect.left_bottom());
-        let mut renamed: Option<String> = None;
-        if let Some((i, typed)) = rename {
-            let name = add_part::part_name_from_typed(&typed);
-            let taken: Vec<&str> = set
-                .emitters
-                .iter()
-                .enumerate()
-                .filter(|(k, _)| *k != i)
-                .map(|(_, e)| e.name.as_str())
-                .collect();
-            let name = add_part::unique_part_name(&name, &taken);
-            if let Some(em) = set
-                .emitters
-                .get_mut(i)
-                .filter(|e| !name.is_empty() && e.name != name)
-            {
-                renamed = Some(format!(
-                    "Rename {} to {}",
-                    part_words(&em.name),
-                    part_words(&name)
-                ));
-                em.name = name;
-                changed = true;
+        let paste = paste_state(
+            clip.as_deref(),
+            clip_blocked.as_deref(),
+            &tree,
+            selected,
+            false,
+        );
+        let mut open_add = None;
+        ui.horizontal(|ui| {
+            let add = ui.button("Add part").on_hover_text(ADD_PART_HOVER);
+            open_add = add.clicked().then(|| add.rect.left_bottom());
+            let button = ui.add_enabled(paste.is_ok(), egui::Button::new("Paste"));
+            let button = match &paste {
+                Ok(hover) => button.on_hover_text(hover),
+                Err(why) => button.on_disabled_hover_text(why),
+            };
+            if button.clicked() {
+                action = Some((selected, part_tree::PartAction::Paste));
             }
-            self.renaming = None;
+        });
+        if let Some(error) = &self.paste_error {
+            ui.colored_label(egui::Color32::from_rgb(230, 110, 110), error);
         }
         if let Some(i) = select {
             self.selected_emitter = i;
             self.emitter_tab = EmitterTab::Attributes;
         }
-
-        // Every one of these operates on an emitter's whole SUBTREE, not on the one row. The
-        // list is flat but the emitters are a tree, and the nesting is carried by `depth` and
-        // position — so moving a parent without its children hands those children to whichever
-        // emitter ends up above them.
-        let mut select_copy = None;
-        if let Some(i) = duplicate {
-            let range = subtree(&set.emitters, i);
-            let mut copies: Vec<EmitterDef> = set.emitters[range.clone()].to_vec();
-            // Names are renamed against the list AS IT GROWS, so duplicating a parent with two
-            // identically-shaped children does not produce two emitters called the same thing.
-            let mut taken = set.emitters.clone();
-            for copy in copies.iter_mut() {
-                copy.name = unique_emitter_name(&copy.name, &taken);
-                // `source_idx` keeps pointing at the emitter this was copied FROM, so the copy
-                // is diffed against the same pristine values and the exporter knows what to
-                // clone. It is not the copy's position in the list.
-                taken.push(copy.clone());
-            }
-            if !copies.is_empty() {
-                let at = range.end;
-                set.emitters.splice(at..at, copies);
-                changed = true;
-                // The copy is what gets edited next.
-                select_copy = Some(at);
-            }
-        }
-        if let Some(i) = remove {
-            let range = subtree(&set.emitters, i);
-            if !range.is_empty() {
-                set.emitters.drain(range);
-                changed = true;
-            }
-        }
-        if let Some((i, delta)) = move_by {
-            let range = subtree(&set.emitters, i);
-            if !range.is_empty() {
-                let depth = set.emitters[i].depth;
-                if delta > 0 {
-                    // Swap places with the next sibling, taking both subtrees whole.
-                    let next = range.end;
-                    if set.emitters.get(next).is_some_and(|e| e.depth == depth) {
-                        let next_end = subtree(&set.emitters, next).end;
-                        set.emitters[range.start..next_end].rotate_left(range.len());
-                        changed = true;
-                    }
-                } else if range.start > 0 {
-                    // The row above is either the previous sibling's LAST descendant or this
-                    // emitter's parent. Walk back to the previous sibling's root; a parent
-                    // (shallower than us) means there is no earlier sibling to swap with.
-                    let prev = (0..range.start)
-                        .rev()
-                        .find(|&k| set.emitters[k].depth <= depth);
-                    if let Some(prev) = prev.filter(|&k| set.emitters[k].depth == depth) {
-                        set.emitters[prev..range.end].rotate_left(range.start - prev);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if let Some((i, delta)) = nest {
-            // At most one level deeper than the emitter above: any more and there is no emitter
-            // at the depth being asked for, and the exporter would clamp it back anyway.
-            let ceiling = if i == 0 {
-                0
-            } else {
-                set.emitters
-                    .get(i - 1)
-                    .map(|p| p.depth.saturating_add(1).min(1))
-                    .unwrap_or(0)
-            };
-            if let Some(root) = set.emitters.get(i) {
-                let old_depth = root.depth;
-                let new_depth = (old_depth as i16 + delta as i16).clamp(0, ceiling as i16) as u8;
-                let applied = new_depth as i16 - old_depth as i16;
-                // Nesting is a tree operation: descendants have to move by the same depth
-                // delta or the root leaves its children behind as siblings.
-                if shift_subtree_depth(&mut set.emitters, i, applied) {
-                    changed = true;
-                }
-            }
-        }
-        if let Some(at) = select_copy {
-            self.selected_emitter = at;
-        }
         if changed {
-            self.clamp_selected_emitter(set_idx);
             touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
-        if renamed.is_some() {
-            self.history.next_label = renamed;
-        }
-        if let Some(i) = reset {
-            self.history_close_step();
-            self.reset_part_fields(set_idx, i);
-            self.history.next_label = Some(self.reset_part_label(set_idx, i));
+        if let Some((i, does)) = action {
+            self.part_action(set_idx, i, does);
         }
         if let Some(at) = open_add {
             self.open_add_part(set_idx, at);
@@ -8112,14 +8079,9 @@ impl EffEditor {
             .as_ref()
             .and_then(|p| p.emitter_sets.get(set_idx))
             .map(|s| {
-                edited
-                    .iter()
-                    .map(|i| match s.emitters.get(*i) {
-                        Some(e) if !e.name.is_empty() => format!("{i}:{}", e.name),
-                        _ => format!("{i}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                let tree = PartTree::of(&s.emitters);
+                let names: Vec<String> = edited.iter().map(|i| tree.path(*i)).collect();
+                names.join(", ")
             })
             .unwrap_or_default();
         ui.add_space(4.0);
@@ -9841,7 +9803,7 @@ mod tests {
             let mut found = false;
             for _ in 0..2 {
                 let output = context.run_test_ui(egui::RawInput::default(), |ui| {
-                    draw_attribute_groups(ui, em, &pr, &mut filter, &[], egui::Id::NULL);
+                    draw_attribute_groups(ui, em, &pr, &mut filter, &[], egui::Id::NULL, None);
                 });
                 found = output
                     .shapes
@@ -9881,6 +9843,7 @@ mod tests {
                         &mut filter,
                         &[],
                         egui::Id::unique(part),
+                        None,
                     );
                 });
                 found = output
@@ -10585,7 +10548,7 @@ mod tests {
         let pr = EmitterSnapshot::of(&em);
         let mut filter = String::new();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL, None);
             let basics: Vec<usize> = BASIC_ATTRS
                 .iter()
                 .filter_map(|id| crate::eff_attrs::index_of(id))
@@ -10598,15 +10561,15 @@ mod tests {
         // bad index would surface.
         let mut filter = "e".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL, None);
         });
         let mut filter = "gravity".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL, None);
         });
         let mut filter = "no such attribute".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL, None);
         });
     }
 
