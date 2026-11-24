@@ -570,6 +570,7 @@ const OBJECT_WORDS: &[&str] = &[
     "rope", "power", "cursor", "reticle", "buddy", "rush", "coil", "metal", "blade", "hard",
     "knuckle", "leaf", "cutter", "death", "black", "hole", "thunder", "bird", "base", "barrel",
     "jet", "flower", "pot", "cannon", "spike", "spit", "stealth", "super", "crash", "tree", "big",
+    "huge", "pump",
 ];
 
 fn split_glued(word: &str) -> String {
@@ -1369,6 +1370,21 @@ pub fn call_detail(arguments: &[String]) -> String {
 #[cfg(test)]
 mod common_sense_tests {
     use super::*;
+
+    #[test]
+    fn object_names_read_as_words() {
+        for (symbol, name) in [
+            (
+                "BAYONETTA_GENERATE_ARTICLE_WICKEDWEAVELEG",
+                "Wicked weave leg",
+            ),
+            ("X_GENERATE_ARTICLE_HUGEFLAME", "Huge flame"),
+            ("X_GENERATE_ARTICLE_PUMPWATER", "Pump water"),
+            ("X_GENERATE_ARTICLE_CAPPY", "Cappy"),
+        ] {
+            assert_eq!(object_name(symbol), name);
+        }
+    }
 
     #[test]
     fn the_smash_release_check_is_a_when_and_game_values_read_as_words() {

@@ -1310,6 +1310,12 @@ fn editor_subsection_heading(ui: &mut Ui, title: &str, description: &str) {
         .on_hover_text(description);
 }
 
+/// An object's folder name in plain words: "hugeflame" is "Huge flame".
+fn plain_object_name(name: &str) -> String {
+    let symbol = format!("X_GENERATE_ARTICLE_{}", name.to_uppercase());
+    crate::move_nodes::plain::object_name(&symbol)
+}
+
 /// A heading for the resizable left sidebar. Unlike the main editor headings, this one must not
 /// report its full text width as an intrinsic minimum when the sidebar is intentionally clipped.
 fn sidebar_section_heading(ui: &mut Ui, title: &str, description: &str) {
@@ -2947,6 +2953,55 @@ fn tracked_header<R>(
         set_persistent_collapsing_open(ui, salt, !open);
     }
     response
+}
+
+/// The fighter list's groups while a project is open, and whether each starts open.
+const FIGHTER_GROUPS: [(&str, bool); 2] = [("project", true), ("rest", false)];
+
+/// A search opens the fighter groups that have matches, as the move list does for its
+/// categories, and puts them back as the user had them afterwards.
+#[derive(Debug, Default)]
+struct FighterGroups {
+    /// How they were just before the search began.
+    before_search: Option<[bool; 2]>,
+    /// Those the user toggled by hand during this search: it stops forcing them open.
+    touched: [bool; 2],
+}
+
+impl FighterGroups {
+    fn search(&mut self, ui: &Ui, searching: bool, has_matches: [bool; 2]) {
+        let before = match (searching, self.before_search) {
+            (false, None) => return,
+            (true, Some(before)) => before,
+            (true, None) => {
+                self.touched = [false; 2];
+                FIGHTER_GROUPS.map(|(key, default)| {
+                    persistent_collapsing_open(ui, ("fighter_group", key), default)
+                })
+            }
+            (false, Some(before)) => before,
+        };
+        self.before_search = searching.then_some(before);
+        for (n, (key, _)) in FIGHTER_GROUPS.iter().enumerate() {
+            if !searching {
+                set_persistent_collapsing_open(ui, ("fighter_group", *key), before[n]);
+            } else if has_matches[n] && !self.touched[n] {
+                set_persistent_collapsing_open(ui, ("fighter_group", *key), true);
+            }
+        }
+    }
+}
+
+/// One of [`FIGHTER_GROUPS`], drawn with the open state [`FighterGroups`] sets.
+fn fighter_group<R>(
+    ui: &mut Ui,
+    (key, default_open): (&str, bool),
+    title: String,
+    rows: impl FnOnce(&mut Ui) -> R,
+) -> egui::CollapsingResponse<R> {
+    let salt = ("fighter_group", key);
+    let header = egui::CollapsingHeader::new(title).id_salt(salt);
+    tracked_header(ui, salt, header, default_open, rows)
 }
 
 /// Allocate a scroll viewport from the space that remains in its parent rather than letting a
@@ -5482,11 +5537,9 @@ pub struct VisionaryApp {
     /// the donor (GitHub scripts, disk-cached) — not just moves already played/opened.
     use_scan: Option<UseScan>,
     fighter_search: String,
-    /// Open state of the "In this project" and "Everything else" groups captured just before
-    /// fighter search began, so clearing the search puts them back.
-    fighter_group_before_search: Option<[bool; 2]>,
-    /// Groups the user toggled by hand during this search; search stops forcing them open.
-    fighter_group_touched: [bool; 2],
+    fighter_groups: FighterGroups,
+    /// The Classic sidebar's Objects section is open.
+    objects_open: bool,
     /// Title of the open "Add fighter" popup, if any.
     add_fighter_popup: Option<String>,
     add_fighter_search: String,
@@ -6103,8 +6156,8 @@ impl VisionaryApp {
             downloaded_labels: HashMap::new(),
             use_scan: None,
             fighter_search: String::new(),
-            fighter_group_before_search: None,
-            fighter_group_touched: [false; 2],
+            fighter_groups: FighterGroups::default(),
+            objects_open: config_path(OBJECTS_OPEN_CONFIG_KEY).is_some_and(|path| path.is_file()),
             add_fighter_popup: None,
             add_fighter_search: String::new(),
             move_search: String::new(),
@@ -10185,7 +10238,7 @@ impl VisionaryApp {
                 ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
                 if !self.state.acmd_source.is_none() {
                     ui.label(
-                        egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
+                        egui::RichText::new(format!("from {}", self.script_origin_words()))
                             .small()
                             .color(egui::Color32::GRAY),
                     );
@@ -11552,14 +11605,24 @@ impl VisionaryApp {
 
         let available = ui.available_height();
         // Keep both lists proportional to the panel while retaining a usable minimum when the
-        // window is compressed below its normal height. With a fighter selected, a share goes
-        // to its Objects list below the moves.
-        let objects_height = if self.state.selected_fighter.is_some() {
-            ((available - 80.0) * 0.25).max(60.0)
+        // window is compressed below its normal height. With a fighter selected, its Objects
+        // below the moves take a row, more for what an open one's script says of itself, and a
+        // share while they are open.
+        let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+        let objects_height = match self.objects_open {
+            true => ((available - 80.0) * 0.25).max(60.0),
+            false => 0.0,
+        };
+        let objects_rows = if self.open_article.is_some() {
+            3.0
         } else {
             0.0
         };
-        let half = ((available - 80.0 - objects_height) / 2.0).max(1.0);
+        let objects_space = match self.state.selected_fighter {
+            Some(_) => row * (objects_rows + 0.5) + objects_height,
+            None => 0.0,
+        };
+        let half = ((available - 80.0 - objects_space) / 2.0).max(1.0);
 
         let mut restore_forgotten = false;
         let mut forget_fighter: Option<crate::mod_project::ProjectFighter> = None;
@@ -11623,23 +11686,9 @@ impl VisionaryApp {
                 let (project_rows, other_rows): (Vec<&FighterRow>, Vec<&FighterRow>) =
                     rows.iter().partition(|row| !row.reasons.is_empty());
 
-                // Searching force-opens any group with matches (as the move list does for its
-                // categories) and puts the groups back as the user had them afterwards.
-                const GROUPS: [(&str, bool); 2] = [("project", true), ("rest", false)];
                 let has_matches = [!project_rows.is_empty(), !other_rows.is_empty()];
-                if fighter_searching {
-                    if self.fighter_group_before_search.is_none() {
-                        self.fighter_group_touched = [false; 2];
-                        self.fighter_group_before_search = Some(GROUPS.map(|(key, default)| {
-                            persistent_collapsing_open(ui, ("fighter_group", key), default)
-                        }));
-                    }
-                } else if let Some(before) = self.fighter_group_before_search.take() {
-                    for (n, (key, _)) in GROUPS.iter().enumerate() {
-                        set_persistent_collapsing_open(ui, ("fighter_group", *key), before[n]);
-                    }
-                    self.fighter_group_touched = [false; 2];
-                }
+                self.fighter_groups
+                    .search(ui, fighter_searching, has_matches);
 
                 let active = self.active_key();
                 let mut pick_character: Option<crate::character::CharacterKey> = None;
@@ -11647,88 +11696,81 @@ impl VisionaryApp {
                     crate::character::CharacterKey,
                     crate::character::CharacterPage,
                 )> = None;
-                for (n, (key, default_open)) in GROUPS.iter().enumerate() {
+                for (n, (key, default_open)) in FIGHTER_GROUPS.iter().enumerate() {
                     let group = if n == 0 { &project_rows } else { &other_rows };
-                    if fighter_searching && has_matches[n] && !self.fighter_group_touched[n] {
-                        set_persistent_collapsing_open(ui, ("fighter_group", *key), true);
-                    }
                     let title = if n == 0 {
                         format!("In this project ({})", group.len())
                     } else {
                         format!("Everything else ({})", group.len())
                     };
-                    let response = egui::CollapsingHeader::new(title)
-                        .id_salt(("fighter_group", *key))
-                        .default_open(*default_open)
-                        .show(ui, |ui| {
-                            for row in group {
-                                self.draw_fighter_row(ui, row, n == 0, &mut row_actions);
-                                // Characters made on this fighter, under it, each with its own costumes.
-                                if row.character.is_none() {
-                                    let made: Vec<(crate::character::CharacterKey, String)> =
-                                        crate::character::made_on(&row.name, &self.roster.project)
-                                            .map(|entry| {
-                                                let key = crate::character::CharacterKey::made(
-                                                    entry.key.clone(),
-                                                );
-                                                let range = key
-                                                    .costume_range(&self.roster.project)
-                                                    .unwrap_or_default();
-                                                (key, range)
-                                            })
-                                            .collect();
-                                    for (key, range) in made {
-                                        let selected = self.state.selected_fighter == Some(row.idx)
-                                            && active.as_ref() == Some(&key);
-                                        let label = format!("    {}", self.character_name(&key));
-                                        let counts = self.character_edit_counts(&key);
-                                        let mut hover = format!("{} {range}", row.label);
-                                        if !counts.is_empty() {
-                                            hover.push_str(&format!(
-                                                "\n{} moves edited, {} with nodes",
-                                                counts.game_moves, counts.node_graphs
-                                            ));
-                                        }
-                                        let response = ui
-                                            .selectable_label(selected, label)
-                                            .on_hover_text(hover);
-                                        if response.clicked() && !selected {
-                                            pick_character = Some(key.clone());
-                                        }
-                                        response.context_menu(|ui| {
-                                            if ui.button("Edit as nodes").clicked() {
-                                                open_on = Some((
-                                                    key.clone(),
-                                                    crate::character::CharacterPage::MoveNodes,
-                                                ));
-                                                ui.close();
-                                            }
-                                            if ui.button("Edit gimmicks").clicked() {
-                                                open_on = Some((
-                                                    key.clone(),
-                                                    crate::character::CharacterPage::Gimmicks,
-                                                ));
-                                                ui.close();
-                                            }
-                                        });
+                    let response = fighter_group(ui, (key, *default_open), title, |ui| {
+                        for row in group {
+                            self.draw_fighter_row(ui, row, n == 0, &mut row_actions);
+                            // Characters made on this fighter, under it, each with its own costumes.
+                            if row.character.is_none() {
+                                let made: Vec<(crate::character::CharacterKey, String)> =
+                                    crate::character::made_on(&row.name, &self.roster.project)
+                                        .map(|entry| {
+                                            let key = crate::character::CharacterKey::made(
+                                                entry.key.clone(),
+                                            );
+                                            let range = key
+                                                .costume_range(&self.roster.project)
+                                                .unwrap_or_default();
+                                            (key, range)
+                                        })
+                                        .collect();
+                                for (key, range) in made {
+                                    let selected = self.state.selected_fighter == Some(row.idx)
+                                        && active.as_ref() == Some(&key);
+                                    let label = format!("    {}", self.character_name(&key));
+                                    let counts = self.character_edit_counts(&key);
+                                    let mut hover = format!("{} {range}", row.label);
+                                    if !counts.is_empty() {
+                                        hover.push_str(&format!(
+                                            "\n{} moves edited, {} with nodes",
+                                            counts.game_moves, counts.node_graphs
+                                        ));
                                     }
+                                    let response =
+                                        ui.selectable_label(selected, label).on_hover_text(hover);
+                                    if response.clicked() && !selected {
+                                        pick_character = Some(key.clone());
+                                    }
+                                    response.context_menu(|ui| {
+                                        if ui.button("Edit as nodes").clicked() {
+                                            open_on = Some((
+                                                key.clone(),
+                                                crate::character::CharacterPage::MoveNodes,
+                                            ));
+                                            ui.close();
+                                        }
+                                        if ui.button("Edit gimmicks").clicked() {
+                                            open_on = Some((
+                                                key.clone(),
+                                                crate::character::CharacterPage::Gimmicks,
+                                            ));
+                                            ui.close();
+                                        }
+                                    });
                                 }
                             }
-                            if n == 0 {
-                                if group.is_empty() && !fighter_searching {
-                                    ui.weak("No fighters");
-                                }
-                                if ui
-                                    .small_button("Add fighter")
-                                    .on_hover_text("Pick fighters that belong to this project")
-                                    .clicked()
-                                {
-                                    open_add_fighter = true;
-                                }
+                        }
+                        if n == 0 {
+                            if group.is_empty() && !fighter_searching {
+                                ui.weak("No fighters");
                             }
-                        });
+                            if ui
+                                .small_button("Add fighter")
+                                .on_hover_text("Pick fighters that belong to this project")
+                                .clicked()
+                            {
+                                open_add_fighter = true;
+                            }
+                        }
+                    });
                     if fighter_searching && response.header_response.clicked() {
-                        self.fighter_group_touched[n] = true;
+                        self.fighter_groups.touched[n] = true;
                     }
                 }
                 if let Some(key) = pick_character {
@@ -14349,10 +14391,7 @@ impl VisionaryApp {
                             ui.painter().text(
                                 at + egui::vec2(0.0, 14.0),
                                 egui::Align2::CENTER_TOP,
-                                crate::move_nodes::plain::object_name(&format!(
-                                    "X_GENERATE_ARTICLE_{}",
-                                    object.kind.name.to_uppercase()
-                                )),
+                                plain_object_name(&object.kind.name),
                                 egui::FontId::proportional(11.0),
                                 Color32::from_rgb(255, 214, 120),
                             );
@@ -14997,14 +15036,8 @@ impl VisionaryApp {
         if let Some(agent) = &self.open_article {
             // Graphs, the edit log and the export are all keyed by fighter; an object's script
             // saved there would land on the fighter's move of the same name.
-            ui.weak(format!(
-                "{agent} is an object's script, and Move nodes don't edit object scripts yet. {}",
-                if self.open_article_in_source {
-                    "Edit it in the Classic editor; syncing saves its changes into the linked source."
-                } else {
-                    self.unsaveable_object_script_words()
-                }
-            ));
+            ui.weak(format!("{agent}: an object's script"))
+                .on_hover_text("Move nodes don't edit object scripts. The Classic editor does.");
             return;
         }
         if self.fetching_acmd {
@@ -22702,48 +22735,22 @@ impl VisionaryApp {
     /// The Objects list under the fighter's moves: each object with where it comes from, its
     /// scripts as moves, and its Settings card; then what the source has that isn't modelled.
     fn draw_objects_list(&mut self, ui: &mut Ui, max_height: f32) {
-        self.ensure_article_catalog();
-        let Some(cache) = self.article_catalog.as_ref() else {
-            let fighter = self
-                .state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i))
-                .map(|f| f.name.clone())
-                .unwrap_or_default();
-            if let Some((_, _, reason)) = self
-                .article_catalog_failed
-                .as_ref()
-                .filter(|(f, _, _)| *f == fighter)
-            {
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_rgb(235, 170, 90),
-                    format!("Visionary couldn't read this fighter's objects: {reason}"),
-                );
-            } else if self.article_catalog_job.is_some() {
-                ui.separator();
-                ui.weak("Reading this fighter's objects…");
-            }
-            return;
-        };
-        let rows = crate::articles::view::object_rows_with(&cache.catalog, &cache.dump_scripts);
-        let dump_note = cache.dump_note.clone();
-        let agents: Vec<String> = cache
-            .catalog
-            .articles
-            .iter()
-            .map(|a| a.agent.clone())
-            .collect();
-        let unresolved_clones = cache.catalog.unresolved_clones.clone();
-        let unresolved_statuses = cache.unresolved_statuses.clone();
-        let unread_overrides = cache.unread_overrides.clone();
-        let root = self.acmd_src.as_ref().map(|index| index.root.clone());
         ui.separator();
-        sidebar_section_heading(
-            ui,
-            "Objects",
-            "Projectiles and other objects this fighter can create: the game's own, ones the linked moveset rewrites, and clones it adds. Click a script to open it like a move.",
-        );
+        let heading = egui::CollapsingHeader::new(RichText::new("Objects").strong())
+            .open(Some(self.objects_open))
+            .show_unindented(ui, |_| ())
+            .header_response
+            .on_hover_text(
+                "Projectiles and other objects this fighter can create: the game's own, ones the linked moveset rewrites, and clones it adds. Click a script to open it like a move.",
+            );
+        if heading.clicked() {
+            self.objects_open = !self.objects_open;
+            if self.objects_open {
+                save_config_path(OBJECTS_OPEN_CONFIG_KEY, Path::new("open"));
+            } else {
+                clear_config_path(OBJECTS_OPEN_CONFIG_KEY);
+            }
+        }
         if let Some(agent) = &self.open_article {
             ui.colored_label(
                 egui::Color32::from_rgb(235, 170, 90),
@@ -22767,6 +22774,43 @@ impl VisionaryApp {
                 .on_hover_text(why);
             }
         }
+        if !self.objects_open {
+            return;
+        }
+        self.ensure_article_catalog();
+        let Some(cache) = self.article_catalog.as_ref() else {
+            let fighter = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+            if let Some((_, _, reason)) = self
+                .article_catalog_failed
+                .as_ref()
+                .filter(|(f, _, _)| *f == fighter)
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 170, 90),
+                    format!("Visionary couldn't read this fighter's objects: {reason}"),
+                );
+            } else if self.article_catalog_job.is_some() {
+                ui.weak("Reading this fighter's objects…");
+            }
+            return;
+        };
+        let rows = crate::articles::view::object_rows_with(&cache.catalog, &cache.dump_scripts);
+        let dump_note = cache.dump_note.clone();
+        let agents: Vec<String> = cache
+            .catalog
+            .articles
+            .iter()
+            .map(|a| a.agent.clone())
+            .collect();
+        let unresolved_clones = cache.catalog.unresolved_clones.clone();
+        let unresolved_statuses = cache.unresolved_statuses.clone();
+        let unread_overrides = cache.unread_overrides.clone();
+        let root = self.acmd_src.as_ref().map(|index| index.root.clone());
         let selected_move = self.state.selected_move.as_ref().map(|m| m.name.clone());
         let mut to_open: Option<(String, String)> = None;
         let mut settings_for: Option<String> = None;
@@ -22783,7 +22827,8 @@ impl VisionaryApp {
                     ui.weak(RichText::new(note).small());
                 }
                 for (row, agent) in rows.iter().zip(&agents) {
-                    egui::CollapsingHeader::new(format!("{}  ·  {}", row.title, row.badge))
+                    let name = plain_object_name(&row.title);
+                    egui::CollapsingHeader::new(format!("{name}  ·  {}", row.badge))
                         .id_salt(("object", agent.as_str()))
                         .default_open(false)
                         .show(ui, |ui| {
@@ -22830,7 +22875,9 @@ impl VisionaryApp {
                             {
                                 settings_for = Some(agent.clone());
                             }
-                        });
+                        })
+                        .header_response
+                        .on_hover_text(&row.title);
                 }
                 if !unresolved_clones.is_empty() || !unresolved_statuses.is_empty() || !unread_overrides.is_empty() {
                     egui::CollapsingHeader::new(format!(
@@ -23479,12 +23526,25 @@ impl VisionaryApp {
     /// Why the open object script can't be saved: the game's own script the moveset doesn't
     /// define, or, for a clone (which has no game scripts), one the moveset hasn't written yet.
     fn unsaveable_object_script_words(&self) -> &'static str {
-        if self.open_article_is_clone() {
+        if self.acmd_src.is_none() {
+            "Changes to this script can't be saved: no move code is linked."
+        } else if self.open_article_is_clone() {
             "Changes to this script can't be saved yet: the moveset doesn't define this script for \
              its clone yet."
         } else {
             "Changes to this script can't be saved yet: it's the game's own script and the moveset \
              doesn't define it."
+        }
+    }
+
+    /// Where the open move's script came from, in words.
+    fn script_origin_words(&self) -> &'static str {
+        match &self.state.acmd_source {
+            // The project keeps no object's script.
+            crate::data::ScriptOrigin::Saved if self.open_article.is_some() => {
+                "this session's copy"
+            }
+            origin => origin.label(),
         }
     }
 
@@ -26876,7 +26936,11 @@ impl VisionaryApp {
                                 return;
                             }
                             ui.label(
-                                RichText::new(format!("{fighters_with_files} fighters with files"))
+                                RichText::new(counted(
+                                    fighters_with_files,
+                                    "fighter with files",
+                                    "fighters with files",
+                                ))
                                     .small(),
                             );
                             ui.horizontal(|ui| {
@@ -40882,7 +40946,7 @@ Click to see the code, or link your own project"
                                 egui::Label::new(
                                     RichText::new(format!(
                                         "Loaded from {}",
-                                        self.state.acmd_source.label()
+                                        self.script_origin_words()
                                     ))
                                     .small()
                                     .color(Color32::GRAY),
@@ -45730,6 +45794,9 @@ pub(crate) enum SourceRow {
     ProjectFiles,
     MovesetCode,
 }
+
+/// There while the Classic sidebar's Objects section is open.
+const OBJECTS_OPEN_CONFIG_KEY: &str = "objects_open";
 
 /// Config key for the user's own ACMD source project — the smashline crate that builds their
 /// plugin. When set, its scripts are read in preference to the dumped-script mirror.
@@ -57295,6 +57362,45 @@ fn hitbox_menu_scroll_area(viewport_height: f32) -> egui::ScrollArea {
 mod collapsing_id_tests {
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+    /// Searching shows the matches of a group that is closed, leaves one the user closes during
+    /// the search closed, and afterwards both are as they were.
+    #[test]
+    fn a_fighter_search_shows_its_matches() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut groups = super::FighterGroups::default();
+        let mut draw = |searching: bool, has_matches: [bool; 2], touch: Option<usize>| {
+            let mut shown = [false; 2];
+            for _ in 0..2 {
+                let _ = ctx.run_test_ui(Default::default(), |ui| {
+                    groups.search(ui, searching, has_matches);
+                    for (n, group) in super::FIGHTER_GROUPS.iter().enumerate() {
+                        shown[n] = super::fighter_group(ui, *group, group.0.to_owned(), |ui| {
+                            ui.label("Samus")
+                        })
+                        .body_returned
+                        .is_some();
+                    }
+                    if let Some(n) = touch {
+                        groups.touched[n] = true;
+                        let salt = ("fighter_group", super::FIGHTER_GROUPS[n].0);
+                        super::set_persistent_collapsing_open(ui, salt, false);
+                    }
+                });
+            }
+            shown
+        };
+        assert_eq!(draw(false, [true, true], None), [true, false]);
+        assert_eq!(draw(true, [false, true], None), [true, true]);
+        // Matches in one group only open that one.
+        assert_eq!(draw(false, [true, true], None), [true, false]);
+        assert_eq!(draw(true, [true, false], None), [true, false]);
+        // Closed by hand during the search, and put back afterwards.
+        assert_eq!(draw(true, [true, true], Some(0)), [false, true]);
+        assert_eq!(draw(true, [true, true], None), [false, true]);
+        assert_eq!(draw(false, [true, true], None), [true, false]);
+    }
+
     #[test]
     fn a_header_opened_by_salt_draws_open() {
         let ctx = egui::Context::default();
