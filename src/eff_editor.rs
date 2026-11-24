@@ -745,6 +745,10 @@ pub struct EffEditor {
     pub carrier_gen_now: u64,
     /// Final carrier reading from the last send, kept on screen after the spinner clears.
     pub(crate) last_carrier_result: Option<SendOutcome>,
+    /// The owner of the edits it is of. It is shown beside that owner's file.
+    pub(crate) result_owner: Option<String>,
+    /// The owner of the open file's edits.
+    pub(crate) open_owner: Option<String>,
     /// The game's own numbers behind that reading, for its hover.
     pub last_carrier_detail: Option<String>,
     /// Whether the send in flight must wait for the game to read new bytes. A send of the
@@ -883,6 +887,8 @@ impl Default for EffEditor {
             carrier_state_since: None,
             carrier_gen_now: 0,
             last_carrier_result: None,
+            result_owner: None,
+            open_owner: None,
             last_carrier_detail: None,
             carrier_needs_new_bytes: true,
             carrier_ok: false,
@@ -3773,6 +3779,13 @@ impl EffEditor {
         self.last_sent_note = Some(note.into());
     }
 
+    /// The outcome of the last send, when it is of the open file's edits: beside another file it
+    /// would be read as that one's.
+    fn shown_result(&self) -> Option<SendOutcome> {
+        let of_open = self.result_owner == self.open_owner;
+        self.last_carrier_result.filter(|_| of_open)
+    }
+
     /// Drop the outcome of the last send and stop waiting on it.
     pub fn forget_send_result(&mut self) {
         self.awaiting_game = None;
@@ -4778,7 +4791,7 @@ impl EffEditor {
                 )
                 .on_hover_text("Edits the game has not been sent");
             }
-        } else if let Some(r) = self.last_carrier_result {
+        } else if let Some(r) = self.shown_result() {
             let label = ui.label(
                 egui::RichText::new(r.text())
                     .small()
@@ -8264,7 +8277,13 @@ impl EffEditor {
         // Feedback for BOTH senders (the header's rebuild and the kind color×/speed "Send now"
         // below) lives here, above the live-kind guard: a rebuild works whether or not the
         // effect has been seen in game yet, so its result must stay visible either way.
-        if let Some(note) = &self.last_sent_note {
+        let result = self.last_carrier_result.map(SendOutcome::text);
+        let hidden = self.shown_result().is_none().then_some(result).flatten();
+        if let Some(note) = self
+            .last_sent_note
+            .as_deref()
+            .filter(|note| Some(*note) != hidden)
+        {
             ui.label(
                 egui::RichText::new(note)
                     .small()
@@ -8532,6 +8551,24 @@ mod tests {
         assert_eq!(editor.last_carrier_detail, None);
         assert_eq!(editor.awaiting_game, None);
         assert_eq!(editor.last_sent_note, None);
+    }
+
+    /// What is said of a send is beside the file it was of: Vision's "it loads at the next match"
+    /// stood beside Bomberman's, which never does.
+    #[test]
+    fn a_send_result_is_beside_its_own_file_only() {
+        let mut editor = EffEditor {
+            last_carrier_result: Some(SendOutcome::NextMatch),
+            result_owner: Some("mario#c08".into()),
+            open_owner: Some("mario#c08".into()),
+            ..EffEditor::default()
+        };
+        assert_eq!(editor.shown_result(), Some(SendOutcome::NextMatch));
+        editor.open_owner = Some("bomberman".into());
+        assert_eq!(editor.shown_result(), None);
+        // Nothing sent, and no file: nothing to say.
+        editor.last_carrier_result = None;
+        assert_eq!(editor.shown_result(), None);
     }
 
     #[test]

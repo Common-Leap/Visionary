@@ -41607,6 +41607,9 @@ Click to see the code, or link your own project"
                 })
                 .collect();
             self.eff_editor.set_edit_sources(sources);
+            self.eff_editor.result_owner = self.sent_owner.clone();
+            let open = self.eff_editor.loaded_rel().map(|rel| self.eff_owner(&rel));
+            self.eff_editor.open_owner = open.map(|owner| owner.to_lowercase());
             // Which textures are already replaced, so the panel can say so and offer to
             // restore them. Scoped to the loaded eff by its `source_rel`, not to the selected
             // fighter — the editor can be showing a file the main window is not.
