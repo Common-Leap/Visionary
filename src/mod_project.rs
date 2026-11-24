@@ -1525,6 +1525,17 @@ pub struct TransplantOp {
     pub replace_entry: Option<String>,
 }
 
+impl TransplantOp {
+    /// Whether both put an effect under the same name in their file.
+    pub fn lands_on(&self, other: &Self) -> bool {
+        let name = |op: &Self| {
+            let name = op.replace_entry.as_ref().unwrap_or(&op.new_entry_name);
+            name.to_lowercase()
+        };
+        name(self) == name(other)
+    }
+}
+
 /// The game path (`effect/fighter/mario/ef_mario.eff`) an eff on disk stands for — what
 /// [`EffMod::source_rel`] records and what export writes under the mod folder.
 ///

@@ -101,6 +101,9 @@ pub(super) struct Card {
     made: bool,
     /// The fighter a made character plays as, by name.
     base_name: String,
+    /// The fighter list's name of the mod's character this card is for, whose moves are its
+    /// fighter's: only its effect file is its own.
+    row: Option<String>,
     /// The fighters this card stands for, with their names, when it is more than one.
     members: &'static [(&'static str, &'static str)],
     /// Whether the project edits this character, so it cannot be hidden.
@@ -940,7 +943,7 @@ impl VisionaryApp {
                 .eff_mods
                 .iter()
                 .filter(|(_, eff)| !eff.is_empty())
-                .map(|(owner, _)| self.moves_owner(owner))
+                .map(|(owner, _)| self.effects_character(owner))
                 .collect(),
             values: roster
                 .params
@@ -1064,6 +1067,7 @@ impl VisionaryApp {
                 key,
                 made: false,
                 base_name: String::new(),
+                row: None,
                 members: group.map_or(&[], |(_, members)| members),
                 has_edits: match group {
                     Some((_, members)) => {
@@ -1073,16 +1077,44 @@ impl VisionaryApp {
                 },
             });
         }
-        for authored in &self.roster.project.authored {
-            let base_name = self
-                .state
-                .fighters
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(&authored.donor))
+        let base_name = |fighter: &str| {
+            let mut rows = self.state.fighters.iter();
+            rows.find(|row| row.name.eq_ignore_ascii_case(fighter) && row.custom_name.is_none())
                 .map_or_else(
-                    || crate::data::fighter_display_name(&authored.donor),
-                    |entry| entry.display_name.clone(),
-                );
+                    || crate::data::fighter_display_name(fighter),
+                    |row| row.display_name.clone(),
+                )
+        };
+        // A mod's character whose effects are edited.
+        for owner in edited.iter().filter(|owner| owner.contains('#')) {
+            let key = crate::character::CharacterKey::parse(owner);
+            let Some(row) = key
+                .costume_file(&self.roster.project)
+                .and_then(|slot| self.slot_row(key.engine_fighter(), slot))
+            else {
+                continue;
+            };
+            let base_name = base_name(&row.name);
+            let slot = parts.characters.get(owner).copied();
+            cards.push(Card {
+                id: owner.clone(),
+                fighter: row.name.clone(),
+                slot: slot
+                    .filter(|slot| row.slots.contains(slot))
+                    .unwrap_or(row.base_slot()),
+                name: row.display_name.clone(),
+                line: format!("{base_name} {}", slot_ranges(&row.slots)),
+                slots: row.slots.clone(),
+                key: key.roster_key().clone(),
+                made: false,
+                base_name,
+                row: row.custom_name.clone(),
+                members: &[],
+                has_edits: true,
+            });
+        }
+        for authored in &self.roster.project.authored {
+            let base_name = base_name(&authored.donor);
             let slots = authored.all_slots();
             let slot = parts
                 .characters
@@ -1103,6 +1135,7 @@ impl VisionaryApp {
                 key: authored.key.clone(),
                 made: true,
                 base_name,
+                row: None,
                 members: &[],
                 has_edits: true,
             });
@@ -1113,7 +1146,7 @@ impl VisionaryApp {
 
     /// The character a card stands for: its made character, or the fighter it shows.
     fn card_character(card: &Card) -> crate::character::CharacterKey {
-        if card.made {
+        if card.made || card.row.is_some() {
             crate::character::CharacterKey::made(card.key.clone())
         } else {
             crate::character::CharacterKey::base(&card.fighter)
@@ -1146,7 +1179,7 @@ impl VisionaryApp {
         let counts = self.character_edit_counts(&owner);
         let fighter = card.fighter.to_ascii_lowercase();
         let roster = &self.roster;
-        let (values, gimmick_values) = if card.made {
+        let (values, gimmick_values) = if card.made || card.row.is_some() {
             (0, 0)
         } else {
             let values = roster.fighter_value_count(&fighter);
@@ -1175,7 +1208,7 @@ impl VisionaryApp {
 
     /// The select screen cell a card stands for.
     fn card_cell(&self, card: &Card) -> RosterKey {
-        if card.made {
+        if card.made || card.row.is_some() {
             return card.key.clone();
         }
         let members: Vec<&str> = if card.members.is_empty() {
@@ -1235,7 +1268,7 @@ impl VisionaryApp {
         };
         let fighter = card.fighter.to_ascii_lowercase();
         // The base fighter's effect file, or a made character's own one for this costume.
-        let effect_name = if card.made {
+        let effect_name = if card.made || card.row.is_some() {
             format!("ef_{fighter}_c{:02}.eff", card.slot)
         } else {
             format!("ef_{fighter}.eff")
@@ -1300,8 +1333,19 @@ impl VisionaryApp {
         }
     }
 
+    /// The fighter list's row of `fighter`, or of the mod's character on it.
+    fn row_index(&self, fighter: &str, character: Option<&str>) -> Option<usize> {
+        self.state.fighters.iter().position(|row| {
+            row.name.eq_ignore_ascii_case(fighter) && row.custom_name.as_deref() == character
+        })
+    }
+
     /// Whether `card`'s character is the one the editors have open.
     fn card_is_active(&self, card: &Card) -> bool {
+        if card.row.is_some() {
+            let open = self.state.selected_fighter;
+            return open == self.row_index(&card.fighter, card.row.as_deref());
+        }
         self.active_key().as_ref() == Some(&Self::card_character(card))
     }
 
@@ -1398,7 +1442,7 @@ impl VisionaryApp {
             // Fighters with a card of their own; a made character's base fighter is not one.
             let shown: BTreeSet<&str> = cards
                 .iter()
-                .filter(|card| !card.made)
+                .filter(|card| !card.made && card.row.is_none())
                 .flat_map(|card| {
                     std::iter::once(card.fighter.as_str())
                         .chain(card.members.iter().map(|(member, _)| *member))
@@ -1604,7 +1648,9 @@ impl VisionaryApp {
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        for part in Part::ALL {
+                        // A mod's character shares everything but its effects with its fighter.
+                        let own = |part: &Part| card.row.is_none() || *part == Part::Effects;
+                        for part in Part::ALL.into_iter().filter(own) {
                             let summary = part_summary(part, &facts);
                             let picked = part.has_folder()
                                 && parts.link(&card.fighter, part, card.slot).is_some();
@@ -1734,7 +1780,7 @@ impl VisionaryApp {
                     );
                 }
                 // Where the part's files are, for the parts that have files.
-                if part.has_folder() && part != Part::Moves {
+                if part.has_folder() && part != Part::Moves && card.row.is_none() {
                     let workspace = self.workspace();
                     let folder = workspace
                         .as_deref()
@@ -1806,6 +1852,9 @@ impl VisionaryApp {
                             .clicked()
                         {
                             actions.push(go(CardPage::Effects));
+                        }
+                        if card.row.is_some() {
+                            return;
                         }
                         if act(ui, look, "Edit in moves", None)
                             .on_hover_text("Which effects a move plays, and where")
@@ -2174,6 +2223,23 @@ impl VisionaryApp {
         use crate::character::{CharacterKey, CharacterPage};
         let character = CharacterKey::parse(key.as_str());
         let fighter = character.engine_fighter().to_owned();
+        // A mod's character: its row, and its own effect file with it.
+        if let Some(slot) = character.costume_file(&self.roster.project) {
+            let row = self.slot_row(&fighter, slot);
+            let row = row.and_then(|row| self.row_index(&row.name, row.custom_name.as_deref()));
+            if row.is_some_and(|row| self.select_row(row)) {
+                self.roster.open = false;
+                self.eff_editor.open = false;
+                self.node_workspace = false;
+                if page == CardPage::Effects {
+                    if let Some((rel, path)) = self.open_character_effect_file() {
+                        self.eff_editor.open_as(&path, rel);
+                    }
+                    self.open_effects_page();
+                }
+            }
+            return;
+        }
         let page = match page {
             CardPage::Values => {
                 self.roster.focus_traits_for(&fighter);
