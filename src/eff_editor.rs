@@ -186,8 +186,9 @@ fn effective_keys_to_attrs(emitter: &mut EmitterDef) {
     let color1_animated = attr(emitter, "emitter_static.num_color1_keys")
         .is_some_and(|v| v.as_i64() > 0)
         && attr(emitter, "particle_color.color1_type").is_some_and(|v| v.as_i64() != 0);
-    let alpha0_animated =
-        attr(emitter, "emitter_static.num_alpha0_keys").is_some_and(|v| v.as_i64() > 0);
+    let alpha0_animated = attr(emitter, "emitter_static.num_alpha0_keys")
+        .is_some_and(|v| v.as_i64() > 0)
+        && attr(emitter, "particle_color.alpha0_type").is_some_and(|v| v.as_i64() != 0);
 
     let color0 = emitter.color0.clone();
     for (i, key) in color0.iter().enumerate() {
@@ -269,8 +270,9 @@ fn attrs_to_effective_keys(emitter: &mut EmitterDef) {
     let color1_animated = attr(emitter, "emitter_static.num_color1_keys")
         .is_some_and(|v| v.as_i64() > 0)
         && attr(emitter, "particle_color.color1_type").is_some_and(|v| v.as_i64() != 0);
-    let alpha0_animated =
-        attr(emitter, "emitter_static.num_alpha0_keys").is_some_and(|v| v.as_i64() > 0);
+    let alpha0_animated = attr(emitter, "emitter_static.num_alpha0_keys")
+        .is_some_and(|v| v.as_i64() > 0)
+        && attr(emitter, "particle_color.alpha0_type").is_some_and(|v| v.as_i64() != 0);
 
     if color0_animated {
         for i in 0..emitter.color0.len() {
@@ -10376,6 +10378,31 @@ mod tests {
         attrs_to_effective_keys(em);
         assert_eq!(em.color0[0].frame, 19.0);
         assert_eq!(em.color0[0].r, 0.9);
+    }
+
+    /// The Opacity row of a part whose opacity is constant is that constant, both ways: the key
+    /// table beside it, which the game does not read then, is left alone.
+    #[test]
+    fn the_opacity_row_of_a_constant_opacity_is_the_constant() {
+        let mut editor = editor_with_one_emitter("effect/fighter/kirby/ef_kirby.eff");
+        let em = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0].emitters[0];
+        let table = "emitter_static.alpha0.keys[0].x";
+        set_attr(em, "emitter_static.num_alpha0_keys", AttrValue::Int(1));
+        set_attr(em, "particle_color.alpha0_type", AttrValue::Int(0));
+        set_attr(em, table, AttrValue::Float(1.0));
+        em.alpha0_keys = vec![key(0.25, 0.25, 0.25)];
+        effective_keys_to_attrs(em);
+        assert_eq!(attr_f32(em, "particle_color.alpha0"), 0.25);
+        assert_eq!(attr_f32(em, table), 1.0);
+        set_attr(em, "particle_color.alpha0", AttrValue::Float(0.5));
+        attrs_to_effective_keys(em);
+        assert_eq!(em.alpha0_keys[0].r, 0.5);
+        // One that changes over its life is its table.
+        set_attr(em, "particle_color.alpha0_type", AttrValue::Int(2));
+        em.alpha0_keys[0].r = 0.75;
+        effective_keys_to_attrs(em);
+        assert_eq!(attr_f32(em, table), 0.75);
+        assert_eq!(attr_f32(em, "particle_color.alpha0"), 0.5);
     }
 
     /// A duplicated emitter has to be addressable: its own name, its own row in the list, and a

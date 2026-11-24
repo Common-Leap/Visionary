@@ -8,8 +8,8 @@
 //   color0/color1 → whichever source `effects.rs` READ for this emitter, at the same
 //                   precedence: a Constant ParticleColor, else the EmitterStatic key table
 //                   (key.x/y/z = r/g/b; times untouched), else the EmitterInfo static color
-//   alpha0        → EmitterStatic.alpha0 keys (value in key.x), else a Constant
-//                   ParticleColor.alpha0, else EmitterInfo.color0_a — same rule
+//   alpha0        → a Constant ParticleColor.alpha0, else EmitterStatic.alpha0 keys (value in
+//                   key.x), else EmitterInfo.color0_a — same rule
 //
 // Writes are strictly scoped: one AuthoredEdit names ONE emitter set and ONE emitter, and
 // touches only that emitter's LIVE key slots. Every other emitter, channel and inert key
@@ -2472,23 +2472,23 @@ fn apply_fields(em: &mut effect_library::structs::Emitter, f: &EmitterFieldEdits
         }
     }
     // Alpha follows the SAME source-precedence rule as the colors above — `alpha_keys` in
-    // `effects.rs` reads the key table first, then a Constant ParticleColor alpha, then the
+    // `effects.rs` reads a Constant ParticleColor alpha first, then the key table, then the
     // EmitterInfo static alpha. Writing unconditionally into the key table dropped every
-    // alpha edit on an emitter with no alpha keys (the game ignores the inert table) while
-    // scribbling over slots the editor never showed.
+    // alpha edit on an emitter whose alpha is constant (the game ignores the inert table)
+    // while scribbling over slots the editor never showed.
     if let Some(rows) = &f.alpha0 {
         let live = d.emitter_static.num_alpha0_keys as usize;
-        if live > 0 {
-            for (k, row) in d.emitter_static.alpha0.keys.iter_mut().take(live).zip(rows) {
-                k.x = row[0];
-                k.time = row[1];
-            }
-        } else if matches!(
+        if matches!(
             d.particle_color.alpha0_type,
             effect_library::ColorType::Constant
         ) {
             if let Some(row) = rows.first() {
                 d.particle_color.alpha0 = row[0];
+            }
+        } else if live > 0 {
+            for (k, row) in d.emitter_static.alpha0.keys.iter_mut().take(live).zip(rows) {
+                k.x = row[0];
+                k.time = row[1];
             }
         } else if let Some(row) = rows.first() {
             d.emitter_info.color0_a = row[0];
@@ -5461,6 +5461,7 @@ pub(crate) mod tests {
         let mut data = crate::eff_attrs::blank_emitter_data(crate::eff_attrs::SSBU_VFX_VERSION);
         data.particle_color.color0_type = effect_library::ColorType::Animated8Key;
         data.particle_color.color1_type = effect_library::ColorType::Animated8Key;
+        data.particle_color.alpha0_type = effect_library::ColorType::Animated8Key;
         data.emitter_static.num_color0_keys = 1;
         data.emitter_static.num_color1_keys = 1;
         data.emitter_static.num_alpha0_keys = 1;
@@ -5484,6 +5485,67 @@ pub(crate) mod tests {
         assert_eq!(emitter.data.emitter_static.color0.keys[0].time, 11.0);
         assert_eq!(emitter.data.emitter_static.color1.keys[0].time, 12.0);
         assert_eq!(emitter.data.emitter_static.alpha0.keys[0].time, 13.0);
+    }
+
+    /// The opacity of a part whose opacity is constant is that constant, whatever its key table
+    /// holds: the game never reads the table (Smash 0x10490). Bayonetta's witch time clock hand
+    /// (clock1) has both, and stayed solid in game with its Opacity row at 0.
+    #[test]
+    fn a_constant_opacity_is_the_one_shown_and_written() {
+        use crate::effects::load_effect;
+        let Some(root) = effect_root() else {
+            return;
+        };
+        const SRC: &str = "effect/fighter/bayonetta/ef_bayonetta.eff";
+        let src = std::fs::read(root.join(SRC)).unwrap();
+        let clock = |bytes: &[u8]| {
+            let file = effect_library::NamcoEffectFile::load(bytes).unwrap();
+            let sets = file.ptcl_file.unwrap().emitter_list.emitter_sets;
+            let set = sets
+                .into_iter()
+                .find(|s| s.name == "P_BayonettaWitchTimeClock");
+            set.unwrap().emitters.remove(0).data
+        };
+        let was = clock(&src);
+        assert_eq!(was.display_name(), "clock1");
+        assert_eq!(
+            (
+                was.particle_color.alpha0,
+                was.emitter_static.num_alpha0_keys
+            ),
+            (1.0, 1)
+        );
+        let listed = load_effect(&root.join(SRC)).unwrap().ptcl;
+        let (set_idx, set) = listed
+            .emitter_sets
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.name == "P_BayonettaWitchTimeClock")
+            .unwrap();
+        let shown = &set.emitters[0].alpha0_keys;
+        assert_eq!(shown.iter().map(|k| k.r).collect::<Vec<_>>(), [1.0]);
+
+        let eff = crate::mod_project::EffMod {
+            source_rel: SRC.into(),
+            authored: vec![AuthoredEdit {
+                set_name: set.name.clone(),
+                entry_name: String::new(),
+                set_idx,
+                emitter_name: "clock1".into(),
+                emitter_idx: 0,
+                fields: EmitterFieldEdits {
+                    alpha0: Some(vec![[0.0, 0.0]]),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let now = clock(&super::rebuild_eff_bytes(&src, &eff, None).expect("export"));
+        assert_eq!(
+            now.particle_color.alpha0, 0.0,
+            "the constant the game draws"
+        );
+        assert_eq!(now.emitter_static.alpha0.keys[0].x, 1.0, "not the table");
     }
 
     /// The exporter takes an emitter list back from flat-and-parent-first to a tree, which is
