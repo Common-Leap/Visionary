@@ -221,9 +221,6 @@ impl NodeEditor {
             buttons.iter().sum::<f32>() + width("● 00 not live yet", 0.0),
             spacing.interact_size.y,
         );
-        if ui.available_size_before_wrap().x < size.x {
-            ui.end_row();
-        }
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         self.toolbar_rect = Some(rect);
     }
