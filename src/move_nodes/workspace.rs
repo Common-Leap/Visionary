@@ -397,22 +397,33 @@ impl NodeEditor {
         })
     }
 
-    pub(super) fn import_tracks(
+    /// Lanes the saved blocks leave to the Classic editor, read from the scripts as they are.
+    pub(super) fn import_missing_tracks(
         &mut self,
         fighter: &str,
         scripts: [&AcmdScript; 3],
         effects: &crate::data::EffectScript,
     ) {
-        self.draft.tracks = [Track::Game, Track::Sound, Track::Expression]
-            .into_iter()
-            .zip(scripts)
-            .map(|(track, script)| {
-                super::super::timeline::import_for_fighter(fighter, track, script)
-            })
-            .collect();
-        self.draft
-            .tracks
-            .push(super::super::effects::import_for_fighter(fighter, effects));
+        use super::super::{effects::import_for_fighter as import_effects, project::insert_lane};
+        let [game, sound, expression] = scripts.map(Some);
+        for (slot, (track, script)) in [
+            (Track::Game, game),
+            (Track::Sound, sound),
+            (Track::Expression, expression),
+            (Track::Effect, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if self.draft.tracks.iter().any(|lane| lane.track == track) {
+                continue;
+            }
+            let lane = match script {
+                Some(script) => super::super::timeline::import_for_fighter(fighter, track, script),
+                None => import_effects(fighter, effects),
+            };
+            insert_lane(&mut self.draft, slot, lane);
+        }
     }
 
     pub(super) fn workspace_field(
@@ -1407,6 +1418,136 @@ mod tests {
             );
         }
     }
+    const SOUND: &str = r#"unsafe extern "C" fn sound_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_s"));
+    }
+}"#;
+
+    /// The workspace on a move with one sound, drawn one frame with the window's events. Returns
+    /// what it applied and what it put on the system clipboard.
+    fn draw(
+        editor: &mut NodeEditor,
+        context: &egui::Context,
+        sound: &AcmdScript,
+        saved: Option<&MoveGraph>,
+        events: Vec<egui::Event>,
+        typing: bool,
+    ) -> (Option<MoveGraph>, Option<String>) {
+        use crate::ui::TestFrame;
+        let (plain, mut applied) = (AcmdScript::default(), None);
+        let mut words = String::new();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let output = context.run_test_ui(input, |ui| {
+            let field = ui.text_edit_singleline(&mut words);
+            if typing {
+                field.request_focus();
+            }
+            applied = editor.workspace_ui(
+                ui,
+                "mario",
+                "attack_11",
+                saved,
+                [&plain, sound, &plain],
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+            );
+        });
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            });
+        (applied, copied)
+    }
+
+    fn sounds(graph: &MoveGraph) -> usize {
+        let lane = graph.tracks.iter().find(|lane| lane.track == Track::Sound);
+        lane.map_or(0, |lane| {
+            let sounds = lane.nodes.iter();
+            sounds
+                .filter(|node| matches!(node.kind, NodeKind::Execute { .. }))
+                .count()
+        })
+    }
+
+    /// The Classic editor changed the move: the blocks shown are its version, Undo goes back, and
+    /// an edit of its own is no change from outside. A lane the saved blocks leave to the Classic
+    /// editor is read from the scripts, with ids no saved block has.
+    #[test]
+    fn blocks_take_a_classic_edit_as_one_step() {
+        let louder = |name: &str| {
+            let mut sound = crate::acmd::parse_sound_script(SOUND);
+            let Some(ExcuteStmt::Sound(call)) = sound.sound_stmt_mut(0) else {
+                panic!("the sound");
+            };
+            call.sounds[0] = name.into();
+            sound
+        };
+        let shown = |editor: &NodeEditor| {
+            let lane = &editor.draft.tracks[1];
+            let NodeKind::Execute { commands } = &lane.nodes[1].kind else {
+                panic!("the sound's block");
+            };
+            let [ExcuteStmt::Sound(call)] = &commands[..] else {
+                panic!("the sound");
+            };
+            call.sounds[0].clone()
+        };
+        let context = egui::Context::default();
+        let mut editor = NodeEditor::default();
+        let (first, second) = (louder("se_first"), louder("se_second"));
+        let frame = |editor: &mut NodeEditor, sound: &AcmdScript, saved: Option<&MoveGraph>| {
+            draw(editor, &context, sound, saved, Vec::new(), false).0
+        };
+        frame(&mut editor, &first, None);
+        assert_eq!(
+            (shown(&editor).as_str(), editor.undo.len()),
+            ("se_first", 0)
+        );
+        frame(&mut editor, &second, None);
+        assert_eq!(
+            (shown(&editor).as_str(), editor.undo.len()),
+            ("se_second", 1)
+        );
+        frame(&mut editor, &second, None);
+        assert_eq!(editor.undo.len(), 1, "once");
+        let before = editor.undo.back().unwrap().graph.clone();
+        assert_eq!(sounds(&before), 1);
+
+        // Its own edit, applied: the saved blocks change, the draft and its history do not.
+        editor.auto_apply = true;
+        let mut applied = frame(&mut editor, &second, None).expect("applied");
+        applied.tracks.retain(|lane| lane.track != Track::Sound);
+        let added = MoveNode {
+            id: 1 << 29,
+            kind: NodeKind::Wait { frames: 1.0 },
+        };
+        applied.tracks[0].nodes.push(added);
+        frame(&mut editor, &second, Some(&applied));
+        assert_eq!(editor.undo.len(), 1);
+
+        // Opened again, the lane left out of them comes from the script.
+        let mut editor = NodeEditor::default();
+        frame(&mut editor, &second, Some(&applied));
+        assert_eq!(shown(&editor), "se_second");
+        super::super::super::timeline::compile("mario", "attack_11", &editor.draft)
+            .expect("every block has an id of its own");
+    }
+
     #[test]
     fn refresh_drops_only_an_unedited_controller_draft() {
         let draft = |initial: &str| CharacterDraft {

@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::data::{AcmdScript, EditRecord};
 use crate::mod_project::{FighterMod, ModProjectFile};
 
-use super::model::{NodeError, Track};
+use super::model::{MoveGraph, MoveNode, MoveTrack, NodeError, NodeKind, Track};
 
 pub(crate) const MAX_FIGHTER_MOVES: usize = crate::gimmicks::live_model::MAX_TRANSITIONS;
 
@@ -296,11 +296,8 @@ fn validate_character_value_conditions(
     }
 }
 
-/// Expand every saved move graph into ordinary project edits.
-///
-/// The input is never modified. Any invalid name, compiler diagnostic, or collision rejects the
-/// whole expansion; callers can therefore persist or export the returned value atomically.
-pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>> {
+/// The names and sizes a project file must have to be read at all, its graphs uncompiled.
+pub fn preflight(project: &ModProjectFile) -> Result<(), Vec<NodeError>> {
     let mut errors = Vec::new();
 
     validate_structured_fighter_identities(project, &mut errors);
@@ -326,6 +323,7 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
             });
         }
         for (move_name, graph) in &data.move_graphs {
+            validate_identifier(move_name, &format!("fighter {fighter} move"), &mut errors);
             if let Err(reason) = super::block_clipboard::preflight_graph(graph) {
                 errors.push(NodeError {
                     subject: format!(
@@ -364,6 +362,7 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
             });
         }
         for (move_name, graph) in &data.move_graphs {
+            validate_identifier(move_name, &format!("character {key} move"), &mut errors);
             if let Err(reason) = super::block_clipboard::preflight_graph(graph) {
                 errors.push(NodeError {
                     subject: format!(
@@ -375,9 +374,20 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
             }
         }
     }
-    if !errors.is_empty() {
-        return Err(errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
+}
+
+/// Expand every saved move graph into ordinary project edits.
+///
+/// The input is never modified. Any invalid name, compiler diagnostic, or collision rejects the
+/// whole expansion; callers can therefore persist or export the returned value atomically.
+pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>> {
+    preflight(project)?;
+    let mut errors = Vec::new();
     let mut expanded = project.clone();
 
     let mut fighter_names = project.fighters.keys().collect::<Vec<_>>();
@@ -393,9 +403,6 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
         let fighter_name = character.engine_fighter();
         let start = errors.len();
         validate_identifier(fighter_name, "fighter", &mut errors);
-        for move_name in source_character.move_graphs.keys() {
-            validate_identifier(move_name, &format!("character {key} move"), &mut errors);
-        }
         if errors.len() != start {
             continue;
         }
@@ -462,16 +469,6 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
         let fighter_error_start = errors.len();
 
         validate_identifier(fighter_name, "fighter", &mut errors);
-        let mut move_names = source_fighter.move_graphs.keys().collect::<Vec<_>>();
-        move_names.sort();
-        for move_name in &move_names {
-            validate_identifier(
-                move_name,
-                &format!("fighter {fighter_name} move"),
-                &mut errors,
-            );
-        }
-
         if errors.len() != fighter_error_start {
             continue;
         }
@@ -1424,6 +1421,319 @@ fn collision(fighter: &str, move_name: &str, track: Track) -> NodeError {
         subject: format!("fighter {fighter} move {move_name} {track:?} track"),
         reason: "saved script differs from the compiled move graph; make the existing edit match the graph or remove that category edit before applying the recipe".into(),
     }
+}
+
+/// A lane whose blocks were made to write the script saved beside them.
+#[derive(Debug, PartialEq)]
+pub struct Followed {
+    pub track: Track,
+    /// What the blocks did that the script does not.
+    pub dropped: Vec<String>,
+}
+
+/// Make a move's blocks write `scripts`, where one was changed without them: by the Classic
+/// editor, or in a project saved before the two kept in step. Applying blocks writes both, so a
+/// script that differs is the newer edit. One no block can hold takes its lane out of the graph,
+/// and the script alone decides that part of the move.
+pub fn follow_scripts(
+    fighter: &str,
+    main: &crate::gimmicks::behavior::BehaviorGraph,
+    charts: &BTreeMap<String, crate::mod_project::ControllerChart>,
+    move_name: &str,
+    graph: &mut MoveGraph,
+    scripts: &[(Track, &AcmdScript)],
+) -> Vec<Followed> {
+    let mut followed = Vec::new();
+    for (track, script) in scripts {
+        let Some(slot) = graph.tracks.iter().position(|lane| lane.track == *track) else {
+            continue;
+        };
+        let was = &graph.tracks[slot];
+        // Blocks that do not compile have written nothing to compare; export names the reason.
+        let Some(wrote) = lane_script(fighter, main, charts, move_name, was) else {
+            continue;
+        };
+        if structurally_equal(&wrote, script) {
+            continue;
+        }
+        let lane = import_lane(fighter, move_name, *track, script);
+        let holds = lane_script(fighter, main, charts, move_name, &lane)
+            .is_some_and(|wrote| structurally_equal(&wrote, script));
+        let mut dropped = lane_words(&was.nodes);
+        for kept in lane_words(&lane.nodes) {
+            if let Some(index) = dropped.iter().position(|words| *words == kept) {
+                dropped.remove(index);
+            }
+        }
+        graph.tracks.remove(slot);
+        if holds {
+            insert_lane(graph, slot, lane);
+        }
+        super::canvas::prune_positions(graph);
+        followed.push(Followed {
+            track: *track,
+            dropped,
+        });
+    }
+    followed
+}
+
+/// Put an imported lane in a graph. Imported ids start over in every lane, so blocks added to
+/// another one may have them.
+pub(super) fn insert_lane(graph: &mut MoveGraph, slot: usize, lane: MoveTrack) {
+    let ids = super::flow::known_position_keys;
+    let taken = ids(graph);
+    let slot = slot.min(graph.tracks.len());
+    graph.tracks.insert(slot, lane);
+    let alone = MoveGraph {
+        tracks: vec![graph.tracks[slot].clone()],
+        ..MoveGraph::default()
+    };
+    if !taken.is_disjoint(&ids(&alone)) {
+        let mut next = super::view::next_id(graph);
+        for node in &mut graph.tracks[slot].nodes {
+            super::view::rekey(node, &mut next);
+        }
+    }
+}
+
+/// What one lane of a move writes, or nothing when it does not compile.
+fn lane_script(
+    fighter: &str,
+    main: &crate::gimmicks::behavior::BehaviorGraph,
+    charts: &BTreeMap<String, crate::mod_project::ControllerChart>,
+    move_name: &str,
+    lane: &MoveTrack,
+) -> Option<AcmdScript> {
+    let graph = MoveGraph {
+        tracks: vec![lane.clone()],
+        ..MoveGraph::default()
+    };
+    let moves = BTreeMap::from([(move_name.to_owned(), graph)]);
+    // A gimmick that does not compile is no reason to lose track of the blocks.
+    let mut tracks = match compile_recipes_with_controllers(fighter, main, charts, &moves) {
+        Ok(mut compiled) => compiled.tracks.remove(move_name)?,
+        Err(_) => super::timeline::compile(fighter, move_name, &moves[move_name]).ok()?,
+    };
+    tracks.pop().map(|(_, script)| script)
+}
+
+fn import_lane(fighter: &str, move_name: &str, track: Track, script: &AcmdScript) -> MoveTrack {
+    if track == Track::Effect {
+        let source = crate::acmd::preview_effect_structure_fn(script, move_name);
+        super::effects::import_for_fighter(fighter, &crate::acmd::parse_effect_script(&source))
+    } else {
+        super::timeline::import_for_fighter(fighter, track, script)
+    }
+}
+
+/// What a lane does, one line a call, timing aside.
+fn lane_words(nodes: &[MoveNode]) -> Vec<String> {
+    let mut words = Vec::new();
+    for node in nodes {
+        let one = |kind| super::canvas::story_caption(&MoveNode { id: node.id, kind });
+        match &node.kind {
+            NodeKind::Frame { .. } | NodeKind::Wait { .. } => {}
+            NodeKind::Execute { commands } => words.extend(commands.iter().map(|command| {
+                one(NodeKind::Execute {
+                    commands: vec![command.clone()],
+                })
+            })),
+            NodeKind::EffectExecute { commands } => words.extend(commands.iter().map(|command| {
+                one(NodeKind::EffectExecute {
+                    commands: vec![command.clone()],
+                })
+            })),
+            NodeKind::Branch {
+                then_nodes,
+                else_nodes,
+                ..
+            } => {
+                words.push(super::canvas::story_caption(node));
+                words.extend(lane_words(then_nodes));
+                words.extend(lane_words(else_nodes));
+            }
+            NodeKind::Repeat { body, .. } => {
+                words.push(super::canvas::story_caption(node));
+                words.extend(lane_words(body));
+            }
+            _ => words.push(super::canvas::story_caption(node)),
+        }
+    }
+    words
+}
+
+/// Bring every move's blocks in step with the scripts saved beside them, for a project saved by
+/// a build that let the two part. One line a move, for the person who opens it.
+pub fn reconcile(project: &mut ModProjectFile) -> Vec<String> {
+    let mut notes = Vec::new();
+    let roster = &project.roster;
+    let mut owners: Vec<(String, String, &mut FighterMod)> = project
+        .fighters
+        .iter_mut()
+        .map(|(fighter, data)| (crate::character::CharacterKey::base(fighter), data))
+        .chain(
+            project
+                .characters
+                .iter_mut()
+                .map(|(key, data)| (crate::character::CharacterKey::made(key.clone()), data)),
+        )
+        .map(|(key, data)| {
+            let engine = key.engine_fighter().to_owned();
+            let display = crate::data::fighter_display_name(&engine);
+            (key.display_name(roster, Some(&display)), engine, data)
+        })
+        .collect();
+    owners.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, fighter, data) in owners {
+        let moves: Vec<String> = data.move_graphs.keys().cloned().collect();
+        for move_name in moves {
+            let mut graph = data.move_graphs.remove(&move_name).unwrap_or_default();
+            let lost = adopt_effect_calls(&fighter, &move_name, &graph, data);
+            let scripts: Vec<(Track, &AcmdScript)> = [
+                (Track::Game, data.acmd.get(&move_name).map(|r| &r.script)),
+                (Track::Sound, data.sound_scripts.get(&move_name)),
+                (Track::Expression, data.expression_scripts.get(&move_name)),
+                (Track::Effect, data.effect_scripts.get(&move_name)),
+            ]
+            .into_iter()
+            .filter_map(|(track, script)| Some((track, script?)))
+            .collect();
+            let followed = follow_scripts(
+                &fighter,
+                &data.behavior,
+                &data.controller_charts,
+                &move_name,
+                &mut graph,
+                &scripts,
+            );
+            let mut dropped: Vec<String> = followed
+                .iter()
+                .flat_map(|lane| lane.dropped.iter().cloned())
+                .chain(lost)
+                .collect();
+            if !followed.is_empty() || !dropped.is_empty() {
+                let more = dropped.len().saturating_sub(3);
+                dropped.truncate(3);
+                let mut note = format!(
+                    "{name}, {}: kept the Classic editor's newer edit",
+                    crate::move_kinds::plain_name(&move_name)
+                );
+                if !dropped.is_empty() {
+                    note.push_str(&format!(
+                        " and dropped from its blocks: {}",
+                        dropped.join("; ")
+                    ));
+                }
+                if more > 0 {
+                    note.push_str(&format!("; {more} more"));
+                }
+                notes.push(note);
+            }
+            // Applying blocks used to take a move's effects along, changed or not.
+            let source = data.move_sources.get(&move_name).map(|s| &s.body);
+            if source.filter(|body| !body.is_empty()).is_some_and(|body| {
+                let effects = crate::acmd::parse_effect_script(body);
+                data.effect_scripts
+                    .get(&move_name)
+                    .is_some_and(|script| effects_unchanged(&fighter, &move_name, &effects, script))
+            }) {
+                data.effect_scripts.remove(&move_name);
+                graph.tracks.retain(|lane| lane.track != Track::Effect);
+            }
+            if !graph.is_empty() {
+                data.move_graphs.insert(move_name, graph);
+            }
+        }
+    }
+    notes
+}
+
+/// Effect edits saved beside blocks that own the move's effects, put into the blocks' script:
+/// the list they were kept in has no place in a move whose effects are blocks. Returns the edits
+/// and lines that could not go in.
+fn adopt_effect_calls(
+    fighter: &str,
+    move_name: &str,
+    graph: &MoveGraph,
+    data: &mut FighterMod,
+) -> Vec<String> {
+    let Some(lane) = graph
+        .tracks
+        .iter()
+        .find(|lane| lane.track == Track::Effect)
+        .filter(|_| has_active_legacy_effect_data(data, move_name))
+    else {
+        return Vec::new();
+    };
+    let edits = data.effect_calls.remove(move_name).unwrap_or_default();
+    let full = data.effect_calls_full.remove(move_name);
+    data.effect_frame_residue.remove(move_name);
+    data.effect_dropped_lines.remove(move_name);
+    let blocks = data.effect_scripts.get(move_name).cloned().or_else(|| {
+        lane_script(
+            fighter,
+            &data.behavior,
+            &data.controller_charts,
+            move_name,
+            lane,
+        )
+    });
+    // A list with no edits is the game's own calls, kept by a look at who plays an effect.
+    let Some(blocks) = blocks.filter(|_| !edits.is_empty()) else {
+        return Vec::new();
+    };
+    let source = crate::acmd::preview_effect_structure_fn(&blocks, move_name);
+    let source = crate::acmd::parse_effect_script(&source);
+    let (calls, _, report) =
+        crate::app::reconcile_saved_effects(&source.to_effect_calls(), full.as_ref(), Some(&edits));
+    let Some(script) = effect_calls_script(fighter, move_name, &calls, &source) else {
+        return vec![format!("{} effect edits", edits.len())];
+    };
+    data.effect_scripts.insert(move_name.to_owned(), script);
+    let mut lost = crate::acmd::unexportable_effect_lines(&source);
+    if report.dropped_edits > 0 {
+        lost.push(format!("{} effect edits", report.dropped_edits));
+    }
+    lost
+}
+
+/// Whether `script`, the effects a move's blocks write, is what the move plays without them.
+pub fn effects_unchanged(
+    fighter: &str,
+    move_name: &str,
+    effects: &crate::data::EffectScript,
+    script: &AcmdScript,
+) -> bool {
+    let lane = super::effects::import_for_fighter(fighter, effects);
+    lane_script(
+        fighter,
+        &Default::default(),
+        &Default::default(),
+        move_name,
+        &lane,
+    )
+    .is_some_and(|plain| structurally_equal(&plain, script))
+}
+
+/// The script blocks write for `calls`, an edited list of the effects `source` plays.
+pub fn effect_calls_script(
+    fighter: &str,
+    move_name: &str,
+    calls: &[crate::data::EffectCall],
+    source: &crate::data::EffectScript,
+) -> Option<AcmdScript> {
+    let (_, residue) = source.to_effect_calls_and_residue();
+    let code = crate::acmd::preview_effect_fn(calls, move_name, &[], &residue);
+    let lane =
+        super::effects::import_for_fighter(fighter, &crate::acmd::parse_effect_script(&code));
+    lane_script(
+        fighter,
+        &Default::default(),
+        &Default::default(),
+        move_name,
+        &lane,
+    )
 }
 
 fn structurally_equal<T: Serialize>(left: &T, right: &T) -> bool {
@@ -2912,6 +3222,26 @@ mod tests {
             .iter()
             .any(|error| error.reason.contains("differs from the compiled")));
         assert_eq!(serde_json::to_value(&project).unwrap(), before);
+    }
+
+    /// Blocks that stopped working, as a gimmick taken away on the Gimmicks page leaves them, keep
+    /// their move out of an export and nothing out of reach: the file opens, with the blocks.
+    #[test]
+    fn a_project_whose_blocks_no_longer_work_still_opens() {
+        let mut project = project_with_gimmick_event("begin", false, true);
+        project.name = "gone".into();
+        expand(&project).unwrap();
+        project.fighters.get_mut("mario").unwrap().behavior = BehaviorGraph::default();
+        assert!(expand(&project).is_err());
+        crate::mod_export::validate_project(&project).unwrap();
+        let before = serde_json::to_value(&project).unwrap();
+        assert!(reconcile(&mut project).is_empty());
+        assert_eq!(serde_json::to_value(&project).unwrap(), before);
+        // A name that is no name is still refused at the door.
+        let mario = project.fighters.get_mut("mario").unwrap();
+        let graph = mario.move_graphs.remove("attack11").unwrap();
+        mario.move_graphs.insert("../attack11".into(), graph);
+        assert!(crate::mod_export::validate_project(&project).is_err());
     }
 
     #[test]

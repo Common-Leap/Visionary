@@ -7985,10 +7985,6 @@ impl EditLog {
         }
     }
 
-    pub fn remove_fighter(&mut self, fighter: &str) {
-        self.entries.remove(fighter);
-    }
-
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

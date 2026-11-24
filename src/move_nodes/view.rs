@@ -64,6 +64,10 @@ pub struct NodeEditor {
     pending_tell: bool,
     /// A finished edit is waiting to reach the running match.
     auto_apply: bool,
+    /// The saved blocks and scripts last shown, and whether what changed them since is the edit
+    /// this editor just applied.
+    given: Option<u64>,
+    applied: bool,
     in_expanded_field: bool,
     block_clipboard: Option<super::block_clipboard::BlockClipboard>,
     /// Code being typed for the selected block: (block, code it started from, text).
@@ -217,10 +221,6 @@ impl NodeEditor {
             self.controller_values.clear();
         }
     }
-    /// Reloads the open move's saved graph on the next frame.
-    pub fn reload_move(&mut self) {
-        self.key.clear();
-    }
     pub fn invalidate(&mut self) {
         *self = Self::default();
     }
@@ -266,8 +266,9 @@ impl NodeEditor {
         siblings: &BTreeMap<String, MoveGraph>,
     ) -> Option<MoveGraph> {
         let key = format!("{fighter}/{move_name}");
-        if self.key != key {
-            self.key = key;
+        let loaded = self.key != key;
+        if loaded {
+            self.key.clone_from(&key);
 
             self.draft = saved.cloned().unwrap_or_default();
             self.error.clear();
@@ -280,9 +281,42 @@ impl NodeEditor {
             self.gesture_text_focus = None;
             self.gesture_dirty = false;
 
-            if self.workspace && self.draft.tracks.is_empty() {
-                self.import_tracks(fighter, scripts, effects);
+            if self.workspace {
+                self.import_missing_tracks(fighter, scripts, effects);
             }
+        }
+        if self.workspace {
+            let given = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                serde_json::to_string(&(saved, scripts, effects))
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                hasher.finish()
+            };
+            let outside = self.given.replace(given) != Some(given);
+            if outside && !loaded && !std::mem::take(&mut self.applied) {
+                // The Classic editor changed the move: take its version, and let Undo take it back.
+                let previous = EditorSnapshot {
+                    graph: std::mem::replace(&mut self.draft, saved.cloned().unwrap_or_default()),
+                    character: self.character.clone(),
+                };
+                self.import_missing_tracks(fighter, scripts, effects);
+                self.gesture = None;
+                self.gesture_text_focus = None;
+                self.gesture_dirty = false;
+                if self.snapshot_changed(&previous, siblings) {
+                    if self.undo.len() == 16 {
+                        self.undo.pop_front();
+                    }
+                    self.undo.push_back(previous);
+                    self.redo.clear();
+                    self.clean_depth = self.undo.len();
+                    self.error.clear();
+                    self.canvas.clear_errors();
+                }
+            }
+            self.applied = false;
         }
         let workspace_base = self
             .character
@@ -413,9 +447,7 @@ impl NodeEditor {
             if ui.button("Revert draft").clicked() {
                 self.draft = saved.cloned().unwrap_or_default();
                 if self.workspace {
-                    if self.draft.tracks.is_empty() {
-                        self.import_tracks(fighter, scripts, effects);
-                    }
+                    self.import_missing_tracks(fighter, scripts, effects);
                     self.character = self.saved_character.clone();
                 }
                 self.track = 0;
@@ -723,6 +755,7 @@ impl NodeEditor {
             self.clean_depth = self.undo.len();
             if errors.is_empty() {
                 self.saved_character = self.character.clone();
+                self.applied = true;
                 return Some(self.draft.clone());
             }
         }
@@ -1739,7 +1772,7 @@ pub(crate) fn native_source_ui(
     }
 }
 
-fn next_id(graph: &MoveGraph) -> u32 {
+pub(super) fn next_id(graph: &MoveGraph) -> u32 {
     fn max(nodes: &[MoveNode]) -> u32 {
         nodes
             .iter()
@@ -6251,7 +6284,7 @@ fn replace_node(nodes: &mut Vec<MoveNode>, id: u32, replacement: Vec<MoveNode>) 
     false
 }
 
-fn rekey(node: &mut MoveNode, next: &mut u32) {
+pub(super) fn rekey(node: &mut MoveNode, next: &mut u32) {
     node.id = *next;
     *next = next.saturating_add(1);
     match &mut node.kind {
@@ -9087,5 +9120,124 @@ mod palette_live_tests {
         }
         let _ = std::panic::take_hook();
         assert!(missing.is_empty(), "not live: {missing:?}");
+    }
+
+    /// A Classic edit reads the lane's blocks again from its script: every block a user can add
+    /// is still there, and still one to edit, or the edit is refused.
+    #[test]
+    fn every_palette_block_outlives_a_classic_edit() {
+        use super::super::model::*;
+        std::panic::set_hook(Box::new(|_| {}));
+        let (mut lost, mut kept) = (Vec::new(), 0);
+        let added = crate::acmd::parse_effect_script(
+            r#"unsafe extern "C" fn effect_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 60.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 12.8, 6.2, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 360, false);
+    }
+}"#,
+        );
+        for fighter in ["mario", "cloud", "pikmin", "samus"] {
+            for track in [Track::Game, Track::Sound, Track::Expression, Track::Effect] {
+                for (kind, label) in super::node_choices_for_fighter(track, fighter) {
+                    let editor = super::NodeEditor::default();
+                    let Ok(Some(block)) =
+                        std::panic::catch_unwind(|| editor.make_node(kind, fighter, 40, track))
+                    else {
+                        continue;
+                    };
+                    let mut block = block;
+                    if track == Track::Effect {
+                        // Around an effect: a list of effects has nothing to say of a bare wait.
+                        match &mut block {
+                            NodeKind::Frame { .. } | NodeKind::Wait { .. } => continue,
+                            NodeKind::Repeat { body: nodes, .. }
+                            | NodeKind::Branch {
+                                then_nodes: nodes, ..
+                            } => nodes.extend(
+                                super::super::effects::import_for_fighter(fighter, &added).nodes,
+                            ),
+                            _ => {}
+                        }
+                    }
+                    let mut graph = MoveGraph {
+                        tracks: vec![MoveTrack {
+                            track,
+                            nodes: vec![MoveNode {
+                                id: 40,
+                                kind: block,
+                            }],
+                            baseline: Vec::new(),
+                            effect_execute_baseline: Vec::new(),
+                        }],
+                        ..Default::default()
+                    };
+                    let Ok(written) = super::super::timeline::compile(fighter, "attack_11", &graph)
+                    else {
+                        continue;
+                    };
+                    // As each lane's edit is written: the script changed in place, or for effects
+                    // written again from the list of them, where a list can say them.
+                    let script = if track == Track::Effect {
+                        let code =
+                            crate::acmd::preview_effect_structure_fn(&written[0].1, "attack_11");
+                        let source = crate::acmd::parse_effect_script(&code);
+                        if !crate::acmd::unexportable_effect_lines(&source).is_empty() {
+                            continue;
+                        }
+                        let mut calls = source.to_effect_calls();
+                        calls.extend(added.to_effect_calls());
+                        super::super::project::effect_calls_script(
+                            fighter,
+                            "attack_11",
+                            &calls,
+                            &source,
+                        )
+                        .expect("an effect list is a script")
+                    } else {
+                        let mut script = written[0].1.clone();
+                        script.stmts.push(crate::data::AcmdStmt::Frame(60.0));
+                        script
+                    };
+                    super::super::project::follow_scripts(
+                        fighter,
+                        &Default::default(),
+                        &Default::default(),
+                        "attack_11",
+                        &mut graph,
+                        &[(track, &script)],
+                    );
+                    let preserved = |nodes: &[MoveNode]| {
+                        nodes
+                            .iter()
+                            .any(|node| matches!(node.kind, NodeKind::Preserved { .. }))
+                    };
+                    // Every line the block wrote is written still, by a block to edit.
+                    let lines = |script: &crate::data::AcmdScript| {
+                        let mut lines = crate::acmd::emit_stmts(&script.stmts, "");
+                        lines.retain(|line| {
+                            let line = line.trim();
+                            track != Track::Effect
+                                || !["frame(", "wait(", "for ", "}", "if macros::is_excute"]
+                                    .iter()
+                                    .any(|timing| line.starts_with(timing))
+                        });
+                        for line in &mut lines {
+                            *line = line.trim().to_owned();
+                        }
+                        lines
+                    };
+                    let now = lines(&script);
+                    let gone = lines(&written[0].1).iter().any(|line| !now.contains(line));
+                    match graph.tracks.first() {
+                        Some(lane) if !preserved(&lane.nodes) && !gone => kept += 1,
+                        _ => lost.push(format!("{fighter} {track:?}: {label}")),
+                    }
+                }
+            }
+        }
+        let _ = std::panic::take_hook();
+        println!("{kept} kept, lost: {lost:#?}");
+        assert!(lost.is_empty() && kept > 0, "{kept} kept, lost: {lost:#?}");
     }
 }

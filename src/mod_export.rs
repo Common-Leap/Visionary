@@ -1445,11 +1445,7 @@ pub fn validate_project(project: &ModProjectFile) -> Result<()> {
             PROJECT_VERSION
         );
     }
-    if project.name.trim().is_empty() {
-        bail!("project name is empty");
-    }
-    crate::move_nodes::project::expand(project).map_err(node_errors)?;
-    Ok(())
+    crate::move_nodes::project::preflight(project).map_err(node_errors)
 }
 
 #[cfg(test)]

@@ -4815,11 +4815,11 @@ fn effect_call_identity(call: &crate::data::EffectCall) -> (u64, String, String,
 
 /// What [`reconcile_saved_effects`] had to discard.
 #[derive(Debug, Default, PartialEq)]
-struct SavedEffectsReconcile {
+pub(crate) struct SavedEffectsReconcile {
     /// The saved full call list was made against a different version of the script.
     stale_full: bool,
     /// Edits whose target call no longer exists in the script.
-    dropped_edits: usize,
+    pub(crate) dropped_edits: usize,
     /// Edits whose target call moved to another position and were re-anchored to it.
     reanchored_edits: usize,
 }
@@ -4837,7 +4837,7 @@ struct SavedEffectsReconcile {
 /// edit touches is still in its place. Otherwise the edits are reapplied on their own, each
 /// re-anchored to its call by identity when the script has moved it, and dropped when the call
 /// it was made for is gone.
-fn reconcile_saved_effects(
+pub(crate) fn reconcile_saved_effects(
     pristine: &[crate::data::EffectCall],
     full: Option<&Vec<crate::data::EffectCall>>,
     edits: Option<&[crate::data::EffectCallEdit]>,
@@ -5375,6 +5375,8 @@ pub struct VisionaryApp {
     node_preview: bool,
     move_graphs: BTreeMap<String, BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     node_effect_scripts: HashMap<String, crate::data::AcmdScript>,
+    /// Moves whose blocks were last found to write their scripts, by what was compared.
+    synced_graphs: HashMap<String, u64>,
     /// The game's own scripts of each "fighter/move" counted on a card, compiled once the way
     /// the export compiles them, so the counts leave out what the export leaves out.
     game_script_baselines:
@@ -5683,6 +5685,8 @@ pub struct VisionaryApp {
     hub_pending: Option<crate::project_hub::HubAction>,
     /// Last mod-import report, shown until dismissed.
     import_report: Option<crate::mod_import::ImportReport>,
+    /// What opening the project changed, shown until it is closed.
+    load_notes: Vec<String>,
     /// Kept so background workers can wake the (reactive) UI when their result lands.
     egui_ctx: egui::Context,
     /// Saved window geometry (`"main"`, `"transplant"`, `"edits"`), persisted between runs.
@@ -6003,6 +6007,7 @@ impl VisionaryApp {
             node_preview: true,
             move_graphs: Default::default(),
             node_effect_scripts: Default::default(),
+            synced_graphs: Default::default(),
             game_script_baselines: Default::default(),
             edit_revision: 0,
             revision_snapshot: None,
@@ -6209,6 +6214,7 @@ impl VisionaryApp {
             ),
             hub_pending: None,
             import_report: None,
+            load_notes: Vec::new(),
             egui_ctx: cc.egui_ctx.clone(),
             window_geometry: load_window_geometry(),
             geometry_dirty: false,
@@ -11268,7 +11274,7 @@ impl VisionaryApp {
         if let Some((f, m)) = remove_move {
             let key = format!("{f}/{m}");
             let is_active = self.current_move_key().as_deref() == Some(key.as_str());
-            self.state.edit_log.remove_move(&f, &m);
+            self.discard_hitbox_edits(&f, &m);
             self.hitbox_rules_store.remove(&key);
             if is_active {
                 // The autosave pass runs later in this frame. Restore the working copy now;
@@ -11302,7 +11308,9 @@ impl VisionaryApp {
             let active_is_removed = active_key
                 .as_deref()
                 .is_some_and(|key| key.starts_with(&format!("{f}/")));
-            self.state.edit_log.remove_fighter(&f);
+            for m in self.state.edit_log.moves_for(&f) {
+                self.discard_hitbox_edits(&f, &m);
+            }
             self.hitbox_rules_store
                 .retain(|k, _| !k.starts_with(&format!("{f}/")));
             if active_is_removed {
@@ -11349,6 +11357,27 @@ impl VisionaryApp {
         if let Some((fighter, move_name)) = export_move {
             self.export_logged_move(&fighter, &move_name);
         }
+    }
+
+    /// Put a move's hitboxes back to the source's. Blocks keep the rest of what they change.
+    fn discard_hitbox_edits(&mut self, owner: &str, move_name: &str) {
+        let key = Self::move_key(owner, move_name);
+        let graph = self.move_graphs.get(owner).and_then(|g| g.get(move_name));
+        let blocks = graph.is_some_and(|graph| {
+            let mut lanes = graph.tracks.iter();
+            lanes.any(|lane| lane.track == crate::move_nodes::model::Track::Game)
+        });
+        let moves = self.state.edit_log.entries.get_mut(owner);
+        let Some(record) = moves
+            .and_then(|moves| moves.get_mut(move_name))
+            .filter(|_| blocks)
+        else {
+            self.state.edit_log.remove_move(owner, move_name);
+            return;
+        };
+        record.script = game_script_for_edits(&record.script, &record.hitboxes_pristine);
+        record.hitboxes = record.hitboxes_pristine.clone();
+        self.sync_move_graph(&key);
     }
 
     fn export_logged_move(&mut self, fighter: &str, move_name: &str) {
@@ -13389,22 +13418,72 @@ impl VisionaryApp {
         self.state.effects.push(call.clone());
         let idx = self.state.effects.len() - 1;
         if let Some(mv) = self.current_move_key() {
-            self.state
-                .effect_call_edits
-                .entry(mv.clone())
-                .or_default()
-                .push(crate::data::EffectCallEdit {
-                    index: idx,
-                    op: crate::data::EffectCallOp::Add(call),
-                    pristine: None,
-                });
-            self.state
-                .effect_call_full
-                .insert(mv, self.state.effects.clone());
+            if self.node_effect_scripts.contains_key(&mv) {
+                self.put_effects_in_blocks(&mv, &self.state.effects.clone());
+            } else {
+                self.state
+                    .effect_call_edits
+                    .entry(mv.clone())
+                    .or_default()
+                    .push(crate::data::EffectCallEdit {
+                        index: idx,
+                        op: crate::data::EffectCallOp::Add(call),
+                        pristine: None,
+                    });
+                self.state
+                    .effect_call_full
+                    .insert(mv, self.state.effects.clone());
+            }
         }
         self.state.selected_effect_call = Some(idx);
         self.push_effect_rules();
         idx
+    }
+
+    /// The effects a move's blocks play, when they own its effects.
+    fn block_effects(&self, key: &str) -> Option<crate::data::EffectScript> {
+        let script = self.node_effect_scripts.get(key)?;
+        let move_name = crate::character::split_move_key(key)?.1;
+        Some(crate::acmd::parse_effect_script(
+            &crate::acmd::preview_effect_structure_fn(script, move_name),
+        ))
+    }
+
+    /// Put an edited effect list in the blocks that own the move's effects. Blocks that do
+    /// something no list of effects says are left as they are, and the edit is taken back.
+    fn put_effects_in_blocks(&mut self, key: &str, calls: &[crate::data::EffectCall]) {
+        let open = self.current_move_key().as_deref() == Some(key);
+        let script = self
+            .block_effects(key)
+            .filter(|source| crate::acmd::unexportable_effect_lines(source).is_empty())
+            .zip(crate::character::parse_move_key(key))
+            .and_then(|(source, (owner, move_name))| {
+                crate::move_nodes::project::effect_calls_script(
+                    owner.engine_fighter(),
+                    move_name,
+                    calls,
+                    &source,
+                )
+            });
+        match script {
+            Some(script) => {
+                self.node_effect_scripts.insert(key.to_owned(), script);
+                self.sync_move_graph(key);
+                if let Some(source) = self.block_effects(key).filter(|_| open) {
+                    self.state.effect_script = source;
+                }
+            }
+            None => {
+                let move_name = crate::character::split_move_key(key).map_or(key, |(_, name)| name);
+                self.state.status = format!(
+                    "{}: only Move nodes can change these effects",
+                    crate::move_kinds::plain_name(move_name)
+                );
+                if open {
+                    self.restore_node_effects_to_current();
+                }
+            }
+        }
     }
 
     /// The Effects page's "Use in <move>": add the effect to the open move and stay on the
@@ -13423,13 +13502,15 @@ impl VisionaryApp {
                 let frame = self.state.current_frame;
                 let index = self.add_effect_call(&name, frame);
                 let move_name = shown_move(&self.state);
-                self.eff_editor.use_in_move_note =
-                    Some(format!("Added to {move_name} at frame {frame}"));
-                self.state.status = format!(
-                    "Added {} to {move_name} at frame {frame}",
-                    effect_words(&name)
-                );
-                self.use_in_move_added = Some((mv, index, name));
+                if self.state.effects.len() > index {
+                    self.eff_editor.use_in_move_note =
+                        Some(format!("Added to {move_name} at frame {frame}"));
+                    self.state.status = format!(
+                        "Added {} to {move_name} at frame {frame}",
+                        effect_words(&name)
+                    );
+                    self.use_in_move_added = Some((mv, index, name));
+                }
             }
         }
         // Still the call it added: the same move, and that index still holds the effect.
@@ -15104,28 +15185,6 @@ impl VisionaryApp {
             .unwrap_or_default();
         // Hitboxes changed in the classic editor show here too, the way export writes them.
         let current_game = game_script_for_edits(&self.state.script, &self.state.hitboxes);
-        // A saved graph wins over the scripts, so fold classic hitbox edits into its action lane.
-        if self.state.script.to_hitboxes() != self.state.hitboxes {
-            if let Some(graph) = self
-                .move_graphs
-                .get_mut(&owner)
-                .and_then(|graphs| graphs.get_mut(&move_entry.name))
-            {
-                let game = crate::move_nodes::timeline::import_for_fighter(
-                    &fighter.name,
-                    crate::move_nodes::model::Track::Game,
-                    &current_game,
-                );
-                graph
-                    .tracks
-                    .retain(|track| track.track != crate::move_nodes::model::Track::Game);
-                graph.tracks.insert(0, game);
-                crate::move_nodes::canvas::prune_positions(graph);
-                self.state.hitboxes = current_game.to_hitboxes();
-                self.state.script = current_game.clone();
-                self.node_editor.reload_move();
-            }
-        }
         let siblings = self.move_graphs.get(&owner).cloned().unwrap_or_default();
         self.restore_node_effects_to_current();
         let key = Self::move_key(&owner, &move_entry.name);
@@ -15190,7 +15249,7 @@ impl VisionaryApp {
                 (frame.round() as u32).clamp(1, self.state.total_frames.max(1));
             self.state.playing = false;
         }
-        let Some(graph) = graph else { return };
+        let Some(mut graph) = graph else { return };
         let character = self.node_editor.applied_character();
         let base = character.as_ref().map_or(&base, |(main, _, _)| main);
         let controller_charts = character
@@ -15252,16 +15311,43 @@ impl VisionaryApp {
                         .insert(key.clone(), script);
                 }
                 crate::move_nodes::model::Track::Effect => {
-                    self.state.effect_script = crate::acmd::parse_effect_script(
-                        &crate::acmd::preview_effect_structure_fn(&script, &move_entry.name),
-                    );
-                    self.state.effects = self.state.effect_script.to_effect_calls();
-                    self.node_effect_scripts.insert(key.clone(), script);
+                    // The effects stay the Classic editor's until the blocks change them, and are
+                    // its again once the blocks play what the move's source does.
+                    let plays = |effects: &crate::data::EffectScript| {
+                        crate::move_nodes::project::effects_unchanged(
+                            &fighter.name,
+                            &move_entry.name,
+                            effects,
+                            &script,
+                        )
+                    };
+                    let unchanged =
+                        !self.node_effect_scripts.contains_key(&key) && plays(&current_effects);
+                    let source = crate::acmd::parse_effect_script(&self.state.loaded_body);
+                    let back = !self.state.loaded_body.is_empty() && plays(&source);
+                    if unchanged || back {
+                        graph
+                            .tracks
+                            .retain(|lane| lane.track != crate::move_nodes::model::Track::Effect);
+                    }
+                    if unchanged {
+                        continue;
+                    }
+                    if back {
+                        self.node_effect_scripts.remove(&key);
+                        self.state.effect_script = source;
+                        self.state.effects = self.state.effects_pristine.clone();
+                    } else {
+                        self.state.effect_script = crate::acmd::parse_effect_script(
+                            &crate::acmd::preview_effect_structure_fn(&script, &move_entry.name),
+                        );
+                        self.state.effects = self.state.effect_script.to_effect_calls();
+                        self.node_effect_scripts.insert(key.clone(), script);
+                    }
                     // Explicit Apply replaces the legacy source of this track, atomically.
                     self.state.effect_call_edits.remove(&key);
                     self.state.effect_call_full.remove(&key);
-                    self.state.effect_frame_residue.remove(&key);
-                    self.state.effect_dropped_lines.remove(&key);
+                    self.record_dropped_effect_lines();
                 }
             }
         }
@@ -25516,6 +25602,64 @@ impl VisionaryApp {
         }
     }
 
+    /// Make the blocks of the move under `key` write its scripts, where one was changed outside
+    /// Move nodes. Nothing may be saved that the next load or export would find at odds.
+    fn sync_move_graph(&mut self, key: &str) -> bool {
+        let Some((owner, move_name)) = crate::character::parse_move_key(key) else {
+            return false;
+        };
+        let Some(mut graph) = self
+            .move_graphs
+            .get(owner.as_str())
+            .and_then(|graphs| graphs.get(move_name))
+            .cloned()
+        else {
+            return false;
+        };
+        let scripts = saved_scripts(&self.state, &self.node_effect_scripts, key);
+        let stamp = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            Self::json_bytes(&(&graph, &scripts)).hash(&mut hasher);
+            hasher.finish()
+        };
+        if self.synced_graphs.insert(key.to_owned(), stamp) == Some(stamp) {
+            return false;
+        }
+        let followed = crate::move_nodes::project::follow_scripts(
+            owner.engine_fighter(),
+            &self
+                .roster
+                .behaviors
+                .get(owner.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            &self
+                .roster
+                .controller_charts
+                .get(owner.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            move_name,
+            &mut graph,
+            &scripts,
+        );
+        if followed.is_empty() {
+            return false;
+        }
+        let graphs = self
+            .move_graphs
+            .entry(owner.as_str().to_owned())
+            .or_default();
+        if graph.is_empty() {
+            graphs.remove(move_name);
+        } else {
+            graphs.insert(move_name.to_owned(), graph);
+        }
+        self.node_live_cache = None;
+        true
+    }
+
     fn begin_history_frame(&mut self) {
         self.history_before_frame = self.current_edit_snapshot();
     }
@@ -25528,10 +25672,17 @@ impl VisionaryApp {
             self.history_suppress_frame = false;
             return;
         };
-        let Some((after_key, after)) = self.current_edit_snapshot() else {
+        let Some((after_key, mut after)) = self.current_edit_snapshot() else {
             self.history_suppress_frame = false;
             return;
         };
+        if before_key == after_key && before != after && after.move_graph.is_some() {
+            self.commit_current_edits();
+            if self.sync_move_graph(&after_key) {
+                self.push_node_step_rules();
+            }
+            after = self.capture_edit_snapshot(&after_key);
+        }
         if !self.history_suppress_frame && before_key == after_key && before != after {
             let history = self.edit_history.entry(before_key).or_default();
             history.undo.push(HistoryEntry {
@@ -26025,6 +26176,14 @@ impl VisionaryApp {
         // Export can happen in the same frame as the last panel edit. Commit the current
         // collision/script surface before collecting the keyed project maps.
         self.commit_current_edits();
+        let graph_keys: Vec<String> = self
+            .move_graphs
+            .iter()
+            .flat_map(|(owner, graphs)| graphs.keys().map(|name| Self::move_key(owner, name)))
+            .collect();
+        for key in graph_keys {
+            self.sync_move_graph(&key);
+        }
         self.normalize_effect_call_storage();
         self.sync_eff_mods_from_editor();
         let mut project = ModProjectFile {
@@ -26108,6 +26267,8 @@ impl VisionaryApp {
             .effect_call_edits
             .keys()
             .chain(self.state.effect_call_full.keys())
+            // Blocks own these moves' effects: a list here is a look at who plays an effect.
+            .filter(|key| !self.node_effect_scripts.contains_key(*key))
             .collect();
         for key in effect_keys {
             let (fighter, mv) =
@@ -26189,6 +26350,7 @@ impl VisionaryApp {
                     .state
                     .effect_call_full
                     .iter()
+                    .filter(|(key, _)| !self.node_effect_scripts.contains_key(*key))
                     .filter(|(_, calls)| {
                         calls
                             .iter()
@@ -27289,6 +27451,30 @@ impl VisionaryApp {
             }
             Some(_) => self.hub_pending = None,
             None => {}
+        }
+    }
+
+    fn draw_load_notes(&mut self, ctx: &egui::Context) {
+        if self.load_notes.is_empty() {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new("Changed while opening")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for note in &self.load_notes {
+                            ui.label(note);
+                        }
+                    });
+                close = ui.button("Close").clicked();
+            });
+        if close {
+            self.load_notes.clear();
         }
     }
 
@@ -28459,12 +28645,16 @@ impl VisionaryApp {
                 return;
             }
         };
+        if project.name.trim().is_empty() {
+            project.name = "unnamed_mod".into();
+        }
         if let Err(error) = crate::mod_export::validate_project(&project)
             .and_then(|_| crate::mod_export::resolve_project_assets(&mut project, path))
         {
             self.state.status = format!("Project load failed: {error}");
             return;
         }
+        migration_findings.extend(crate::move_nodes::project::reconcile(&mut project));
 
         // An "Add fighter" popup left open adds to whichever project is open: close it.
         self.close_add_fighter_popup();
@@ -28485,20 +28675,12 @@ impl VisionaryApp {
             .filter(|(_, fm)| !fm.behavior.is_unset())
             .map(|(owner, fm)| (owner, fm.behavior.clone()))
             .collect();
-        project = match crate::move_nodes::project::expand(&project) {
-            Ok(project) => project,
-            Err(errors) => {
-                self.state.status = format!(
-                    "Project load failed: {}",
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-                return;
-            }
-        };
+        match crate::move_nodes::project::expand(&project) {
+            Ok(expanded) => project = expanded,
+            // Blocks that no longer work, after a gimmick they use was taken away, must not keep
+            // the rest of the project shut: their moves play the scripts last written.
+            Err(errors) => migration_findings.extend(errors.iter().map(ToString::to_string)),
+        }
 
         // Loading is replacement, not an undocumented merge. Clear the previous project's
         // runtime rules/carrier first, then replace every local edit store so saving immediately
@@ -28820,11 +29002,7 @@ impl VisionaryApp {
             self.project_name
         );
         self.state.status.push_str(&live_report.status_suffix());
-        if !migration_findings.is_empty() {
-            self.state
-                .status
-                .push_str(&format!(" | {}", migration_findings.join(" | ")));
-        }
+        self.load_notes = migration_findings;
         // Effect edits and borrowed effects from a saved project have not been sent to the game
         // in this session, so Send edits says so.
         if n_eff > 0 || !self.eff_mods.is_empty() {
@@ -37724,7 +37902,10 @@ impl VisionaryApp {
                     continue;
                 }
                 let motion_captures = self.captures_for_selected_fighter(m);
-                let calls = Self::effect_calls_from_captures(&motion_captures, &bone_rev, &eff_rev);
+                let calls = match self.block_effects(&key) {
+                    Some(blocks) => blocks.to_effect_calls(),
+                    None => Self::effect_calls_from_captures(&motion_captures, &bone_rev, &eff_rev),
+                };
                 if !calls.is_empty() {
                     self.state.effect_call_full.insert(key, calls);
                 }
@@ -38145,6 +38326,9 @@ impl VisionaryApp {
                     if self.state.effect_call_full.contains_key(&key) {
                         continue; // captured/opened already — its uses are listed
                     }
+                    let calls = self
+                        .block_effects(&key)
+                        .map_or(calls, |blocks| blocks.to_effect_calls());
                     let new_uses: Vec<RedirectUse> = calls
                         .iter()
                         .enumerate()
@@ -38384,6 +38568,15 @@ impl VisionaryApp {
                 }
             }
         }
+        // A move whose effects are blocks' own keeps the redirect in its blocks.
+        for key in prompt.uses.iter().map(|u| &u.move_key) {
+            if self.node_effect_scripts.contains_key(key) {
+                self.state.effect_call_edits.remove(key);
+                if let Some(calls) = self.state.effect_call_full.remove(key) {
+                    self.put_effects_in_blocks(key, &calls);
+                }
+            }
+        }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
         self.publish_effect_rules();
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
@@ -38413,6 +38606,10 @@ impl VisionaryApp {
         call.normalize_timing();
         if let Some(current) = self.state.effects.get_mut(i) {
             current.normalize_timing();
+        }
+        if self.node_effect_scripts.contains_key(&mv) {
+            self.put_effects_in_blocks(&mv, &self.state.effects.clone());
+            return;
         }
         let is_added = i >= self.state.effects_pristine.len();
         let pristine_call = self
@@ -38461,6 +38658,13 @@ impl VisionaryApp {
         let Some(mv) = self.current_move_key() else {
             return;
         };
+        if self.node_effect_scripts.contains_key(&mv) {
+            self.state.effects.remove(i);
+            self.state.selected_effect_call = None;
+            self.put_effects_in_blocks(&mv, &self.state.effects.clone());
+            self.push_effect_rules();
+            return;
+        }
         let is_added = i >= self.state.effects_pristine.len();
         if is_added {
             self.state.effects.remove(i);
@@ -41741,6 +41945,7 @@ Click to see the code, or link your own project"
         self.draw_sources_window(&ctx);
         self.draw_hub_pending_modal(&ctx);
         self.draw_import_report(&ctx);
+        self.draw_load_notes(&ctx);
         self.draw_workspace_panel(&ctx);
         let t = self.perf.start();
         self.draw_transplant_studio(&ctx);
@@ -42900,8 +43105,69 @@ fn game_script_for_edits(
         // control tree. Its exact statement structure is also checked against the recipe.
         original.clone()
     } else {
-        rebuild_script_from_hitboxes(original, hitboxes)
+        revalue_hitboxes(original, hitboxes)
+            .unwrap_or_else(|| rebuild_script_from_hitboxes(original, hitboxes))
     }
+}
+
+/// `original` with new values in its hitboxes' own calls, when nothing but their values changed:
+/// what is around them, and the branch they are in, stays as written. Nothing when a hitbox was
+/// added, removed or retimed, or one call makes several.
+fn revalue_hitboxes(
+    original: &crate::data::AcmdScript,
+    hitboxes: &[crate::data::Hitbox],
+) -> Option<crate::data::AcmdScript> {
+    use crate::data::{AcmdStmt, ExcuteStmt, Hitbox};
+    type Pairs<'a> = std::collections::VecDeque<(&'a Hitbox, &'a Hitbox)>;
+    fn call(stmt: &mut ExcuteStmt, left: &mut Pairs) -> Option<()> {
+        let category = match stmt {
+            ExcuteStmt::Attack(_) => 0,
+            ExcuteStmt::Catch(_) => 1,
+            ExcuteStmt::Wind(_) => 2,
+            ExcuteStmt::AttackFp(_) => crate::data::CAT_ATTACK_FP,
+            ExcuteStmt::AttackAbs(_) => crate::data::CAT_ABS,
+            ExcuteStmt::Search(_) => crate::data::CAT_SEARCH,
+            _ => return Some(()),
+        };
+        let (was, now) = left.pop_front()?;
+        if was == now {
+            return Some(());
+        }
+        let same = (was.category, was.id, was.active_start, was.active_end)
+            == (now.category, now.id, now.active_start, now.active_end);
+        *stmt = match stmt {
+            ExcuteStmt::Attack(_) => ExcuteStmt::Attack(now.to_attack_call()),
+            ExcuteStmt::Catch(_) => ExcuteStmt::Catch(now.to_catch_call()),
+            ExcuteStmt::AttackFp(_) => ExcuteStmt::AttackFp(now.to_attack_fp_call()?),
+            ExcuteStmt::AttackAbs(_) => ExcuteStmt::AttackAbs(now.to_attack_abs_call()?),
+            ExcuteStmt::Search(_) => ExcuteStmt::Search(now.to_search_call()),
+            _ => return None,
+        };
+        (same && now.category == category).then_some(())
+    }
+    fn walk(stmts: &mut [AcmdStmt], left: &mut Pairs) -> Option<()> {
+        for stmt in stmts {
+            match stmt {
+                AcmdStmt::Excute(inner) => {
+                    for one in inner {
+                        call(one, left)?;
+                    }
+                }
+                AcmdStmt::Bare(one) => call(one, left)?,
+                AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => walk(body, left)?,
+                _ => {}
+            }
+        }
+        Some(())
+    }
+    let before = original.to_hitboxes();
+    if before.len() != hitboxes.len() {
+        return None;
+    }
+    let mut script = original.clone();
+    let mut left = before.iter().zip(hitboxes).collect();
+    walk(&mut script.stmts, &mut left)?;
+    (left.is_empty() && script.to_hitboxes() == hitboxes).then_some(script)
 }
 
 /// Rebuild an ACMD script from the complete edited collision list while retaining every
@@ -43704,6 +43970,28 @@ fn commit_open_move(state: &mut crate::data::AppState) {
         state.hitboxes_pristine.clone(),
         state.hitboxes.clone(),
     );
+}
+
+/// The scripts saved for the move under `key`, whichever editor changed them.
+fn saved_scripts<'a>(
+    state: &'a crate::data::AppState,
+    block_effects: &'a HashMap<String, crate::data::AcmdScript>,
+    key: &str,
+) -> Vec<(crate::move_nodes::model::Track, &'a crate::data::AcmdScript)> {
+    use crate::move_nodes::model::Track;
+    let record = crate::character::split_move_key(key).and_then(|(owner, move_name)| {
+        let moves = state.edit_log.entries.get(owner)?;
+        moves.get(move_name).map(|record| &record.script)
+    });
+    [
+        (Track::Game, record),
+        (Track::Sound, state.sound_script_edits.get(key)),
+        (Track::Expression, state.expression_script_edits.get(key)),
+        (Track::Effect, block_effects.get(key)),
+    ]
+    .into_iter()
+    .filter_map(|(track, script)| Some((track, script?)))
+    .collect()
 }
 
 fn clear_move_state(state: &mut crate::data::AppState) {
@@ -57179,6 +57467,673 @@ mod game_script_save_tests {
         }];
         let saved = game_script_for_edits(&AcmdScript::default(), &hitboxes);
         assert_eq!(saved.to_hitboxes(), hitboxes);
+    }
+}
+
+/// A move with blocks, edited in the Classic editor: both must say the same, in every category
+/// the Classic editor changes, or the project it is saved in cannot be opened.
+#[cfg(test)]
+mod classic_edits_on_blocks_tests {
+    use super::*;
+    use crate::data::ExcuteStmt;
+    use crate::move_nodes::model::{MoveGraph, MoveNode, NodeKind, Track};
+    use crate::move_nodes::{effects, project, timeline};
+
+    /// Mario's Jab 1, as the game's scripts have it.
+    const JAB: &str = r##"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 2.2, 361, 30, 0, 20, 1.2, 0.0, 6.3, 6.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 1, 0, Hash40::new("top"), 2.2, 361, 30, 0, 20, 1.5, 0.0, 6.3, 8.7, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 2, 0, Hash40::new("top"), 2.2, 180, 20, 0, 15, 1.8, 0.0, 6.3, 12.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_FIGHTER, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 3, 0, Hash40::new("top"), 2.2, 361, 20, 0, 15, 1.8, 0.0, 6.3, 12.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+    wait(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO);
+    }
+    frame(agent.lua_state_agent, 7.0);
+    if macros::is_excute(agent) {
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_RESTART);
+    }
+}
+
+unsafe extern "C" fn effect_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLIP(agent, Hash40::new("sys_attack_line"), Hash40::new("sys_attack_line"), Hash40::new("top"), -4, 6.2, 0, 0, 0, 0, 0.95, 0, 1, 0, 0, 0, 0, false, *EF_FLIP_YZ);
+    }
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 12.8, 6.2, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 360, false);
+        macros::LAST_EFFECT_SET_ALPHA(agent, 0.7);
+    }
+}
+
+unsafe extern "C" fn sound_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_s"));
+    }
+}
+
+unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_NONE), AttackDirectionAxis(*ATTACK_DIRECTION_NONE));
+        ItemModule::set_have_item_visibility(agent.module_accessor, false, 0);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
+    }
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new("rbkind_nohits"), 4, false, *BATTLE_OBJECT_ID_INVALID as u32);
+    }
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::RUMBLE_HIT(agent, Hash40::new("rbkind_attacks"), 0);
+    }
+}"##;
+    const KEY: &str = "mario/attack_11";
+
+    /// Mario's jab opened, with two blocks added in Move nodes and applied, as the app does.
+    fn jab_with_a_block() -> (AppState, MoveGraph) {
+        let mut state = AppState {
+            fighters: vec![crate::data::FighterEntry {
+                name: "mario".into(),
+                display_name: "Mario".into(),
+                param_path: PathBuf::new(),
+                motion_dir: PathBuf::new(),
+                model_dir: PathBuf::new(),
+                effect_dir: None,
+                slots: (0..8).collect(),
+                fighter_dir: PathBuf::new(),
+                source: crate::data::FighterSource::DataRoot,
+                custom_name: None,
+            }],
+            selected_fighter: Some(0),
+            ..AppState::default()
+        };
+        state.open_move(
+            "mario",
+            MoveEntry {
+                name: "attack_11".into(),
+                hash: hash40::hash40("attack_11").0,
+                frame_count: 32,
+                anim_path: None,
+                cancel_frame: 0,
+            },
+        );
+        let game = crate::acmd::parse_acmd_script(JAB);
+        state.hitboxes = game.to_hitboxes();
+        state.hitboxes_pristine = state.hitboxes.clone();
+        state.set_script(game);
+        state.sound_script = crate::acmd::parse_sound_script(JAB);
+        state.expression_script = crate::acmd::parse_expression_script(JAB);
+        state.effect_script = crate::acmd::parse_effect_script(JAB);
+        state.effects = state.effect_script.to_effect_calls();
+        state.effects_pristine = state.effects.clone();
+
+        let mut graph = MoveGraph::default();
+        for (track, script) in [
+            (Track::Game, &state.script),
+            (Track::Sound, &state.sound_script),
+            (Track::Expression, &state.expression_script),
+        ] {
+            let lane = timeline::import_for_fighter("mario", track, script);
+            graph.tracks.push(lane);
+        }
+        let lane = effects::import_for_fighter("mario", &state.effect_script);
+        graph.tracks.push(lane);
+        let block = NodeKind::Execute {
+            commands: vec![ExcuteStmt::SetSpeed(crate::data::SetSpeedCall {
+                speed_x: 1.5,
+                speed_y: 0.0,
+            })],
+        };
+        // What the node editor gives an added block: an id after every lane's.
+        let id = (3 << 29) + 40;
+        graph.tracks[0].nodes.push(MoveNode { id, kind: block });
+        graph.tracks[0].nodes.push(MoveNode {
+            id: id + 1,
+            kind: NodeKind::MotionRate { rate: 0.5 },
+        });
+        let compiled = timeline::compile("mario", "attack_11", &graph).unwrap();
+        for (track, script) in compiled {
+            match track {
+                Track::Game => {
+                    state.hitboxes = script.to_hitboxes();
+                    state.script = script.clone();
+                    state.edit_log.save(
+                        "mario",
+                        "mario",
+                        "Mario",
+                        "attack_11",
+                        script,
+                        state.hitboxes_pristine.clone(),
+                        state.hitboxes.clone(),
+                    );
+                }
+                Track::Expression => {
+                    state.expression_script = script.clone();
+                    state.expression_script_edits.insert(KEY.into(), script);
+                }
+                // Neither changed: the Classic editor's still.
+                Track::Sound | Track::Effect => {}
+            }
+        }
+        graph.tracks.retain(|lane| lane.track != Track::Effect);
+        (state, graph)
+    }
+
+    /// What the app does with a Classic edit: log the move, then bring its blocks in step.
+    fn settle(state: &mut AppState, graph: &mut MoveGraph) {
+        commit_open_move(state);
+        project::follow_scripts(
+            "mario",
+            &Default::default(),
+            &Default::default(),
+            "attack_11",
+            graph,
+            &saved_scripts(state, &HashMap::new(), KEY),
+        );
+    }
+
+    fn saved(state: &AppState, graph: &MoveGraph) -> crate::mod_project::ModProjectFile {
+        let mut file = crate::mod_project::ModProjectFile {
+            name: "mix".into(),
+            ..Default::default()
+        };
+        let mario = file.fighters.entry("mario".into()).or_default();
+        mario.acmd = state.edit_log.entries["mario"].clone();
+        mario.move_graphs.insert("attack_11".into(), graph.clone());
+        for (store, scripts) in [
+            (&state.sound_script_edits, &mut mario.sound_scripts),
+            (
+                &state.expression_script_edits,
+                &mut mario.expression_scripts,
+            ),
+        ] {
+            if let Some(script) = store.get(KEY) {
+                scripts.insert("attack_11".into(), script.clone());
+            }
+        }
+        serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap()
+    }
+
+    fn has_the_block(graph: &MoveGraph) -> bool {
+        graph.tracks.iter().any(|lane| {
+            lane.track == Track::Game
+                && lane.nodes.iter().any(|node| {
+                    matches!(&node.kind, NodeKind::Execute { commands }
+                        if matches!(commands[..], [ExcuteStmt::SetSpeed(_)]))
+                })
+        })
+    }
+
+    type Edit = fn(&mut AppState);
+
+    /// One Classic edit of every category, as its panel makes it.
+    const EDITS: &[(&str, Edit)] = &[
+        ("hitbox damage", |state| state.hitboxes[0].damage = 12.0),
+        ("hitbox added", |state| {
+            let mut hitbox = state.hitboxes[0].clone();
+            (hitbox.id, hitbox.active_start, hitbox.active_end) = (4, 9, 11);
+            state.hitboxes.push(hitbox);
+        }),
+        ("hitbox removed", |state| {
+            state.hitboxes.remove(1);
+        }),
+        ("hitbox retimed", |state| {
+            (state.hitboxes[2].active_start, state.hitboxes[2].active_end) = (5, 9);
+        }),
+        ("every hitbox removed", |state| state.hitboxes.clear()),
+        ("hurtbox", |state| {
+            let status = "*HIT_STATUS_XLU".to_string();
+            let target = crate::data::HurtTarget::Whole;
+            assert!(state.script.insert_hurtbox_at_frame(3, target, status));
+        }),
+        ("flag", |state| {
+            let call = state.script.work_flag_stmt_mut(0).unwrap();
+            call.flag = "*FIGHTER_STATUS_ATTACK_FLAG_ENABLE_100".into();
+        }),
+        ("speed of the added block", |state| {
+            state.script.set_speed_stmt_mut(0).unwrap().speed_x = 3.0;
+        }),
+        ("animation speed", |state| {
+            let site = state.script.motion_rate_sites()[0].0;
+            *state.script.motion_rate_mut(site).unwrap() = 2.0;
+        }),
+        ("leaves the ground", |state| {
+            assert!(state.script.insert_set_air_at_frame(4));
+        }),
+        ("movement stopped", |state| {
+            assert!(state.script.insert_kinetic_clear_speed_all_at_frame(6));
+        }),
+        ("facing", |state| {
+            assert!(state.script.insert_reverse_lr_at_frame(6));
+        }),
+        ("sound changed", |state| {
+            let Some(ExcuteStmt::Sound(call)) = state.sound_script.sound_stmt_mut(0) else {
+                panic!("the jab's sound");
+            };
+            call.sounds[0] = "se_common_punch_kick_swing_l".into();
+            let script = state.sound_script.clone();
+            state.sound_script_edits.insert(KEY.into(), script);
+        }),
+        ("sound added", |state| {
+            let call = crate::data::SoundCall {
+                func: "PLAY_SE".into(),
+                sounds: vec!["se_mario_jump01".into()],
+                tail: None,
+            };
+            assert!(state.sound_script.insert_sound_at_frame(9, call));
+            let script = state.sound_script.clone();
+            state.sound_script_edits.insert(KEY.into(), script);
+        }),
+        ("sound removed", |state| {
+            assert!(state.sound_script.remove_sound(0));
+            let script = state.sound_script.clone();
+            state.sound_script_edits.insert(KEY.into(), script);
+        }),
+        ("expression removed", |state| {
+            assert!(state.expression_script.remove_expression(0));
+            let script = state.expression_script.clone();
+            state.expression_script_edits.insert(KEY.into(), script);
+        }),
+        ("expression added", |state| {
+            let call = crate::data::ExpressionCall::RumbleHit {
+                kind: "Hash40::new(\"rbkind_attackm\")".into(),
+                unk: "0".into(),
+            };
+            assert!(state.expression_script.insert_expression_at_frame(9, call));
+            let script = state.expression_script.clone();
+            state.expression_script_edits.insert(KEY.into(), script);
+        }),
+    ];
+
+    #[test]
+    fn every_classic_edit_reaches_the_moves_blocks_and_the_project_opens() {
+        for (what, edit) in EDITS {
+            let (mut state, mut graph) = jab_with_a_block();
+            project::expand(&saved(&state, &graph)).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            edit(&mut state);
+            commit_open_move(&mut state);
+            let parted = project::expand(&saved(&state, &graph));
+            assert!(
+                parted.is_err(),
+                "{what}: the edit is not one blocks can miss"
+            );
+            settle(&mut state, &mut graph);
+            let file = saved(&state, &graph);
+            let expanded = project::expand(&file).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let mario = &expanded.fighters["mario"];
+            let record = &mario.acmd["attack_11"];
+            let by_id = |hitboxes: &[crate::data::Hitbox]| {
+                let mut hitboxes = hitboxes.to_vec();
+                hitboxes.sort_by_key(|hitbox| hitbox.id);
+                hitboxes
+            };
+            assert_eq!(
+                by_id(&record.script.to_hitboxes()),
+                by_id(&state.hitboxes),
+                "{what}"
+            );
+            for (track, script) in saved_scripts(&state, &HashMap::new(), KEY) {
+                let kept = match track {
+                    Track::Game => &record.script,
+                    Track::Sound => &mario.sound_scripts["attack_11"],
+                    Track::Expression => &mario.expression_scripts["attack_11"],
+                    Track::Effect => unreachable!(),
+                };
+                assert!(same_script(kept, script), "{what}: {track:?}");
+            }
+            // The blocks themselves hold the edit, and the block added in Move nodes is there.
+            let lanes: Vec<Track> = graph.tracks.iter().map(|lane| lane.track).collect();
+            assert_eq!(
+                lanes,
+                [Track::Game, Track::Sound, Track::Expression],
+                "{what}"
+            );
+            assert!(has_the_block(&graph), "{what}");
+            // Nothing is left to do, and the next block edit writes what the project has.
+            let before = serde_json::to_value(&graph).unwrap();
+            settle(&mut state, &mut graph);
+            assert_eq!(serde_json::to_value(&graph).unwrap(), before, "{what}");
+            timeline::compile("mario", "attack_11", &graph).unwrap();
+        }
+    }
+
+    /// Edits one after another, the classic way round and back: a block edit after a Classic
+    /// edit, and the Classic editor's undo of its edit.
+    #[test]
+    fn block_edits_and_classic_edits_take_turns() {
+        let (mut state, mut graph) = jab_with_a_block();
+        let (applied, first) = (
+            state.hitboxes.clone(),
+            serde_json::to_value(&graph).unwrap(),
+        );
+        state.hitboxes[0].damage = 12.0;
+        settle(&mut state, &mut graph);
+        assert_ne!(serde_json::to_value(&graph).unwrap(), first);
+
+        // Undo in the Classic editor: the list as it was, and the blocks follow it back.
+        state.hitboxes = applied;
+        settle(&mut state, &mut graph);
+        let undone = timeline::compile("mario", "attack_11", &graph).unwrap();
+        assert!(same_script(&undone[0].1, &state.script));
+        assert!(has_the_block(&graph));
+
+        // Then blocks again: what Apply compiles carries the Classic edit.
+        state.hitboxes[0].damage = 14.0;
+        settle(&mut state, &mut graph);
+        graph.tracks[0].nodes.push(MoveNode {
+            id: (3 << 29) + 50,
+            kind: NodeKind::MotionRate { rate: 3.0 },
+        });
+        let script = timeline::compile("mario", "attack_11", &graph).unwrap()[0]
+            .1
+            .clone();
+        assert_eq!(script.to_hitboxes()[0].damage, 14.0);
+        let sites = script.motion_rate_sites();
+        let rates: Vec<f32> = sites.iter().map(|site| site.2).collect();
+        assert_eq!(rates, [0.5, 3.0]);
+    }
+
+    /// A damage edit changes the number and nothing around it: a hitbox in an If stays in it.
+    #[test]
+    fn a_hitbox_value_changes_in_place() {
+        let guarded = JAB.replacen(
+            "    if macros::is_excute(agent) {",
+            "    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO) {\n    if macros::is_excute(agent) {",
+            1,
+        )
+        .replacen("    wait(agent.lua_state_agent, 2.0);", "    }\n    wait(agent.lua_state_agent, 2.0);", 1);
+        let script = crate::acmd::parse_acmd_script(&guarded);
+        assert!(matches!(
+            script.stmts[1],
+            crate::data::AcmdStmt::RawBlock { .. }
+        ));
+        let mut hitboxes = script.to_hitboxes();
+        hitboxes[1].damage = 9.0;
+        hitboxes[1].size = 4.0;
+        let edited = game_script_for_edits(&script, &hitboxes);
+        assert_eq!(edited.to_hitboxes(), hitboxes);
+        let (was, now) = (
+            crate::acmd::preview_game_fn(&script, "attack_11"),
+            crate::acmd::preview_game_fn(&edited, "attack_11"),
+        );
+        let changed = was.lines().zip(now.lines()).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            (was.lines().count(), changed),
+            (now.lines().count(), 1),
+            "{now}"
+        );
+        // A retime is no value: it rebuilds the schedule.
+        hitboxes[1].active_start = 4;
+        hitboxes[1].active_end = 6;
+        assert!(revalue_hitboxes(&script, &hitboxes).is_none());
+        assert_eq!(
+            game_script_for_edits(&script, &hitboxes)
+                .to_hitboxes()
+                .len(),
+            4
+        );
+    }
+
+    /// A project saved while the two were apart opens with the Classic edit, says what its blocks
+    /// lost, and its blocks agree from then on. The check itself stays: the same file is refused
+    /// as a recipe to apply.
+    #[test]
+    fn a_project_saved_with_the_two_apart_opens_with_the_newer_edit() {
+        let (mut state, graph) = jab_with_a_block();
+        state.hitboxes[0].damage = 12.0;
+        commit_open_move(&mut state);
+        let mut file = saved(&state, &graph);
+        let refused = project::expand(&file).unwrap_err();
+        assert!(refused[0].reason.contains("differs"), "{refused:?}");
+        assert!(crate::mod_export::validate_project(&file).is_ok());
+
+        let notes = project::reconcile(&mut file);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Mario, Jab 1"), "{notes:?}");
+        assert!(notes[0].contains("2.2%"), "{notes:?}");
+        let expanded = project::expand(&file).unwrap();
+        let record = &expanded.fighters["mario"].acmd["attack_11"];
+        assert_eq!(record.hitboxes[0].damage, 12.0);
+        assert!(has_the_block(
+            &file.fighters["mario"].move_graphs["attack_11"]
+        ));
+        assert!(project::reconcile(&mut file).is_empty());
+        // One that was never apart says nothing.
+        let (state, graph) = jab_with_a_block();
+        assert!(project::reconcile(&mut saved(&state, &graph)).is_empty());
+    }
+
+    /// Effects stay the Classic editor's until blocks change them; then an effect edited in the
+    /// old lists beside them goes into the blocks, and one only listed there changes nothing.
+    #[test]
+    fn effects_blocks_own_take_the_edits_kept_beside_them() {
+        let source = crate::acmd::parse_effect_script(JAB);
+        let lane = effects::import_for_fighter("mario", &source);
+        let script = |lane: &crate::move_nodes::model::MoveTrack| {
+            let graph = MoveGraph {
+                tracks: vec![lane.clone()],
+                ..MoveGraph::default()
+            };
+            timeline::compile("mario", "attack_11", &graph).unwrap()[0]
+                .1
+                .clone()
+        };
+        let plain = script(&lane);
+        assert!(project::effects_unchanged(
+            "mario",
+            "attack_11",
+            &source,
+            &plain
+        ));
+        let mut owned = lane.clone();
+        let NodeKind::EffectExecute { commands } = &mut owned.nodes[1].kind else {
+            panic!("the jab's first effect");
+        };
+        let crate::data::EffectMacro::Effect { scale, .. } = &mut commands[0] else {
+            panic!("the jab's first effect");
+        };
+        *scale = 2.0;
+        let owned_script = script(&owned);
+        assert!(!project::effects_unchanged(
+            "mario",
+            "attack_11",
+            &source,
+            &owned_script
+        ));
+
+        let blocks = crate::acmd::parse_effect_script(&crate::acmd::preview_effect_structure_fn(
+            &owned_script,
+            "attack_11",
+        ))
+        .to_effect_calls();
+        assert_eq!(blocks[0].scale, 2.0);
+        let file = |edits: Vec<crate::data::EffectCallEdit>| {
+            let (state, mut graph) = jab_with_a_block();
+            graph.tracks.push(owned.clone());
+            let mut file = saved(&state, &graph);
+            let mario = file.fighters.get_mut("mario").unwrap();
+            mario
+                .effect_scripts
+                .insert("attack_11".into(), owned_script.clone());
+            // As the borrow scan listed it: the game's own calls.
+            let full = source.to_effect_calls();
+            mario.effect_calls_full.insert("attack_11".into(), full);
+            mario.effect_calls.insert("attack_11".into(), edits);
+            file
+        };
+        let played = |file: &crate::mod_project::ModProjectFile| {
+            let expanded = project::expand(file).unwrap();
+            let script = &expanded.fighters["mario"].effect_scripts["attack_11"];
+            crate::acmd::parse_effect_script(&crate::acmd::preview_effect_structure_fn(
+                script,
+                "attack_11",
+            ))
+            .to_effect_calls()
+        };
+        let mut listed = file(Vec::new());
+        assert!(project::expand(&listed).is_err());
+        assert!(project::reconcile(&mut listed).is_empty());
+        assert_eq!(played(&listed), blocks);
+
+        // One applied by a build that took the effects along unchanged: the Classic editor's again.
+        let mut along = file(Vec::new());
+        let mario = along.fighters.get_mut("mario").unwrap();
+        mario.effect_scripts.insert("attack_11".into(), plain);
+        let body = JAB.to_owned();
+        let snapshot = crate::mod_project::MoveSourceSnapshot {
+            body,
+            ..Default::default()
+        };
+        mario.move_sources.insert("attack_11".into(), snapshot);
+        project::reconcile(&mut along);
+        let mario = &along.fighters["mario"];
+        assert!(mario.effect_scripts.is_empty());
+        assert_eq!(mario.move_graphs["attack_11"].tracks.len(), 3);
+
+        let mut added = blocks[1].clone();
+        added.effect_name = "sys_hit_elec".into();
+        added.active_start = 5;
+        added.active_end = 5;
+        let mut edited = file(vec![crate::data::EffectCallEdit {
+            index: 2,
+            op: crate::data::EffectCallOp::Add(added),
+            pristine: None,
+        }]);
+        let notes = project::reconcile(&mut edited);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let calls = played(&edited);
+        let names: Vec<(&str, u32, f32)> = calls
+            .iter()
+            .map(|call| (call.effect_name.as_str(), call.active_start, call.scale))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("sys_attack_line", 1, 2.0),
+                ("sys_attack_impact", 2, 1.0),
+                ("sys_hit_elec", 5, 1.0),
+            ]
+        );
+        assert_eq!(calls[1].alpha, blocks[1].alpha);
+        assert!(project::reconcile(&mut edited).is_empty());
+    }
+
+    /// Every fighter's real moves: blocks made of the move's own scripts hold every Classic
+    /// hitbox edit. Set `VISIONARY_SCRIPT_DUMP` to the dump's `smashline` folder to run it.
+    #[test]
+    fn every_fighters_blocks_hold_classic_hitbox_edits() {
+        let Some(root) = std::env::var_os("VISIONARY_SCRIPT_DUMP") else {
+            return;
+        };
+        let (mut moves, mut in_place, mut problems) = (0, 0, Vec::new());
+        for kind in crate::gimmicks::registry::FIGHTER_KINDS {
+            let fighter = kind.fighter;
+            let dir = Path::new(&root)
+                .join(format!("lua2cpp_{fighter}"))
+                .join(fighter);
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let Ok(body) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let body = crate::acmd::script_source_from_body(&body);
+                let source = crate::acmd::parse_acmd_script(&body);
+                let hitboxes = source.to_hitboxes();
+                if hitboxes.is_empty() {
+                    continue;
+                }
+                let lane = timeline::import_for_fighter(fighter, Track::Game, &source);
+                let applied = MoveGraph {
+                    tracks: vec![lane],
+                    ..MoveGraph::default()
+                };
+                let Ok(written) = timeline::compile(fighter, "attack", &applied) else {
+                    continue;
+                };
+                moves += 1;
+                let written = &written[0].1;
+                let hitboxes = match written.to_hitboxes() {
+                    written if written.len() == hitboxes.len() => written,
+                    _ => continue,
+                };
+                let mut damage = hitboxes.clone();
+                damage[0].damage += 1.0;
+                in_place += usize::from(revalue_hitboxes(written, &damage).is_some());
+                let mut reshaped = hitboxes[1..].to_vec();
+                if let Some(retimed) = reshaped.first_mut() {
+                    retimed.active_start += 1;
+                    retimed.active_end = retimed.active_end.max(retimed.active_start);
+                }
+                reshaped.push(crate::data::Hitbox {
+                    id: 7,
+                    active_start: 40,
+                    active_end: 42,
+                    ..crate::data::Hitbox::default()
+                });
+                for (what, edited) in [("damage", damage), ("reshaped", reshaped)] {
+                    let script = game_script_for_edits(written, &edited);
+                    let mut graph = applied.clone();
+                    project::follow_scripts(
+                        fighter,
+                        &Default::default(),
+                        &Default::default(),
+                        "attack",
+                        &mut graph,
+                        &[(Track::Game, &script)],
+                    );
+                    if graph.tracks.len() != 1 {
+                        let name = entry.file_name();
+                        problems.push(format!("{fighter}/{}: {what}", name.to_string_lossy()));
+                    }
+                }
+            }
+        }
+        println!("{moves} moves with hitboxes, {in_place} take a damage edit in place");
+        assert!(
+            problems.is_empty(),
+            "{} of {moves}:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
+    /// The app brings the blocks in step with every edit it records, before the undo step that
+    /// holds it, and again for every move before a project is written or exported.
+    #[test]
+    fn the_app_settles_blocks_at_the_end_of_an_edit_and_before_a_save() {
+        let source = include_str!("app.rs");
+        let body = |name: &str| {
+            let rest = source.split(name).nth(1).expect("function");
+            rest.split("\n    fn ").next().unwrap().to_owned()
+        };
+        let frame = body("fn finish_history_frame(");
+        let settled = frame.find("self.sync_move_graph(").expect("settles");
+        assert!(
+            frame
+                .find("self.commit_current_edits()")
+                .expect("logs first")
+                < settled
+        );
+        assert!(settled < frame.find("history.undo.push").expect("then the undo step"));
+        let build = body("fn build_project(");
+        let settled = build.find("self.sync_move_graph(").expect("settles");
+        assert!(settled < build.find("&self.move_graphs {").expect("then the file"));
+        let load = body("fn load_project_from(");
+        let apart = load
+            .find("move_nodes::project::reconcile(")
+            .expect("settles");
+        let expands = load.find("move_nodes::project::expand(").unwrap();
+        assert!(apart < expands);
+        let rest = load[expands..]
+            .split("// Loading is replacement")
+            .next()
+            .unwrap();
+        assert!(!rest.contains("return"), "blocks keep no project shut");
     }
 }
 

@@ -56,6 +56,9 @@ fn load_project(project_path: &Path) -> anyhow::Result<ModProjectFile> {
     let mut project: ModProjectFile = serde_json::from_str(&text)
         .map_err(|error| anyhow::anyhow!("could not parse {}: {error}", project_path.display()))?;
     project.migrate()?;
+    for note in crate::move_nodes::project::reconcile(&mut project) {
+        eprintln!("{note}");
+    }
     Ok(project)
 }
 
