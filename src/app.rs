@@ -773,6 +773,7 @@ enum PendingLeave {
     UnlinkSource,
     SaveSourceBuffer,
     ReloadSource,
+    Close,
 }
 
 impl PendingLeave {
@@ -791,6 +792,7 @@ impl PendingLeave {
             Self::UnlinkSource => "unlink the moveset source",
             Self::SaveSourceBuffer => "save the source editor's text and reload the script",
             Self::ReloadSource => "reload this script from disk",
+            Self::Close => "close Visionary",
         }
     }
 }
@@ -5618,6 +5620,8 @@ pub struct VisionaryApp {
     pending_leave: Option<(PendingLeave, Option<String>)>,
     /// Set for one navigation the prompt already approved.
     leave_confirmed: bool,
+    /// The window may close over an object script's unsynced changes: the prompt said so.
+    close_confirmed: bool,
     /// Whether the last source sync ran and wrote everything it meant to.
     last_sync_clean: bool,
     /// Whether the open object script is defined in the linked source (so a sync saves it).
@@ -6159,6 +6163,7 @@ impl VisionaryApp {
             object_baseline: None,
             pending_leave: None,
             leave_confirmed: false,
+            close_confirmed: false,
             last_sync_clean: false,
             open_article_in_source: false,
             article_settings: None,
@@ -23446,6 +23451,10 @@ impl VisionaryApp {
             PendingLeave::UnlinkSource => self.unlink_acmd_source(),
             PendingLeave::SaveSourceBuffer => self.save_source_buffer(),
             PendingLeave::ReloadSource => self.fetch_acmd(),
+            PendingLeave::Close => {
+                self.close_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         self.leave_confirmed = false;
     }
@@ -40236,6 +40245,13 @@ impl eframe::App for VisionaryApp {
         // Background workers and game reports must be polled even without pointer or keyboard
         // events. This deadline also keeps an unfocused window's progress/status current.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Closing the window leaves an object script as any other way out does.
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.close_confirmed
+            && self.leave_gate(|| PendingLeave::Close)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         // Keep the game link alive whenever the app runs — live offsets, hitbox rules,
         // ACMD capture, the reconnect modal, and the Transplant pool all need it, not just
         // the Eff Editor window (which used to be the only thing that started it).
@@ -50028,6 +50044,11 @@ mod live_effect_capture_tests {
                 .and_then(|rest| rest.split("\n    fn ").next())
                 .unwrap_or_else(|| panic!("{name}"))
         };
+        // Closing the window asks too, and closes once it is answered.
+        let frame = body("fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {");
+        let asked = frame.find("&& self.leave_gate(|| PendingLeave::Close)");
+        let held = frame.find("ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose)");
+        assert!(asked.is_some() && asked < held);
         let prompt = body("fn draw_object_leave_prompt(&mut self, ctx: &egui::Context) {");
         let dropped = prompt
             .find("if choice == LeaveChoice::Discard {\n            self.discard_object_edits();")
