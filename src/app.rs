@@ -37837,12 +37837,12 @@ impl VisionaryApp {
         let (state, kinds, _, spawned) = self.game_link.carrier_status();
         let took = !self.eff_editor.carrier_needs_new_bytes
             || self.game_link.carrier_gen() > self.eff_editor.gen_at_send;
-        let live = carrier_send_reached_goal(true, state, kinds, spawned, took, true);
+        let up = carrier_send_reached_goal(true, state, kinds, spawned, took, true);
         let Some(now) = crate::live_carrier::since_send(
             was,
             &self.game_link.gimmick_agents(),
             &self.carrier_fighters,
-            live.then(|| self.reached_outcome()),
+            up.then(|| self.reached_outcome()),
         ) else {
             return;
         };
