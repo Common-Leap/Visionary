@@ -43087,6 +43087,8 @@ fn rebuild_script_from_hitboxes(
     // What changes a hitbox goes where the hitbox went.
     let pristine = original.to_hitboxes();
     let mut timed: Vec<(f32, u8, AcmdStmt)> = Vec::new();
+    // The frame each line put on a frame was on before.
+    let mut placed: HashMap<(u32, String), f32> = HashMap::new();
     for (at, follows, stmt) in retained {
         let AcmdStmt::Excute(inner) = &stmt else {
             timed.push((at, if follows { 2 } else { 0 }, stmt));
@@ -43099,7 +43101,11 @@ fn rebuild_script_from_hitboxes(
         let mut by_frame: BTreeMap<u32, Vec<ExcuteStmt>> = BTreeMap::new();
         for one in inner {
             for frame in frames_of_modifier(one, at as u32, &pristine, hitboxes) {
-                by_frame.entry(frame).or_default().push(one.clone());
+                // One line for hitboxes that were apart, and are on one frame again, is one line.
+                let line = crate::acmd::emit_excute_stmts(std::slice::from_ref(one), "").join("");
+                if *placed.entry((frame, line)).or_insert(at) == at {
+                    by_frame.entry(frame).or_default().push(one.clone());
+                }
             }
         }
         timed.extend(
@@ -54386,6 +54392,27 @@ mod live_effect_capture_tests {
             "{frames:?}"
         );
         assert_eq!(frames[2].0, 7.0);
+
+        // Saved with them apart, and put together again: the shared line is there once, as it
+        // was; and one written twice for a frame stays twice.
+        let mut apart = pristine.clone();
+        apart[2].active_start = 7;
+        let saved = rebuild_script_from_hitboxes(&original, &apart);
+        let count = |script: &crate::data::AcmdScript, hitboxes: &[Hitbox]| {
+            let script = rebuild_script_from_hitboxes(script, hitboxes);
+            let body = crate::acmd::preview_game_fn(&script, "attack_lw3");
+            body.matches("set_attack_height_all").count()
+        };
+        assert_eq!(count(&saved, &apart), 2);
+        assert_eq!(count(&saved, &pristine), 1);
+        let line = "AttackModule::set_attack_height_all(";
+        let source = crate::source_timing::tests::DK_DTILT;
+        let start = source.find(line).unwrap();
+        let start = source[..start].rfind('\n').unwrap() + 1;
+        let end = start + source[start..].find('\n').unwrap() + 1;
+        let twice = format!("{}{}", &source[..end], &source[start..]);
+        let twice = crate::acmd::parse_acmd_script(&twice);
+        assert_eq!(count(&twice, &pristine), 2);
 
         // All of them sooner: nothing is left behind.
         let mut hitboxes = pristine;
