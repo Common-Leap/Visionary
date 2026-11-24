@@ -19,8 +19,9 @@ pub type Effect = (String, usize);
 #[derive(Default)]
 pub struct Share {
     pub owner: String,
-    /// The fighter the game runs for it.
+    /// The fighter the game runs for it. Nobody's, for effects anyone plays.
     pub fighter: String,
+    pub everyone: bool,
     /// What is copied in, each under the name the carrier keeps it by.
     pub ops: Vec<TransplantOp>,
     pub authored: Vec<CarrierAuthored>,
@@ -55,6 +56,28 @@ type Edits = (
     Option<EmitterRoster>,
     Option<EntryEdit>,
 );
+
+/// Whose effects a file has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plays {
+    Fighter,
+    /// The shared files, which the game loads once, as it starts.
+    Everyone,
+    /// A stage, an assist, a menu: its effects can't go into a running match, and its file is
+    /// loaded when the game needs it.
+    Other,
+}
+
+pub fn who_plays(rel: &str) -> Plays {
+    let rel = rel.to_lowercase();
+    if rel.starts_with("effect/system/") {
+        Plays::Everyone
+    } else if rel.is_empty() || rel.starts_with("effect/fighter/") {
+        Plays::Fighter
+    } else {
+        Plays::Other
+    }
+}
 
 /// What `eff` changes about each effect of its file, by the effect's lowercase name. Edits with no
 /// effect recorded (projects saved before `entry_name` existed) are skipped rather than guessed:
@@ -122,6 +145,7 @@ impl Share {
         let mut share = Self {
             owner: from.owner.to_owned(),
             fighter: from.fighter.to_owned(),
+            everyone: who_plays(from.source_rel) == Plays::Everyone,
             textures: eff.textures.clone(),
             new_textures: eff.textures_added.clone(),
             gone_textures: eff.textures_removed.clone(),
@@ -167,6 +191,7 @@ impl Share {
                     from: from_hash,
                     to,
                     slots: (from.borrowed_costumes)(op),
+                    everyone: share.everyone,
                 };
                 if !share.aliases.contains(&wire) {
                     share.aliases.push(wire);
@@ -230,6 +255,7 @@ impl Share {
                 from: effect_name_hash(&name),
                 to: effect_name_hash(&clone),
                 slots: from.costumes.to_vec(),
+                everyone: share.everyone,
             };
             // One name leads to one effect on a costume. A borrowed copy keeps it.
             if share.aliases.iter().any(|alias| clash(alias, &wire)) {
@@ -361,10 +387,20 @@ pub fn left_note(left: Vec<(bool, String)>) -> String {
     note(true, "next match") + &note(false, "not sent")
 }
 
-/// Whether nobody of the match that is on plays a fighter the carrier is for.
+/// Whether nobody of the match that is on plays a fighter the carrier is for. One with effects
+/// anyone plays is for no fighter in particular, and has none.
 pub fn nobody_holds(agents: &[LiveGimmickAgent], fighters: &[String]) -> bool {
     let mut playing = agents.iter().filter_map(|agent| agent.fighter.as_ref());
-    !agents.is_empty() && !playing.any(|fighter| fighters.contains(fighter))
+    let anyone = fighters.is_empty() || playing.any(|fighter| fighters.contains(fighter));
+    !agents.is_empty() && !anyone
+}
+
+/// The fighters a carrier with `shares` is for; none when any fighter may hold it.
+pub fn holders(shares: &[Share]) -> Vec<String> {
+    match shares.iter().any(|share| share.everyone) {
+        true => Vec::new(),
+        false => shares.iter().map(|share| share.fighter.clone()).collect(),
+    }
 }
 
 /// What a send the game has taken means for its character. `agents` is what is in the match, when
@@ -395,6 +431,20 @@ pub fn reached(
     }
 }
 
+/// What is said of a send that ended in `outcome`, by whose effects its file has. `shares` is
+/// whether the plugin in the game can change a shared effect; `staged` whether the file waits for
+/// the game to load it.
+pub fn said(plays: Plays, outcome: SendOutcome, shares: bool, staged: bool) -> SendOutcome {
+    use SendOutcome as S;
+    match (plays, outcome) {
+        (Plays::Fighter, _) | (_, S::NotBuilt) => outcome,
+        (Plays::Other, _) if staged => S::NextFile,
+        (Plays::Other, _) | (Plays::Everyone, S::NextMatch) => S::NotInMatch,
+        (Plays::Everyone, S::InGame) if !shares => S::NotInMatch,
+        (Plays::Everyone, _) => outcome,
+    }
+}
+
 /// The plugin's half, run here: tests in the plugin crate never run.
 #[cfg(test)]
 #[path = "../plugins/slight_replica/src/slight/effect_viewer/carrier_gate.rs"]
@@ -408,6 +458,8 @@ mod tests {
     use super::*;
 
     const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+    const PACMAN: &str = "effect/fighter/pacman/ef_pacman.eff";
+    const COMMON: &str = "effect/system/common/ef_common.eff";
 
     fn edit(entry: &str) -> AuthoredEdit {
         AuthoredEdit {
@@ -590,7 +642,7 @@ mod tests {
     /// Two characters that edited their own copies of one donor each keep theirs.
     #[test]
     fn edited_copies_of_one_donor_are_kept_apart() {
-        let pacman = "effect/fighter/pacman/ef_pacman.eff";
+        let pacman = PACMAN;
         let with = |rel: &str, edited: bool| EffMod {
             transplants: vec![borrow(pacman, "pacman_akabei")],
             ..edits(
@@ -733,6 +785,127 @@ mod tests {
         assert!(nobody_holds(&c00, &fighters(&["pacman"])));
         assert!(!nobody_holds(&c00, &fighters(&["pacman", "fox"])));
         assert!(!nobody_holds(&[], &fighters(&["pacman"])));
+        // One with effects of the shared file is for whoever is in the match.
+        let mario = edits(MARIO, &["mario_atkhi3_arc"]);
+        let mario = || share("mario", &mario, &[], &[]);
+        let common = || share("common", &edits(COMMON, &["sys_smash_flash"]), &[], &[]);
+        assert!(nobody_holds(
+            &c00,
+            &holders(&[share("pacman", &edits(PACMAN, &["x"]), &[], &[])])
+        ));
+        assert!(!nobody_holds(&c00, &holders(&[common()])));
+        assert!(!nobody_holds(&c00[1..], &holders(&[mario(), common()])));
+        assert_eq!(holders(&[mario()]), ["mario"]);
+    }
+
+    /// An edit to an effect of the shared file reaches every fighter in the match: its copy rides
+    /// the same carrier, beside the fighters' own edits, under a name of its own.
+    #[test]
+    fn a_shared_effects_edit_is_in_the_carrier_for_everyone() {
+        let common = edits(COMMON, &["sys_smash_flash"]);
+        let mario = edits(MARIO, &["mario_atkhi3_arc"]);
+        let (shares, left) = both(
+            vec![
+                share("mario", &mario, &[0], &[]),
+                share("common", &common, &[], &[]),
+            ],
+            None,
+        );
+        assert_eq!(left, Vec::<String>::new());
+        let everyone = |share: &Share| share.aliases.iter().map(|a| a.everyone).collect::<Vec<_>>();
+        assert_eq!(shares[0].owner, "common");
+        assert_eq!(
+            (everyone(&shares[0]), shares[0].everyone),
+            (vec![true], true)
+        );
+        assert_eq!(
+            (everyone(&shares[1]), shares[1].everyone),
+            (vec![false], false)
+        );
+        // Under the shared effect's own name the carrier's copy would stand in for the game's.
+        assert_eq!(shares[0].ops[0].new_entry_name, "vsnedit_sys_smash_flash");
+        assert_eq!(shares[0].ops[0].src_file_rel, COMMON);
+        assert!(shares[0].aliases[0].slots.is_empty());
+        let kinds = [
+            (COMMON, Plays::Everyone),
+            ("effect/system/item/ef_item.eff", Plays::Everyone),
+            (MARIO, Plays::Fighter),
+            ("", Plays::Fighter),
+            ("effect/stage/battlefield/ef_battlefield.eff", Plays::Other),
+            ("effect/assist/robin/ef_robin.eff", Plays::Other),
+            ("effect/ui/menu/ef_menu.eff", Plays::Other),
+        ];
+        for (rel, plays) in kinds {
+            assert_eq!(who_plays(rel), plays, "{rel}");
+        }
+    }
+
+    /// The game loads the shared files once: an edit to one is in the match or it is not, and is
+    /// never said to load later. A stage's or a menu's file is loaded when the game needs it.
+    #[test]
+    fn only_a_file_the_game_loads_again_is_said_to_load() {
+        use SendOutcome as S;
+        let ended = [S::InGame, S::NextMatch, S::NoMatch, S::Unreadable];
+        for outcome in ended.into_iter().chain([S::NotBuilt, S::Restored]) {
+            for (shares, staged) in [(true, true), (true, false), (false, true)] {
+                let said = |plays| said(plays, outcome, shares, staged);
+                assert_eq!(said(Plays::Fighter), outcome);
+                let everyone = said(Plays::Everyone);
+                assert_ne!(everyone, S::NextMatch);
+                assert!(shares || everyone != S::InGame);
+                assert_eq!(
+                    shares && everyone == S::InGame,
+                    shares && outcome == S::InGame
+                );
+                let other = said(Plays::Other);
+                match (outcome, staged) {
+                    (S::NotBuilt, _) => assert_eq!(other, S::NotBuilt),
+                    (_, true) => assert_eq!(other, S::NextFile),
+                    (_, false) => assert_eq!(other, S::NotInMatch),
+                }
+            }
+        }
+    }
+
+    /// With nobody in the match that the carrier was built for, the first player holds one with
+    /// shared effects in it, and nobody one without.
+    #[test]
+    fn the_first_player_holds_a_carrier_for_everyone() {
+        use super::plugin_carrier::stands_in;
+        let holds = |fighters: &[(u32, i32, bool)]| -> Vec<u32> {
+            let ids = fighters.iter().map(|(id, ..)| *id);
+            ids.filter(|id| stands_in(*id, fighters)).collect()
+        };
+        assert_eq!(holds(&[(0x10000, 1, false), (0, 0, false)]), [0]);
+        // A player with two fighters at once.
+        assert_eq!(holds(&[(7, 0, false), (3, 0, false), (1, 1, false)]), [3]);
+        assert_eq!(holds(&[(0, 0, false), (0x10000, 1, true)]), [0u32; 0]);
+        assert_eq!(holds(&[]), [0u32; 0]);
+    }
+
+    /// A shared effect's name leads to its edited copy while the game has the copy, whoever asks,
+    /// and to the game's own effect while the carrier is on its way up or down.
+    #[test]
+    fn a_shared_name_leads_to_its_copy_only_while_the_game_has_it() {
+        use super::plugin_carrier::looked_up;
+        let shared = [(1, 101), (2, 102)];
+        let has = |copy: u64| copy == 101;
+        assert_eq!(looked_up(1, &shared, has), 101);
+        assert_eq!(looked_up(2, &shared, has), 2);
+        assert_eq!(looked_up(3, &shared, has), 3);
+        // The lookups it changes are checked to be what they were on the known game first, and a
+        // game it can't change is named to the editor.
+        let plugin =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/shared_names.rs");
+        let install = plugin.split("pub fn install() {").nth(1).expect("install");
+        let check = install.find("sites.iter().all(there)").expect("checked");
+        assert!(check < install.find("A64InlineHook(").expect("hooked"));
+        let server = include_str!(
+            "../plugins/slight_replica/src/rust_extender/debugging/debuggable_server/mod.rs"
+        );
+        assert!(
+            server.contains("\"shared\": crate::slight::effect_viewer::shared_names::installed(),")
+        );
     }
 
     /// A match with a fighter the carrier is for always has one that looks after it, whoever held

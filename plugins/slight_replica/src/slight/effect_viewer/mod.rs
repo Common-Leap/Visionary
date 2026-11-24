@@ -21,6 +21,7 @@ pub mod resource_reload;
 pub mod script_frames;
 pub mod show;
 pub mod spawn_rules;
+pub mod shared_names;
 mod staged_files;
 pub mod tracker;
 

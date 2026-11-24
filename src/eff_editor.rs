@@ -40,6 +40,7 @@ use crate::mod_project::{AuthoredEdit, EmitterFieldEdits, TransplantOp};
 mod add_part;
 mod part_clip;
 mod part_tree;
+pub(crate) use add_part::SHARED_FILE_REL;
 use add_part::{AddPartPicker, AddedData, PartOrigin, SharedFile};
 use part_clip::{paste_state, PartClip};
 use part_tree::{part_lines, PartMenu, PartTree};
@@ -8369,6 +8370,10 @@ pub(crate) enum SendOutcome {
     NoMatch,
     /// The match did not take it; the staged files load at the next match.
     NextMatch,
+    /// The match did not take it, and nothing more comes of it by itself.
+    NotInMatch,
+    /// No match takes it; the staged file loads when the game loads its own.
+    NextFile,
     /// The game dropped the last edit, but loaded changed effects with the fighter that can't be
     /// put back without loading it again.
     NextLoad,
@@ -8383,6 +8388,8 @@ impl SendOutcome {
             Self::NotBuilt => "Not sent: the edit could not be built",
             Self::NoMatch => "Saved for the next match",
             Self::NextMatch => "Not in this match: it loads at the next match",
+            Self::NotInMatch => "Not in this match",
+            Self::NextFile => "Loads when the game next opens this file",
             Self::NextLoad => "Its own effects come back when the fighter loads again",
         }
     }
@@ -8392,6 +8399,8 @@ impl SendOutcome {
         match self {
             Self::InGame | Self::Restored => "In the game",
             Self::Unreadable | Self::NotBuilt => "Not sent",
+            Self::NotInMatch => "Not in this match",
+            Self::NextFile => "Saved for when the game next opens its file",
             Self::NoMatch | Self::NextMatch | Self::NextLoad => "Saved for the next match",
         }
     }
@@ -8465,6 +8474,8 @@ mod tests {
             SendOutcome::NotBuilt,
             SendOutcome::NoMatch,
             SendOutcome::NextMatch,
+            SendOutcome::NotInMatch,
+            SendOutcome::NextFile,
         ];
         for phase in [
             send_phase(0, false, false, 0),
@@ -8481,6 +8492,12 @@ mod tests {
         }
         assert!(SendOutcome::InGame.ok() && SendOutcome::Restored.ok());
         assert!(!SendOutcome::NextMatch.ok() && !SendOutcome::NoMatch.ok());
+        assert!(!SendOutcome::NotInMatch.ok() && !SendOutcome::NextFile.ok());
+        // Nothing is said to come of a send that nothing more comes of.
+        let refused = SendOutcome::NotInMatch;
+        for said in [refused.text(), refused.status_prefix()] {
+            assert_eq!(said, "Not in this match");
+        }
     }
 
     /// "Not played yet" waits for the game's first report: before it, nothing has come back,

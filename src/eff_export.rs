@@ -7579,6 +7579,84 @@ pub(crate) mod tests {
         super::verify_shader_indices_resolve(&dest, "every shared part").expect("shaders");
     }
 
+    /// Every effect of the shared files can be edited in a running match: its copy, made the way a
+    /// send makes it, has every part its original has, and the file keeps every game-file rule.
+    #[test]
+    fn every_shared_effect_can_be_in_the_live_carrier() {
+        let Some(root) = effect_root() else {
+            return;
+        };
+        const CARRIER: &str = "effect/assist/bomberman/ef_bomberman.eff";
+        let carrier_base = std::fs::read(root.join(CARRIER)).expect("carrier eff");
+        let parts = |file: &effect_library::NamcoEffectFile, entry: usize| {
+            let mut sets = std::collections::HashSet::new();
+            super::entry_emitter_sets(file, entry, &mut sets);
+            let list = &file.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets;
+            let mut count = 0usize;
+            for set in sets.iter().filter_map(|set| list.get(*set)) {
+                super::visit_emitters_ref(&set.emitters, &mut |_| count += 1);
+            }
+            count
+        };
+        for (rel, whole) in [(SHARED, 201), ("effect/system/item/ef_item.eff", 0)] {
+            let file = effect_library::NamcoEffectFile::load(
+                &std::fs::read(root.join(rel)).expect("shared eff"),
+            )
+            .expect("shared parse");
+            let clone_of = |name: &str| format!("{}{name}", crate::mod_project::EDIT_CLONE_PREFIX);
+            let names: Vec<String> = file.entry_names.iter().map(|n| n.to_lowercase()).collect();
+            // A model alone has no part to edit.
+            let with_parts: Vec<usize> = (0..names.len())
+                .filter(|entry| parts(&file, *entry) > 0)
+                .collect();
+            println!("{rel}: {} of {}", with_parts.len(), names.len());
+            assert!(with_parts.len() >= whole, "{rel}");
+            for batch in with_parts.chunks(40) {
+                let ops: Vec<_> = batch
+                    .iter()
+                    .map(|entry| crate::mod_project::TransplantOp {
+                        new_entry_name: clone_of(&names[*entry]),
+                        src_file_rel: rel.into(),
+                        src_set_name: names[*entry].clone(),
+                        src_set_idx: 0,
+                        one_slot_slots: Vec::new(),
+                        replace_entry: None,
+                    })
+                    .collect();
+                let mut warnings = Vec::new();
+                let built = super::rebuild_runtime_carrier_eff_bytes_with_edits(
+                    &carrier_base,
+                    CARRIER,
+                    &ops,
+                    &root,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &mut warnings,
+                )
+                .unwrap_or_else(|error| panic!("{rel} {}: {error:#}", names[batch[0]]));
+                assert!(warnings.is_empty(), "{rel}: {warnings:?}");
+                let problems = crate::eff_validate::problems(&built);
+                assert!(problems.is_empty(), "{rel}: {problems:?}");
+                let carrier = effect_library::NamcoEffectFile::load(&built).expect("re-read");
+                for entry in batch {
+                    let name = &names[*entry];
+                    let copy = carrier
+                        .entry_names
+                        .iter()
+                        .position(|has| has.eq_ignore_ascii_case(&clone_of(name)))
+                        .unwrap_or_else(|| panic!("{rel}: no copy of {name}"));
+                    // One with a model of its own carries that as a part.
+                    assert!(
+                        parts(&carrier, copy) >= parts(&file, *entry),
+                        "{rel}: {name}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The live send of an effect with a part added from the shared file: the carrier keeps
     /// every game-file rule and plays the part, with its texture, in its copy of the effect.
     #[test]

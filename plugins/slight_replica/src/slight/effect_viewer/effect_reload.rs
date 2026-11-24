@@ -188,17 +188,6 @@ fn hook_build_effect_set(
 #[skyline::from_offset(offsets::GAME_MALLOC.get())]
 fn game_malloc(align: u64, size: u64) -> *mut u8;
 
-/// The REAL kind resolver `req()` calls (FUN_02601110). Takes (effect_manager, kind_hash40),
-/// returns a pointer to the resolved entry (`slot_entry_table + entry_index*0x10`) or 0.
-/// Calling it directly is the ground truth for "is this kind registered + reachable" — unlike
-/// the get_last_handle heuristic, which only says whether an effect instance got created.
-#[skyline::from_offset(offsets::RESOLVE_KIND.get())]
-fn resolve_kind(manager: *mut u64, kind_hash: u64) -> *const u8;
-
-/// HOOK on the resolver: we can't safely call it ourselves (build t froze), but the game
-/// calls it constantly — so observe it on the game's own path. Logs (a) the manager pointer
-/// the GAME passes vs the one we derived (a mismatch would explain both the refusal and the
-/// build-t freeze — two manager instances), and (b) every `_os` lookup with its result.
 /// Hook the CONFIRMED req impl (obj vtable+0x68 = FUN_0044de70). It reads inner=*(obj+0x10)
 /// and, if nonzero, calls inner_vt[0x190] then tail-calls inner_vt[0x50] — the real
 /// resolve+instantiate. Capturing param_1 (the true obj) and inner HERE (at the real call,
@@ -289,37 +278,11 @@ fn hook_req_impl(param_1: *mut u64) {
     original!()(param_1)
 }
 
-#[skyline::hook(offset = offsets::RESOLVE_KIND.get())]
-fn hook_resolve_kind(mgr: *mut u64, kind_hash: u64) -> *const u8 {
-    let r = original!()(mgr, kind_hash);
-    use std::sync::atomic::AtomicBool;
-    static FIRST: AtomicBool = AtomicBool::new(false);
-    let first = !FIRST.swap(true, Ordering::Relaxed);
-    let h40 = kind_hash & 0xff_ffff_ffff;
-    let label = crate::slight::effect_viewer::effect_names::label(h40);
-    let interesting =
-        first || crate::slight::effect_viewer::effect_names::is_transplant_label(&label);
-    if interesting {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("sd:/effect_viewer_os_req.txt")
-        {
-            let ours = effect_manager();
-            let entry = if r.is_null() {
-                "NULL".to_string()
-            } else {
-                format!("{:02x?}", unsafe { std::slice::from_raw_parts(r, 8) })
-            };
-            let _ = writeln!(
-                f,
-                "RESOLVER {label} h40={h40:#x} mgr={mgr:?} ours={ours:?} same={} -> {entry}",
-                mgr == ours
-            );
-        }
-    }
-    r
+/// A request's effect name; what is above it picks one of the effect's variants.
+pub const NAME_MASK: u64 = 0xff_ffff_ffff;
+
+pub unsafe fn kind_is_registered(manager: *mut u64, name: u64) -> bool {
+    kind_lookup(manager, name).is_some()
 }
 
 /// The manager-GLOBAL kind-name map `req(hash40(name))` resolves through. Decompiled from
@@ -414,7 +377,7 @@ unsafe fn kind_chain_debug(mgr: *mut u64, h40: u64) -> String {
     format!("miss at chain end after {steps} steps (bucket {bucket}, size={size})")
 }
 
-/// Guarded replica of the game's kind resolver FUN_02601110 — identical three-step walk
+/// Guarded replica of the game's kind resolver — identical three-step walk
 /// (kind map @+0x193d8 → handle map @+0x193b0 → slot entry table @slot*0xa8+0x18018) but
 /// with cycle guards on both bucket chains, so it can NEVER hang and it narrates each step.
 unsafe fn resolve_kind_replica(mgr: *mut u64, h40: u64) -> (String, Option<*const u8>) {
@@ -1281,6 +1244,8 @@ static AUTO_CARRIER_HOST: AtomicU64 = AtomicU64::new(NO_HOST);
 /// destroying the carrier and flickering every edited effect back to vanilla while it rebuilds.
 static AUTO_CARRIER_TARGETS: LazyLock<Mutex<Vec<String>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+/// The carrier has effects anyone plays in it, so a match with none of its fighters gets one too.
+static AUTO_CARRIER_FOR_ANYONE: AtomicBool = AtomicBool::new(false);
 /// Diagnostic threshold for a carrier swap. A stuck teardown is logged but never bypassed:
 /// building over a resource tree that still has an owner produces the invisible second-load
 /// state and leaks another parsed set, so it cannot be part of an indefinitely repeatable cycle.
@@ -1819,6 +1784,7 @@ pub fn set_donor_specs(specs: Vec<DonorSpec>) {
     // The spec's target also names WHICH FIGHTER must hold the carrier: one whose effects it was
     // built for. See [`AUTO_CARRIER_TARGETS`].
     let mut targets = Vec::new();
+    let mut for_anyone = false;
     let mut carrier_path: Option<String> = None;
     for spec in &specs {
         let target = eff_dir(&spec.target.to_lowercase()).to_string();
@@ -1830,14 +1796,20 @@ pub fn set_donor_specs(specs: Vec<DonorSpec>) {
             .iter()
             .map(|path| path.to_lowercase())
             .find(|path| carrier_item_kind(path).is_some());
-        if let (Some(fighter), Some(donor)) = (fighter, donor) {
-            targets.push(fighter.to_string());
+        if let Some(donor) = donor {
+            match fighter {
+                Some(fighter) => targets.push(fighter.to_string()),
+                None => for_anyone = true,
+            }
             carrier_path.get_or_insert(donor);
         }
     }
-    if !targets.is_empty() {
-        dlog(&format!("AUTO_CARRIER_TARGETS fighters={targets:?}"));
+    if for_anyone || !targets.is_empty() {
+        dlog(&format!(
+            "AUTO_CARRIER_TARGETS fighters={targets:?} anyone={for_anyone}"
+        ));
         *AUTO_CARRIER_TARGETS.lock() = targets;
+        AUTO_CARRIER_FOR_ANYONE.store(for_anyone, Ordering::Release);
     }
     // The editor pushes bytes first, then specs. Some editor actions publish a spec snapshot
     // that omits the carrier target while its bytes are still staged; that is a partial push,
@@ -1962,21 +1934,33 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     // The editor already tells us whose it is: the donor specs' target fighters. An older editor,
     // or a spec without a fighter target, names none: whoever claims it keeps it until they leave.
     let boid = (*boma).battle_object_id;
-    let is_target = |kind: i32| {
-        let targets = AUTO_CARRIER_TARGETS.lock();
-        targets.is_empty()
-            || crate::slight::slight_consts::fighters::game_kind_name(kind)
-                .is_some_and(|name| targets.iter().any(|target| target == name))
+    let named = |kind: i32| {
+        crate::slight::slight_consts::fighters::game_kind_name(kind)
+            .is_some_and(|name| AUTO_CARRIER_TARGETS.lock().iter().any(|target| target == name))
+    };
+    let anyone = AUTO_CARRIER_FOR_ANYONE.load(Ordering::Acquire);
+    let mut fighters = Vec::new();
+    if anyone {
+        for agent in crate::slight::agents::all_records() {
+            if agent.category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER {
+                fighters.push((agent.boid, agent.entry_id, named(agent.kind)));
+            }
+        }
+    }
+    let is_target = |boid: u32, kind: i32| {
+        // An older editor names none: whoever claims it keeps it until they leave.
+        let unnamed = !anyone && AUTO_CARRIER_TARGETS.lock().is_empty();
+        unnamed || named(kind) || (anyone && carrier_gate::stands_in(boid, &fighters))
     };
     let host = host_id(AUTO_CARRIER_HOST.load(Ordering::Relaxed));
     let holder = host
         .filter(|host| *host != boid)
         .and_then(crate::slight::agents::lookup);
     let turn = carrier_gate::Turn {
-        target: is_target(smash::app::utility::get_kind(&mut *boma)),
+        target: is_target(boid, smash::app::utility::get_kind(&mut *boma)),
         holds: host == Some(boid),
         held_elsewhere: holder.is_some(),
-        holder_is_target: holder.is_some_and(|holder| is_target(holder.kind)),
+        holder_is_target: holder.is_some_and(|holder| is_target(holder.boid, holder.kind)),
     };
     if !carrier_gate::looks_after(state, turn) {
         return;
@@ -4036,6 +4020,7 @@ pub fn install_hooks() {
     // Load/unload carry real work (slot tracking, donor co-loads), so they always install.
     skyline::install_hook!(hook_load_effects);
     skyline::install_hook!(hook_unload_effects);
+    super::shared_names::install();
     // The rest only observe and log. `ensure_dir_loaded` and the readiness check in particular
     // fire thousands of times while a match loads, on the game's loading thread — installing
     // them unconditionally put a nest of SD writes underneath the resource loader, where a

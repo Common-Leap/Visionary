@@ -34,7 +34,7 @@ const MANIFEST: &str = "sd:/effect_viewer/live_eff/manifest.json";
 const DIR: &str = "sd:/effect_viewer/live_eff/";
 /// Written into every diag file so on-device logs are attributable to a specific build.
 /// Keep this in step with plugin changes so captured diagnostics identify the running binary.
-pub const BUILD_TAG: &str = "2026-11-23-every-characters-effects";
+pub const BUILD_TAG: &str = "2026-11-24-shared-effects";
 
 /// Times the game's own loader pulled staged bytes through [`disk_cb`].
 static CB_GAME: AtomicU64 = AtomicU64::new(0);

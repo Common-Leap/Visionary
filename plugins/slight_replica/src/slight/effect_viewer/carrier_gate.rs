@@ -17,6 +17,14 @@ pub struct Turn {
     pub holder_is_target: bool,
 }
 
+/// Whether fighter `id` holds a carrier with effects anyone plays in it, in a match with nobody it
+/// was built for: the first player does, since the others are the ones being hit. `fighters` is
+/// everyone in the match: their id, their player and whether the carrier was built for them.
+pub fn stands_in(id: u32, fighters: &[(u32, i32, bool)]) -> bool {
+    let first = fighters.iter().min_by_key(|(id, player, _)| (*player, *id));
+    !fighters.iter().any(|(_, _, named)| *named) && first.is_some_and(|(first, ..)| *first == id)
+}
+
 /// Whether this fighter looks after the carrier in `state` (see `AUTO_CARRIER_STATE`). Only a
 /// fighter it was built for is ever given one. Any fighter may let an old one go: its own may
 /// never play again, and the next one waits for that.
@@ -49,6 +57,15 @@ pub fn outgoing(object: u64, alive: bool, handle: u64) -> Outgoing {
         (_, true, 0) => Outgoing::Unidentified,
         _ => Outgoing::Up,
     }
+}
+
+/// The name an effect is looked up by, for a request of `name`: a shared effect's copy while the
+/// game has it. `shared` is each edited shared effect and its copy.
+pub fn looked_up(name: u64, shared: &[(u64, u64)], has: impl Fn(u64) -> bool) -> u64 {
+    let lead = shared.iter().find(|(from, _)| *from == name);
+    lead.map(|(_, copy)| *copy)
+        .filter(|copy| has(*copy))
+        .unwrap_or(name)
 }
 
 /// How many of an old carrier's effect names its file still answers to. `owners` is, for each

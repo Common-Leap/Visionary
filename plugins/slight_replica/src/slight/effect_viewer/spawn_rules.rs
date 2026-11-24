@@ -579,6 +579,9 @@ pub struct EffectAlias {
     /// index range the runtime can report.
     #[serde(default)]
     pub slots: Vec<u8>,
+    /// An effect of the shared file, which anyone plays. See [`super::shared_names`].
+    #[serde(default)]
+    pub everyone: bool,
 }
 
 static ALIASES: parking_lot::Mutex<Vec<EffectAlias>> = parking_lot::Mutex::new(Vec::new());
@@ -586,6 +589,8 @@ static ALIASES: parking_lot::Mutex<Vec<EffectAlias>> = parking_lot::Mutex::new(V
 /// Full-list replace (idempotent, like rules). Empty clears all aliases.
 pub fn set_aliases(aliases: Vec<EffectAlias>) {
     let n = aliases.len();
+    let (shared, aliases): (Vec<_>, Vec<_>) = aliases.into_iter().partition(|a| a.everyone);
+    super::shared_names::set(shared.into_iter().map(|a| (a.from, a.to)).collect());
     // Held only for one lookup or one swap of the list. Spin rather than park, as `stage_rules`
     // does; a push that gave up instead left edits out of the game that the editor counted in it.
     let mut current = loop {

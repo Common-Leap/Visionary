@@ -1112,6 +1112,7 @@ pub fn notify_carrier_status(state: u8, kinds: usize, spawned: bool, generation:
             "CarrierStatus": {
                 "state": state, "kinds": kinds, "spawned": spawned, "gen": generation,
                 "staged": crate::slight::effect_viewer::live_eff::in_the_game(),
+                "shared": crate::slight::effect_viewer::shared_names::installed(),
             }
         }),
     );

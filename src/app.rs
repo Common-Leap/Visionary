@@ -36837,7 +36837,7 @@ impl VisionaryApp {
         });
         shares
             .filter(|share| !share.is_empty())
-            .filter(|share| fighter_kind_id(&share.fighter).is_some())
+            .filter(|share| share.everyone || fighter_kind_id(&share.fighter).is_some())
             .collect()
     }
 
@@ -37099,13 +37099,15 @@ impl VisionaryApp {
                 }
             }
         }
-        // Any of the fighters whose edits it carries may hold it: whichever is in the match.
+        // Any of the fighters whose edits it carries may hold it: whichever is in the match. The
+        // shared file's name any fighter.
         if built.is_ok() {
             for share in &shares {
-                per_target.insert(
-                    format!("effect/fighter/{0}/ef_{0}.eff", share.fighter),
-                    vec![live_carrier_rel.into()],
-                );
+                let target = match share.everyone {
+                    true => crate::eff_editor::SHARED_FILE_REL.to_owned(),
+                    false => format!("effect/fighter/{0}/ef_{0}.eff", share.fighter),
+                };
+                per_target.insert(target, vec![live_carrier_rel.into()]);
             }
         }
         let mut donor_specs: Vec<crate::game_link::DonorEffWire> = Vec::new();
@@ -37275,7 +37277,7 @@ impl VisionaryApp {
             let key = crate::character::CharacterKey::parse(owner);
             (
                 self.game_has_effect_file(&key.effect_rel(&self.roster.project)),
-                self.character_name(&key),
+                self.effect_owner_name(owner),
             )
         };
         what.push_str(&crate::live_carrier::left_note(
@@ -37330,7 +37332,7 @@ impl VisionaryApp {
         donor_bytes.sort_by(|a, b| a.path.cmp(&b.path));
         let carrier_changed = carrier_fingerprint != self.last_carrier_fingerprint;
         self.sent_owner = open_owner.clone();
-        self.carrier_fighters = shares.iter().map(|share| share.fighter.clone()).collect();
+        self.carrier_fighters = crate::live_carrier::holders(&shares);
         self.last_carrier_fingerprint = carrier_fingerprint;
         if std::mem::take(&mut self.carrier_send_armed) {
             self.eff_editor.carrier_needs_new_bytes = carrier_changed && carrier_added;
@@ -37419,9 +37421,14 @@ impl VisionaryApp {
                 .collect(),
             None => vec![eff.source_rel.clone()],
         };
-        // ARCropolis takes the game down when it is asked for a path the game has no file at.
-        // The carrier alone shows those edits, in this match and the next.
-        rels.retain(|rel| self.game_has_effect_file(rel));
+        // ARCropolis takes the game down when it is asked for a path the game has no file at, and
+        // the game loads the shared files once, as it starts. The carrier alone shows those edits,
+        // in this match and the next.
+        rels.retain(|rel| {
+            let shared =
+                crate::live_carrier::who_plays(rel) == crate::live_carrier::Plays::Everyone;
+            self.game_has_effect_file(rel) && !shared
+        });
         if rels.is_empty() {
             self.live_eff_deployed.insert(fighter.to_owned(), eff);
             return false;
@@ -37611,16 +37618,24 @@ impl VisionaryApp {
         let edited =
             self.put_back.is_none() && self.eff_mods.get(owner).is_some_and(|eff| !eff.is_empty());
         let costumes = self.eff_costumes(owner);
+        let of_a_fighter = self.plays_effects_of(owner) == crate::live_carrier::Plays::Fighter;
         crate::live_carrier::reached(
             edited,
             self.holds_unknown_effects(owner),
-            self.game_link
-                .has_gimmick_agents_snapshot()
+            (of_a_fighter && self.game_link.has_gimmick_agents_snapshot())
                 .then(|| self.game_link.gimmick_agents())
                 .as_deref(),
             crate::character::CharacterKey::parse(owner).engine_fighter(),
             &costumes,
         )
+    }
+
+    /// Who plays the effects kept under `owner`.
+    fn plays_effects_of(&self, owner: &str) -> crate::live_carrier::Plays {
+        let file = self.eff_mods.get(owner).map(|eff| eff.source_rel.clone());
+        let open = self.eff_editor.loaded_rel();
+        let open = || open.filter(|rel| self.eff_owner(rel) == owner);
+        crate::live_carrier::who_plays(&file.or_else(open).unwrap_or_default())
     }
 
     /// Whether the game loaded effects changed in an earlier session with `owner`'s fighter: which
@@ -37693,8 +37708,7 @@ impl VisionaryApp {
                 (sets.len(), e.transplants.len())
             })
             .unwrap_or((0, 0));
-        let fighter = self.character_name(&crate::character::CharacterKey::parse(owner));
-        send_what(&fighter, edits, transplants)
+        send_what(&self.effect_owner_name(owner), edits, transplants)
     }
 
     /// Record the [`TransplantOp`](crate::mod_project::TransplantOp) for `fighter` and open
@@ -41675,6 +41689,9 @@ Click to see the code, or link your own project"
                 );
             // The edit could not be built, so the game was never asked for it.
             let not_built = self.eff_editor.carrier_build_error.take();
+            use crate::live_carrier::Plays;
+            let sent = self.sent_owner.clone().unwrap_or_default();
+            let plays = self.plays_effects_of(&sent);
             if live || silent || stalled || absent || rejected.is_some() || not_built.is_some() {
                 self.eff_editor.awaiting_game = None;
                 let outcome = if not_built.is_some() {
@@ -41688,12 +41705,22 @@ Click to see the code, or link your own project"
                 } else {
                     SendOutcome::NextMatch
                 };
+                let outcome = crate::live_carrier::said(
+                    plays,
+                    outcome,
+                    self.game_link.carrier_shares(),
+                    self.live_eff_deployed.contains_key(&sent),
+                );
                 // One plain outcome on the Send row, in the In game panel and on the status
                 // line. The game's numbers and the likely cause go in the row's hover: they are
                 // what settles a stall, and they mean nothing to someone making an effect.
                 let why = if let Some(reason) = &not_built {
                     format!("\n{reason}")
-                } else if live {
+                } else if plays == Plays::Everyone && outcome == SendOutcome::NotInMatch && live {
+                    "\nThe plugin in the game can't change shared effects: install Visionary's \
+                     plugin again."
+                        .to_string()
+                } else if live || plays == Plays::Other {
                     String::new()
                 } else if let Some(reason) = &rejected {
                     format!(
@@ -41706,6 +41733,9 @@ Click to see the code, or link your own project"
                     "\nNo match is reporting back: start one, then send again.".to_string()
                 } else if stalled && state == 0 {
                     "\nThe game never started the swap.".to_string()
+                } else if plays == Plays::Everyone {
+                    "\nThe swap stopped while the game let go of the last edit. Send it again."
+                        .to_string()
                 } else {
                     "\nThe swap stopped while the game let go of the last edit. Reloading the \
                      match loads the edit."
@@ -50279,6 +50309,12 @@ mod live_effect_capture_tests {
             assert!(!body.contains("export_root"), "{name}");
         }
         assert!(body("fn refresh_acmd_src_fighters(").contains("self.follow_effect_files()"));
+        // The shared files are loaded once, as the game starts: none waits for a match.
+        let staged = body("fn deploy_live_eff(");
+        assert!(staged.contains("self.game_has_effect_file(rel) && !shared"));
+        assert!(
+            staged.find("rels.retain(").unwrap() < staged.find("self.serve_live_eff(").unwrap()
+        );
     }
 
     /// Removing a made character takes its effect edits, the Effects page's working copy of them

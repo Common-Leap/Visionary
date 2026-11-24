@@ -66,7 +66,11 @@ pub(crate) const MGR_MUTEX_LOCK: GameOffset = GameOffset(0x39c1410, 0x39c19c0);
 pub(crate) const MGR_MUTEX_UNLOCK: GameOffset = GameOffset(0x39c1420, 0x39c19d0);
 pub(crate) const BUILD_EFFECT_SET: GameOffset = GameOffset(0xa4d90, 0xa4d90);
 pub(crate) const GAME_MALLOC: GameOffset = GameOffset(0x392dce0, 0x392e290);
-pub(crate) const RESOLVE_KIND: GameOffset = GameOffset(0x2601110, 0x2601560);
+// Where the game looks an effect's name up to make it, and to read its flags. 13.0.5's are the
+// 13.0.4 ones moved with the functions around them (LOAD_EFFECTS, DRAIN_LOAD_QUEUE and
+// LOAD_EFFECTS_RESIDENT_INTERIOR all move by 0x5b0); the code there is checked before it is used.
+pub(crate) const MAKE_EFFECT_NAME: GameOffset = GameOffset(0x3562eec, 0x356349c);
+pub(crate) const EFFECT_FLAGS_NAME: GameOffset = GameOffset(0x355b318, 0x355b8c8);
 pub(crate) const TEX_GUARD: GameOffset = GameOffset(0x93f10, 0x93f10);
 pub(crate) const REQ_IMPL: GameOffset = GameOffset(0x44de70, 0x44de70);
 pub(crate) const ENSURE_DIR_LOADED: GameOffset = GameOffset(0x35407a0, 0x3540d50);

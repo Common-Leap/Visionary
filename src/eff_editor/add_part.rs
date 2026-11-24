@@ -72,7 +72,7 @@ pub(super) struct Starter {
 }
 
 /// The shared effects file every fighter plays, relative to the game folder.
-pub(super) const SHARED_FILE_REL: &str = "effect/system/common/ef_common.eff";
+pub(crate) const SHARED_FILE_REL: &str = "effect/system/common/ef_common.eff";
 
 /// Each a part of the shared file, which every game folder has. Picked by what each part is in
 /// that file (its texture, blend and how it is drawn), and all of them stop on their own: a part

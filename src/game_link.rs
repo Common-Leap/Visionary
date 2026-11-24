@@ -547,6 +547,9 @@ pub struct EffectAliasWire {
     /// Costume slots (c00…) the alias applies to; empty = all.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<u8>,
+    /// Applies whoever plays the effect, the game's own code included: one of the shared file's.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub everyone: bool,
 }
 
 /// Wire form of the plugin's `effect_reload::DonorSpec` (field names must match).
@@ -2139,6 +2142,8 @@ struct Shared {
     /// so without this the editor waits for a carrier that is never coming.
     carrier_error: Option<String>,
     staged_effects: Option<Vec<(u64, u64)>>,
+    /// The carrier's copy of a shared effect reaches whoever plays it.
+    carrier_shares: bool,
     /// Asset-carrier progress. These files are never installed by resident-buffer mutation.
     asset_bundle_target: String,
     asset_bundle_generation: u64,
@@ -2353,6 +2358,7 @@ impl Default for Shared {
             carrier_gen: 0,
             carrier_error: None,
             staged_effects: None,
+            carrier_shares: false,
             asset_bundle_target: String::new(),
             asset_bundle_generation: 0,
             asset_bundle_staged: 0,
@@ -3299,6 +3305,11 @@ impl GameLink {
         self.shared.lock().map(|s| s.carrier_gen).unwrap_or(0)
     }
 
+    /// Whether an edit to a shared effect can reach this game's matches.
+    pub fn carrier_shares(&self) -> bool {
+        self.shared.lock().is_ok_and(|s| s.carrier_shares)
+    }
+
     /// The path and stamp of each staged effect file the game holds (see `live_eff`), once this
     /// connection has reported them.
     pub fn staged_effects(&self) -> Option<Vec<(u64, u64)>> {
@@ -3710,6 +3721,7 @@ fn reset_session(s: &mut Shared) {
     s.gimmick_feature_capabilities_seq = None;
     s.gimmick_operations_in_flight = 0;
     s.staged_effects = None;
+    s.carrier_shares = false;
     s.last_rx = None;
     s.replaced = false;
 }
@@ -4397,6 +4409,7 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.carrier_seq += 1;
             let staged = c.get("staged").cloned();
             s.staged_effects = staged.and_then(|staged| serde_json::from_value(staged).ok());
+            s.carrier_shares = c.get("shared").and_then(|v| v.as_bool()).unwrap_or(false);
         }
         "CarrierError" => {
             s.carrier_error = body
@@ -6420,11 +6433,13 @@ mod tests {
                 from: 0x111,
                 to: 0x222,
                 slots: vec![],
+                everyone: false,
             },
             EffectAliasWire {
                 from: 0x333,
                 to: 0x444,
                 slots: vec![1, 3],
+                everyone: true,
             },
         ]);
         let frame = link.shared.lock().unwrap().outbox[0].clone();
@@ -6438,6 +6453,8 @@ mod tests {
         assert!(aliases[0].get("slots").is_none());
         assert_eq!(aliases[1]["slots"][0].as_u64(), Some(1));
         assert_eq!(aliases[1]["slots"][1].as_u64(), Some(3));
+        assert!(aliases[0].get("everyone").is_none());
+        assert_eq!(aliases[1]["everyone"].as_bool(), Some(true));
     }
 
     #[test]
@@ -7004,8 +7021,13 @@ mod tests {
         let held = report(r#","staged":[[5,18446744073709551615],[6,7]]"#);
         assert_eq!(held, Some(vec![(5, u64::MAX), (6, 7)]));
         assert_eq!(shared.lock().unwrap().carrier_gen, 3);
+        // Nor does a plugin from before say that it can change shared effects.
+        assert!(!shared.lock().unwrap().carrier_shares);
+        report(r#","shared":true"#);
+        assert!(shared.lock().unwrap().carrier_shares);
         reset_session(&mut shared.lock().unwrap());
         assert_eq!(shared.lock().unwrap().staged_effects, None);
+        assert!(!shared.lock().unwrap().carrier_shares);
     }
 
     /// Effect, sound, game, and expression ACMD coroutines can enter the live-retime scheduler
