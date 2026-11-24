@@ -730,17 +730,24 @@ pub fn source_spawn_names(
     out
 }
 
-/// Source graphics this move no longer spawns anywhere.
+/// Source graphics this move no longer spawns anywhere. `script` is what its blocks play, when
+/// they own its effects: one no block can hold has no lane in the graph. With neither, the
+/// effects are still the source's and nothing was removed.
 pub fn removed_spawns(
     graph: &MoveGraph,
+    script: Option<&crate::data::EffectScript>,
     source: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
-    let mut kept = Default::default();
-    for track in graph
+    let mut lanes = graph
         .tracks
         .iter()
         .filter(|track| track.track == Track::Effect)
-    {
+        .peekable();
+    if lanes.peek().is_none() && script.is_none() {
+        return Vec::new();
+    }
+    let mut kept = script.map(source_spawn_names).unwrap_or_default();
+    for track in lanes {
         spawn_names(&track.nodes, &mut kept);
     }
     source.difference(&kept).cloned().collect()
@@ -786,6 +793,35 @@ mod tests {
     #[test]
     fn an_untouched_move_sends_nothing() {
         assert_eq!(rules("mario", 1, &source(), &imported()).len(), 0);
+    }
+
+    /// A move whose blocks do not change its effects keeps no effect lane. Taking that for "no
+    /// effects kept" stopped every effect of any move with a node edit in the match.
+    #[test]
+    fn effects_the_blocks_leave_alone_are_not_removed() {
+        let effects = crate::acmd::parse_effect_script(
+            "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 4.0);\n    if macros::is_excute(agent) {\n        macros::EFFECT_FOLLOW(agent, Hash40::new(\"sys_attack_arc\"), Hash40::new(\"top\"), 0, 8, 0, 0, 0, 0, 1.0, true);\n    }\n}\n",
+        );
+        let source = source_spawn_names(&effects);
+        assert_eq!(source.len(), 1);
+        // Blocks of the hitboxes only.
+        assert!(removed_spawns(&imported(), None, &source).is_empty());
+        // Blocks that own the effects and no longer make it: in an emptied lane, or in a script
+        // no block can hold.
+        let mut owned = imported();
+        owned
+            .tracks
+            .push(crate::move_nodes::effects::import_for_fighter(
+                "mario", &effects,
+            ));
+        assert!(removed_spawns(&owned, None, &source).is_empty());
+        owned.tracks.last_mut().unwrap().nodes.clear();
+        assert_eq!(removed_spawns(&owned, None, &source).len(), 1);
+        let none = crate::acmd::parse_effect_script(
+            "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {\n}\n",
+        );
+        assert_eq!(removed_spawns(&imported(), Some(&none), &source).len(), 1);
+        assert!(removed_spawns(&imported(), Some(&effects), &source).is_empty());
     }
 
     #[test]

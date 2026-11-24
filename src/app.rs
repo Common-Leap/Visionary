@@ -39013,6 +39013,7 @@ impl VisionaryApp {
         {
             for name in crate::move_nodes::live_steps::removed_spawns(
                 graph,
+                self.block_effects(&mv_key).as_ref(),
                 &self.state.source_effect_spawns,
             ) {
                 let eff_hash = effect_name_hash(&name);

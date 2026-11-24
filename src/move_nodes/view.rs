@@ -466,7 +466,8 @@ impl NodeEditor {
                 self.canvas.reset();
 
                 self.clean_depth = self.undo.len();
-                self.auto_apply = true;
+                // A move with no saved blocks has nothing to go back to: applying stored it.
+                self.auto_apply = saved.is_some();
             }
             let dirty = self.undo.len() != self.clean_depth || self.gesture_dirty;
             if !self.workspace
