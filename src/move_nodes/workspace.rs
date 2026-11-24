@@ -1139,16 +1139,35 @@ impl NodeEditor {
         base: &BehaviorGraph,
         siblings: &BTreeMap<String, MoveGraph>,
     ) {
+        use super::super::canvas::EditCommand;
         let command = self.canvas.take_edit_command();
         let keyboard = !ui.ctx().text_edit_focused();
-        let key = |key| keyboard && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, key));
-        let copy = command == Some(super::super::canvas::EditCommand::Copy) || key(egui::Key::C);
-        let duplicate =
-            command == Some(super::super::canvas::EditCommand::Duplicate) || key(egui::Key::D);
+        // The window turns Ctrl+C, Ctrl+X and Ctrl+V into these events; no key press arrives.
+        // Text marked in a label is what Ctrl+C copies, not the block.
+        let marked = ui
+            .ctx()
+            .plugin_opt::<egui::text_selection::LabelSelectionState>()
+            .is_some_and(|state| state.lock().has_selection());
+        let (copied, cut, pasted) = ui.input(|i| {
+            (
+                i.events.contains(&egui::Event::Copy),
+                i.events.contains(&egui::Event::Cut),
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+            )
+        });
+        let cut = keyboard && cut && !marked;
+        let copy = command == Some(EditCommand::Copy) || cut || keyboard && copied && !marked;
+        let duplicate = command == Some(EditCommand::Duplicate)
+            || keyboard && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
         if copy || duplicate {
             self.copy_selected_block(fighter);
         }
-        if duplicate || key(egui::Key::V) {
+        let cut = cut && self.error.is_empty();
+        if copy && self.error.is_empty() {
+            // No paste arrives while the system clipboard is empty, so the block's code goes there.
+            ui.ctx().copy_text(self.selected_block_code(fighter));
+        }
+        if duplicate || keyboard && pasted {
             self.paste_block(
                 fighter,
                 move_name,
@@ -1157,17 +1176,25 @@ impl NodeEditor {
                 self.canvas.selected_node(),
             );
         }
-        if command == Some(super::super::canvas::EditCommand::Delete)
-            || keyboard && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-        {
-            for selected in self.canvas.selection() {
-                if let Some(id) = selected
-                    .strip_prefix("node:")
-                    .and_then(|id| id.parse().ok())
-                {
-                    for track in &mut self.draft.tracks {
-                        remove_workspace_node(&mut track.nodes, id);
-                    }
+        let delete = command == Some(EditCommand::Delete)
+            || keyboard
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
+        // A cut takes the one block it copied.
+        let removed: Vec<u32> = if delete {
+            let ids = self.canvas.selection().into_iter();
+            ids.filter_map(|key| key.strip_prefix("node:")?.parse().ok())
+                .collect()
+        } else {
+            self.canvas
+                .selected_node()
+                .filter(|_| cut)
+                .into_iter()
+                .collect()
+        };
+        if !removed.is_empty() {
+            for track in &mut self.draft.tracks {
+                for id in &removed {
+                    remove_workspace_node(&mut track.nodes, *id);
                 }
             }
             super::super::canvas::prune_positions(&mut self.draft);
@@ -1482,6 +1509,46 @@ mod tests {
                 .filter(|node| matches!(node.kind, NodeKind::Execute { .. }))
                 .count()
         })
+    }
+
+    /// Ctrl+C, Ctrl+X and Ctrl+V reach an app as the window's own events, not as key presses.
+    #[test]
+    fn the_windows_copy_cut_and_paste_events_reach_the_blocks() {
+        let sound = crate::acmd::parse_sound_script(SOUND);
+        let context = egui::Context::default();
+        let mut editor = NodeEditor::default();
+        let frame = |editor: &mut NodeEditor, events: Vec<egui::Event>, typing: bool| {
+            draw(editor, &context, &sound, None, events, typing)
+        };
+        frame(&mut editor, Vec::new(), true);
+        frame(&mut editor, Vec::new(), true);
+        let block = editor.draft.tracks[1].nodes[1].id;
+        editor.canvas.select(format!("node:{block}"));
+        // While a text box has the keys they are the text box's.
+        frame(&mut editor, vec![egui::Event::Copy], true);
+        assert!(editor.block_clipboard.is_none());
+        frame(&mut editor, vec![egui::Event::Cut], true);
+        assert_eq!(sounds(&editor.draft), 1);
+
+        context.memory_mut(|memory| memory.stop_text_input());
+        frame(&mut editor, Vec::new(), false);
+        let (_, copied) = frame(&mut editor, vec![egui::Event::Copy], false);
+        let copied = copied.expect("with nothing on the clipboard no paste arrives");
+        assert!(copied.contains("PLAY_SE"), "{copied}");
+        assert_eq!(sounds(&editor.draft), 1);
+
+        let paste = || vec![egui::Event::Paste(copied.clone())];
+        let (applied, _) = frame(&mut editor, paste(), false);
+        let applied = applied.or_else(|| frame(&mut editor, Vec::new(), false).0);
+        assert_eq!(sounds(&applied.expect("a paste is an edit")), 2);
+
+        let (applied, cut) = frame(&mut editor, vec![egui::Event::Cut], false);
+        let applied = applied.or_else(|| frame(&mut editor, Vec::new(), false).0);
+        assert_eq!(sounds(&applied.expect("a cut is an edit")), 1);
+        assert!(cut.is_some_and(|text| text.contains("PLAY_SE")));
+        let (applied, _) = frame(&mut editor, paste(), false);
+        let applied = applied.or_else(|| frame(&mut editor, Vec::new(), false).0);
+        assert_eq!(sounds(&applied.expect("a cut block pastes")), 2);
     }
 
     /// The Classic editor changed the move: the blocks shown are its version, Undo goes back, and

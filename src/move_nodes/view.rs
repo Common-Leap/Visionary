@@ -92,6 +92,16 @@ impl NodeEditor {
         }
     }
 
+    fn selected_block_code(&self, fighter: &str) -> String {
+        let id = self.canvas.selected_node().unwrap_or_default();
+        let code = self.draft.tracks.iter().find_map(|lane| {
+            let node = super::flow::find_node(&lane.nodes, id)?;
+            Some(super::timeline::block_code(fighter, lane, node))
+        });
+        code.filter(|code| !code.trim().is_empty())
+            .unwrap_or_else(|| "Move block".into())
+    }
+
     fn paste_block(
         &mut self,
         fighter: &str,
@@ -355,6 +365,7 @@ impl NodeEditor {
                         matches!(
                             event,
                             egui::Event::Text(_)
+                                | egui::Event::Cut
                                 | egui::Event::Paste(_)
                                 | egui::Event::Key { pressed: true, .. }
                         )
