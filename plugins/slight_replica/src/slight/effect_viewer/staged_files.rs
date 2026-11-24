@@ -53,3 +53,12 @@ impl StagedFiles {
         held
     }
 }
+
+/// Which listings in the game's file table are of `file`. `listings` is the file each one is of.
+pub fn listings_of(file: u32, listings: impl Iterator<Item = u32>) -> Vec<usize> {
+    let listings = listings.enumerate();
+    listings
+        .filter(|(_, of)| *of == file)
+        .map(|(at, _)| at)
+        .collect()
+}

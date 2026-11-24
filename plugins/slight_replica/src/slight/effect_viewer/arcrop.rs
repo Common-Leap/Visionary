@@ -97,6 +97,7 @@ pub fn register_disk(hash: u64, max_size: usize, cb: DiskCallbackFn) -> bool {
         return false;
     };
     (api.register_callback)(hash, max_size, cb);
+    super::resource_reload::make_room(hash, max_size);
     true
 }
 

@@ -997,6 +997,26 @@ mod tests {
         assert_eq!(files.in_the_game(), []);
     }
 
+    /// Two folders list the carrier's file, each with a size of its own, and the game loads it
+    /// through the one ARCropolis leaves alone: 3,752,464 bytes went into the 3,670,016 it made
+    /// for its own file, and the game crashed on whatever was after them.
+    #[test]
+    fn a_served_file_has_room_wherever_the_game_lists_it() {
+        use super::plugin_staged::listings_of;
+        let table = [65314, 65315, 7, 65315, 65316];
+        assert_eq!(listings_of(65315, table.into_iter()), vec![1, 3]);
+        assert_eq!(listings_of(7, table.into_iter()), vec![2]);
+        assert!(listings_of(8, table.into_iter()).is_empty());
+
+        let source = include_str!("../plugins/slight_replica/src/slight/effect_viewer/arcrop.rs");
+        let register = source.split("pub fn register_disk(").nth(1);
+        let register = register.and_then(|rest| rest.split("\n}\n").next());
+        let register = register.expect("register_disk");
+        let callback = register.find("(api.register_callback)(hash, max_size, cb)");
+        let room = register.find("make_room(hash, max_size)");
+        assert!(callback.is_some() && callback < room);
+    }
+
     const LIVE_EFF: &str =
         include_str!("../plugins/slight_replica/src/slight/effect_viewer/live_eff.rs");
 

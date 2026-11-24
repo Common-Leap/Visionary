@@ -5,7 +5,9 @@
 //! search index / loaded-data buffer.
 
 use crate::offsets;
+use parking_lot::Mutex;
 use smash_arc::{ArcLookup, Hash40, Region, SearchLookup};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Freeze-pinpoint marker, shared with the rest of the injection path (trace opt-in only).
@@ -401,6 +403,34 @@ pub fn resident_len(file_hash: u64) -> Option<usize> {
     let arc = loaded_arc()?;
     let info = arc.get_file_info_from_hash(Hash40(file_hash)).ok()?;
     Some(arc.get_file_data(info, Region::UsEnglish).decomp_size as usize)
+}
+
+/// The file table's listings of each file served this boot. Finding them goes through the table.
+static LISTINGS: Mutex<BTreeMap<u64, Vec<usize>>> = Mutex::new(BTreeMap::new());
+
+/// Give a served file room for `size` bytes. A file can be listed by more than one folder, each
+/// listing with a size of its own, and the game makes the file's buffer as big as the listing it
+/// loads it through says. ARCropolis raises the one the file's path leads to: loaded through
+/// another, a file bigger than the game's own ran past the end of its buffer.
+pub fn make_room(file_hash: u64, size: usize) {
+    let Some(arc) = loaded_arc() else { return };
+    let Ok(path) = arc.get_file_path_index_from_hash(Hash40(file_hash)) else {
+        return;
+    };
+    let infos = arc.get_file_infos();
+    let mut known = LISTINGS.lock();
+    let listings = known.entry(file_hash).or_insert_with(|| {
+        let file = arc.get_file_paths()[path].path.index();
+        let files = infos.iter().map(|info| info.file_info_indice_index.0);
+        super::staged_files::listings_of(file, files)
+    });
+    let datas = (arc as *const smash_arc::LoadedArc).cast_mut();
+    let datas = unsafe { (*datas).get_file_datas_mut() };
+    for &listing in listings.iter() {
+        let data = arc.get_file_in_folder(&infos[listing], Region::UsEnglish);
+        let data = &mut datas[usize::from(data.file_data_index)];
+        data.decomp_size = data.decomp_size.max(size as u32);
+    }
 }
 
 /// DELIBERATELY repoint the resident-data slot for `file_hash` at a caller-owned buffer,
