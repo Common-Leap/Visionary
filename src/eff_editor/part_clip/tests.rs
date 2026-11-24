@@ -740,6 +740,7 @@ fn a_part_that_cannot_leave_its_file_says_why() {
     copy(&mut editor, set, &name);
     editor.export_root = PathBuf::from("/nowhere");
     editor.loaded_path = Some(PathBuf::from("/fx/ef_luigi.eff"));
+    editor.loaded_as = Some(LUIGI.into());
     assert_eq!(
         editor.clip_blocked().as_deref(),
         Some("ef_mario.eff was not found")
