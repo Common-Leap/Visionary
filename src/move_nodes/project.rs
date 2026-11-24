@@ -1509,13 +1509,23 @@ fn lane_script(
         tracks: vec![lane.clone()],
         ..MoveGraph::default()
     };
+    let (_, script) = super::timeline::compile(fighter, move_name, &graph)
+        .ok()?
+        .pop()?;
+    // The gimmick has a say only in how a block that tells it something is written, and one that
+    // does not compile is no reason to lose track of the blocks.
+    if !script_has_chart_event(&script) {
+        return Some(script);
+    }
     let moves = BTreeMap::from([(move_name.to_owned(), graph)]);
-    // A gimmick that does not compile is no reason to lose track of the blocks.
-    let mut tracks = match compile_recipes_with_controllers(fighter, main, charts, &moves) {
-        Ok(mut compiled) => compiled.tracks.remove(move_name)?,
-        Err(_) => super::timeline::compile(fighter, move_name, &moves[move_name]).ok()?,
-    };
-    tracks.pop().map(|(_, script)| script)
+    match compile_recipes_with_controllers(fighter, main, charts, &moves) {
+        Ok(mut compiled) => compiled
+            .tracks
+            .remove(move_name)?
+            .pop()
+            .map(|(_, told)| told),
+        Err(_) => Some(script),
+    }
 }
 
 fn import_lane(fighter: &str, move_name: &str, track: Track, script: &AcmdScript) -> MoveTrack {

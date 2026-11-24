@@ -8497,6 +8497,14 @@ pub fn slot_from_eff_stem(stem: &str, fighter: &str) -> Option<u8> {
     parse_costume_dir(rest)
 }
 
+/// Whether a listed entry is a folder, which the listing itself says but for a link.
+fn lists_a_folder(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+        _ => entry.path().is_dir(),
+    }
+}
+
 /// Costume slot indices found directly under `dir` (each `cNN` subdirectory).
 fn slots_in_costume_parent(dir: &std::path::Path) -> Vec<u8> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -8504,7 +8512,7 @@ fn slots_in_costume_parent(dir: &std::path::Path) -> Vec<u8> {
     };
     entries
         .flatten()
-        .filter(|e| e.path().is_dir())
+        .filter(lists_a_folder)
         .filter_map(|e| parse_costume_dir(e.file_name().to_str()?))
         .collect()
 }
@@ -8529,7 +8537,7 @@ pub fn discover_costume_slots(roots: &[PathBuf], fighter: &str) -> Vec<u8> {
             let group_dir = fighter_dir.join(group);
             if let Ok(parts) = std::fs::read_dir(&group_dir) {
                 for part in parts.flatten() {
-                    if part.path().is_dir() {
+                    if lists_a_folder(&part) {
                         found.extend(slots_in_costume_parent(&part.path()));
                     }
                 }
@@ -8582,6 +8590,11 @@ pub fn slot_characters(roots: &[PathBuf], fighter: &str) -> Vec<SlotCharacter> {
     let mut claimed_slots: std::collections::HashSet<u8> = std::collections::HashSet::new();
     let mut found: Vec<SlotCharacter> = Vec::new();
     for root in roots.iter().rev() {
+        // Asked first: most roots name nobody, and finding the slots reads every folder there.
+        let names = root.join("ui/message/msg_name.xmsbt");
+        if !names.is_file() {
+            continue;
+        }
         let slots: Vec<u8> = discover_costume_slots(std::slice::from_ref(root), fighter)
             .into_iter()
             .filter(|slot| *slot >= VANILLA_SLOT_COUNT && !claimed_slots.contains(slot))
@@ -8589,7 +8602,7 @@ pub fn slot_characters(roots: &[PathBuf], fighter: &str) -> Vec<SlotCharacter> {
         if slots.is_empty() {
             continue;
         }
-        let Ok(text) = std::fs::read(root.join("ui/message/msg_name.xmsbt")) else {
+        let Ok(text) = std::fs::read(names) else {
             continue;
         };
         let Some(name) = xmsbt_character_name(&decode_xmsbt(&text), fighter) else {

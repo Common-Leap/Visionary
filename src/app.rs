@@ -5019,6 +5019,11 @@ pub(crate) fn reconcile_saved_effects(
     (calls, kept, report)
 }
 
+fn has_raw_effect_name(call: &crate::data::EffectCall) -> bool {
+    let names = std::iter::once(&call.effect_name).chain(&call.effect_name_alt);
+    names.into_iter().any(|name| name.starts_with("0x"))
+}
+
 /// Spell out effect names stored as raw `0x…` hashes wherever `names` knows them.
 ///
 /// A capture taken before a name was known (ParamLabels still loading, or an effect that lives
@@ -25586,16 +25591,26 @@ impl VisionaryApp {
     }
 
     fn publish_hitbox_rules(&self) {
+        // The moves of a project being opened are sent together, once all are in.
+        if self.rebuilding_project_live {
+            return;
+        }
         let hitboxes: Vec<_> = self.live_hitbox_rule_union(self.put_back.as_ref());
         self.game_link.send_hitbox_rules(&hitboxes);
     }
 
     fn publish_effect_rules(&self) {
+        if self.rebuilding_project_live {
+            return;
+        }
         let effects: Vec<_> = self.live_effect_rule_union(self.put_back.as_ref());
         self.game_link.send_spawn_rules(&effects);
     }
 
     fn publish_effect_control_rules(&self) {
+        if self.rebuilding_project_live {
+            return;
+        }
         let controls: Vec<_> = self.live_effect_control_rule_union(self.put_back.as_ref());
         self.game_link.send_effect_control_rules(&controls);
     }
@@ -26178,7 +26193,22 @@ impl VisionaryApp {
         let Some(mv) = self.current_move_key() else {
             return;
         };
-        let names = self.effect_reverse_map();
+        let saved_calls = self.state.effect_call_full.get(&mv).into_iter().flatten();
+        let edits = self.state.effect_call_edits.get(&mv).into_iter().flatten();
+        let edited_calls = edits.filter_map(|edit| match &edit.op {
+            crate::data::EffectCallOp::Modify(call) | crate::data::EffectCallOp::Add(call) => {
+                Some(call)
+            }
+            crate::data::EffectCallOp::Remove => None,
+        });
+        let mut calls = self.state.effects_pristine.iter().chain(saved_calls);
+        // The names are read from every effect file of the fighter's.
+        let unnamed =
+            calls.any(has_raw_effect_name) || edited_calls.into_iter().any(has_raw_effect_name);
+        let names = match unnamed {
+            true => self.effect_reverse_map(),
+            false => HashMap::new(),
+        };
         resolve_raw_effect_names(&mut self.state.effects_pristine, &names);
         let (mut effects, kept, report) = reconcile_saved_effects(
             &self.state.effects_pristine,
@@ -58643,6 +58673,40 @@ mod saved_effect_tests {
             calls[1].effect_name, "0xdeadbeef",
             "an unknown hash stays a hash"
         );
+    }
+
+    /// Opening a project opens every saved move: reading every effect file of its fighter for
+    /// each, and working out all the rules each time only to send none, was most of the wait.
+    #[test]
+    fn opening_a_projects_moves_reads_and_sends_only_what_is_needed() {
+        let mut named = call("sys_smash_flash", 1);
+        assert!(!has_raw_effect_name(&named));
+        named.effect_name_alt = Some("0xdeadbeef".into());
+        assert!(has_raw_effect_name(&named));
+        assert!(has_raw_effect_name(&call("0xdeadbeef", 1)));
+        let source = include_str!("app.rs");
+        let body = |name: &str| {
+            let rest = source.split(name).nth(1).expect(name);
+            rest.split("\n    fn ").next().unwrap().to_owned()
+        };
+        let open = body("fn apply_effect_call_edits_to_current(&mut self) {");
+        assert!(open.contains("true => self.effect_reverse_map(),"));
+        assert_eq!(open.matches("effect_reverse_map()").count(), 1);
+        for publish in [
+            "fn publish_hitbox_rules(&self) {",
+            "fn publish_effect_rules(&self) {",
+            "fn publish_effect_control_rules(&self) {",
+        ] {
+            let publish = body(publish);
+            let held = publish.find("if self.rebuilding_project_live {");
+            assert!(held.unwrap() < publish.find("_rule_union(").unwrap());
+        }
+        // All of it goes out once the last move is in.
+        let rebuild = body("fn rebuild_all_saved_live_rules(&mut self) -> LiveApplyReport {");
+        let done = rebuild
+            .find("self.rebuilding_project_live = false;")
+            .unwrap();
+        assert!(done < rebuild.rfind("self.publish_live_rule_union();").unwrap());
     }
 }
 
