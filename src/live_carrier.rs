@@ -66,11 +66,15 @@ pub enum Plays {
     /// A stage, an assist, a menu: its effects can't go into a running match, and its file is
     /// loaded when the game needs it.
     Other,
+    /// Nobody, in a match with edits: their carrier is in this file's place.
+    Carrier,
 }
 
 pub fn who_plays(rel: &str) -> Plays {
     let rel = rel.to_lowercase();
-    if rel.starts_with("effect/system/") {
+    if rel == crate::eff_editor::CARRIER_BASE_REL {
+        Plays::Carrier
+    } else if rel.starts_with("effect/system/") {
         Plays::Everyone
     } else if rel.is_empty() || rel.starts_with("effect/fighter/") {
         Plays::Fighter
@@ -460,7 +464,7 @@ pub fn said(plays: Plays, outcome: SendOutcome, shares: bool, staged: bool) -> S
     match (plays, outcome) {
         (Plays::Fighter, _) | (_, S::NotBuilt) => outcome,
         (Plays::Other, _) if staged => S::NextFile,
-        (Plays::Other, _) | (Plays::Everyone, S::NextMatch) => S::NotInMatch,
+        (Plays::Other | Plays::Carrier, _) | (Plays::Everyone, S::NextMatch) => S::NotInMatch,
         (Plays::Everyone, S::InGame) if !shares => S::NotInMatch,
         (Plays::Everyone, _) => outcome,
     }
@@ -924,6 +928,7 @@ mod tests {
             ("effect/stage/battlefield/ef_battlefield.eff", Plays::Other),
             ("effect/assist/robin/ef_robin.eff", Plays::Other),
             ("effect/ui/menu/ef_menu.eff", Plays::Other),
+            (crate::eff_editor::CARRIER_BASE_REL, Plays::Carrier),
         ];
         for (rel, plays) in kinds {
             assert_eq!(who_plays(rel), plays, "{rel}");
@@ -953,6 +958,16 @@ mod tests {
                     (_, true) => assert_eq!(other, S::NextFile),
                     (_, false) => assert_eq!(other, S::NotInMatch),
                 }
+                // The carrier is in its place, staged or not.
+                let carrier = said(Plays::Carrier);
+                assert_eq!(
+                    carrier,
+                    if outcome == S::NotBuilt {
+                        S::NotBuilt
+                    } else {
+                        S::NotInMatch
+                    }
+                );
             }
         }
     }

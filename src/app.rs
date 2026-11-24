@@ -4015,6 +4015,23 @@ fn send_what(fighter: &str, edited: usize, borrowed: usize) -> String {
     }
 }
 
+/// [`send_what`] of `eff`, counted as the Edited chip counts it.
+fn send_what_of(owner: &str, eff: Option<&crate::mod_project::EffMod>) -> String {
+    let count = |of: fn(&crate::mod_project::EffMod) -> usize| eff.map_or(0, of);
+    let (edited, borrowed) = (
+        count(|e| e.changed_effects()),
+        count(|e| e.transplants.len()),
+    );
+    match count(|e| e.textures.len() + e.textures_added.len() + e.textures_removed.len()) {
+        0 => send_what(owner, edited, borrowed),
+        _ if edited + borrowed > 0 => send_what(owner, edited, borrowed),
+        n => format!(
+            "{owner}, {}",
+            counted(n, "edited texture", "edited textures")
+        ),
+    }
+}
+
 /// The status line a send starts with. Connected, it is "Sending to the game: …", which the
 /// outcome rewrites once the game answers; with no game, it says that what it carries goes to
 /// the game when one connects (the connection sends every edit).
@@ -6614,10 +6631,10 @@ impl VisionaryApp {
 
     /// The name effect edits kept under `owner` are shown by.
     fn effect_owner_name(&self, owner: &str) -> String {
-        if owner == "common" {
-            "Shared effects".to_owned()
-        } else {
-            self.character_name(&crate::character::CharacterKey::parse(owner))
+        match owner {
+            "common" => "Shared effects".to_owned(),
+            "item" => "Item effects".to_owned(),
+            _ => self.character_name(&crate::character::CharacterKey::parse(owner)),
         }
     }
 
@@ -37577,24 +37594,7 @@ impl VisionaryApp {
         let Some(eff) = self.eff_mods.get(fighter).cloned() else {
             return false;
         };
-        let character = crate::character::CharacterKey::parse(fighter);
-        // A made character's file stands for each of its costumes' files.
-        let mut rels = match character.authored(&self.roster.project) {
-            Some(_) => character
-                .made_slots(&self.roster.project)
-                .iter()
-                .map(|slot| crate::roster::scaffold::effect_file(character.engine_fighter(), *slot))
-                .collect(),
-            None => vec![eff.source_rel.clone()],
-        };
-        // ARCropolis takes the game down when it is asked for a path the game has no file at, and
-        // the game loads the shared files once, as it starts. The carrier alone shows those edits,
-        // in this match and the next.
-        rels.retain(|rel| {
-            let shared =
-                crate::live_carrier::who_plays(rel) == crate::live_carrier::Plays::Everyone;
-            self.game_has_effect_file(rel) && !shared
-        });
+        let rels = self.staged_files_of(fighter, &eff);
         if rels.is_empty() {
             self.live_eff_deployed.insert(fighter.to_owned(), eff);
             return false;
@@ -37630,6 +37630,35 @@ impl VisionaryApp {
             self.live_eff_deployed.insert(fighter.to_owned(), eff);
         }
         served
+    }
+
+    /// The files the game can be given `eff`, the edits of `owner`, in. ARCropolis takes the game
+    /// down when it is asked for a path the game has no file at, and the game loads the shared
+    /// files once, as it starts: the carrier alone shows those edits, in this match and the next.
+    /// Its own file can't hold others.
+    fn staged_files_of(&self, owner: &str, eff: &crate::mod_project::EffMod) -> Vec<String> {
+        use crate::live_carrier::{who_plays, Plays};
+        let character = crate::character::CharacterKey::parse(owner);
+        // A made character's file stands for each of its costumes' files.
+        let mut rels = match character.authored(&self.roster.project) {
+            Some(_) => character
+                .made_slots(&self.roster.project)
+                .iter()
+                .map(|slot| crate::roster::scaffold::effect_file(character.engine_fighter(), *slot))
+                .collect(),
+            None => vec![eff.source_rel.clone()],
+        };
+        rels.retain(|rel| {
+            matches!(who_plays(rel), Plays::Fighter | Plays::Other)
+                && self.game_has_effect_file(rel)
+        });
+        rels
+    }
+
+    /// Whether the game loads `owner`'s edits the next time it loads their file.
+    fn stages_effects_of(&self, owner: &str) -> bool {
+        let deployed = self.live_eff_deployed.get(owner);
+        deployed.is_some_and(|eff| !self.staged_files_of(owner, eff).is_empty())
     }
 
     /// Whether the running game has a file at this effect path: its own, or one an installed mod
@@ -37822,7 +37851,7 @@ impl VisionaryApp {
             self.plays_effects_of(&sent),
             now,
             self.game_link.carrier_shares(),
-            self.live_eff_deployed.contains_key(&sent),
+            self.stages_effects_of(&sent),
         );
         if now == was {
             return;
@@ -37906,15 +37935,7 @@ impl VisionaryApp {
     /// What a send for `owner` carries, counted in effects, not parts: the status line counts
     /// one thing for one send.
     fn live_send_what(&self, owner: &str) -> String {
-        let (edits, transplants) = self
-            .eff_mods
-            .get(owner)
-            .map(|e| {
-                let sets: HashSet<&str> = e.authored.iter().map(|a| a.set_name.as_str()).collect();
-                (sets.len(), e.transplants.len())
-            })
-            .unwrap_or((0, 0));
-        send_what(&self.effect_owner_name(owner), edits, transplants)
+        send_what_of(&self.effect_owner_name(owner), self.eff_mods.get(owner))
     }
 
     /// Record the [`TransplantOp`](crate::mod_project::TransplantOp) for `fighter` and open
@@ -41915,7 +41936,7 @@ Click to see the code, or link your own project"
                     plays,
                     outcome,
                     self.game_link.carrier_shares(),
-                    self.live_eff_deployed.contains_key(&sent),
+                    self.stages_effects_of(&sent),
                 );
                 // One plain outcome on the Send row, in the In game panel and on the status
                 // line. The game's numbers and the likely cause go in the row's hover: they are
@@ -41925,6 +41946,9 @@ Click to see the code, or link your own project"
                 } else if plays == Plays::Everyone && outcome == SendOutcome::NotInMatch && live {
                     "\nThe plugin in the game can't change shared effects: install Visionary's \
                      plugin again."
+                        .to_string()
+                } else if plays == Plays::Carrier {
+                    "\nEdits go into the match in place of this file, so its own can't be shown there."
                         .to_string()
                 } else if live || plays == Plays::Other {
                     String::new()
@@ -50519,10 +50543,13 @@ mod live_effect_capture_tests {
         assert!(body("fn refresh_acmd_src_fighters(").contains("self.follow_effect_files()"));
         // The shared files are loaded once, as the game starts: none waits for a match.
         let staged = body("fn deploy_live_eff(");
-        assert!(staged.contains("self.game_has_effect_file(rel) && !shared"));
-        assert!(
-            staged.find("rels.retain(").unwrap() < staged.find("self.serve_live_eff(").unwrap()
-        );
+        let files = staged.find("let rels = self.staged_files_of(").unwrap();
+        assert!(files < staged.find("self.serve_live_eff(").unwrap());
+        let files = body("fn staged_files_of(");
+        assert!(files.contains("matches!(who_plays(rel), Plays::Fighter | Plays::Other)"));
+        assert!(files.contains("&& self.game_has_effect_file(rel)"));
+        // And a file that is not staged is never said to load.
+        assert!(body("fn stages_effects_of(").contains("self.staged_files_of(owner, eff)"));
     }
 
     /// Removing a made character takes its effect edits, the Effects page's working copy of them
@@ -50627,6 +50654,20 @@ mod live_effect_capture_tests {
             status_after_send(&sending, SendOutcome::NextMatch).as_deref(),
             Some("Saved for the next match: Mario, 1 edited effect")
         );
+        // It counts what the Edited chip counts: a part added to an effect, a new picture for
+        // one. Neither is "Mario's own effects".
+        let mut eff = crate::mod_project::EffMod::default();
+        assert_eq!(send_what_of("Mario", Some(&eff)), "Mario's own effects");
+        assert_eq!(send_what_of("Mario", None), "Mario's own effects");
+        eff.textures_removed.push("ef_mario_smoke".into());
+        assert_eq!(send_what_of("Mario", Some(&eff)), "Mario, 1 edited texture");
+        eff.rosters.push(crate::mod_project::EmitterRoster {
+            set_name: "P_MarioFbShoot".into(),
+            entry_name: "mario_fb_shoot".into(),
+            set_idx: 0,
+            slots: Vec::new(),
+        });
+        assert_eq!(send_what_of("Mario", Some(&eff)), "Mario, 1 edited effect");
         // A reset says what it is sending, and waits for the game like any other send.
         let reset = send_note(true, &send_what("Mario", 0, 0));
         assert_eq!(reset, "Sending to the game: Mario's own effects");
