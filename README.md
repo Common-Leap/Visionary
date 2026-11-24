@@ -8,10 +8,9 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
 - [`ssbh_wgpu`](https://github.com/Common-Leap/ssbh_wgpu) (a fork of
   ScanMountGoat's, with two additions for effects) draws the fighters, their
-  objects and the stage. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu)
-  of it, which adds loading a model from files in different folders (costumes
-  that share files through `config.json`) and the skeleton edit that scales a
-  fighter at its root.
+  objects and the stage. It also has joobert's two additions:
+  loading a model from files in different folders (costumes that share files through
+  `config.json`) and the skeleton edit that scales a fighter at its root.
 - [`eff_wgpu`](https://github.com/Common-Leap/eff_wgpu) simulates and draws the
   effects in the preview the way the game does.
 - The [`effect_library`](https://crates.io/crates/effect_library) crate on

@@ -1215,7 +1215,7 @@ dependencies = [
 [[package]]
 name = "eff_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/Common-Leap/eff_wgpu?rev=95e4293986a9773100e4e1542adddc6fd0531a5f#95e4293986a9773100e4e1542adddc6fd0531a5f"
+source = "git+https://github.com/Common-Leap/eff_wgpu?rev=f400c6c41a6dc3084a638b47641f9def2de42633#f400c6c41a6dc3084a638b47641f9def2de42633"
 dependencies = [
  "binrw 0.15.2",
  "bntx",
@@ -3217,7 +3217,7 @@ dependencies = [
 [[package]]
 name = "nutexb_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/joobert/ssbh_wgpu.git?rev=6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016#6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016"
+source = "git+https://github.com/Common-Leap/ssbh_wgpu?rev=e3a603f0b7c3fe2a10a2077cf4e27f75a3c8f7f0#e3a603f0b7c3fe2a10a2077cf4e27f75a3c8f7f0"
 dependencies = [
  "bytemuck",
  "log",
@@ -5012,7 +5012,7 @@ dependencies = [
 [[package]]
 name = "ssbh_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/joobert/ssbh_wgpu.git?rev=6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016#6702cb4eac8748f8d92ac132e2ac0b2f1a8cc016"
+source = "git+https://github.com/Common-Leap/ssbh_wgpu?rev=e3a603f0b7c3fe2a10a2077cf4e27f75a3c8f7f0#e3a603f0b7c3fe2a10a2077cf4e27f75a3c8f7f0"
 dependencies = [
  "aho-corasick",
  "bytemuck",
