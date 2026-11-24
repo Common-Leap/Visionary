@@ -204,7 +204,27 @@ impl NodeEditor {
     pub fn set_move_length(&mut self, frames: u32) {
         self.move_length = (frames > 0).then_some(frames as f32);
     }
-    pub fn set_toolbar_rect(&mut self, rect: egui::Rect) {
+    /// Keep room for Undo, Redo, Revert draft and the live line at the end of the workspace's
+    /// bar: on a row of their own where they don't fit beside the rest.
+    pub fn place_toolbar(&mut self, ui: &mut egui::Ui) {
+        let spacing = ui.spacing().clone();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let width = |text: &str, padding: f32| {
+            let text =
+                ui.painter()
+                    .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE);
+            text.size().x + 2.0 * padding + spacing.item_spacing.x
+        };
+        let buttons =
+            ["Undo", "Redo", "Revert draft"].map(|text| width(text, spacing.button_padding.x));
+        let size = egui::vec2(
+            buttons.iter().sum::<f32>() + width("● 00 not live yet", 0.0),
+            spacing.interact_size.y,
+        );
+        if ui.available_size_before_wrap().x < size.x {
+            ui.end_row();
+        }
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         self.toolbar_rect = Some(rect);
     }
     pub fn set_playhead(&mut self, frame: f32, playing: bool) {
@@ -6903,6 +6923,64 @@ mod tests {
     use crate::ui::TestFrame;
 
     use super::*;
+
+    /// Undo, Redo, Revert draft and the live line are inside the window, down to 900 wide: they
+    /// take a row of their own where the rest of the bar leaves them no room.
+    #[test]
+    fn the_bars_own_controls_are_inside_a_narrow_window() {
+        for (width, rows) in [(1400.0, 1), (1000.0, 2), (900.0, 2), (760.0, 2)] {
+            let context = egui::Context::default();
+            let mut editor = NodeEditor::default();
+            let mut bar = egui::Rect::NOTHING;
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                context.run_test_ui(input(), |ui| {
+                    bar = ui
+                        .horizontal_wrapped(|ui| {
+                            // What the bar has before them, as it is at 1400 wide.
+                            let before = [54.0, 160.0, 220.0, 40.0, 62.0, 160.0, 34.0, 78.0, 46.0];
+                            for size in before {
+                                ui.allocate_exact_size(
+                                    egui::vec2(size, 18.0),
+                                    egui::Sense::hover(),
+                                );
+                            }
+                            editor.place_toolbar(ui);
+                        })
+                        .response
+                        .rect;
+                });
+            }
+            let place = editor.toolbar_rect.expect("placed");
+            assert!(
+                place.left() >= 0.0 && place.right() <= width,
+                "{width}: {place:?}"
+            );
+            assert!(bar.contains_rect(place), "{width}: {place:?} {bar:?}");
+            assert_eq!(
+                bar.height() > 1.8 * place.height(),
+                rows == 2,
+                "{width}: {bar:?}"
+            );
+            let app = include_str!("../app.rs");
+            let draw = app.split("fn draw_node_workspace(").nth(1).unwrap();
+            let bar = draw
+                .split("self.node_editor.place_toolbar(ui);")
+                .next()
+                .unwrap();
+            assert!(
+                bar.ends_with("ui.separator();\n            "),
+                "last in the bar"
+            );
+            assert!(bar.contains("ui.horizontal_wrapped(|ui| {"));
+        }
+    }
 
     fn native_expression_frame(
         context: &egui::Context,

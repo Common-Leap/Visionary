@@ -15114,7 +15114,7 @@ impl VisionaryApp {
         let escape = !ui.ctx().text_edit_focused()
             && !egui::Popup::is_any_open(ui.ctx())
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("← Back").clicked() || escape {
                 self.leave_move_nodes();
             }
@@ -15179,11 +15179,7 @@ impl VisionaryApp {
                 }
             });
             ui.separator();
-            let rest = egui::Rect::from_min_size(
-                ui.cursor().min,
-                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
-            );
-            self.node_editor.set_toolbar_rect(rest);
+            self.node_editor.place_toolbar(ui);
         });
         if let Some(key) = character_choice.filter(|key| Some(key) != self.active_key().as_ref()) {
             self.select_character(key);
