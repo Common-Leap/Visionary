@@ -359,16 +359,16 @@ pub fn authored_characters(roster: &crate::mod_project::RosterMod) -> BTreeSet<P
 
 /// Add each character `roster` authors now but did not in `previously_authored` to `set`, and
 /// return the characters it authors now. Like [`absorb_edited_fighters`]: a character made in
-/// the Roster window joins the project once, and removing it from the project sticks.
+/// the Roster window joins the project once, and removing it from the project sticks. One that
+/// is no longer authored leaves with its row.
 pub fn absorb_authored_characters(
     set: &mut BTreeSet<ProjectFighter>,
     previously_authored: &BTreeSet<ProjectFighter>,
     roster: &crate::mod_project::RosterMod,
 ) -> BTreeSet<ProjectFighter> {
     let authored = authored_characters(roster);
-    for row in authored.difference(previously_authored) {
-        set.insert(row.clone());
-    }
+    set.extend(authored.difference(previously_authored).cloned());
+    set.retain(|row| authored.contains(row) || !previously_authored.contains(row));
     authored
 }
 
@@ -453,6 +453,8 @@ mod tests {
     fn a_project_from_before_links_uses_this_machines() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        // A folder picked elsewhere, absolute as this system spells it.
+        let page = dir.join("elsewhere").join("page");
         let global = || Some(PathBuf::from("/machine"));
         let of = |stored: Option<&str>, version: u32, keeps_scope: bool| {
             let stored = stored.map(PathBuf::from);
@@ -466,14 +468,9 @@ mod tests {
         assert_eq!(of(Some("/mine"), 10, true), Some(PathBuf::from("/mine")));
         // One whose page named its move code; the project's own link takes over from 10 on.
         let mut parts = crate::project_parts::ProjectParts::default();
-        parts.set_link(
-            "",
-            crate::project_parts::Part::Moves,
-            0,
-            Some(PathBuf::from("/page")),
-        );
+        parts.set_link("", crate::project_parts::Part::Moves, 0, Some(page.clone()));
         parts.save(dir).unwrap();
-        assert_eq!(of(None, 8, false), Some(PathBuf::from("/page")));
+        assert_eq!(of(None, 8, false), Some(page));
         assert_eq!(of(None, 10, true), None);
         assert_eq!(of(Some("/mine"), 8, true), Some(PathBuf::from("/mine")));
     }
@@ -920,6 +917,33 @@ mod tests {
         set.remove(&shy_guy);
         absorb_authored_characters(&mut set, &authored, &project.roster);
         assert!(set.is_empty());
+    }
+
+    /// Removing a made character takes its row out of the project's list: "Vision" stayed on it.
+    /// The other rows stay, a mod's character of the same fighter too.
+    #[test]
+    fn a_removed_characters_row_goes_with_it() {
+        let made = |name: &str| crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: name.into(),
+            name_id: name.to_lowercase(),
+            moveset_scaffolded: false,
+            files_root: None,
+        };
+        let mario = ProjectFighter::fighter("mario");
+        let mod_made = ProjectFighter::character("mario", "Geno");
+        let mut set = BTreeSet::from([mario.clone(), mod_made.clone()]);
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(made("Vision"));
+        let authored = absorb_authored_characters(&mut set, &BTreeSet::new(), &roster);
+        assert!(set.contains(&ProjectFighter::character("mario", "Vision")));
+        roster.authored.clear();
+        let authored = absorb_authored_characters(&mut set, &authored, &roster);
+        assert!(authored.is_empty());
+        assert_eq!(set, BTreeSet::from([mario, mod_made]));
     }
 
     #[test]
