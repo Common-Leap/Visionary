@@ -36,6 +36,8 @@ pub struct Playing {
     inherited: f32,
     /// Told to start, not yet seen on a frame.
     fresh: bool,
+    /// Had its first once-per-frame tick.
+    ticked: bool,
     fired: Vec<Fired>,
 }
 
@@ -48,13 +50,22 @@ impl Playing {
             passed: if first { START } else { frame - step },
             inherited: START,
             fresh: false,
+            ticked: false,
             fired: Vec::new(),
         }
     }
 
+    /// The once-per-frame tick. Whether it is the playing's first, when nothing can fire yet: a
+    /// motion's game and expression scripts start before it, and an effect made then, or on it,
+    /// is there but never drawn. Its effect script starts after it.
+    pub fn tick(&mut self) -> bool {
+        !std::mem::replace(&mut self.ticked, true)
+    }
+
     /// Whether what `slot` holds is due now that the motion has reached `frame`.
     pub fn due(&self, slot: usize, identity: u64, target: f32, frame: f32) -> bool {
-        self.passed < target
+        self.ticked
+            && self.passed < target
             && target <= frame
             && self
                 .fired(slot, identity)
@@ -121,6 +132,7 @@ impl Playings {
             passed: reached,
             inherited: reached,
             fresh: !inherits,
+            ticked: false,
             fired: Vec::new(),
         };
     }

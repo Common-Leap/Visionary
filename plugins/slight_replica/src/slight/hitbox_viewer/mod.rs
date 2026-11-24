@@ -4625,6 +4625,8 @@ pub unsafe fn inject_tick(lua_state: u64) {
             }
             if category == node_steps::CAT_NODE_STEP {
                 let mut agent = smash::lib::L2CAgent::new(lua_state);
+                // What the fighter's status code left there would be read as the first argument.
+                agent.clear_lua_stack();
                 let command = inj.command.as_deref().unwrap_or_default();
                 let done = {
                     let _g = InjectGuard::new();

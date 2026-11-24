@@ -6931,6 +6931,61 @@ mod tests {
         }
     }
 
+    /// An added block's arguments are read from the bottom of a Lua stack the fighter's own code
+    /// uses too: "Animation speed" read the `is_excute` answer left there as its speed, and did
+    /// nothing. Every place that puts arguments on it empties it first.
+    #[test]
+    fn added_blocks_put_their_arguments_on_an_empty_stack() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/slight_replica/src/slight");
+        let mut files = vec![root];
+        let mut pushers = 0;
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                let entries = std::fs::read_dir(&path).expect("plugin folder");
+                files.extend(entries.map(|entry| entry.expect("entry").path()));
+                continue;
+            }
+            // Every node step runs through `node_steps::run`, checked below.
+            let steps = path.ends_with("hitbox_viewer/node_steps.rs");
+            if steps || path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let source = read_source(&path).expect("plugin source");
+            for body in source
+                .split("\nunsafe fn ")
+                .skip(1)
+                .chain(source.split("\npub unsafe fn ").skip(1))
+            {
+                let body = body.split("\n}\n").next().unwrap_or(body);
+                let Some(pushed) = body.find("push_lua_stack(") else {
+                    continue;
+                };
+                pushers += 1;
+                assert!(
+                    body.find("clear_lua_stack()")
+                        .is_some_and(|clear| clear < pushed),
+                    "{}: {}",
+                    path.display(),
+                    body.lines().next().unwrap_or_default()
+                );
+            }
+        }
+        assert!(pushers > 5, "{pushers}");
+        let collisions = read_source(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+        )
+        .expect("read the plugin's hitbox hooks");
+        assert_eq!(collisions.matches("node_steps::run(").count(), 1);
+        let step = collisions
+            .split("if category == node_steps::CAT_NODE_STEP {")
+            .nth(1)
+            .expect("node step");
+        let run = step.find("node_steps::run(").expect("run");
+        assert!(step[..run].contains("agent.clear_lua_stack();"));
+    }
+
     /// The game says which staged effect files it holds; a new game holds none of them.
     #[test]
     fn the_effects_the_game_holds_come_with_the_carrier_report() {
@@ -6954,8 +7009,8 @@ mod tests {
     }
 
     /// Effect, sound, game, and expression ACMD coroutines can enter the live-retime scheduler
-    /// from different game workers. Its startup markers and motion hints used to share three
-    /// blocking `parking_lot` collections; a contended waiter can spin forever on Horizon even
+    /// from different game workers. Its motion hints used to be in blocking `parking_lot`
+    /// collections; a contended waiter can spin forever on Horizon even
     /// after the holder leaves. The scheduler must keep that cross-coroutine state lock-free and
     /// skip its native-query path entirely when no structural retime exists.
     #[test]
@@ -6975,11 +7030,10 @@ mod tests {
             .0;
         assert!(
             lifecycle.contains("static MOTION_HINTS: [MotionHintSlot;")
-                && lifecycle.contains("static ACMD_STARTUP_PENDING: [")
                 && lifecycle.contains("compare_exchange")
                 && !lifecycle.contains("Mutex")
                 && !lifecycle.contains(".lock()"),
-            "cross-coroutine startup state must remain fixed-size and lock-free"
+            "cross-coroutine motion hints must remain fixed-size and lock-free"
         );
         // What has fired is kept in a map, which is asked for and never waited on.
         assert!(source.contains("PLAYINGS.try_lock()") && !source.contains("PLAYINGS.lock()"));
@@ -7380,12 +7434,8 @@ mod tests {
             "trail_suppressed",
             "lifetime_stop_suppressed",
             "stop_suppressed",
-            "L2CAgentBase_start_coroutine",
-            "hook_start_coroutine",
             "L2CAgentBase_resume_coroutine",
             "hook_resume_coroutine",
-            "L2CAgentBase_call_coroutine",
-            "hook_call_coroutine",
             "MotionModule::change_motion",
             "hook_motion_change",
             "MotionModule::change_motion_inherit_frame",
@@ -7404,8 +7454,6 @@ mod tests {
             "sv_animcmd::wait",
             "hook_acmd_wait",
             "inject_for_acmd",
-            "CoroutineBoundary::Call",
-            "CoroutineBoundary::Start",
             "CoroutineBoundary::Effect",
             "CoroutineBoundary::Control",
             "MotionHint",
@@ -7430,26 +7478,6 @@ mod tests {
         assert!(
             !hooks.contains("effect_acmd_state_matches"),
             "frame-zero dispatch must not wait for a previously observed effect coroutine"
-        );
-        let start_original = hooks
-            .find("let result = original!()(agent, coroutine_index, name, state);")
-            .expect("start coroutine must call the native implementation");
-        let start_injection = hooks
-            .find("inject_for_acmd_at_frame(&mut *agent, CoroutineBoundary::Start, 0.0)")
-            .expect("start coroutine must cover frame zero before the native body");
-        assert!(
-            start_injection < start_original,
-            "startup injection must run before the original coroutine enters its first slice"
-        );
-        let call_original = hooks
-            .find("let result = original!()(agent, coroutine_index, name);")
-            .expect("call coroutine must call the native implementation");
-        let call_injection = hooks
-            .find("inject_for_acmd(&mut *agent, CoroutineBoundary::Call)")
-            .expect("call coroutine must inject after the native implementation");
-        assert!(
-            call_original < call_injection,
-            "call-boundary injection must run after the original coroutine call"
         );
         assert!(
             hooks.contains("inject_after_acmd_frame(lua_state, target)"),
@@ -11465,6 +11493,9 @@ mod playing_tests {
 
         /// The once-per-frame tick.
         fn tick(&mut self, motion: u64, frame: f32) {
+            if self.playings.at(7, motion, frame, self.step).tick() {
+                return;
+            }
             self.fire(motion, frame, frame);
             self.playings.at(7, motion, frame, self.step).pass(frame);
         }
@@ -11486,6 +11517,39 @@ mod playing_tests {
         (0..)
             .map(move |n| from + n as f32 * step)
             .take_while(move |frame| *frame <= to)
+    }
+
+    /// Measured in the game (13.0.4): an effect made by a move's game or expression script on its
+    /// first frame, or by the tick that follows them, is there for its whole life and never drawn.
+    /// Made by its sound or effect script, which start after that tick, it is.
+    #[test]
+    fn a_first_frame_effect_waits_for_the_scripts_that_start_after_the_tick() {
+        let mut game = Game::new(&[(GROUND, 0.0)]);
+        for _ in 0..2 {
+            game.fired.clear();
+            game.playings.started(7, GROUND, false);
+            game.boundary(GROUND, 0.0, 0.0);
+            game.tick(GROUND, 0.0);
+            assert_eq!(game.fired, []);
+            game.boundary(GROUND, 0.0, 0.0);
+            assert_eq!(game.fired, [(GROUND, 0.0)]);
+            game.tick(GROUND, 1.0);
+            game.boundary(GROUND, 1.0, 1.0);
+            assert_eq!(game.fired, [(GROUND, 0.0)]);
+        }
+        // With no script after it, the next tick's is the first that is drawn.
+        game.fired.clear();
+        game.play(GROUND, frames(0.0, 1.0, 1.0));
+        assert_eq!(game.fired, [(GROUND, 0.0)]);
+
+        // Each script's turn on the first frame is seen, whatever its first line is.
+        let frame = HOOKS
+            .split("unsafe fn hook_acmd_frame(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("hook_acmd_frame");
+        let entered = frame.find("inject_before_acmd_wait(lua_state, CoroutineBoundary::Frame);");
+        assert!(entered.is_some() && entered < frame.find("original!()(lua_state, target);"));
     }
 
     #[test]
@@ -11604,8 +11668,10 @@ mod playing_tests {
     #[test]
     fn a_motion_begun_again_on_the_same_frame_is_a_new_playing() {
         let mut game = Game::new(&[(GROUND, 0.0)]);
-        game.play(GROUND, frames(0.0, 0.0, 1.0));
-        game.play(GROUND, frames(0.0, 0.0, 1.0));
+        for _ in 0..2 {
+            game.play(GROUND, frames(0.0, 0.0, 1.0));
+            game.boundary(GROUND, 0.0, 0.0);
+        }
         assert_eq!(game.fired, [(GROUND, 0.0); 2]);
     }
 
@@ -11678,6 +11744,7 @@ mod playing_tests {
     fn an_unconfirmed_dispatch_gets_one_more_try_on_its_frame() {
         let mut playings = Playings::default();
         let playing = playings.at(7, GROUND, 0.0, 1.0);
+        playing.tick();
         assert!(playing.due(0, 1, 0.0, 0.0));
         assert_eq!(playing.fire(0, 1, false), 1);
         assert!(playing.due(0, 1, 0.0, 0.0));
@@ -11685,6 +11752,7 @@ mod playing_tests {
         assert!(!playing.due(0, 1, 0.0, 0.0));
         // Confirmed on the first try, it is done; unconfirmed, its frame passing ends it too.
         let playing = playings.at(8, GROUND, 0.0, 1.0);
+        playing.tick();
         playing.fire(0, 1, true);
         assert!(!playing.due(0, 1, 0.0, 0.0));
         playing.fire(1, 1, false);
@@ -11766,6 +11834,7 @@ mod playing_tests {
             ".due(slot, identity, target, reached.frame)",
             ".fire(slot, identity, confirmed)",
             ".pass(frame)",
+            ".tick()",
             "playings.started(boid, motion, inherits)",
         ] {
             assert!(HOOKS.contains(call), "{call}");
