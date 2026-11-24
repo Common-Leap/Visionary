@@ -4267,6 +4267,21 @@ fn effect_costumes(
     crate::character::base_costumes(fighter, &slots, roster)
 }
 
+/// Whether the fighter list shows row `row` as the open one, or the row of `made`, a character
+/// made on its fighter: the one open, never both.
+fn row_is_open(
+    selected: Option<usize>,
+    row: usize,
+    active: Option<&crate::character::CharacterKey>,
+    made: Option<&crate::character::CharacterKey>,
+) -> bool {
+    selected == Some(row)
+        && match made {
+            Some(made) => active == Some(made),
+            None => active.is_none_or(|active| !active.is_made()),
+        }
+}
+
 /// The fighter's own row in `fighters`, or failing that any row that plays as it.
 fn own_row_index(fighters: &[crate::data::FighterEntry], fighter: &str) -> Option<usize> {
     let mut rows = fighters
@@ -11538,7 +11553,8 @@ impl VisionaryApp {
         actions: &mut Vec<FighterRowAction>,
     ) {
         let i = row.idx;
-        let selected = self.state.selected_fighter == Some(i);
+        let active = self.active_key();
+        let selected = row_is_open(self.state.selected_fighter, i, active.as_ref(), None);
         let mut label = row.label.clone();
         if row.modded {
             label.push_str("  [mod]");
@@ -11824,8 +11840,12 @@ impl VisionaryApp {
                                         })
                                         .collect();
                                 for (key, range) in made {
-                                    let selected = self.state.selected_fighter == Some(row.idx)
-                                        && active.as_ref() == Some(&key);
+                                    let selected = row_is_open(
+                                        self.state.selected_fighter,
+                                        row.idx,
+                                        active.as_ref(),
+                                        Some(&key),
+                                    );
                                     let label = format!("    {}", self.character_name(&key));
                                     let counts = self.character_edit_counts(&key);
                                     let mut hover = format!("{} {range}", row.label);
@@ -11892,11 +11912,9 @@ impl VisionaryApp {
         for action in row_actions {
             match action {
                 FighterRowAction::Select(i) => {
-                    if self.state.selected_fighter != Some(i) {
-                        let t = self.perf.start();
-                        self.select_fighter(i);
-                        self.perf.end("select_fighter", t);
-                    }
+                    let t = self.perf.start();
+                    self.select_row(i);
+                    self.perf.end("select_fighter", t);
                 }
                 FighterRowAction::Forget(target) => forget_fighter = Some(target),
                 FighterRowAction::Add(i) => self.add_to_project(i),
@@ -46191,7 +46209,7 @@ mod editor_timeline_filter_tests {
 
 #[cfg(test)]
 mod carrier_send_state_tests {
-    use super::{carrier_send_reached_goal, held_back, send_to_judge};
+    use super::{carrier_send_reached_goal, held_back, row_is_open, send_to_judge};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
     use std::collections::HashMap;
@@ -46320,6 +46338,25 @@ mod carrier_send_state_tests {
         ] {
             assert!(back.contains(taken), "{taken}");
         }
+    }
+
+    /// The fighter list shows one row as open: the character made on a fighter, or the fighter.
+    #[test]
+    fn only_the_open_character_is_highlighted() {
+        use crate::character::CharacterKey;
+        let vision = CharacterKey::made(crate::roster::RosterKey::slot("mario", 7));
+        let other = CharacterKey::made(crate::roster::RosterKey::slot("mario", 8));
+        let mario = CharacterKey::base("mario");
+        let open = |active: &CharacterKey, made: Option<&CharacterKey>| {
+            row_is_open(Some(3), 3, Some(active), made)
+        };
+        assert!(!open(&vision, None));
+        assert!(open(&vision, Some(&vision)));
+        assert!(!open(&vision, Some(&other)));
+        assert!(open(&mario, None));
+        assert!(!open(&mario, Some(&vision)));
+        assert!(!row_is_open(Some(2), 3, Some(&mario), None));
+        assert!(!row_is_open(None, 3, None, None));
     }
 }
 
