@@ -4058,6 +4058,17 @@ fn status_after_send(status: &str, outcome: crate::eff_editor::SendOutcome) -> O
     Some(format!("{}:{rest}", outcome.status_prefix()))
 }
 
+/// The status line of a send the game settled as `was`, once a change of match makes it `now`.
+fn status_after_match(
+    status: &str,
+    was: crate::eff_editor::SendOutcome,
+    now: crate::eff_editor::SendOutcome,
+) -> Option<String> {
+    let rest = status.strip_prefix(was.status_prefix())?;
+    rest.starts_with(':')
+        .then(|| format!("{}{rest}", now.status_prefix()))
+}
+
 /// Values worked out from every edit, kept until the edit revision they were worked out at
 /// changes.
 struct RevisionCache<K, V>(std::cell::RefCell<HashMap<K, (u64, V)>>);
@@ -37785,6 +37796,46 @@ impl VisionaryApp {
         )
     }
 
+    /// Another match, or none, since the last send settled: what is said of it is what is true
+    /// of it now.
+    fn follow_the_match(&mut self) {
+        let Some(was) = self.eff_editor.last_carrier_result else {
+            return;
+        };
+        if !self.eff_editor.carrier_expected || !self.game_link.has_gimmick_agents_snapshot() {
+            return;
+        }
+        let (state, kinds, _, spawned) = self.game_link.carrier_status();
+        let took = !self.eff_editor.carrier_needs_new_bytes
+            || self.game_link.carrier_gen() > self.eff_editor.gen_at_send;
+        let live = carrier_send_reached_goal(true, state, kinds, spawned, took, true);
+        let Some(now) = crate::live_carrier::since_send(
+            was,
+            &self.game_link.gimmick_agents(),
+            &self.carrier_fighters,
+            live.then(|| self.reached_outcome()),
+        ) else {
+            return;
+        };
+        let sent = self.sent_owner.clone().unwrap_or_default();
+        let now = crate::live_carrier::said(
+            self.plays_effects_of(&sent),
+            now,
+            self.game_link.carrier_shares(),
+            self.live_eff_deployed.contains_key(&sent),
+        );
+        if now == was {
+            return;
+        }
+        self.eff_editor.last_carrier_result = Some(now);
+        self.eff_editor.last_carrier_detail = None;
+        self.eff_editor.carrier_ok = now.ok();
+        self.eff_editor.set_sent_note(now.text());
+        if let Some(status) = status_after_match(&self.state.status, was, now) {
+            self.state.status = status;
+        }
+    }
+
     /// Who plays the effects kept under `owner`.
     fn plays_effects_of(&self, owner: &str) -> crate::live_carrier::Plays {
         let file = self.eff_mods.get(owner).map(|eff| eff.source_rel.clone());
@@ -41905,7 +41956,7 @@ Click to see the code, or link your own project"
                     crate::eff_source::shadow(&rel, &crate::scratch_dirs::installed_mods())
                         .map(|shadow| format!("\n{shadow}"))
                         .unwrap_or_default();
-                self.eff_editor.last_carrier_result = Some(outcome.text().to_string());
+                self.eff_editor.last_carrier_result = Some(outcome);
                 self.eff_editor.last_carrier_detail = Some(format!(
                     "{} after {:.1}s, edit {generation}{why}{shadow}",
                     crate::eff_editor::carrier_numbers(state, kinds, spawned),
@@ -41919,6 +41970,8 @@ Click to see the code, or link your own project"
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
+        } else if awaiting.is_none() {
+            self.follow_the_match();
         }
 
         // Single debounced sender for every live override (color/speed kind multipliers;
@@ -50619,6 +50672,18 @@ mod live_effect_capture_tests {
                 Some("Not connected: Mario, 1 edited effect will be sent when the game connects")
             );
         }
+        // And a change of match rewrites what the outcome wrote, and no other line.
+        let matches =
+            |line: &str| status_after_match(line, SendOutcome::NextMatch, SendOutcome::InGame);
+        assert_eq!(
+            matches("Saved for the next match: Mario, 1 edited effect").as_deref(),
+            Some(in_game)
+        );
+        assert_eq!(matches(&edited), None);
+        assert_eq!(matches("Saved for the next matches of Mario"), None);
+        assert!(
+            app.contains("} else if awaiting.is_none() {\n            self.follow_the_match();")
+        );
         // Saved for the next match stays true after a drop; so does any other line.
         assert_eq!(
             status_after_disconnect("Saved for the next match: Mario, 1 edited effect"),

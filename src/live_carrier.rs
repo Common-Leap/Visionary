@@ -431,6 +431,27 @@ pub fn reached(
     }
 }
 
+/// What has become of a send that ended in `was`, by what is in the match now: `agents`, and
+/// `live` what it reaches when the game has the carrier for `fighters` up. None while nothing new
+/// is known, and for a send no match decides.
+pub fn since_send(
+    was: SendOutcome,
+    agents: &[LiveGimmickAgent],
+    fighters: &[String],
+    live: Option<SendOutcome>,
+) -> Option<SendOutcome> {
+    use SendOutcome as S;
+    match was {
+        S::InGame | S::NoMatch | S::NextMatch | S::NotInMatch => {}
+        _ => return None,
+    }
+    match agents.is_empty() {
+        true => Some(S::NoMatch),
+        false if nobody_holds(agents, fighters) => Some(S::NextMatch),
+        false => live,
+    }
+}
+
 /// What is said of a send that ended in `outcome`, by whose effects its file has. `shares` is
 /// whether the plugin in the game can change a shared effect; `staged` whether the file waits for
 /// the game to load it.
@@ -796,6 +817,75 @@ mod tests {
         assert!(!nobody_holds(&c00, &holders(&[common()])));
         assert!(!nobody_holds(&c00[1..], &holders(&[mario(), common()])));
         assert_eq!(holders(&[mario()]), ["mario"]);
+    }
+
+    /// What was said of a send is about the match it was sent in. The next one, with Vision in it,
+    /// played the edit and was still said not to.
+    #[test]
+    fn what_is_said_of_a_send_follows_the_match() {
+        let agent = |fighter: &str| LiveGimmickAgent {
+            boid: 0,
+            category: 0,
+            kind: 0,
+            entry_id: 0,
+            owner_boid: None,
+            fighter: Some(fighter.into()),
+            costume: None,
+        };
+        let (mario, fox) = ([agent("mario")], [agent("fox")]);
+        let carrier = ["mario".to_owned()];
+        use SendOutcome as S;
+        let of_any = [];
+        for (was, agents, fighters, live, now) in [
+            (
+                S::NextMatch,
+                &mario[..],
+                &carrier[..],
+                Some(S::InGame),
+                Some(S::InGame),
+            ),
+            (
+                S::NoMatch,
+                &mario,
+                &carrier,
+                Some(S::InGame),
+                Some(S::InGame),
+            ),
+            (
+                S::NotInMatch,
+                &fox,
+                &of_any,
+                Some(S::InGame),
+                Some(S::InGame),
+            ),
+            (
+                S::InGame,
+                &fox,
+                &carrier,
+                Some(S::InGame),
+                Some(S::NextMatch),
+            ),
+            (S::InGame, &[], &carrier, Some(S::InGame), Some(S::NoMatch)),
+            // Another costume of its fighter plays.
+            (
+                S::InGame,
+                &mario,
+                &carrier,
+                Some(S::NextMatch),
+                Some(S::NextMatch),
+            ),
+            // The carrier is on its way up.
+            (S::NoMatch, &mario, &carrier, None, None),
+            (S::InGame, &fox, &of_any, None, None),
+            // Not about a match.
+            (S::NotBuilt, &mario, &carrier, Some(S::InGame), None),
+            (S::Unreadable, &[], &carrier, None, None),
+            (S::Restored, &[], &carrier, None, None),
+            (S::NextFile, &mario, &carrier, Some(S::InGame), None),
+            (S::NextLoad, &mario, &carrier, Some(S::InGame), None),
+        ] {
+            assert_eq!(since_send(was, agents, fighters, live), now, "{was:?}");
+        }
     }
 
     /// An edit to an effect of the shared file reaches every fighter in the match: its copy rides

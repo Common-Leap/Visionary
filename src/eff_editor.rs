@@ -744,7 +744,7 @@ pub struct EffEditor {
     /// freshly-taken carrier from the previous one still sitting there reporting ready.
     pub carrier_gen_now: u64,
     /// Final carrier reading from the last send, kept on screen after the spinner clears.
-    pub last_carrier_result: Option<String>,
+    pub(crate) last_carrier_result: Option<SendOutcome>,
     /// The game's own numbers behind that reading, for its hover.
     pub last_carrier_detail: Option<String>,
     /// Whether the send in flight must wait for the game to read new bytes. A send of the
@@ -4778,12 +4778,16 @@ impl EffEditor {
                 )
                 .on_hover_text("Edits the game has not been sent");
             }
-        } else if let Some(r) = &self.last_carrier_result {
-            let label = ui.label(egui::RichText::new(r).small().color(if self.carrier_ok {
-                egui::Color32::from_rgb(0x70, 0xB0, 0x70)
-            } else {
-                egui::Color32::from_rgb(0xD0, 0x80, 0x60)
-            }));
+        } else if let Some(r) = self.last_carrier_result {
+            let label = ui.label(
+                egui::RichText::new(r.text())
+                    .small()
+                    .color(if self.carrier_ok {
+                        egui::Color32::from_rgb(0x70, 0xB0, 0x70)
+                    } else {
+                        egui::Color32::from_rgb(0xD0, 0x80, 0x60)
+                    }),
+            );
             if let Some(detail) = &self.last_carrier_detail {
                 label.on_hover_text(detail);
             }
@@ -8517,7 +8521,7 @@ mod tests {
         let link = GameLink::default();
         assert!(!link.status().is_connected());
         let mut editor = EffEditor {
-            last_carrier_result: Some(SendOutcome::NextMatch.text().to_string()),
+            last_carrier_result: Some(SendOutcome::NextMatch),
             last_carrier_detail: Some("Game report: state 4".to_string()),
             awaiting_game: Some(Instant::now()),
             ..EffEditor::default()
