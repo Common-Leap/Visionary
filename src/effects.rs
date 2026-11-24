@@ -404,9 +404,15 @@ fn color_keys(data: &effect_library::EmitterData, channel: usize) -> Vec<ColorKe
     vec![key(0.0, fallback[0], fallback[1], fallback[2], 1.0)]
 }
 
+/// A part whose opacity is constant keeps a key table the game never reads (14,497 of the game's
+/// 37,601 parts): the constant comes first, as a colour's does (Smash 0x10490).
 fn alpha_keys(data: &effect_library::EmitterData) -> Vec<ColorKey> {
+    let constant = matches!(
+        data.particle_color.alpha0_type,
+        effect_library::ColorType::Constant
+    );
     let count = data.emitter_static.num_alpha0_keys as usize;
-    if count > 0 {
+    if count > 0 && !constant {
         return data
             .emitter_static
             .alpha0
@@ -416,10 +422,7 @@ fn alpha_keys(data: &effect_library::EmitterData) -> Vec<ColorKey> {
             .map(|value| key(value.time, value.x, value.x, value.x, value.x))
             .collect();
     }
-    let alpha = if matches!(
-        data.particle_color.alpha0_type,
-        effect_library::ColorType::Constant
-    ) {
+    let alpha = if constant {
         data.particle_color.alpha0
     } else {
         data.emitter_info.color0_a
@@ -433,6 +436,24 @@ mod tests {
 
     fn corpus_root() -> Option<std::path::PathBuf> {
         std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+    }
+
+    /// The opacity of a part whose opacity is constant is that constant, not the key table it
+    /// keeps beside it and the game does not read.
+    #[test]
+    fn a_constant_opacity_is_not_its_key_table() {
+        let mut data = crate::eff_attrs::blank_emitter_data(crate::eff_attrs::SSBU_VFX_VERSION);
+        data.emitter_static.num_alpha0_keys = 1;
+        data.emitter_static.alpha0.keys[0].x = 0.25;
+        data.particle_color.alpha0 = 0.75;
+        for (kind, opacity) in [
+            (effect_library::ColorType::Constant, 0.75),
+            (effect_library::ColorType::Animated8Key, 0.25),
+        ] {
+            data.particle_color.alpha0_type = kind;
+            let shown = super::alpha_keys(&data);
+            assert_eq!(shown.iter().map(|k| k.r).collect::<Vec<_>>(), [opacity]);
+        }
     }
 
     /// A multi-part effect has to resolve to a real emitter set, not to -1.

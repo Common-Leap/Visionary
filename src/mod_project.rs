@@ -1155,7 +1155,10 @@ impl EffMod {
             .rosters
             .iter_mut()
             .flat_map(|roster| &mut roster.slots)
-            .map(|slot| &mut slot.source_file)
+            .flat_map(|slot| {
+                let textures = slot.textures.iter_mut().map(|texture| &mut texture.file);
+                std::iter::once(&mut slot.source_file).chain(textures)
+            })
             .chain(self.transplants.iter_mut().map(|op| &mut op.src_file_rel));
         for file in from {
             if !own.is_empty() && slashed(file) == own {
@@ -1239,6 +1242,20 @@ pub struct EmitterSlot {
     /// The part's textures, models and shaders come with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_file: String,
+    /// Textures it samples instead of its source's, for a part copied into another file after
+    /// its texture was changed: the file it goes to need not have them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub textures: Vec<SlotTexture>,
+}
+
+/// A texture a copied part brings from another file than its source's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlotTexture {
+    /// Which of the part's texture slots samples it, 0 to 2.
+    pub slot: usize,
+    pub name: String,
+    /// The file it is in, relative to the game folder.
+    pub file: String,
 }
 
 impl EmitterSlot {
@@ -2546,6 +2563,14 @@ mod older_project_tests {
             .unwrap();
         let path = eff.source_rel.clone();
         assert_eq!(eff.rosters[0].slots[1].source_file, path);
+        // A texture of the file's own given to a part copied from another, and one of neither.
+        eff.rosters[0].slots[1].textures = [path.clone(), LINK.to_string()]
+            .map(|file| SlotTexture {
+                slot: 0,
+                name: "ef_x".into(),
+                file,
+            })
+            .to_vec();
         // Borrowed within the file, spelled as Windows does, and from another file.
         for file in [path.replace('/', "\\"), LINK.to_string()] {
             eff.transplants.push(TransplantOp {
@@ -2566,6 +2591,8 @@ mod older_project_tests {
         );
         assert_eq!(eff.rosters[0].slots[1].source_file, MARIO);
         assert!(eff.rosters[0].slots[0].source_file.is_empty());
+        let files = eff.rosters[0].slots[1].textures.iter().map(|t| &t.file);
+        assert_eq!(files.collect::<Vec<_>>(), [MARIO, LINK]);
         assert_eq!(eff.transplants[0].src_file_rel, MARIO);
         assert_eq!(eff.transplants[1].src_file_rel, LINK);
         // Saved and opened again, the file is still known.

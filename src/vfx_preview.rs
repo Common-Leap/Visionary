@@ -37,7 +37,9 @@ pub struct EffectDraw {
     pub particle_colour: [f32; 4],
     /// The fighter's ink colour, for spawns that take it (Inkling's).
     pub ink: Option<[f32; 3]>,
-    /// Draw only this emitter of the set (the Effects page's "Show only this part").
+    /// Draw only this part of the set, numbered parents first as the Effects page lists them
+    /// ("Show only this part"): a part on its own with what is made from it, or one made from
+    /// another alone.
     pub solo: Option<usize>,
     /// Play the effect over and over on its own length, this many frames since the loop
     /// started, at the last placement (the Effects page shows an effect no move spawns so).
@@ -650,11 +652,15 @@ impl VfxPreview {
             };
             let (_, rotation, translation) = placement.to_scale_rotation_translation();
             let rt = Mat4::from_rotation_translation(rotation, translation);
+            // A part made from another needs that one's particles: they run, undrawn.
+            let solo = draw.solo.map(|part| solo_part(&file.emitters[set], part));
             for index in draw_order(&file.emitters[set]) {
                 let emitter = &file.emitters[set][index];
-                if draw.solo.is_some_and(|solo| solo != index) {
-                    continue;
-                }
+                let only = match solo {
+                    None => None,
+                    Some(Some((root, child))) if root == index => child,
+                    Some(_) => continue,
+                };
                 // A mesh primitive is looked up in this file, then in the shared one; an emitter
                 // whose mesh is in neither draws nothing.
                 let find_mesh = |emitter: &Emitter| {
@@ -691,7 +697,7 @@ impl VfxPreview {
                     }
                     s.step_at(set);
                 }
-                for (emitter, s, matrices) in draw_parts(emitter, &s, &placement, &rt) {
+                for (emitter, s, matrices) in draw_parts(emitter, &s, &placement, &rt, only) {
                     let Some(mesh) = find_mesh(emitter) else {
                         continue;
                     };
@@ -996,6 +1002,7 @@ fn draw_parts<'a>(
     s: &'a sim::EmitterSim<'a>,
     placement: &Mat4,
     rt: &Mat4,
+    only: Option<usize>,
 ) -> Vec<(&'a Emitter, &'a sim::EmitterSim<'a>, (Mat4, Mat4))> {
     let children = || emitter.children.iter().zip(s.children());
     let first = |e: &Emitter| e.fixed.get(0x7e1) == Some(&1);
@@ -1003,8 +1010,32 @@ fn draw_parts<'a>(
         .filter(|(e, _)| first(e))
         .chain(std::iter::once((emitter, s)))
         .chain(children().filter(|(e, _)| !first(e)))
+        .filter(|(e, _)| only.is_none_or(|k| std::ptr::eq(*e, &emitter.children[k])))
         .map(|(e, s)| (e, s, (s.emitter_srt(placement), s.emitter_rt(rt))))
         .collect()
+}
+
+/// Which emitter of a set part `part` is, and which of its children when it is made from it. The
+/// parts are numbered parents first, as the part list numbers them.
+fn solo_part(emitters: &[Emitter], part: usize) -> Option<(usize, Option<usize>)> {
+    fn size(emitter: &Emitter) -> usize {
+        1 + emitter.children.iter().map(size).sum::<usize>()
+    }
+    let mut first = 0;
+    for (root, emitter) in emitters.iter().enumerate() {
+        if part == first {
+            return Some((root, None));
+        }
+        let mut at = first + 1;
+        for (child, made) in emitter.children.iter().enumerate() {
+            if (at..at + size(made)).contains(&part) {
+                return Some((root, Some(child)));
+            }
+            at += size(made);
+        }
+        first = at;
+    }
+    None
 }
 
 /// An emitter as the preview runs it: from this spawn's seeds, with its child emitters, and
@@ -1255,7 +1286,7 @@ mod tests {
                 s.step();
             }
             let trail = s.children()[0].streams()["sysScaleAttr"][0];
-            let order: Vec<String> = draw_parts(clock, &s, &Mat4::IDENTITY, &Mat4::IDENTITY)
+            let order: Vec<String> = draw_parts(clock, &s, &Mat4::IDENTITY, &Mat4::IDENTITY, None)
                 .iter()
                 .map(|(e, ..)| e.data.name.clone().unwrap_or_default())
                 .collect();
@@ -1281,6 +1312,133 @@ mod tests {
         ]);
         assert!(close(scale, 0.5), "{scale:?}");
         assert_eq!(order, ["clock1", "trace1"]);
+    }
+
+    /// A device to draw with, when there is one.
+    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        // wgpu's native requests are ready on their first polls.
+        fn ready<T>(f: impl std::future::Future<Output = T>) -> T {
+            let mut f = std::pin::pin!(f);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            loop {
+                if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                    return v;
+                }
+                std::thread::yield_now();
+            }
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = ready(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU; skipped");
+            return None;
+        };
+        Some(ready(adapter.request_device(&Default::default())).unwrap())
+    }
+
+    /// "Show only this part" numbers the parts as the part list does, parents first. Counted by
+    /// emitters alone, every part after a family was another one, and a child none.
+    #[test]
+    fn show_only_this_part_finds_the_part_the_list_numbers() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        for rel in [
+            "effect/fighter/bayonetta/ef_bayonetta.eff",
+            "effect/fighter/edge/ef_edge.eff",
+        ] {
+            let path = root.join(rel);
+            let listed = crate::effects::load_effect(&path).unwrap().ptcl;
+            let file =
+                effect_library::NamcoEffectFile::load(&std::fs::read(&path).unwrap()).unwrap();
+            let sets = set_emitters(file.ptcl_file.as_ref().unwrap());
+            let mut children = 0;
+            for (set, emitters) in listed.emitter_sets.iter().zip(&sets) {
+                for (i, part) in set.emitters.iter().enumerate() {
+                    let (at, child) = solo_part(emitters, i).expect(&part.name);
+                    let found = match child {
+                        None => &emitters[at],
+                        Some(child) => &emitters[at].children[child],
+                    };
+                    assert_eq!(found.data.name.as_deref(), Some(part.name.as_str()));
+                    assert_eq!(child.is_some(), part.depth > 0);
+                    children += usize::from(child.is_some());
+                }
+                assert_eq!(solo_part(emitters, set.emitters.len()), None);
+            }
+            assert!(children > 0, "{rel} has parts made from others");
+        }
+    }
+
+    /// Alone, the dots Sephiroth's charge sparks (edge_fire2_hold sparks4) trail draw and the
+    /// sparks do not, though they run for the dots to come out of; the sparks alone keep both
+    /// children made from them.
+    #[test]
+    fn a_child_part_shows_alone() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let mut vfx = VfxPreview::new(
+            ssbh_wgpu::RGBA_COLOR_FORMAT,
+            Some(ssbh_wgpu::DEPTH_FORMAT),
+            ssbh_wgpu::MSAA_SAMPLE_COUNT,
+        );
+        let path = root.join("effect/fighter/edge/ef_edge.eff");
+        let listed = crate::effects::load_effect(&path).unwrap().ptcl;
+        let set = listed
+            .emitter_sets
+            .iter()
+            .find(|s| s.name == "P_EdgeFire2Hold")
+            .unwrap();
+        let sparks = set
+            .emitters
+            .iter()
+            .position(|e| e.name == "sparks4")
+            .unwrap();
+        let mut draws = |solo: Option<usize>| {
+            let draw = EffectDraw {
+                file: path.clone(),
+                name: "edge_fire2_hold".into(),
+                placements: vec![Mat4::IDENTITY; 30],
+                kill_at: None,
+                colour: [1.0; 4],
+                particle_colour: [1.0; 4],
+                ink: None,
+                solo,
+                looping: None,
+                rate: 1.0,
+                spawn: 0,
+            };
+            for _ in 0..400 {
+                vfx.prepare(
+                    &device,
+                    &queue,
+                    Mat4::IDENTITY,
+                    Mat4::IDENTITY,
+                    [0.0, 0.0, 50.0],
+                    1.0,
+                    1000.0,
+                    std::slice::from_ref(&draw),
+                );
+                if !vfx.waiting() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            vfx.prepared.len()
+        };
+        let all = draws(None);
+        assert!(all > 3, "{all} parts drawn");
+        assert_eq!(draws(Some(sparks + 1)), 1, "Emitter1 alone");
+        assert_eq!(draws(Some(sparks + 2)), 1, "Emitter2 alone");
+        assert_eq!(draws(Some(sparks)), 3, "the sparks and both made from them");
+        assert_eq!(draws(Some(999)), 0);
     }
 
     /// Sephiroth's charge sparks (edge_fire2_hold sparks4) trail red and gold dots from two
@@ -1389,7 +1547,7 @@ mod tests {
         for _ in 0..8 {
             s.step_at(&placement);
         }
-        let parts = draw_parts(&emitters[at], &s, &placement, &rt);
+        let parts = draw_parts(&emitters[at], &s, &placement, &rt, None);
         // The parent itself has no transform of its own: it draws on the set's matrix.
         assert_eq!(parts[0].2, (placement, rt));
         let rows = [9.9, 5.9, 1.95, -1.95, -5.9, -9.9, -13.8];
@@ -1625,23 +1783,9 @@ mod tests {
             eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
             return;
         };
-        // wgpu's native requests are ready on their first polls.
-        fn ready<T>(f: impl std::future::Future<Output = T>) -> T {
-            let mut f = std::pin::pin!(f);
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            loop {
-                if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
-                    return v;
-                }
-                std::thread::yield_now();
-            }
-        }
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let Ok(adapter) = ready(instance.request_adapter(&Default::default())) else {
-            eprintln!("no GPU; skipped");
+        let Some((device, queue)) = gpu() else {
             return;
         };
-        let (device, queue) = ready(adapter.request_device(&Default::default())).unwrap();
         let (format, depth_format, samples) = (
             ssbh_wgpu::RGBA_COLOR_FORMAT,
             ssbh_wgpu::DEPTH_FORMAT,
