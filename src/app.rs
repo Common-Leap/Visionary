@@ -3683,7 +3683,8 @@ fn line_up_effects(
     let at = |a: &EffectCall, b: &EffectCall| a.active_start == b.active_start;
     // Blocks may write a condition in other words than the game's script does.
     let under = |a: &EffectCall, b: &EffectCall| a.guard == b.guard;
-    let steps: [&dyn Fn(&EffectCall, &EffectCall) -> bool; 6] = [
+    type Same<'a> = &'a dyn Fn(&EffectCall, &EffectCall) -> bool;
+    let steps: [Same; 6] = [
         &|a, b| a == b,
         &|a, b| alike(a, b) && at(a, b) && under(a, b),
         &|a, b| alike(a, b) && at(a, b),
