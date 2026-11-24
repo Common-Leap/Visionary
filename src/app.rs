@@ -28157,7 +28157,9 @@ impl VisionaryApp {
         } else {
             dest.clone()
         };
-        for file in crate::roster::costume_config::undeclared_costume_effects(&mod_root) {
+        // A made character's are listed with its other files, beside `effect_mod/`.
+        let configs = [mod_root.as_path(), dest.as_path()];
+        for file in crate::roster::costume_config::undeclared_costume_effects(&mod_root, &configs) {
             errors.push(format!(
                 "{file} is not listed for its costume in config.json, so the game would crash when that costume is picked"
             ));
@@ -55709,11 +55711,13 @@ mod blocked_export_writes_nothing_tests {
             config["new-dir-files"]["fighter/bayonetta/c01"],
             serde_json::json!([costume])
         );
-        assert!(crate::roster::costume_config::undeclared_costume_effects(&dest).is_empty());
+        assert!(
+            crate::roster::costume_config::undeclared_costume_effects(&dest, &[&dest]).is_empty()
+        );
 
         std::fs::remove_file(dest.join("config.json")).unwrap();
         assert_eq!(
-            crate::roster::costume_config::undeclared_costume_effects(&dest),
+            crate::roster::costume_config::undeclared_costume_effects(&dest, &[&dest]),
             [costume]
         );
     }
@@ -55798,7 +55802,9 @@ mod blocked_export_writes_nothing_tests {
         assert!(!dest
             .join("effect/fighter/pacman/ef_pacman_c40_c40.eff")
             .exists());
-        assert!(crate::roster::costume_config::undeclared_costume_effects(&dest).is_empty());
+        assert!(
+            crate::roster::costume_config::undeclared_costume_effects(&dest, &[&dest]).is_empty()
+        );
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dest.join("config.json")).unwrap()).unwrap();
         assert_eq!(

@@ -343,9 +343,12 @@ pub fn declare(config: &mut Value, fighter: &str, costume: u8, paths: &[String])
     );
 }
 
-/// Every costume effect file under `mod_root` that its `config.json` does not list in the
+/// Every costume effect file under `mod_root` that no `config.json` of `configs` lists in the
 /// costume's directory entry. The game crashes when that costume is picked.
-pub fn undeclared_costume_effects(mod_root: &std::path::Path) -> Vec<String> {
+pub fn undeclared_costume_effects(
+    mod_root: &std::path::Path,
+    configs: &[&std::path::Path],
+) -> Vec<String> {
     fn walk(dir: &std::path::Path, root: &std::path::Path, found: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -359,20 +362,22 @@ pub fn undeclared_costume_effects(mod_root: &std::path::Path) -> Vec<String> {
     let mut files = Vec::new();
     walk(&mod_root.join("effect"), mod_root, &mut files);
     files.sort();
-    let config: Value = std::fs::read(mod_root.join("config.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or(Value::Null);
+    let configs: Vec<Value> = configs
+        .iter()
+        .filter_map(|dir| std::fs::read(dir.join("config.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+        .collect();
     files
         .into_iter()
         .filter(|path| {
             let Some((fighter, costume)) = costume_effect_of(path) else {
                 return false;
             };
-            let listed = config["new-dir-files"][format!("fighter/{fighter}/c{costume:02}")]
-                .as_array()
-                .is_some_and(|list| list.iter().any(|item| item.as_str() == Some(path)));
-            !listed
+            !configs.iter().any(|config| {
+                config["new-dir-files"][format!("fighter/{fighter}/c{costume:02}")]
+                    .as_array()
+                    .is_some_and(|list| list.iter().any(|item| item.as_str() == Some(path)))
+            })
         })
         .collect()
 }
@@ -418,18 +423,36 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"x").unwrap();
         }
-        assert_eq!(undeclared_costume_effects(dir.path()), [costume, trail]);
+        assert_eq!(
+            undeclared_costume_effects(dir.path(), &[dir.path()]),
+            [costume, trail]
+        );
 
         // Listed under another costume is still unlisted.
         let mut config = json!({"new-dir-files": {"kept": ["as it was"]}});
         declare(&mut config, "Bayonetta", 2, &[costume.to_owned()]);
         std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-        assert_eq!(undeclared_costume_effects(dir.path()), [costume, trail]);
+        assert_eq!(
+            undeclared_costume_effects(dir.path(), &[dir.path()]),
+            [costume, trail]
+        );
 
         declare(&mut config, "bayonetta", 1, &[costume.to_owned()]);
         declare(&mut config, "bayonetta", 2, &[trail.to_owned()]);
         std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-        assert!(undeclared_costume_effects(dir.path()).is_empty());
+        assert!(undeclared_costume_effects(dir.path(), &[dir.path()]).is_empty());
+        // Exported source code keeps a made character's list beside the folder its effect files
+        // are in: either folder's counts, and neither does not.
+        let beside = tempfile::tempdir().unwrap();
+        let listed = std::fs::read(dir.path().join("config.json")).unwrap();
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        let both = [dir.path(), beside.path()];
+        assert_eq!(
+            undeclared_costume_effects(dir.path(), &both),
+            [costume, trail]
+        );
+        std::fs::write(beside.path().join("config.json"), listed).unwrap();
+        assert!(undeclared_costume_effects(dir.path(), &both).is_empty());
         assert_eq!(
             strings(&config["new-dir-files"]["fighter/bayonetta/c02"]),
             [costume, trail]

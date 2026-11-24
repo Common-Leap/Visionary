@@ -1834,7 +1834,7 @@ mod tests {
         let mut files = Vec::new();
         walk(&root, &mut files);
         assert!(!files.is_empty(), "no effect files in {}", root.display());
-        let unlisted = crate::roster::costume_config::undeclared_costume_effects(&root);
+        let unlisted = crate::roster::costume_config::undeclared_costume_effects(&root, &[&root]);
         assert!(
             unlisted.is_empty(),
             "costume effect files not listed in config.json: {unlisted:?}"
