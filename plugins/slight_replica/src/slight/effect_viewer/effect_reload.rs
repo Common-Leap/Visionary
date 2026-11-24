@@ -8,6 +8,7 @@
 use crate::offsets;
 
 use super::asset_identity::{host_id, NO_HOST};
+use super::carrier_gate::{self, Outgoing};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
@@ -1263,7 +1264,7 @@ static AUTO_CARRIER_RETIRING_KINDS: LazyLock<Mutex<std::collections::HashSet<u64
 static AUTO_CARRIER_BUILT: AtomicBool = AtomicBool::new(false);
 /// Reserve slot keeps the carrier out of the holder's normal usable-item slot.
 const AUTO_CARRIER_SLOT: i32 = 1;
-/// Battle-object id of the fighter currently HOLDING the carrier item, or 0 for unclaimed.
+/// Battle-object id of the fighter currently HOLDING the carrier item, or [`NO_HOST`].
 ///
 /// The carrier lives in a fighter's reserve item slot, so exactly one fighter must drive the
 /// state machine — every fighter runs the same per-frame line callback, and letting two of them
@@ -1271,14 +1272,15 @@ const AUTO_CARRIER_SLOT: i32 = 1;
 /// hardcoded to Kirby, which meant nothing worked at all unless Kirby happened to be on stage.
 /// The first fighter to tick with work pending claims it; the claim is dropped when that
 /// fighter goes away, so the next one picks it up.
-static AUTO_CARRIER_HOST: AtomicU64 = AtomicU64::new(0);
-/// Lowercase name of the fighter the live carrier was built for (from the donor spec's target,
-/// e.g. "kirby"). ONLY that fighter may hold it.
+static AUTO_CARRIER_HOST: AtomicU64 = AtomicU64::new(NO_HOST);
+/// Lowercase names of the fighters the live carrier was built for (from the donor specs' targets,
+/// e.g. "kirby"). ONLY one of them may hold it.
 ///
 /// Without this the carrier landed on whichever fighter ticked first, which is usually the
 /// opponent — and an item in the opponent's hands gets knocked out of them when you hit them,
 /// destroying the carrier and flickering every edited effect back to vanilla while it rebuilds.
-static AUTO_CARRIER_TARGET: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static AUTO_CARRIER_TARGETS: LazyLock<Mutex<Vec<String>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 /// Diagnostic threshold for a carrier swap. A stuck teardown is logged but never bypassed:
 /// building over a resource tree that still has an owner produces the invisible second-load
 /// state and leaks another parsed set, so it cannot be part of an indefinitely repeatable cycle.
@@ -1342,6 +1344,9 @@ unsafe fn evict_carrier_effect_handle(ef_file: &str) -> usize {
 /// Effect handle of the live carrier, remembered so a later swap can evict it even when the new
 /// content shares no entry name with the old. Zero when no carrier has been observed loaded.
 static AUTO_CARRIER_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// The last handle in [`AUTO_CARRIER_HANDLE`], kept once that is forgotten: which of the old
+/// carrier's names are still its own.
+static AUTO_CARRIER_LAST_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Current carrier's effect-set object. Unlike the kind map, this exposes the render-resource
 /// state machine directly (`+0x20`: 0 loading, 3 ready) and lets the readiness hook distinguish
 /// "never scheduled" from "scheduled but waiting on a missing resource handle".
@@ -1417,11 +1422,13 @@ unsafe fn retiring_carrier_kinds_present() -> usize {
     if manager.is_null() {
         return AUTO_CARRIER_RETIRING_KINDS.lock().len();
     }
-    AUTO_CARRIER_RETIRING_KINDS
-        .lock()
-        .iter()
-        .filter(|kind| kind_lookup(manager, **kind).is_some())
-        .count()
+    carrier_gate::still_registered(
+        AUTO_CARRIER_RETIRING_KINDS
+            .lock()
+            .iter()
+            .map(|kind| kind_lookup(manager, *kind).map(|(handle, _)| handle)),
+        AUTO_CARRIER_LAST_HANDLE.load(Ordering::Relaxed),
+    )
 }
 
 /// Record the effect handle the carrier's blessed load produced, by resolving any of its entry
@@ -1438,6 +1445,7 @@ unsafe fn remember_carrier_handle() {
         .map(|(handle, _)| handle);
     if let Some(handle) = handle {
         AUTO_CARRIER_HANDLE.store(handle as u64, Ordering::Relaxed);
+        AUTO_CARRIER_LAST_HANDLE.store(handle as u64, Ordering::Relaxed);
         let set = unsafe { set_object_for_handle(manager, handle) };
         AUTO_CARRIER_SET.store(set, Ordering::Release);
         let (slot, state, tex4e0) = unsafe {
@@ -1808,27 +1816,28 @@ pub fn set_donor_specs(specs: Vec<DonorSpec>) {
     // Any FIGHTER target may own the carrier — the editor builds the carrier from whichever
     // fighter is selected, so pinning this to `effect/fighter/kirby` silently dropped the
     // carrier for every other character (the spec was accepted, but nothing was ever staged).
-    // The spec's target also names WHICH FIGHTER must hold the carrier: the one whose effects
-    // it was built for. See [`AUTO_CARRIER_TARGET`].
-    let mut carrier_target: Option<String> = None;
-    let carrier_path = specs.iter().find_map(|spec| {
+    // The spec's target also names WHICH FIGHTER must hold the carrier: one whose effects it was
+    // built for. See [`AUTO_CARRIER_TARGETS`].
+    let mut targets = Vec::new();
+    let mut carrier_path: Option<String> = None;
+    for spec in &specs {
         let target = eff_dir(&spec.target.to_lowercase()).to_string();
-        let fighter = target.strip_prefix("effect/fighter/")?;
-        let fighter = fighter.split('/').next()?.to_string();
+        let fighter = target
+            .strip_prefix("effect/fighter/")
+            .and_then(|rest| rest.split('/').next());
         let donor = spec
             .donors
             .iter()
             .map(|path| path.to_lowercase())
-            .find(|path| carrier_item_kind(path).is_some())?;
-        carrier_target = Some(fighter);
-        Some(donor)
-    });
-    if let Some(fighter) = carrier_target {
-        let mut current = AUTO_CARRIER_TARGET.lock();
-        if current.as_deref() != Some(fighter.as_str()) {
-            dlog(&format!("AUTO_CARRIER_TARGET fighter={fighter}"));
-            *current = Some(fighter);
+            .find(|path| carrier_item_kind(path).is_some());
+        if let (Some(fighter), Some(donor)) = (fighter, donor) {
+            targets.push(fighter.to_string());
+            carrier_path.get_or_insert(donor);
         }
+    }
+    if !targets.is_empty() {
+        dlog(&format!("AUTO_CARRIER_TARGETS fighters={targets:?}"));
+        *AUTO_CARRIER_TARGETS.lock() = targets;
     }
     // The editor pushes bytes first, then specs. Some editor actions publish a spec snapshot
     // that omits the carrier target while its bytes are still staged; that is a partial push,
@@ -1937,10 +1946,10 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     let state = AUTO_CARRIER_STATE.load(Ordering::Relaxed);
     if state == 0 {
         // Nothing staged: release the claim so a fresh match re-picks a live holder.
-        AUTO_CARRIER_HOST.store(0, Ordering::Relaxed);
+        AUTO_CARRIER_HOST.store(NO_HOST, Ordering::Relaxed);
         return;
     }
-    // The carrier belongs to the fighter it was BUILT FOR, and to no one else.
+    // The carrier belongs to a fighter it was BUILT FOR, and to no one else.
     //
     // "First fighter to tick claims it" put the carrier on whichever object happened to run its
     // line callback first — in practice the OPPONENT. That is not a cosmetic mistake: the
@@ -1950,33 +1959,30 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     // so plainly — `holder_status` was DAMAGE / DAMAGE_AIR / DAMAGE_FLY every single time,
     // because the holder being hit WAS the trigger.
     //
-    // The editor already tells us who it should be: the donor spec's target fighter. Match on
-    // that and the carrier stays with the character whose effects are being edited.
+    // The editor already tells us whose it is: the donor specs' target fighters. An older editor,
+    // or a spec without a fighter target, names none: whoever claims it keeps it until they leave.
     let boid = (*boma).battle_object_id;
-    if let Some(target) = AUTO_CARRIER_TARGET.lock().as_deref() {
-        let kind = smash::app::utility::get_kind(&mut *boma);
-        let is_target = crate::slight::slight_consts::fighters::game_kind_name(kind)
-            .is_some_and(|name| name == target);
-        if !is_target {
-            return;
-        }
+    let is_target = |kind: i32| {
+        let targets = AUTO_CARRIER_TARGETS.lock();
+        targets.is_empty()
+            || crate::slight::slight_consts::fighters::game_kind_name(kind)
+                .is_some_and(|name| targets.iter().any(|target| target == name))
+    };
+    let host = host_id(AUTO_CARRIER_HOST.load(Ordering::Relaxed));
+    let holder = host
+        .filter(|host| *host != boid)
+        .and_then(crate::slight::agents::lookup);
+    let turn = carrier_gate::Turn {
+        target: is_target(smash::app::utility::get_kind(&mut *boma)),
+        holds: host == Some(boid),
+        held_elsewhere: holder.is_some(),
+        holder_is_target: holder.is_some_and(|holder| is_target(holder.kind)),
+    };
+    if !carrier_gate::looks_after(state, turn) {
+        return;
     }
-    // No target known (older editor, or a spec without a fighter target): fall back to a stable
-    // latch. Whoever claims it keeps it until they leave the match — releasing on anything less
-    // makes every other fighter steal it, look at its own empty slot, and rearm on every frame.
-    let host = AUTO_CARRIER_HOST.load(Ordering::Relaxed) as u32;
-    if host != 0 && host != boid {
-        if crate::slight::agents::all_records()
-            .iter()
-            .any(|rec| rec.boid == host)
-        {
-            return;
-        }
-        dlog(&format!(
-            "AUTO_CARRIER_HOST_GONE previous={host:#x} taking_over={boid:#x}"
-        ));
-    }
-    if host != boid {
+    if !turn.holds {
+        dlog(&format!("AUTO_CARRIER_HOST previous={host:x?} now={boid:#x}"));
         AUTO_CARRIER_HOST.store(boid as u64, Ordering::Relaxed);
     }
     if state == 3 {
@@ -2006,21 +2012,43 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     if state == 4 {
         // The replacement snapshot may have arrived before cleanup state 3 got a game
         // frame. Retire the still-current object first, then use the normal unload wait.
-        if AUTO_CARRIER_ID.load(Ordering::Relaxed) != 0 {
-            if AUTO_CARRIER_HANDLE.load(Ordering::Relaxed) == 0 {
-                remember_carrier_handle();
-                if AUTO_CARRIER_HANDLE.load(Ordering::Relaxed) == 0 {
-                    let stalled = AUTO_CARRIER_POLL.fetch_add(1, Ordering::Relaxed);
-                    if stalled % 120 == 0 {
-                        dlog(&format!(
-                            "AUTO_CARRIER_AWAIT_HANDLE stalled={stalled}; carrier kept live"
-                        ));
-                    }
-                    return;
-                }
+        let id = AUTO_CARRIER_ID.load(Ordering::Relaxed);
+        let live_kind = AUTO_CARRIER_ITEM_KIND.load(Ordering::Relaxed) as i32;
+        let found = || {
+            carrier_gate::outgoing(
+                id,
+                carrier_boma_for_id(id, live_kind).is_some(),
+                AUTO_CARRIER_HANDLE.load(Ordering::Relaxed),
+            )
+        };
+        if found() == Outgoing::Unidentified {
+            remember_carrier_handle();
+        }
+        match found() {
+            Outgoing::Removed => {}
+            Outgoing::Up => {
+                remove_auto_carrier(boma);
+                return;
             }
-            remove_auto_carrier(boma);
-            return;
+            Outgoing::Unidentified => {
+                let stalled = AUTO_CARRIER_POLL.fetch_add(1, Ordering::Relaxed);
+                if stalled % 120 == 0 {
+                    dlog(&format!(
+                        "AUTO_CARRIER_AWAIT_HANDLE stalled={stalled}; carrier kept live"
+                    ));
+                }
+                return;
+            }
+            Outgoing::GoneWithItsMatch => {
+                dlog(&format!("AUTO_CARRIER_GONE_WITH_ITS_MATCH id={id:#x}"));
+                AUTO_CARRIER_ID.store(0, Ordering::Relaxed);
+                AUTO_CARRIER_EFFECT_DRAIN.store(0, Ordering::Relaxed);
+                // Zero once its unload has been seen; else the one still to come.
+                AUTO_CARRIER_PENDING_UNLOAD.store(
+                    AUTO_CARRIER_HANDLE.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
         }
         // The replacement cannot be created until the outgoing carrier's effect handle has been
         // fully released. The unload hook returns before the manager's deferred unregister;

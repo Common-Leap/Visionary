@@ -140,6 +140,13 @@ pub fn loaded_arc() -> Option<&'static smash_arc::LoadedArc> {
     Some(unsafe { &*path_info.arc })
 }
 
+/// Whether the running game has a file at this path, its own or one ARCropolis added at boot.
+/// `None` before its file table is up.
+pub fn game_has_file(path_hash: u64) -> Option<bool> {
+    let arc = loaded_arc()?;
+    Some(arc.get_file_path_index_from_hash(Hash40(path_hash)).is_ok())
+}
+
 pub fn loaded_search() -> Option<&'static smash_arc::LoadedSearchSection> {
     let fs_info = filesystem_info()?;
     if fs_info.path_info.is_null() {

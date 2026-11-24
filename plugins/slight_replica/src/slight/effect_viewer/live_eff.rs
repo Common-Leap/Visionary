@@ -26,28 +26,18 @@
 //! mid-match froze the game outright. Anything that must change DURING a match goes through
 //! the carrier instead, whose eff is reloadable by design.
 
+use super::staged_files::StagedFiles;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MANIFEST: &str = "sd:/effect_viewer/live_eff/manifest.json";
 const DIR: &str = "sd:/effect_viewer/live_eff/";
 /// Written into every diag file so on-device logs are attributable to a specific build.
 /// Keep this in step with plugin changes so captured diagnostics identify the running binary.
-pub const BUILD_TAG: &str = "2026-11-23-objects-live";
+pub const BUILD_TAG: &str = "2026-11-23-every-characters-effects";
 
-/// Times [`disk_cb`] served bytes. Split by initiator so we can DECISIVELY answer the
-/// one open question of the whole cross-fighter-live effort: does the game's own resource
-/// loader pull merged bytes through Arcropolis at fighter LOAD (→ `CB_GAME`), or does only
-/// our own `arcrop_load_file` probe ever hit the callback (→ `CB_PROBE`)? `probe()` sets
-/// [`PROBING`] around its `load_file` calls; every other hit is the game.
+/// Times the game's own loader pulled staged bytes through [`disk_cb`].
 static CB_GAME: AtomicU64 = AtomicU64::new(0);
-static CB_PROBE: AtomicU64 = AtomicU64::new(0);
-/// True only while [`probe`] is calling `arcrop_load_file`, so [`disk_cb`] can attribute
-/// that serve to the probe rather than the game. (The res loader runs on its own thread,
-/// but a probe serve is synchronous within our own call, so a plain flag is sufficient —
-/// a stray concurrent game serve mis-attributed as a probe is the only race and it only
-/// ever UNDERcounts CB_GAME, never invents one.)
-static PROBING: AtomicBool = AtomicBool::new(false);
 
 #[derive(serde::Deserialize)]
 struct ManifestEntry {
@@ -55,10 +45,13 @@ struct ManifestEntry {
     path: String,
     /// File name inside `sd:/effect_viewer/live_eff/` holding the merged bytes.
     file: String,
+    /// The editor's name for these bytes, given back to it once the game has read them.
+    #[serde(default)]
+    stamp: u64,
 }
 
-/// arc-path hash40 → absolute sd path served for that path (read by the disk callback).
-static SERVED: parking_lot::Mutex<Option<HashMap<u64, String>>> = parking_lot::Mutex::new(None);
+/// What is staged for which path (arc-path hash40), and what the game has read of it.
+static SERVED: parking_lot::Mutex<StagedFiles> = parking_lot::Mutex::new(StagedFiles::new());
 /// hash → the last bytes served for it, used when a later read fails.
 static LAST_GOOD: parking_lot::Mutex<Option<HashMap<u64, Vec<u8>>>> = parking_lot::Mutex::new(None);
 /// hash → max_size we last registered the generic callback with. Re-registering with a
@@ -67,9 +60,8 @@ static REGISTERED: parking_lot::Mutex<Option<HashMap<u64, usize>>> = parking_lot
 
 /// Generic (disk) callback: fill the game's load buffer with the merged SD bytes.
 extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut usize) -> bool {
-    let path = match SERVED.lock().as_ref().and_then(|m| m.get(&hash).cloned()) {
-        Some(p) => p,
-        None => return false,
+    let Some(path) = SERVED.lock().read(hash) else {
+        return false;
     };
     // Returning false for a file the game has no copy of makes ARCropolis panic ("Physical
     // loader did not return valid file data"), so a failed read (the editor mid-write, or a
@@ -112,7 +104,10 @@ extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut u
             ));
             match last {
                 Some(bytes) => bytes,
-                None => return false,
+                None => {
+                    SERVED.lock().not_read(hash);
+                    return false;
+                }
             }
         }
     };
@@ -120,69 +115,31 @@ extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut u
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
     }
     *out_size = bytes.len();
-    let by_probe = PROBING.load(Ordering::Relaxed);
-    let (cb_game, cb_probe) = if by_probe {
-        (
-            CB_GAME.load(Ordering::Relaxed),
-            CB_PROBE.fetch_add(1, Ordering::Relaxed) + 1,
-        )
-    } else {
-        (
-            CB_GAME.fetch_add(1, Ordering::Relaxed) + 1,
-            CB_PROBE.load(Ordering::Relaxed),
-        )
-    };
+    let cb_game = CB_GAME.fetch_add(1, Ordering::Relaxed) + 1;
     // Proof-of-serve trace: this is the ONLY place that knows a load re-read the file.
-    // `cb_game>0` is the decisive proof that the GAME'S loader (not just our probe) pulls
-    // merged bytes through Arcropolis — i.e. that cross-fighter transplants load at match entry.
     //
     // Behind the trace opt-in: the game serves this callback from its loading thread, so the
-    // two writes below land in the middle of Arcropolis's own read. The same counters are in
-    // `effect_viewer_last_reload.txt` and in the probe, both written off that path.
-    if !crate::slight::smash_utils::trace_enabled() {
-        crate::slight::diag::note(format!(
-            "live eff served {} B for {hash:#x} by {}",
-            bytes.len(),
-            if by_probe { "probe" } else { "GAME" }
-        ));
-        return true;
-    }
-    let _ = std::fs::write(
-        "sd:/effect_viewer_cb.txt",
-        format!(
-            "build={BUILD_TAG}\ncb_game={cb_game}\ncb_probe={cb_probe}\nlast_by={}\nlast_hash={hash:#x}\nlast_bytes={}\ncapacity={capacity}\npath={path}\n",
-            if by_probe { "probe" } else { "GAME" },
-            bytes.len()
-        ),
-    );
-    // A dedicated, append-only proof file for the first game serve — survives later probes.
-    if !by_probe {
+    // two writes below land in the middle of Arcropolis's own read. The same counter is in
+    // `effect_viewer_last_reload.txt`, written off that path.
+    if crate::slight::smash_utils::trace_enabled() {
+        let _ = std::fs::write(
+            "sd:/effect_viewer_cb.txt",
+            format!(
+                "build={BUILD_TAG}\ncb_game={cb_game}\nlast_hash={hash:#x}\nlast_bytes={}\ncapacity={capacity}\npath={path}\n",
+                bytes.len()
+            ),
+        );
+        // A dedicated, append-only proof file for the first game serve.
         let _ = std::fs::write(
             "sd:/effect_viewer_gameserve.txt",
             format!("build={BUILD_TAG}\nGAME read merged bytes\nhash={hash:#x}\nbytes={}\npath={path}\ncb_game={cb_game}\n", bytes.len()),
         );
     }
     crate::slight::diag::note(format!(
-        "live eff served {} B for {hash:#x} by {}",
-        bytes.len(),
-        if by_probe { "probe" } else { "GAME" }
+        "live eff served {} B for {hash:#x} by GAME",
+        bytes.len()
     ));
     true
-}
-
-/// Set while a probe's `arcrop_load_file` is in flight so [`disk_cb`] attributes the serve
-/// to the probe. Returns a guard that clears the flag on drop.
-struct ProbeGuard;
-impl ProbeGuard {
-    fn new() -> Self {
-        PROBING.store(true, Ordering::Relaxed);
-        ProbeGuard
-    }
-}
-impl Drop for ProbeGuard {
-    fn drop(&mut self) {
-        PROBING.store(false, Ordering::Relaxed);
-    }
 }
 
 fn is_eff_path(game_path: &str) -> bool {
@@ -199,11 +156,8 @@ fn reload_inner(apply_live: bool) {
     let text = match std::fs::read_to_string(MANIFEST) {
         Ok(t) => t,
         Err(_) => {
-            if let Some(mut s) = SERVED.try_lock() {
-                if s.as_ref().map(|m| !m.is_empty()).unwrap_or(false) {
-                    *s = Some(HashMap::new());
-                    crate::slight::diag::note("live eff manifest removed — serving nothing");
-                }
+            if SERVED.lock().replace(Vec::new()) {
+                crate::slight::diag::note("live eff manifest removed — serving nothing");
             }
             return;
         }
@@ -221,12 +175,18 @@ fn reload_inner(apply_live: bool) {
     // Always 0 now that eff reparsing is gone; kept in the diag line so a run can be seen to
     // have taken the safe path rather than leaving it to be inferred.
     let reparsed = 0usize;
-    let mut served: HashMap<u64, String> = HashMap::new();
+    let mut served = Vec::new();
     let mut present: Vec<(String, u64)> = Vec::new();
 
     for entry in &entries {
         let path = entry.path.to_lowercase();
         let hash = smash::hash40(&path);
+        // ARCropolis panics, and takes the game with it, when it is asked for a path the game
+        // has no file at. The editor stages none; an older one may.
+        if super::resource_reload::game_has_file(hash) == Some(false) {
+            crate::slight::diag::note(format!("live eff refused, not a file of the game: {path}"));
+            continue;
+        }
         let file = format!("{DIR}{}", entry.file);
         let size = match std::fs::metadata(&file) {
             Ok(m) if m.is_file() => m.len() as usize,
@@ -235,7 +195,7 @@ fn reload_inner(apply_live: bool) {
                 continue;
             }
         };
-        served.insert(hash, file.clone());
+        served.push((hash, file.clone(), entry.stamp));
         present.push((path.clone(), hash));
 
         // Register (or grow) the generic callback: max_size patches the arc file table,
@@ -269,7 +229,7 @@ fn reload_inner(apply_live: bool) {
     // the file THROUGH our disk callback, which reads SERVED. (This ordering being
     // wrong was one reason transplants came back invisible — the first reparse after a
     // deploy re-loaded the VANILLA bytes.)
-    *SERVED.lock() = Some(served.clone());
+    SERVED.lock().replace(served);
 
     // Apply in place while the fighter is loaded — NEVER at boot (apply_live=false):
     // the game's effect manager / arc tables don't exist yet.
@@ -304,29 +264,27 @@ fn reload_inner(apply_live: bool) {
 
     let reg_known = REGISTERED.lock().as_ref().map(|r| r.len()).unwrap_or(0);
     let cb_game = CB_GAME.load(Ordering::Relaxed);
-    let cb_probe = CB_PROBE.load(Ordering::Relaxed);
     crate::slight::diag::note(format!(
-        "live eff reload — arcrop={arcrop_ok} files={} registered={registered} reg_known={reg_known} cb_game={cb_game} cb_probe={cb_probe} reparsed={reparsed} refreshed={refreshed} cleared={cleared}",
-        served.len()
+        "live eff reload — arcrop={arcrop_ok} files={} registered={registered} reg_known={reg_known} cb_game={cb_game} reparsed={reparsed} refreshed={refreshed} cleared={cleared}",
+        present.len()
     ));
     skyline::println!(
         "[SLight] live eff: {} file(s), {registered} registered, {reparsed} reparsed, {refreshed} refreshed, {cleared} respawned (arcrop={arcrop_ok})",
-        served.len()
+        present.len()
     );
     let _ = std::fs::write(
         "sd:/effect_viewer_last_reload.txt",
         format!(
-            "build={BUILD_TAG}\napply_live={apply_live}\narcrop={arcrop_ok}\nfiles={}\nregistered={registered}\nreg_known={reg_known}\ncb_game={cb_game}\ncb_probe={cb_probe}\nreparsed={reparsed}\nrefreshed={refreshed}\ncleared={cleared}\n{}\n",
-            served.len(),
+            "build={BUILD_TAG}\napply_live={apply_live}\narcrop={arcrop_ok}\nfiles={}\nregistered={registered}\nreg_known={reg_known}\ncb_game={cb_game}\nreparsed={reparsed}\nrefreshed={refreshed}\ncleared={cleared}\n{}\n",
+            present.len(),
             crate::slight::effect_viewer::effect_reload::debug_line(),
         ),
     );
 }
 
-/// The SD path currently served for `hash` (the merged eff bytes), if any. Lets the
-/// synchronous live re-read source merged bytes straight off disk (no arc / no thread).
-pub fn served_path(hash: u64) -> Option<String> {
-    SERVED.lock().as_ref().and_then(|m| m.get(&hash).cloned())
+/// The path and stamp of each staged file the game holds now.
+pub fn in_the_game() -> Vec<(u64, u64)> {
+    SERVED.lock().in_the_game()
 }
 
 /// Kill every tracked live effect and re-request it so on-screen particles respawn from
@@ -406,60 +364,6 @@ fn clear_live_effects() -> usize {
     }
 
     snaps.len()
-}
-
-/// Answer the two open questions of the serving chain, per served file:
-///  * `api_bytes` — what `arcrop_load_file` returns THROUGH Arcropolis's own loader
-///    stack. == the SD file size ⇒ the api registration works and any failure is in the
-///    game's load path; == vanilla size (or 0) ⇒ the registration itself isn't serving.
-///  * `resident` — decomp size + head + whether the IN-MEMORY loaded eff contains an
-///    `_os\0` entry name, i.e. whether any (re)load actually brought in merged bytes.
-///
-/// Triggered from TCP (`live_eff_probe`) so it can run seconds AFTER a reparse, once the
-/// async res loads settled. Results go to `sd:/effect_viewer_probe.txt`.
-pub fn probe() -> String {
-    let served: Vec<(u64, String)> = SERVED
-        .lock()
-        .as_ref()
-        .map(|m| m.iter().map(|(h, p)| (*h, p.clone())).collect())
-        .unwrap_or_default();
-    let mut out = format!("build={BUILD_TAG}\nfiles={}\n", served.len());
-    for (hash, sd_path) in &served {
-        let sd_size = std::fs::metadata(sd_path)
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
-        let mut buf = vec![0u8; sd_size + 0x1000];
-        let api_bytes = {
-            let _g = ProbeGuard::new();
-            crate::slight::effect_viewer::arcrop::load_file(*hash, &mut buf)
-        };
-        let resident =
-            crate::slight::effect_viewer::resource_reload::resident_probe(*hash, b"_os\0");
-        out.push_str(&format!(
-            "hash={hash:#x}\n  sd_size={sd_size}\n  api_bytes={:?}\n  resident={}\n",
-            api_bytes,
-            match resident {
-                Some((size, head, found_os)) => format!(
-                    "size={size} head={} merged_entry_present={found_os}",
-                    head.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                ),
-                None => "not-loaded".into(),
-            }
-        ));
-    }
-    out.push_str(&format!(
-        "cb_game={} cb_probe={}\n",
-        CB_GAME.load(Ordering::Relaxed),
-        CB_PROBE.load(Ordering::Relaxed)
-    ));
-    out.push_str(&format!(
-        "{}\n{}",
-        crate::slight::effect_viewer::effect_reload::donor_debug_line(),
-        crate::slight::effect_viewer::effect_reload::slots_debug(),
-    ));
-    let _ = std::fs::write("sd:/effect_viewer_probe.txt", &out);
-    crate::slight::diag::note(format!("live eff probe:\n{out}"));
-    out
 }
 
 /// Install the effect-manager load/unload hooks (must run once at plugin init, before a

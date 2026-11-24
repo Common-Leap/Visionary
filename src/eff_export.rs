@@ -82,6 +82,7 @@ pub fn rebuild_eff_bytes_for_slot(
 ///
 /// `set_name` names the entry AS IT EXISTS IN THE CARRIER (the transplant's `new_entry_name`),
 /// not the fighter's original entry name.
+#[derive(Clone)]
 pub struct CarrierAuthored {
     pub set_name: String,
     pub edits: Vec<AuthoredEdit>,

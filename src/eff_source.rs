@@ -148,6 +148,59 @@ fn made_effect_lookup(
     Some(own.ok_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff")))
 }
 
+/// Whether the running game has a file at effect path `rel`: a fighter's own, or one under `roots`,
+/// its files and the installed mods'.
+pub fn in_the_game(rel: &str, known: &dyn Fn(&str) -> bool, roots: &[PathBuf]) -> bool {
+    let rel = rel.to_lowercase();
+    let fighter = crate::mod_project::fighter_from_source_rel(&rel);
+    let own = rel == format!("effect/fighter/{fighter}/ef_{fighter}.eff") && known(&fighter);
+    own || roots.iter().any(|root| root.join(&rel).is_file())
+}
+
+/// The installed mods that have their own effect file at game path `rel`, in words: the game loads
+/// one mod's file at a path, so with both installed an exported one's edits can stay hidden.
+pub fn shadow(rel: &str, installed: &[PathBuf]) -> Option<String> {
+    let rel = rel.to_lowercase();
+    let has = installed.iter().filter(|root| root.join(&rel).is_file());
+    let name = |root: &PathBuf| {
+        let name = root.file_name().unwrap_or_default().to_string_lossy();
+        format!("\"{name}\"")
+    };
+    let mods: Vec<String> = has.map(name).collect();
+    let file = rel.rsplit('/').next().unwrap_or(&rel);
+    (!mods.is_empty()).then(|| {
+        format!(
+            "{file} is also in {}: only one loads, so remove it there for an exported mod's edits to show",
+            mods.join(", ")
+        )
+    })
+}
+
+/// [`shadow`] for every effect file of the exported mod at `root`, but the copies of that mod
+/// itself among the installed ones.
+pub fn shadowed(root: &Path, installed: &[PathBuf]) -> Vec<String> {
+    let others: Vec<PathBuf> = installed
+        .iter()
+        .filter(|other| other.file_name() != root.file_name())
+        .cloned()
+        .collect();
+    let mut found = Vec::new();
+    let mut folders = vec![root.join("effect")];
+    while let Some(folder) = folders.pop() {
+        for path in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = path.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "eff") {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                found.extend(shadow(&rel.to_string_lossy().replace('\\', "/"), &others));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Say which file `entry`'s first edit is made on, as it is about to be made or was just read
 /// from the editor. `open` is the file open for it and whether the user opened it themselves;
 /// `game` is the one its game path leads to. Never called for an entry that has edits: those
@@ -304,6 +357,54 @@ mod tests {
 
     fn source(files: &EffectFiles, rel: &str) -> Option<PathBuf> {
         files.source(rel, &RosterMod::default(), &|_| None)
+    }
+
+    /// A made character's costume file is in no game and no mod until the exported mod is
+    /// installed, and asking the game for it crashes it.
+    #[test]
+    fn a_costume_file_only_the_editor_has_is_not_in_the_game() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = [tmp.path().join("dump"), tmp.path().join("installed mod")];
+        let known = |fighter: &str| fighter == "mario";
+        let vision = "effect/fighter/mario/ef_mario_c07.eff";
+        assert!(in_the_game(
+            "effect/fighter/Mario/ef_mario.eff",
+            &known,
+            &roots
+        ));
+        assert!(!in_the_game(vision, &known, &roots));
+        assert!(!in_the_game(
+            "effect/fighter/vision/ef_vision.eff",
+            &known,
+            &roots
+        ));
+        put(roots[1].join(vision));
+        assert!(in_the_game(vision, &known, &roots));
+        assert!(!in_the_game(vision, &known, &roots[..1]));
+    }
+
+    /// A slot character's exported effects stay hidden while the mod they were made from is
+    /// installed with its own file: said by name, and not of the exported mod's own copy.
+    #[test]
+    fn a_file_another_installed_mod_has_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = "effect/fighter/pacman/ef_pacman_c40.eff";
+        let mods = ["Shy Guy", "other", "edits"].map(|name| tmp.path().join("mods").join(name));
+        for root in [&mods[0], &mods[2]] {
+            put(root.join(rel));
+        }
+        put(mods[1].join(MARIO));
+        let exported = tmp.path().join("export/edits");
+        put(exported.join(rel));
+        let said = shadowed(&exported, &mods);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("ef_pacman_c40.eff is also in \"Shy Guy\":"));
+        assert_eq!(shadowed(&exported, &mods[1..]), Vec::<String>::new());
+        // The live send knows the same, by the file its edits stand for.
+        assert!(shadow(rel, &mods)
+            .unwrap()
+            .contains("\"Shy Guy\", \"edits\""));
+        assert_eq!(shadow(rel, &mods[1..2]), None);
     }
 
     /// The order: what the project records, the project's own copy (a picked folder's before

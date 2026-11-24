@@ -2655,7 +2655,9 @@ impl VisionaryApp {
         let staged = if self.eff_mods.get(&owner).is_some_and(|eff| !eff.is_empty()) {
             self.deploy_live_eff(&owner)
         } else {
-            std::fs::read(&path).is_ok_and(|bytes| self.serve_live_eff(&owner, &rel, &bytes))
+            self.game_has_effect_file(&rel)
+                && std::fs::read(&path)
+                    .is_ok_and(|bytes| self.serve_live_eff(&rel, &bytes, Default::default()))
         };
         self.state.status = if staged {
             format!(

@@ -35,7 +35,8 @@ use smash::lib::{L2CValue, L2CValueType};
 mod capture_archive;
 pub use super::costume_scope;
 pub use costume_scope::{
-    name_objects, prefer_specific_costumes, runs_on, Acting, CostumeScoped, MoveScope, RuleScope,
+    name_objects, prefer_specific_costumes, runs_on, worn_costume, Acting, CostumeScoped,
+    MoveScope, RuleScope,
 };
 mod drop_hooks;
 mod node_steps;
@@ -2010,6 +2011,17 @@ pub fn acting_is(
                     && kind == *smash::lib::lua_const::FIGHTER_KIND_NANA)
                 || (weapon.is_some() && kind == *smash::lib::lua_const::FIGHTER_KIND_KIRBY)
         },
+    )
+}
+
+/// The costume of the fighter acting, or of the one that made the object that is; -1 for neither.
+pub unsafe fn acting_costume(boma: *mut smash::app::BattleObjectModuleAccessor) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    note_acting(boma);
+    let slot = acting_slot();
+    worn_costume(
+        slot.color.load(Relaxed),
+        slot.founder_color.load(Relaxed),
     )
 }
 
@@ -4613,6 +4625,8 @@ pub unsafe fn inject_tick(lua_state: u64) {
             }
             if category == node_steps::CAT_NODE_STEP {
                 let mut agent = smash::lib::L2CAgent::new(lua_state);
+                // What the fighter's status code left there would be read as the first argument.
+                agent.clear_lua_stack();
                 let command = inj.command.as_deref().unwrap_or_default();
                 let done = {
                     let _g = InjectGuard::new();

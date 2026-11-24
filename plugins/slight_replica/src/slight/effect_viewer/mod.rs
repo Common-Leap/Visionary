@@ -5,6 +5,7 @@ pub mod asset_bundle;
 pub mod asset_identity;
 pub mod asset_path;
 pub mod asset_pool;
+mod carrier_gate;
 pub mod control_rules;
 pub mod effect_data;
 pub mod effect_names;
@@ -20,6 +21,7 @@ pub mod resource_reload;
 pub mod script_frames;
 pub mod show;
 pub mod spawn_rules;
+mod staged_files;
 pub mod tracker;
 
 use smash::app::lua_bind::{EffectModule, StatusModule};

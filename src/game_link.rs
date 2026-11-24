@@ -425,7 +425,7 @@ impl ArticleCaptureLine {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SpawnRuleWire {
     pub eff_hash: u64,
     pub suppress: bool,
@@ -497,7 +497,7 @@ pub struct SpawnRuleWire {
 }
 
 /// Wire form of plugin `spawn_rules::SpawnInject` — a captured EFFECT spawn to replay.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SpawnInjectWire {
     pub frame: f32,
     pub func: String,
@@ -509,7 +509,7 @@ pub struct SpawnInjectWire {
 
 /// One live effect point-control rule. Matching includes the captured argument vector so two
 /// `ENABLE_AREA` calls on one frame cannot suppress each other accidentally.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EffectControlRuleWire {
     pub motion: Option<u64>,
     pub func: String,
@@ -529,7 +529,7 @@ pub struct EffectControlRuleWire {
     pub inject: Option<EffectControlInjectWire>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EffectControlInjectWire {
     pub frame: f32,
     pub func: String,
@@ -984,7 +984,7 @@ pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
 }
 
 /// Sparse ATTACK-arg overrides (plugin `HbOverrides`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HbOverridesWire {
     /// Complete AREA_WIND argument vector when a wind payload changes. Wind calls do not share
@@ -1195,7 +1195,7 @@ pub struct HbOverridesWire {
     pub expression_args: Option<Vec<LuaArgWire>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InjectRuleWire {
     pub frame: f32,
     pub args: Vec<LuaArgWire>,
@@ -1277,7 +1277,7 @@ fn is_zero_u8(v: &u8) -> bool {
 
 /// `frame_start`/`frame_end` scope suppress/override to ONE hit so multi-hit moves (which
 /// reuse the same id across frames) stay independent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HitboxRuleWire {
     pub motion: u64,
     /// Rule family: 0 attack, 1 grab, 2 wind, and 11 `REVERSE_LR`. Omitted when 0 so old
@@ -1743,6 +1743,9 @@ pub struct LiveGimmickAgent {
     pub entry_id: i32,
     pub owner_boid: Option<u32>,
     pub fighter: Option<String>,
+    /// The costume a fighter wears; `None` for an object, or from a plugin that does not say.
+    #[serde(default)]
+    pub costume: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -2135,6 +2138,7 @@ struct Shared {
     /// it into a status line and stops waiting — a rejected push never advances `carrier_gen`,
     /// so without this the editor waits for a carrier that is never coming.
     carrier_error: Option<String>,
+    staged_effects: Option<Vec<(u64, u64)>>,
     /// Asset-carrier progress. These files are never installed by resident-buffer mutation.
     asset_bundle_target: String,
     asset_bundle_generation: u64,
@@ -2212,7 +2216,6 @@ const IDEMPOTENT_COMMAND_MARKERS: &[&str] = &[
     r#""command":"reset_pins""#,
     r#""command":"clear_acmd_captures""#,
     r#""command":"live_eff_reload""#,
-    r#""command":"live_eff_probe""#,
 ];
 
 const GIMMICK_OPERATION_MARKER: &str = r#""gimmick_operation":"#;
@@ -2349,6 +2352,7 @@ impl Default for Shared {
             carrier_seq: 0,
             carrier_gen: 0,
             carrier_error: None,
+            staged_effects: None,
             asset_bundle_target: String::new(),
             asset_bundle_generation: 0,
             asset_bundle_staged: 0,
@@ -3170,18 +3174,6 @@ impl GameLink {
         }
     }
 
-    /// Ask the plugin to write `sd:/effect_viewer_probe.txt` (serving-chain diagnosis).
-    pub fn send_live_eff_probe(&self) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let frame = "<TCP_MESSAGE>{\"command\":\"live_eff_probe\"}</TCP_MESSAGE>".to_string();
-        if let Ok(mut s) = self.shared.lock() {
-            push_outbox_capped(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
-    }
-
     /// Lines from the MOST RECENT playback of `motion` by `kind` — one performance, never a
     /// merge of several.
     ///
@@ -3305,6 +3297,12 @@ impl GameLink {
     /// Donor-bytes generation of the carrier currently live in game.
     pub fn carrier_gen(&self) -> u64 {
         self.shared.lock().map(|s| s.carrier_gen).unwrap_or(0)
+    }
+
+    /// The path and stamp of each staged effect file the game holds (see `live_eff`), once this
+    /// connection has reported them.
+    pub fn staged_effects(&self) -> Option<Vec<(u64, u64)>> {
+        self.shared.lock().ok()?.staged_effects.clone()
     }
 
     /// Take the reason the plugin rejected the last carrier push, clearing it.
@@ -3711,6 +3709,7 @@ fn reset_session(s: &mut Shared) {
     s.gimmick_feature_capabilities = None;
     s.gimmick_feature_capabilities_seq = None;
     s.gimmick_operations_in_flight = 0;
+    s.staged_effects = None;
     s.last_rx = None;
     s.replaced = false;
 }
@@ -4396,6 +4395,8 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.carrier_kinds = c.get("kinds").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             s.carrier_gen = c.get("gen").and_then(|v| v.as_u64()).unwrap_or(0);
             s.carrier_seq += 1;
+            let staged = c.get("staged").cloned();
+            s.staged_effects = staged.and_then(|staged| serde_json::from_value(staged).ok());
         }
         "CarrierError" => {
             s.carrier_error = body
@@ -4753,11 +4754,30 @@ mod plugin_costume_scope;
 #[cfg(test)]
 mod costume_scope_tests {
     use super::plugin_costume_scope::{
-        costume_is, name_objects, prefer_specific_costumes, rule_color, runs_on, Acting,
-        CostumeScoped, MoveScope, RuleScope,
+        costume_is, name_objects, prefer_specific_costumes, rule_color, runs_on, worn_costume,
+        Acting, CostumeScoped, MoveScope, RuleScope,
     };
     use super::ForFighter;
     use crate::roster::RosterKey;
+
+    /// An edited effect reaches its character's costumes whatever spawns it: Mario's fireball has
+    /// no costume of its own, and its own work values read as one.
+    #[test]
+    fn an_objects_effect_is_on_the_costume_of_the_fighter_that_made_it() {
+        assert_eq!(worn_costume(7, -1), 7);
+        assert_eq!(worn_costume(-1, 7), 7);
+        assert_eq!(worn_costume(-1, -1), -1);
+        assert_eq!(worn_costume(0, 7), 0);
+        let hooks =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
+        let costume = hooks
+            .split("unsafe fn costume_of(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("costume_of");
+        assert!(costume.contains("acting_costume(boma)"));
+        assert!(!costume.contains("FIGHTER_INSTANCE_WORK_ID_INT_COLOR"));
+    }
 
     fn roster_with_vision() -> crate::mod_project::RosterMod {
         let mut roster = crate::mod_project::RosterMod::default();
@@ -6911,9 +6931,86 @@ mod tests {
         }
     }
 
+    /// An added block's arguments are read from the bottom of a Lua stack the fighter's own code
+    /// uses too: "Animation speed" read the `is_excute` answer left there as its speed, and did
+    /// nothing. Every place that puts arguments on it empties it first.
+    #[test]
+    fn added_blocks_put_their_arguments_on_an_empty_stack() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/slight_replica/src/slight");
+        let mut files = vec![root];
+        let mut pushers = 0;
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                let entries = std::fs::read_dir(&path).expect("plugin folder");
+                files.extend(entries.map(|entry| entry.expect("entry").path()));
+                continue;
+            }
+            // Every node step runs through `node_steps::run`, checked below.
+            let steps = path.ends_with("hitbox_viewer/node_steps.rs");
+            if steps || path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let source = read_source(&path).expect("plugin source");
+            for body in source
+                .split("\nunsafe fn ")
+                .skip(1)
+                .chain(source.split("\npub unsafe fn ").skip(1))
+            {
+                let body = body.split("\n}\n").next().unwrap_or(body);
+                let Some(pushed) = body.find("push_lua_stack(") else {
+                    continue;
+                };
+                pushers += 1;
+                assert!(
+                    body.find("clear_lua_stack()")
+                        .is_some_and(|clear| clear < pushed),
+                    "{}: {}",
+                    path.display(),
+                    body.lines().next().unwrap_or_default()
+                );
+            }
+        }
+        assert!(pushers > 5, "{pushers}");
+        let collisions = read_source(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+        )
+        .expect("read the plugin's hitbox hooks");
+        assert_eq!(collisions.matches("node_steps::run(").count(), 1);
+        let step = collisions
+            .split("if category == node_steps::CAT_NODE_STEP {")
+            .nth(1)
+            .expect("node step");
+        let run = step.find("node_steps::run(").expect("run");
+        assert!(step[..run].contains("agent.clear_lua_stack();"));
+    }
+
+    /// The game says which staged effect files it holds; a new game holds none of them.
+    #[test]
+    fn the_effects_the_game_holds_come_with_the_carrier_report() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let report = |staged: &str| {
+            let body = format!(
+                r#"{{"header":"CarrierStatus","body":{{"CarrierStatus":{{"state":2,"kinds":7,"spawned":true,"gen":3{staged}}}}}}}"#
+            );
+            handle_frame(&shared, &body);
+            shared.lock().unwrap().staged_effects.clone()
+        };
+        // A plugin that does not say, and one that says none.
+        assert_eq!(report(""), None);
+        assert_eq!(report(r#","staged":[]"#), Some(Vec::new()));
+        // A path and a stamp use all 64 bits.
+        let held = report(r#","staged":[[5,18446744073709551615],[6,7]]"#);
+        assert_eq!(held, Some(vec![(5, u64::MAX), (6, 7)]));
+        assert_eq!(shared.lock().unwrap().carrier_gen, 3);
+        reset_session(&mut shared.lock().unwrap());
+        assert_eq!(shared.lock().unwrap().staged_effects, None);
+    }
+
     /// Effect, sound, game, and expression ACMD coroutines can enter the live-retime scheduler
-    /// from different game workers. Its startup markers and motion hints used to share three
-    /// blocking `parking_lot` collections; a contended waiter can spin forever on Horizon even
+    /// from different game workers. Its motion hints used to be in blocking `parking_lot`
+    /// collections; a contended waiter can spin forever on Horizon even
     /// after the holder leaves. The scheduler must keep that cross-coroutine state lock-free and
     /// skip its native-query path entirely when no structural retime exists.
     #[test]
@@ -6933,11 +7030,10 @@ mod tests {
             .0;
         assert!(
             lifecycle.contains("static MOTION_HINTS: [MotionHintSlot;")
-                && lifecycle.contains("static ACMD_STARTUP_PENDING: [")
                 && lifecycle.contains("compare_exchange")
                 && !lifecycle.contains("Mutex")
                 && !lifecycle.contains(".lock()"),
-            "cross-coroutine startup state must remain fixed-size and lock-free"
+            "cross-coroutine motion hints must remain fixed-size and lock-free"
         );
         // What has fired is kept in a map, which is asked for and never waited on.
         assert!(source.contains("PLAYINGS.try_lock()") && !source.contains("PLAYINGS.lock()"));
@@ -7338,12 +7434,8 @@ mod tests {
             "trail_suppressed",
             "lifetime_stop_suppressed",
             "stop_suppressed",
-            "L2CAgentBase_start_coroutine",
-            "hook_start_coroutine",
             "L2CAgentBase_resume_coroutine",
             "hook_resume_coroutine",
-            "L2CAgentBase_call_coroutine",
-            "hook_call_coroutine",
             "MotionModule::change_motion",
             "hook_motion_change",
             "MotionModule::change_motion_inherit_frame",
@@ -7362,8 +7454,6 @@ mod tests {
             "sv_animcmd::wait",
             "hook_acmd_wait",
             "inject_for_acmd",
-            "CoroutineBoundary::Call",
-            "CoroutineBoundary::Start",
             "CoroutineBoundary::Effect",
             "CoroutineBoundary::Control",
             "MotionHint",
@@ -7388,26 +7478,6 @@ mod tests {
         assert!(
             !hooks.contains("effect_acmd_state_matches"),
             "frame-zero dispatch must not wait for a previously observed effect coroutine"
-        );
-        let start_original = hooks
-            .find("let result = original!()(agent, coroutine_index, name, state);")
-            .expect("start coroutine must call the native implementation");
-        let start_injection = hooks
-            .find("inject_for_acmd_at_frame(&mut *agent, CoroutineBoundary::Start, 0.0)")
-            .expect("start coroutine must cover frame zero before the native body");
-        assert!(
-            start_injection < start_original,
-            "startup injection must run before the original coroutine enters its first slice"
-        );
-        let call_original = hooks
-            .find("let result = original!()(agent, coroutine_index, name);")
-            .expect("call coroutine must call the native implementation");
-        let call_injection = hooks
-            .find("inject_for_acmd(&mut *agent, CoroutineBoundary::Call)")
-            .expect("call coroutine must inject after the native implementation");
-        assert!(
-            call_original < call_injection,
-            "call-boundary injection must run after the original coroutine call"
         );
         assert!(
             hooks.contains("inject_after_acmd_frame(lua_state, target)"),
@@ -9047,7 +9117,6 @@ mod tests {
         link.send_effect_names(&["example".into()]);
         link.send_reset_pins();
         link.send_live_eff_reload();
-        link.send_live_eff_probe();
         link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
         assert!(
             link.shared.lock().unwrap().outbox.is_empty(),
@@ -9065,11 +9134,10 @@ mod tests {
         link.send_effect_names(&["example".into()]);
         link.send_reset_pins();
         link.send_live_eff_reload();
-        link.send_live_eff_probe();
         link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
         assert_eq!(
             link.shared.lock().unwrap().outbox.len(),
-            12,
+            11,
             "the finished import can publish one message per protocol family"
         );
     }
@@ -11425,6 +11493,9 @@ mod playing_tests {
 
         /// The once-per-frame tick.
         fn tick(&mut self, motion: u64, frame: f32) {
+            if self.playings.at(7, motion, frame, self.step).tick() {
+                return;
+            }
             self.fire(motion, frame, frame);
             self.playings.at(7, motion, frame, self.step).pass(frame);
         }
@@ -11446,6 +11517,39 @@ mod playing_tests {
         (0..)
             .map(move |n| from + n as f32 * step)
             .take_while(move |frame| *frame <= to)
+    }
+
+    /// Measured in the game (13.0.4): an effect made by a move's game or expression script on its
+    /// first frame, or by the tick that follows them, is there for its whole life and never drawn.
+    /// Made by its sound or effect script, which start after that tick, it is.
+    #[test]
+    fn a_first_frame_effect_waits_for_the_scripts_that_start_after_the_tick() {
+        let mut game = Game::new(&[(GROUND, 0.0)]);
+        for _ in 0..2 {
+            game.fired.clear();
+            game.playings.started(7, GROUND, false);
+            game.boundary(GROUND, 0.0, 0.0);
+            game.tick(GROUND, 0.0);
+            assert_eq!(game.fired, []);
+            game.boundary(GROUND, 0.0, 0.0);
+            assert_eq!(game.fired, [(GROUND, 0.0)]);
+            game.tick(GROUND, 1.0);
+            game.boundary(GROUND, 1.0, 1.0);
+            assert_eq!(game.fired, [(GROUND, 0.0)]);
+        }
+        // With no script after it, the next tick's is the first that is drawn.
+        game.fired.clear();
+        game.play(GROUND, frames(0.0, 1.0, 1.0));
+        assert_eq!(game.fired, [(GROUND, 0.0)]);
+
+        // Each script's turn on the first frame is seen, whatever its first line is.
+        let frame = HOOKS
+            .split("unsafe fn hook_acmd_frame(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("hook_acmd_frame");
+        let entered = frame.find("inject_before_acmd_wait(lua_state, CoroutineBoundary::Frame);");
+        assert!(entered.is_some() && entered < frame.find("original!()(lua_state, target);"));
     }
 
     #[test]
@@ -11564,8 +11668,10 @@ mod playing_tests {
     #[test]
     fn a_motion_begun_again_on_the_same_frame_is_a_new_playing() {
         let mut game = Game::new(&[(GROUND, 0.0)]);
-        game.play(GROUND, frames(0.0, 0.0, 1.0));
-        game.play(GROUND, frames(0.0, 0.0, 1.0));
+        for _ in 0..2 {
+            game.play(GROUND, frames(0.0, 0.0, 1.0));
+            game.boundary(GROUND, 0.0, 0.0);
+        }
         assert_eq!(game.fired, [(GROUND, 0.0); 2]);
     }
 
@@ -11638,6 +11744,7 @@ mod playing_tests {
     fn an_unconfirmed_dispatch_gets_one_more_try_on_its_frame() {
         let mut playings = Playings::default();
         let playing = playings.at(7, GROUND, 0.0, 1.0);
+        playing.tick();
         assert!(playing.due(0, 1, 0.0, 0.0));
         assert_eq!(playing.fire(0, 1, false), 1);
         assert!(playing.due(0, 1, 0.0, 0.0));
@@ -11645,6 +11752,7 @@ mod playing_tests {
         assert!(!playing.due(0, 1, 0.0, 0.0));
         // Confirmed on the first try, it is done; unconfirmed, its frame passing ends it too.
         let playing = playings.at(8, GROUND, 0.0, 1.0);
+        playing.tick();
         playing.fire(0, 1, true);
         assert!(!playing.due(0, 1, 0.0, 0.0));
         playing.fire(1, 1, false);
@@ -11726,6 +11834,7 @@ mod playing_tests {
             ".due(slot, identity, target, reached.frame)",
             ".fire(slot, identity, confirmed)",
             ".pass(frame)",
+            ".tick()",
             "playings.started(boid, motion, inherits)",
         ] {
             assert!(HOOKS.contains(call), "{call}");

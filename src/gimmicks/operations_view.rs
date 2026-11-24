@@ -429,6 +429,7 @@ mod tests {
             entry_id: if category == 0 { 0 } else { -1 },
             owner_boid,
             fighter: fighter.map(str::to_string),
+            costume: None,
         }
     }
 

@@ -751,17 +751,13 @@ unsafe fn rewrite_kind(lua_state: u64, from: u64, to: u64, flip: bool) {
     }
 }
 
-/// The owner fighter's costume slot (color index), or -1 when unresolvable.
+/// The costume of the fighter behind a call, its own or its object's, or -1 when unresolvable.
 unsafe fn costume_of(lua_state: u64) -> i32 {
-    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
-        as *mut smash::app::BattleObjectModuleAccessor;
+    let boma = boma_of(lua_state);
     if boma.is_null() {
         return -1;
     }
-    smash::app::lua_bind::WorkModule::get_int(
-        boma,
-        *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-    )
+    crate::slight::hitbox_viewer::acting_costume(boma)
 }
 
 /// One-time: log the CONCRETE EffectModule vtable targets (req = vtable+0x68,
@@ -2265,8 +2261,6 @@ unsafe fn hook_effect_off_kind(lua_state: u64) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoroutineBoundary {
-    Start,
-    Call,
     Execute,
     Effect,
     Control,
@@ -2280,8 +2274,6 @@ enum CoroutineBoundary {
 impl CoroutineBoundary {
     fn label(self) -> &'static str {
         match self {
-            Self::Start => "start",
-            Self::Call => "call",
             Self::Execute => "execute",
             Self::Effect => "effect",
             Self::Control => "control",
@@ -2326,29 +2318,8 @@ impl MotionHintSlot {
 static MOTION_HINTS: [MotionHintSlot; ACMD_STATE_SLOTS] =
     [const { MotionHintSlot::new() }; ACMD_STATE_SLOTS];
 
-/// `start_coroutine` enters the authored function before its hook returns.  Keep a bounded marker
-/// for that first execution so a frame-zero request can be retried from the first real command
-/// boundary if the pre-start native dispatch did not create a handle.
-static ACMD_STARTUP_PENDING: [std::sync::atomic::AtomicU64; ACMD_STATE_SLOTS] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; ACMD_STATE_SLOTS];
-
 fn acmd_owner_key(boid: u32) -> u64 {
     boid as u64 + 2
-}
-
-fn startup_key(boid: u32, lua_state: u64) -> u64 {
-    let mut key = 0xcbf29ce484222325_u64;
-    for value in [boid as u64, lua_state] {
-        for byte in value.to_le_bytes() {
-            key ^= byte as u64;
-            key = key.wrapping_mul(0x100000001b3);
-        }
-    }
-    if key <= ACMD_STATE_RESERVED {
-        key + 2
-    } else {
-        key
-    }
 }
 
 fn remember_motion_hint_atomic(boid: u32, motion: u64) {
@@ -2414,46 +2385,6 @@ fn clear_motion_hint_atomic(boid: u32) {
     }
 }
 
-fn insert_atomic_set(slots: &[std::sync::atomic::AtomicU64], key: u64) -> bool {
-    use std::sync::atomic::Ordering;
-
-    let home = key as usize % slots.len();
-    for offset in 0..slots.len() {
-        let slot = &slots[(home + offset) % slots.len()];
-        let current = slot.load(Ordering::Acquire);
-        if current == key {
-            return false;
-        }
-        if current == 0
-            && slot
-                .compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            return true;
-        }
-    }
-    // Bounded stale-state recovery. As above, losing one marker means a retry is skipped; it
-    // never changes or suppresses the game's authored call.
-    slots[home].store(key, Ordering::Release);
-    true
-}
-
-fn remove_atomic_set(slots: &[std::sync::atomic::AtomicU64], key: u64) -> bool {
-    use std::sync::atomic::Ordering;
-
-    let home = key as usize % slots.len();
-    for offset in 0..slots.len() {
-        let slot = &slots[(home + offset) % slots.len()];
-        if slot
-            .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// `inherits`: the motion carries on from the frame the object is on.
 unsafe fn remember_motion_hint(
     boma: *mut smash::app::BattleObjectModuleAccessor,
@@ -2471,31 +2402,6 @@ unsafe fn remember_motion_hint(
     remember_motion_hint_atomic(boid, motion);
 }
 
-unsafe fn remember_acmd_startup(agent: *mut smash::lua2cpp::L2CAgentBase) {
-    if agent.is_null() || (*agent).agent.lua_state_agent == 0 {
-        return;
-    }
-    let boma = (*agent).agent.module_accessor;
-    if boma.is_null() {
-        return;
-    }
-    let key = startup_key((*boma).battle_object_id, (*agent).agent.lua_state_agent);
-    insert_atomic_set(&ACMD_STARTUP_PENDING, key);
-}
-
-unsafe fn take_acmd_startup(
-    lua_state: u64,
-    boma: *mut smash::app::BattleObjectModuleAccessor,
-) -> bool {
-    if lua_state == 0 || boma.is_null() {
-        return false;
-    }
-    remove_atomic_set(
-        &ACMD_STARTUP_PENDING,
-        startup_key((*boma).battle_object_id, lua_state),
-    )
-}
-
 fn choose_motion_hint(
     observed: u64,
     hint: Option<MotionHint>,
@@ -2510,14 +2416,12 @@ fn choose_motion_hint(
         return observed;
     }
 
-    // The explicit pre-start frame-zero path and the following command boundaries are inside the
-    // transition that requested the hinted motion. A post-call notification is still not a
-    // dispatch point. Resume is restricted to the low startup window so an old hint cannot affect
-    // a later, unrelated motion.
+    // The command boundaries are inside the transition that requested the hinted motion. Resume
+    // is restricted to the low startup window so an old hint cannot affect a later, unrelated
+    // motion.
     let startup = matches!(
         boundary,
-        CoroutineBoundary::Start
-            | CoroutineBoundary::Execute
+        CoroutineBoundary::Execute
             | CoroutineBoundary::Effect
             | CoroutineBoundary::Control
             | CoroutineBoundary::Frame
@@ -2568,9 +2472,7 @@ unsafe fn resolve_injection_motion(
 fn injection_frame(boundary: CoroutineBoundary, observed_frame: f32) -> f32 {
     if matches!(
         boundary,
-        CoroutineBoundary::Start
-            | CoroutineBoundary::Call
-            | CoroutineBoundary::Execute
+        CoroutineBoundary::Execute
             | CoroutineBoundary::Effect
             | CoroutineBoundary::Control
             | CoroutineBoundary::Frame
@@ -3006,14 +2908,6 @@ unsafe fn inject_for_lua_state_at_frame(
     // An object's script counts its frames apart from its motion; the motion decides for both.
     let frame_override = frame_override.filter(|_| !crate::slight::hitbox_viewer::is_object(boma));
     let frame = frame_override.unwrap_or_else(|| injection_frame(boundary, observed_frame));
-    // A post-start/call notification is not a reliable native command context. The explicit
-    // start path passes a frame-zero override before the native body runs; a plain lifecycle
-    // notification must not consume an attempt by itself.
-    if matches!(boundary, CoroutineBoundary::Start | CoroutineBoundary::Call)
-        && frame_override.is_none()
-    {
-        return;
-    }
     let (motion, observed_motion) = resolve_injection_motion(boma, boundary, observed_frame);
     let mut reached = Reached {
         observed: injection_frame(boundary, observed_frame),
@@ -3047,20 +2941,10 @@ unsafe fn inject_for_lua_state(
 /// and that accessor, so it must not depend on having observed an effect command from this exact
 /// coroutine first. A newly created effect coroutine can otherwise miss script frame one simply
 /// because its first authored effect is later in the function. The playings make a confirmed
-/// replacement idempotent across the shared ACMD boundaries. Lifecycle-only Start/Call
-/// notifications are deliberately ignored by `inject_for_lua_state`.
+/// replacement idempotent across the shared ACMD boundaries.
 unsafe fn inject_for_acmd(agent: &mut smash::lua2cpp::L2CAgentBase, boundary: CoroutineBoundary) {
     let boma = agent.agent.module_accessor;
     inject_for_lua_state(agent, boma, boundary);
-}
-
-unsafe fn inject_for_acmd_at_frame(
-    agent: &mut smash::lua2cpp::L2CAgentBase,
-    boundary: CoroutineBoundary,
-    frame: f32,
-) {
-    let boma = agent.agent.module_accessor;
-    inject_for_lua_state_at_frame(agent, boma, boundary, Some(frame));
 }
 
 /// The `frame` and `wait` primitives are reliable points inside an ACMD coroutine. The native
@@ -3082,18 +2966,11 @@ unsafe fn inject_before_acmd_wait(lua_state: u64, boundary: CoroutineBoundary) {
     if boma.is_null() {
         return;
     }
-    let observed_frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let startup = take_acmd_startup(lua_state, boma)
-        && (!observed_frame.is_finite() || observed_frame <= 1.0);
     let mut agent = smash::lua2cpp::L2CAgentBase {
         agent: smash::lib::L2CAgent::new(lua_state),
         unk48: [0; 0x10],
     };
-    if startup {
-        inject_for_lua_state_at_frame(&mut agent, boma, boundary, Some(0.0));
-    } else {
-        inject_for_lua_state(&mut agent, boma, boundary);
-    }
+    inject_for_lua_state(&mut agent, boma, boundary);
 }
 
 /// `frame()` carries the script's one-based target even while the native motion accessor is
@@ -3109,10 +2986,6 @@ unsafe fn inject_after_acmd_frame(lua_state: u64, target: f32) {
     if boma.is_null() {
         return;
     }
-    // A startup marker that survived until an absolute wait means the script did not expose a
-    // frame-zero command boundary. Do not reuse it to pretend that the later wait is frame zero;
-    // the pre-start attempt has already covered that exact target.
-    let _ = take_acmd_startup(lua_state, boma);
     let mut agent = smash::lua2cpp::L2CAgentBase {
         agent: smash::lib::L2CAgent::new(lua_state),
         unk48: [0; 0x10],
@@ -3161,6 +3034,10 @@ pub unsafe fn inject_tick(lua_state: u64) {
         clear_motion_hint_atomic(boid);
         return;
     }
+    let step = motion_step(boma);
+    if with_playings(|playings| playings.at(boid, motion, frame, step).tick()) == Some(true) {
+        return;
+    }
     let mut targets: Vec<f32> = spawn_rules::injections_for(motion)
         .into_iter()
         .map(|(_, inject, _)| inject.frame)
@@ -3186,7 +3063,6 @@ pub unsafe fn inject_tick(lua_state: u64) {
         inject_control(&mut agent, boma, motion, CoroutineBoundary::Tick, reached);
         inject_effect(&mut agent, boma, motion, CoroutineBoundary::Tick, reached);
     }
-    let step = motion_step(boma);
     with_playings(|playings| playings.at(boid, motion, frame, step).pass(frame));
 }
 
@@ -3260,9 +3136,8 @@ unsafe fn hook_motion_change_kind(
 }
 
 /// `is_excute` is the boundary immediately before an ACMD block's commands. Some scripts begin
-/// with an effect at frame one and do not call `frame` or `wait` before it, so the startup and
-/// pre-yield hooks alone would observe the request only after the authored call had been
-/// suppressed. Run the same exact-frame injector after the native predicate returns and before
+/// with an effect at frame one and do not call `frame` or `wait` before it, so those hooks
+/// alone would observe the request only after the authored call had been suppressed. Run the same exact-frame injector after the native predicate returns and before
 /// the script executes its command body.
 #[skyline::hook(replace = smash::app::sv_animcmd::is_excute)]
 unsafe fn hook_acmd_is_excute(lua_state: u64) -> bool {
@@ -3288,6 +3163,8 @@ unsafe fn boma_of(lua_state: u64) -> *mut smash::app::BattleObjectModuleAccessor
 #[skyline::hook(replace = smash::app::sv_animcmd::frame)]
 unsafe fn hook_acmd_frame(lua_state: u64, target: f32) {
     crate::slight::hitbox_viewer::script_waits(boma_of(lua_state));
+    // A move's first frame, in a script that has nothing on it before this wait.
+    inject_before_acmd_wait(lua_state, CoroutineBoundary::Frame);
     original!()(lua_state, target);
     follow_script(lua_state, ScriptStep::Reached(target));
     inject_after_acmd_frame(lua_state, target);
@@ -3302,12 +3179,10 @@ unsafe fn hook_acmd_wait(lua_state: u64, target: f32) {
     inject_before_acmd_wait(lua_state, CoroutineBoundary::Wait);
 }
 
-// These four live in `lua2cpp_common`, not the main executable. At plugin load that module is
+// These two live in `lua2cpp_common`, not the main executable. At plugin load that module is
 // not mapped yet, so their imports are unresolved: Skyline silently skipped the hook and ozone
 // aborts on it. Each one is installed once its symbol resolves, at boot or when a lua2cpp module
 // loads.
-const CALL_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase14call_coroutineEiN3phx6Hash40E\0";
-const START_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase15start_coroutineEiN3phx6Hash40ERi\0";
 const RESUME_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase16resume_coroutineEiRi\0";
 const EFFECT_COMMON_CTOR: &[u8] = b"_ZN7lua2cpp29L2CFighterAnimcmdEffectCommonC1EPN3app12BattleObjectEPNS1_26BattleObjectModuleAccessorEP9lua_State\0";
 
@@ -3317,8 +3192,6 @@ fn module_target(import: *const (), mangled: &[u8]) -> *const u8 {
 
 // Address each hook below installs on; written just before its install call. skyline's hook
 // macro only accepts a path for `replace`, and casts it inside its own `unsafe` block.
-static mut CALL_COROUTINE_TARGET: usize = 0;
-static mut START_COROUTINE_TARGET: usize = 0;
 static mut RESUME_COROUTINE_TARGET: usize = 0;
 static mut EFFECT_COMMON_CTOR_TARGET: usize = 0;
 
@@ -3329,25 +3202,7 @@ struct ModuleHook {
     installed: std::sync::atomic::AtomicBool,
 }
 
-static MODULE_HOOKS: [ModuleHook; 4] = [
-    ModuleHook {
-        name: "call_coroutine",
-        symbol: || module_target(smash::lua2cpp::L2CAgentBase_call_coroutine as *const (), CALL_COROUTINE),
-        install: |target| unsafe {
-            CALL_COROUTINE_TARGET = target;
-            skyline::install_hook!(hook_call_coroutine);
-        },
-        installed: std::sync::atomic::AtomicBool::new(false),
-    },
-    ModuleHook {
-        name: "start_coroutine",
-        symbol: || module_target(smash::lua2cpp::L2CAgentBase_start_coroutine as *const (), START_COROUTINE),
-        install: |target| unsafe {
-            START_COROUTINE_TARGET = target;
-            skyline::install_hook!(hook_start_coroutine);
-        },
-        installed: std::sync::atomic::AtomicBool::new(false),
-    },
+static MODULE_HOOKS: [ModuleHook; 2] = [
     ModuleHook {
         name: "resume_coroutine",
         symbol: || module_target(smash::lua2cpp::L2CAgentBase_resume_coroutine as *const (), RESUME_COROUTINE),
@@ -3405,47 +3260,6 @@ fn install_module_hook_retry() {
         skyline::println!("[SLight] nro hook unavailable; lua2cpp_common hooks stay inactive");
         crate::slight::diag::note("lua2cpp module hooks=unavailable (no nro hook)");
     }
-}
-
-/// `call_coroutine` is retained as a lifecycle hook for the pinned runtime, but it is not a live
-/// dispatch point: its callback runs before the ACMD has necessarily reached a valid command
-/// context, and `inject_for_lua_state` intentionally returns for this boundary.
-#[skyline::hook(replace = CALL_COROUTINE_TARGET)]
-unsafe fn hook_call_coroutine(
-    agent: *mut smash::lua2cpp::L2CAgentBase,
-    coroutine_index: i32,
-    name: smash::phx::Hash40,
-) -> smash::lib::L2CValue {
-    if !agent.is_null() {
-        // Some runtime paths enter the first ACMD slice from `call_coroutine` rather than
-        // `start_coroutine`. The marker is idempotent and lets the first `is_excute`/effect
-        // command use the same frame-zero startup normalization in either ordering.
-        remember_acmd_startup(agent);
-    }
-    let result = original!()(agent, coroutine_index, name);
-    if !agent.is_null() {
-        inject_for_acmd(&mut *agent, CoroutineBoundary::Call);
-    }
-    result
-}
-
-#[skyline::hook(replace = START_COROUTINE_TARGET)]
-unsafe fn hook_start_coroutine(
-    agent: *mut smash::lua2cpp::L2CAgentBase,
-    coroutine_index: i32,
-    name: smash::phx::Hash40,
-    state: u64,
-) -> smash::lib::L2CValue {
-    if !agent.is_null() {
-        remember_acmd_startup(agent);
-        // The native start call immediately executes the first ACMD slice. A post-start hook is
-        // therefore already too late for script frame one; use the same initialized agent before
-        // entering the body, then let the startup marker provide one exact-frame retry at the
-        // first `is_excute`/effect/control boundary if the native call did not confirm.
-        inject_for_acmd_at_frame(&mut *agent, CoroutineBoundary::Start, 0.0);
-    }
-    let result = original!()(agent, coroutine_index, name, state);
-    result
 }
 
 #[skyline::hook(replace = RESUME_COROUTINE_TARGET)]
