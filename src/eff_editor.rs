@@ -8369,6 +8369,9 @@ pub(crate) enum SendOutcome {
     NoMatch,
     /// The match did not take it; the staged files load at the next match.
     NextMatch,
+    /// The game dropped the last edit, but loaded changed effects with the fighter that can't be
+    /// put back without loading it again.
+    NextLoad,
 }
 
 impl SendOutcome {
@@ -8380,6 +8383,7 @@ impl SendOutcome {
             Self::NotBuilt => "Not sent: the edit could not be built",
             Self::NoMatch => "Saved for the next match",
             Self::NextMatch => "Not in this match: it loads at the next match",
+            Self::NextLoad => "Its own effects come back when the fighter loads again",
         }
     }
 
@@ -8388,7 +8392,7 @@ impl SendOutcome {
         match self {
             Self::InGame | Self::Restored => "In the game",
             Self::Unreadable | Self::NotBuilt => "Not sent",
-            Self::NoMatch | Self::NextMatch => "Saved for the next match",
+            Self::NoMatch | Self::NextMatch | Self::NextLoad => "Saved for the next match",
         }
     }
 

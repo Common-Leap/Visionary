@@ -35,6 +35,7 @@ mod frame_data;
 mod game_link;
 mod gimmicks;
 mod hash_macros;
+mod live_carrier;
 mod mod_export;
 mod mod_import;
 mod mod_project;

@@ -1111,7 +1111,7 @@ impl FighterMod {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EffMod {
     /// Source .eff path relative to the dump export root,
     /// e.g. "effect/fighter/mario/ef_mario.eff".
@@ -1354,7 +1354,7 @@ pub struct TextureAddition {
 
 /// One emitter's edited authored fields. Names are stored alongside indices; appliers
 /// prefer the name match and fall back to the index with a warning (dump-revision drift).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthoredEdit {
     /// The EMITTER SET name (e.g. `P_KirbyDash`) — what `apply_authored` matches against
     /// `ptcl.emitter_list.emitter_sets[].name`.
@@ -1504,12 +1504,15 @@ pub const TRANSPLANT_SUFFIX: &str = "_tp";
 /// OWN eff under its ORIGINAL entry name (`rebuild_eff_bytes` → `apply_authored`); the clone
 /// exists purely so the running game can be updated without a reload it does not support.
 pub const EDIT_CLONE_PREFIX: &str = "vsnedit_";
+/// Where the live carrier keeps a borrowed effect two characters have different versions of.
+pub const EDIT_COPY_PREFIX: &str = "vsncopy_";
 
 /// True if `name` is in a namespace Visionary reserves for its own generated entries.
 ///
 /// Used to keep user-chosen transplant names out of the editor's internal namespace.
 pub fn is_reserved_entry_name(name: &str) -> bool {
-    name.trim().to_lowercase().starts_with(EDIT_CLONE_PREFIX)
+    let name = name.trim().to_lowercase();
+    name.starts_with(EDIT_CLONE_PREFIX) || name.starts_with(EDIT_COPY_PREFIX)
 }
 
 /// A TRANSPLANT: copy an emitter set from a donor eff into this fighter's eff, either
@@ -1521,7 +1524,7 @@ pub fn is_reserved_entry_name(name: &str) -> bool {
 /// Was named `OneSlotOp` before the transplant/one-slot split. The struct name is invisible
 /// to serde, but the renamed `one_slot_slots` field carries a `serde(alias)` for its old
 /// on-disk name (`slots`) so projects saved before the split still load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransplantOp {
     pub new_entry_name: String,
     /// Donor .eff relative to the export root ("" = same file as the target).

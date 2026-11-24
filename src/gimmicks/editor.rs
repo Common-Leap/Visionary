@@ -577,9 +577,14 @@ impl GimmicksEditor {
     }
 
     pub fn invalidate(&mut self) {
-        let enabled = self.live.enabled;
+        let (enabled, held) = (self.live.enabled, self.live.held);
         *self = Self::default();
-        self.live.enabled = enabled;
+        (self.live.enabled, self.live.held) = (enabled, held);
+    }
+
+    /// Keep everything out of the running game (`hold`), or show it again.
+    pub fn hold_live(&mut self, hold: bool) {
+        self.live.hold(hold);
     }
 
     fn parameters(&mut self, ui: &mut Ui, data: &mut EditorData<'_>) {

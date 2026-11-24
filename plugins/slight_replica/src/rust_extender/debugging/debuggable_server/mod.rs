@@ -298,6 +298,9 @@ pub fn notify_gimmick_agents() {
                 "kind": record.kind,
                 "entry_id": record.entry_id,
                 "owner_boid": owner_boid,
+                "costume": fighter.map(|_| {
+                    crate::slight::gimmicks::live_behavior::costume_of(record.boid)
+                }),
                 "fighter": fighter,
             }))
         })
@@ -550,10 +553,6 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
             // Editor deployed/updated merged eff files on the SD — refresh the served map
             // (content is re-read per load; only NEW paths need registration here).
             "live_eff_reload" => crate::slight::effect_viewer::live_eff::reload(),
-            // Diagnostic: verify what Arcropolis serves + what the game holds resident.
-            "live_eff_probe" => {
-                crate::slight::effect_viewer::live_eff::probe();
-            }
             // Live memory inspection — result hexdump lands in sd:/effect_viewer_peek.txt
             // (the Eden SD is host-visible, so the PC reads it directly). `addr` is absolute
             // hex, or text-relative when "rel":"text". Bounded to 4 KiB per request.
@@ -1111,7 +1110,8 @@ pub fn notify_carrier_status(state: u8, kinds: usize, spawned: bool, generation:
         "CarrierStatus",
         &serde_json::json!({
             "CarrierStatus": {
-                "state": state, "kinds": kinds, "spawned": spawned, "gen": generation
+                "state": state, "kinds": kinds, "spawned": spawned, "gen": generation,
+                "staged": crate::slight::effect_viewer::live_eff::in_the_game(),
             }
         }),
     );

@@ -78,6 +78,22 @@ pub fn emulator_sd_root() -> Option<PathBuf> {
     most_active_sd_root(sd_root_candidates())
 }
 
+/// The mods ARCropolis loads on the game's SD card: it skips folders whose name starts with a dot.
+pub fn installed_mods() -> Vec<PathBuf> {
+    let mods = emulator_sd_root().map(|sd| sd.join("ultimate").join("mods"));
+    let entries = mods.and_then(|dir| std::fs::read_dir(dir).ok());
+    let mut mods: Vec<PathBuf> = entries
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    mods.sort();
+    mods
+}
+
 /// The valid SD root among `candidates` with the newest game activity; the earliest wins a tie.
 fn most_active_sd_root(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     let mut best: Option<(Option<std::time::SystemTime>, PathBuf)> = None;

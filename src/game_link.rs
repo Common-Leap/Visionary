@@ -425,7 +425,7 @@ impl ArticleCaptureLine {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SpawnRuleWire {
     pub eff_hash: u64,
     pub suppress: bool,
@@ -497,7 +497,7 @@ pub struct SpawnRuleWire {
 }
 
 /// Wire form of plugin `spawn_rules::SpawnInject` — a captured EFFECT spawn to replay.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SpawnInjectWire {
     pub frame: f32,
     pub func: String,
@@ -509,7 +509,7 @@ pub struct SpawnInjectWire {
 
 /// One live effect point-control rule. Matching includes the captured argument vector so two
 /// `ENABLE_AREA` calls on one frame cannot suppress each other accidentally.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EffectControlRuleWire {
     pub motion: Option<u64>,
     pub func: String,
@@ -529,7 +529,7 @@ pub struct EffectControlRuleWire {
     pub inject: Option<EffectControlInjectWire>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EffectControlInjectWire {
     pub frame: f32,
     pub func: String,
@@ -984,7 +984,7 @@ pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
 }
 
 /// Sparse ATTACK-arg overrides (plugin `HbOverrides`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HbOverridesWire {
     /// Complete AREA_WIND argument vector when a wind payload changes. Wind calls do not share
@@ -1195,7 +1195,7 @@ pub struct HbOverridesWire {
     pub expression_args: Option<Vec<LuaArgWire>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InjectRuleWire {
     pub frame: f32,
     pub args: Vec<LuaArgWire>,
@@ -1277,7 +1277,7 @@ fn is_zero_u8(v: &u8) -> bool {
 
 /// `frame_start`/`frame_end` scope suppress/override to ONE hit so multi-hit moves (which
 /// reuse the same id across frames) stay independent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HitboxRuleWire {
     pub motion: u64,
     /// Rule family: 0 attack, 1 grab, 2 wind, and 11 `REVERSE_LR`. Omitted when 0 so old
@@ -1743,6 +1743,9 @@ pub struct LiveGimmickAgent {
     pub entry_id: i32,
     pub owner_boid: Option<u32>,
     pub fighter: Option<String>,
+    /// The costume a fighter wears; `None` for an object, or from a plugin that does not say.
+    #[serde(default)]
+    pub costume: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -2135,6 +2138,7 @@ struct Shared {
     /// it into a status line and stops waiting — a rejected push never advances `carrier_gen`,
     /// so without this the editor waits for a carrier that is never coming.
     carrier_error: Option<String>,
+    staged_effects: Option<Vec<(u64, u64)>>,
     /// Asset-carrier progress. These files are never installed by resident-buffer mutation.
     asset_bundle_target: String,
     asset_bundle_generation: u64,
@@ -2212,7 +2216,6 @@ const IDEMPOTENT_COMMAND_MARKERS: &[&str] = &[
     r#""command":"reset_pins""#,
     r#""command":"clear_acmd_captures""#,
     r#""command":"live_eff_reload""#,
-    r#""command":"live_eff_probe""#,
 ];
 
 const GIMMICK_OPERATION_MARKER: &str = r#""gimmick_operation":"#;
@@ -2349,6 +2352,7 @@ impl Default for Shared {
             carrier_seq: 0,
             carrier_gen: 0,
             carrier_error: None,
+            staged_effects: None,
             asset_bundle_target: String::new(),
             asset_bundle_generation: 0,
             asset_bundle_staged: 0,
@@ -3170,18 +3174,6 @@ impl GameLink {
         }
     }
 
-    /// Ask the plugin to write `sd:/effect_viewer_probe.txt` (serving-chain diagnosis).
-    pub fn send_live_eff_probe(&self) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let frame = "<TCP_MESSAGE>{\"command\":\"live_eff_probe\"}</TCP_MESSAGE>".to_string();
-        if let Ok(mut s) = self.shared.lock() {
-            push_outbox_capped(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
-    }
-
     /// Lines from the MOST RECENT playback of `motion` by `kind` — one performance, never a
     /// merge of several.
     ///
@@ -3305,6 +3297,12 @@ impl GameLink {
     /// Donor-bytes generation of the carrier currently live in game.
     pub fn carrier_gen(&self) -> u64 {
         self.shared.lock().map(|s| s.carrier_gen).unwrap_or(0)
+    }
+
+    /// The path and stamp of each staged effect file the game holds (see `live_eff`), once this
+    /// connection has reported them.
+    pub fn staged_effects(&self) -> Option<Vec<(u64, u64)>> {
+        self.shared.lock().ok()?.staged_effects.clone()
     }
 
     /// Take the reason the plugin rejected the last carrier push, clearing it.
@@ -3711,6 +3709,7 @@ fn reset_session(s: &mut Shared) {
     s.gimmick_feature_capabilities = None;
     s.gimmick_feature_capabilities_seq = None;
     s.gimmick_operations_in_flight = 0;
+    s.staged_effects = None;
     s.last_rx = None;
     s.replaced = false;
 }
@@ -4396,6 +4395,8 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.carrier_kinds = c.get("kinds").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             s.carrier_gen = c.get("gen").and_then(|v| v.as_u64()).unwrap_or(0);
             s.carrier_seq += 1;
+            let staged = c.get("staged").cloned();
+            s.staged_effects = staged.and_then(|staged| serde_json::from_value(staged).ok());
         }
         "CarrierError" => {
             s.carrier_error = body
@@ -4753,11 +4754,30 @@ mod plugin_costume_scope;
 #[cfg(test)]
 mod costume_scope_tests {
     use super::plugin_costume_scope::{
-        costume_is, name_objects, prefer_specific_costumes, rule_color, runs_on, Acting,
-        CostumeScoped, MoveScope, RuleScope,
+        costume_is, name_objects, prefer_specific_costumes, rule_color, runs_on, worn_costume,
+        Acting, CostumeScoped, MoveScope, RuleScope,
     };
     use super::ForFighter;
     use crate::roster::RosterKey;
+
+    /// An edited effect reaches its character's costumes whatever spawns it: Mario's fireball has
+    /// no costume of its own, and its own work values read as one.
+    #[test]
+    fn an_objects_effect_is_on_the_costume_of_the_fighter_that_made_it() {
+        assert_eq!(worn_costume(7, -1), 7);
+        assert_eq!(worn_costume(-1, 7), 7);
+        assert_eq!(worn_costume(-1, -1), -1);
+        assert_eq!(worn_costume(0, 7), 0);
+        let hooks =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
+        let costume = hooks
+            .split("unsafe fn costume_of(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("costume_of");
+        assert!(costume.contains("acting_costume(boma)"));
+        assert!(!costume.contains("FIGHTER_INSTANCE_WORK_ID_INT_COLOR"));
+    }
 
     fn roster_with_vision() -> crate::mod_project::RosterMod {
         let mut roster = crate::mod_project::RosterMod::default();
@@ -6911,6 +6931,28 @@ mod tests {
         }
     }
 
+    /// The game says which staged effect files it holds; a new game holds none of them.
+    #[test]
+    fn the_effects_the_game_holds_come_with_the_carrier_report() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let report = |staged: &str| {
+            let body = format!(
+                r#"{{"header":"CarrierStatus","body":{{"CarrierStatus":{{"state":2,"kinds":7,"spawned":true,"gen":3{staged}}}}}}}"#
+            );
+            handle_frame(&shared, &body);
+            shared.lock().unwrap().staged_effects.clone()
+        };
+        // A plugin that does not say, and one that says none.
+        assert_eq!(report(""), None);
+        assert_eq!(report(r#","staged":[]"#), Some(Vec::new()));
+        // A path and a stamp use all 64 bits.
+        let held = report(r#","staged":[[5,18446744073709551615],[6,7]]"#);
+        assert_eq!(held, Some(vec![(5, u64::MAX), (6, 7)]));
+        assert_eq!(shared.lock().unwrap().carrier_gen, 3);
+        reset_session(&mut shared.lock().unwrap());
+        assert_eq!(shared.lock().unwrap().staged_effects, None);
+    }
+
     /// Effect, sound, game, and expression ACMD coroutines can enter the live-retime scheduler
     /// from different game workers. Its startup markers and motion hints used to share three
     /// blocking `parking_lot` collections; a contended waiter can spin forever on Horizon even
@@ -9047,7 +9089,6 @@ mod tests {
         link.send_effect_names(&["example".into()]);
         link.send_reset_pins();
         link.send_live_eff_reload();
-        link.send_live_eff_probe();
         link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
         assert!(
             link.shared.lock().unwrap().outbox.is_empty(),
@@ -9065,11 +9106,10 @@ mod tests {
         link.send_effect_names(&["example".into()]);
         link.send_reset_pins();
         link.send_live_eff_reload();
-        link.send_live_eff_probe();
         link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
         assert_eq!(
             link.shared.lock().unwrap().outbox.len(),
-            12,
+            11,
             "the finished import can publish one message per protocol family"
         );
     }

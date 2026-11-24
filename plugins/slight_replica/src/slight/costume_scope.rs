@@ -27,6 +27,15 @@ pub fn rule_color(acting_color: i32, rule_kind: Option<i32>, founder: Option<(i3
     }
 }
 
+/// The costume of the fighter behind a call: its own, or for an object that of the fighter that
+/// made it. -1 when neither is known.
+pub fn worn_costume(color: i32, founder_color: i32) -> i32 {
+    match color {
+        -1 => founder_color,
+        color => color,
+    }
+}
+
 /// Who is making the call a rule is tested against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acting {

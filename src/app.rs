@@ -3302,11 +3302,14 @@ pub(crate) fn effect_name_hash(name: &str) -> u64 {
 /// Callers must SAY when they drop an op. Dropping one silently is what produced the original
 /// report: no carrier op meant no carrier, no spec, and an editor waiting forever on a carrier
 /// generation that was never coming.
-fn rides_the_carrier(src_file_rel: &str) -> bool {
+pub(crate) fn rides_the_carrier(src_file_rel: &str) -> bool {
     !src_file_rel.is_empty()
 }
 
-fn carrier_stored_name(op: &crate::mod_project::TransplantOp, own_prefix: Option<&str>) -> String {
+pub(crate) fn carrier_stored_name(
+    op: &crate::mod_project::TransplantOp,
+    own_prefix: Option<&str>,
+) -> String {
     let donor_rel = op.src_file_rel.to_lowercase();
     let donor_name = op.src_set_name.to_lowercase();
     // Reusing the donor's name is only safe when nothing else in the match answers to it. The
@@ -3876,6 +3879,36 @@ fn alias_status_is_routine(status: &str) -> bool {
 /// `n` with the singular or plural noun: "1 edited effect", "2 edited effects".
 fn counted(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The move edits that were in the game when it was put back to normal.
+struct PutBack {
+    hitboxes: HashMap<String, Vec<crate::game_link::HitboxRuleWire>>,
+    effects: HashMap<String, Vec<crate::game_link::SpawnRuleWire>>,
+    controls: HashMap<String, Vec<crate::game_link::EffectControlRuleWire>>,
+}
+
+/// Whether a move's edits stay out of the game after it was put back to normal: they do until the
+/// move is edited again.
+fn held_back<R: PartialEq>(held: Option<&HashMap<String, Vec<R>>>, key: &str, rules: &[R]) -> bool {
+    held.and_then(|held| held.get(key))
+        .is_some_and(|held| held == rules)
+}
+
+/// The send to judge by what the game reports, once it has left: until then the report, and
+/// whether there are new bytes for the game to read, are still the last send's.
+fn send_to_judge(
+    awaiting: Option<std::time::Instant>,
+    not_sent_yet: bool,
+) -> Option<std::time::Instant> {
+    awaiting.filter(|_| !not_sent_yet)
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// What a send carries, counted in effects: "1 edited effect and 2 borrowed effects".
@@ -5474,16 +5507,23 @@ pub struct VisionaryApp {
     transplant_replace_search: String,
     /// After a transplant: uses of the donor effect offered for per-use redirect.
     redirect_prompt: Option<RedirectPrompt>,
-    /// Fighters whose merged eff is live-served to the running game (Eden SD +
-    /// arcropolis callback) — their cross-fighter aliases are dropped so the REAL
-    /// entry (loaded on match re-entry) isn't masked.
-    live_eff_deployed: std::collections::HashSet<String>,
+    /// Whose merged eff is staged for the game's next load of it, and the edits it has.
+    live_eff_deployed: HashMap<String, crate::mod_project::EffMod>,
+    /// The game path and the changed effects of each staged file, by its path and stamp. The game
+    /// says which of them it holds.
+    live_eff_staged: HashMap<(u64, u64), (String, BTreeSet<String>)>,
+    /// Which of them the game last said it holds.
+    staged_effects_seen: Vec<(u64, u64)>,
+    /// The character open when effects were last sent.
+    sent_owner: Option<String>,
+    /// The fighters whose edits were in what was sent.
+    carrier_fighters: Vec<String>,
+    /// Set by "Put the game back to normal": the move edits then in the game, which stay out of it
+    /// until everything is sent again, or the move is edited.
+    put_back: Option<PutBack>,
     /// Fighters whose merged-preview build failed this session (retried after the next
     /// transplant record instead of every frame; shown as ⚠ in the eff editor).
     merged_build_failed: std::collections::HashSet<String>,
-    /// When set, send a `live_eff_probe` to the plugin at this time (a few seconds after
-    /// a deploy, so the game's async re-loads have settled before the diagnosis runs).
-    live_eff_probe_due: Option<std::time::Instant>,
     /// Fingerprint of the carrier bytes last handed to the game. The game keeps the live
     /// carrier when the same bytes arrive again, so such a send must not wait for a new read.
     last_carrier_fingerprint: Option<u64>,
@@ -6119,9 +6159,13 @@ impl VisionaryApp {
             transplant_replace: None,
             transplant_replace_search: String::new(),
             redirect_prompt: None,
-            live_eff_deployed: std::collections::HashSet::new(),
+            live_eff_deployed: HashMap::new(),
+            live_eff_staged: HashMap::new(),
+            staged_effects_seen: Vec::new(),
+            sent_owner: None,
+            carrier_fighters: Vec::new(),
+            put_back: None,
             merged_build_failed: std::collections::HashSet::new(),
-            live_eff_probe_due: None,
             last_carrier_fingerprint: None,
             status_edit_rev: 0,
             carrier_send_armed: false,
@@ -7137,7 +7181,7 @@ impl VisionaryApp {
                 source_rel: eff.source_rel.clone(),
                 ..Default::default()
             };
-            if self.live_eff_deployed.contains(&owner) {
+            if self.live_eff_deployed.contains_key(&owner) {
                 self.deploy_live_eff(&owner);
             }
             self.eff_mods.remove(&owner);
@@ -7165,10 +7209,7 @@ impl VisionaryApp {
                 let base = self.resolve_eff_source(&source_rel);
                 self.drop_merged_preview(&owner, &base);
             }
-            let live_removed = self.remove_live_eff_for_fighter(&fighter);
-            if live_removed {
-                self.live_eff_probe_due = None;
-            }
+            self.remove_live_eff_for_fighter(&fighter);
             self.eff_editor.forget_fighter(&fighter);
             self.eff_mods
                 .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
@@ -25089,11 +25130,13 @@ impl VisionaryApp {
     /// and reconnect sends. Retain keyed rules so reverting a recipe can restore flat preview.
     fn live_hitbox_rule_union(
         &self,
+        put_back: Option<&PutBack>,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::HitboxRuleWire>> {
         let roster = &self.roster.project;
         self.hitbox_rules_store
             .iter()
             .filter(|(key, _)| self.allows_flat(key, false))
+            .filter(|(key, rules)| !held_back(put_back.map(|held| &held.hitboxes), key, rules))
             .flat_map(|(key, rules)| {
                 // A call added inside an If only fires when the If passes.
                 let guards = crate::character::parse_move_key(&rule_move_key(key))
@@ -25254,11 +25297,13 @@ impl VisionaryApp {
 
     fn live_effect_rule_union(
         &self,
+        put_back: Option<&PutBack>,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::SpawnRuleWire>> {
         let roster = &self.roster.project;
         self.effect_rules_store
             .iter()
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .filter(|(key, rules)| !held_back(put_back.map(|held| &held.effects), key, rules))
             .flat_map(|(key, rules)| {
                 // An effect added inside an If only fires when the If passes.
                 let guards = crate::character::parse_move_key(key)
@@ -25292,11 +25337,13 @@ impl VisionaryApp {
 
     fn live_effect_control_rule_union(
         &self,
+        put_back: Option<&PutBack>,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::EffectControlRuleWire>> {
         let roster = &self.roster.project;
         self.effect_control_rules_store
             .iter()
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .filter(|(key, rules)| !held_back(put_back.map(|held| &held.controls), key, rules))
             .flat_map(|(key, rules)| {
                 let motions = self.object_rule_motions(key, "effect");
                 rules.iter().cloned().flat_map(move |rule| {
@@ -25312,17 +25359,17 @@ impl VisionaryApp {
     }
 
     fn publish_hitbox_rules(&self) {
-        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
+        let hitboxes: Vec<_> = self.live_hitbox_rule_union(self.put_back.as_ref());
         self.game_link.send_hitbox_rules(&hitboxes);
     }
 
     fn publish_effect_rules(&self) {
-        let effects: Vec<_> = self.live_effect_rule_union();
+        let effects: Vec<_> = self.live_effect_rule_union(self.put_back.as_ref());
         self.game_link.send_spawn_rules(&effects);
     }
 
     fn publish_effect_control_rules(&self) {
-        let controls: Vec<_> = self.live_effect_control_rule_union();
+        let controls: Vec<_> = self.live_effect_control_rule_union(self.put_back.as_ref());
         self.game_link.send_effect_control_rules(&controls);
     }
 
@@ -26631,6 +26678,9 @@ impl VisionaryApp {
         self.game_link.end_project_batch();
         self.game_link.send_reset_pins();
         self.publish_live_rule_union();
+        // The batch held back everything the old project had in the game.
+        self.push_effect_aliases_quietly();
+        self.game_link.send_live_eff_reload();
         self.project_name = crate::mod_export::slugify(name);
         // Adopt the scaffolded file immediately: edits autosave here from now on.
         let project = self.build_project();
@@ -27907,11 +27957,11 @@ impl VisionaryApp {
         std::fs::create_dir_all(dest)?;
         std::fs::copy(plugin, dest.join("plugin.nro"))?;
         // An object's script is not part of the project, so its live edits are not exported.
-        let mut hitboxes = self.live_hitbox_rule_union();
+        let mut hitboxes = self.live_hitbox_rule_union(None);
         hitboxes.retain(|rule| rule.agent.is_none());
-        let mut effects = self.live_effect_rule_union();
+        let mut effects = self.live_effect_rule_union(None);
         effects.retain(|rule| rule.agent.is_none());
-        let mut controls = self.live_effect_control_rule_union();
+        let mut controls = self.live_effect_control_rule_union(None);
         controls.retain(|rule| rule.agent.is_none());
         let mut messages = vec![
             serde_json::json!({ "hitbox_rules": hitboxes }).to_string(),
@@ -28302,6 +28352,13 @@ impl VisionaryApp {
             errors.push(format!(
                 "{file} is not listed for its costume in config.json, so the game would crash when that costume is picked"
             ));
+        }
+
+        // The game loads one mod's file at a path, so another mod's can hide this one's.
+        for shadow in crate::eff_source::shadowed(&mod_root, &crate::scratch_dirs::installed_mods())
+        {
+            report.insert(0, format!("⚠ {shadow}"));
+            warnings.push(shadow);
         }
 
         // 3. Mod-folder exports compile the generated plugin in the background and keep the NRO
@@ -29055,7 +29112,7 @@ impl VisionaryApp {
     /// dump/mod EFF is deliberately outside this path and is never touched here.
     fn remove_live_eff_for_fighter(&mut self, fighter: &str) -> bool {
         let mut changed = false;
-        self.live_eff_deployed.retain(|name| {
+        self.live_eff_deployed.retain(|name, _| {
             let keep = !name.eq_ignore_ascii_case(fighter);
             if !keep {
                 changed = true;
@@ -29137,7 +29194,45 @@ impl VisionaryApp {
             .send_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
         self.game_link
             .send_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
-        self.game_link.send_effect_aliases(&[]);
+        self.put_back = None;
+        self.gimmicks_editor.hold_live(false);
+        self.clear_staged_game_files();
+        self.state.status = "Cleared all in-game edits.".into();
+    }
+
+    /// Take every change out of the running game, and leave it out until it is sent again. The
+    /// carrier goes too, or where the game loaded changed effects with their fighter it has the
+    /// game's own.
+    fn put_game_back(&mut self) {
+        self.put_back = Some(PutBack {
+            hitboxes: self.hitbox_rules_store.clone(),
+            effects: self.effect_rules_store.clone(),
+            controls: self.effect_control_rules_store.clone(),
+        });
+        self.game_link.send_reset_pins();
+        self.publish_live_rule_union();
+        self.gimmicks_editor.hold_live(true);
+        self.clear_staged_game_files();
+        self.push_effect_aliases_quietly();
+        self.eff_editor.forget_send_result();
+        if self.eff_mods.values().any(|eff| !eff.is_empty()) {
+            self.eff_editor.mark_unsent();
+        }
+        self.state.status = "The game is back to normal.".into();
+    }
+
+    /// Sending again puts back in the game what "Put the game back to normal" took out.
+    fn send_again(&mut self) {
+        if self.put_back.take().is_none() {
+            return;
+        }
+        self.publish_live_rule_union();
+        self.live_overrides.resend_tweaks(&self.game_link);
+        self.gimmicks_editor.hold_live(false);
+    }
+
+    /// Take back what the game would load with its fighters.
+    fn clear_staged_game_files(&mut self) {
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
         // staged for the project that was just closed.
@@ -29148,17 +29243,6 @@ impl VisionaryApp {
                 target: String::new(),
                 files: Vec::new(),
             });
-        // Tear the live CARRIER down too. Authored colour edits are cloned into it (the
-        // fighter's own eff cannot be reloaded mid-match), so without this they survive a
-        // "clear all" and keep rendering — the carrier's donor bytes stay resident in the
-        // plugin and its aliases get re-registered on the next spawn.
-        //
-        // Same order as the publish path: bytes first, then specs. Empty is meaningful — it
-        // is what tells the plugin to drop the old carrier rather than keep serving it.
-        self.game_link.send_donor_bytes(&[]);
-        self.game_link.send_donor_effs(&[]);
-        self.carrier_push_callers.clear();
-        self.carrier_push_reports = false;
         // Stop serving merged eff files: wipe the SD-side manifest + files (the plugin's
         // registrations stay for this boot but resolve to nothing → vanilla files load).
         if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
@@ -29166,8 +29250,8 @@ impl VisionaryApp {
             .filter(|d| d.is_dir())
         {
             let _ = std::fs::remove_dir_all(&dir);
-            self.game_link.send_live_eff_reload();
         }
+        self.game_link.send_live_eff_reload();
         // Also remove the guaranteed-fallback Arcropolis mod staged by deploy_live_eff
         // (takes effect on the next boot — the off-switch mirror of the staged mod).
         if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
@@ -29178,9 +29262,6 @@ impl VisionaryApp {
         }
         self.live_eff_deployed.clear();
         self.pin_sync_prompt = None;
-        self.state.status = "Cleared all in-game edits (saved pins + live rules + aliases + \
-             live carrier + live eff files)."
-            .into();
     }
 
     // ── Live ACMD capture + live hitbox rules ─────────────────────────────────
@@ -36445,6 +36526,136 @@ impl VisionaryApp {
         }
     }
 
+    /// Every character's part of the carrier: what the project changes, or after "Put the game
+    /// back to normal" only the game's own effects.
+    fn carrier_shares(
+        &self,
+        using_texture: &dyn Fn(&str, &str) -> Vec<crate::live_carrier::Effect>,
+    ) -> Vec<crate::live_carrier::Share> {
+        let nothing = crate::mod_project::EffMod::default();
+        let edits = |owner: &str| match &self.put_back {
+            Some(_) => None,
+            None => self.eff_mods.get(owner),
+        };
+        let held = self.held_effect_files();
+        // The fighters whose file the game loaded changed, and the characters made on them.
+        let loaded = held.iter().flat_map(|(rel, _)| {
+            let owner = self.eff_owner(rel);
+            let fighter = crate::character::CharacterKey::parse(&owner);
+            let made = crate::character::made_on(fighter.engine_fighter(), &self.roster.project);
+            let made: Vec<String> = made.map(|entry| entry.key.as_str().to_owned()).collect();
+            std::iter::once(owner).chain(made)
+        });
+        let owners: BTreeSet<String> = self.eff_mods.keys().cloned().chain(loaded).collect();
+        let shares = owners.iter().map(|owner| {
+            let eff = edits(owner).unwrap_or(&nothing);
+            let key = crate::character::CharacterKey::parse(owner);
+            let source_rel = match eff.source_rel.is_empty() {
+                true => key.effect_rel(&self.roster.project),
+                false => eff.source_rel.to_lowercase(),
+            };
+            let using = |texture: &str| using_texture(&source_rel, texture);
+            let changed = crate::live_carrier::changed_effects(eff, &using);
+            // The file the game has for it: its own, or with none the fighter's.
+            let file = match self.game_has_effect_file(&source_rel) {
+                true => source_rel.clone(),
+                false => {
+                    let fighter = key.engine_fighter();
+                    format!("effect/fighter/{fighter}/ef_{fighter}.eff")
+                }
+            };
+            let restore: BTreeSet<String> = held
+                .iter()
+                .filter(|(rel, _)| *rel == file)
+                .flat_map(|(_, entries)| entries.difference(&changed).cloned())
+                .collect();
+            let costumes = self.eff_costumes(owner);
+            // A borrowed effect reaches only its owner's costumes; one added to a fighter's
+            // own file, every costume that shares its moves, as the export writes it.
+            let borrowed_costumes = |op: &crate::mod_project::TransplantOp| {
+                if !op.one_slot_slots.is_empty() {
+                    op.one_slot_slots.clone()
+                } else if op.replace_entry.is_none() && !owner.contains('#') {
+                    let roster = &self.roster.project;
+                    effect_costumes(owner, &self.state.fighters, roster, &|_| false)
+                } else {
+                    costumes.clone()
+                }
+            };
+            crate::live_carrier::Share::new(&crate::live_carrier::ShareOf {
+                owner: &owner.to_lowercase(),
+                fighter: key.engine_fighter(),
+                eff,
+                source_rel: &source_rel,
+                costumes: &costumes,
+                borrowed_costumes: &borrowed_costumes,
+                using_texture: &using,
+                restore: &restore,
+            })
+        });
+        shares
+            .filter(|share| !share.is_empty())
+            .filter(|share| fighter_kind_id(&share.fighter).is_some())
+            .collect()
+    }
+
+    /// The effect files the game loaded changed, and the effects changed in each, as far as this
+    /// session staged them.
+    fn held_effect_files(&self) -> Vec<(String, BTreeSet<String>)> {
+        let held = self.staged_effects_seen.iter();
+        let staged = held.filter_map(|held| self.live_eff_staged.get(held));
+        staged.cloned().collect()
+    }
+
+    /// The carrier with `shares` in it, and what the build could not do.
+    fn build_carrier(
+        &self,
+        shares: &[crate::live_carrier::Share],
+        resolve: &dyn Fn(&str) -> Option<PathBuf>,
+    ) -> Result<(Vec<u8>, Vec<String>), String> {
+        const LIVE_CARRIER_REL: &str = crate::eff_editor::CARRIER_BASE_REL;
+        if shares.is_empty() {
+            return Ok(Default::default());
+        }
+        let base = resolve(LIVE_CARRIER_REL).ok_or_else(|| {
+            "the unmodded game files were not found: set them under Game files on the Effects page"
+                .to_owned()
+        })?;
+        let base = std::fs::read(base)
+            .map_err(|error| format!("could not read {LIVE_CARRIER_REL}: {error}"))?;
+        let mut names = HashSet::new();
+        let ops: Vec<_> = shares
+            .iter()
+            .flat_map(|share| &share.ops)
+            .filter(|op| names.insert(op.new_entry_name.clone()))
+            .cloned()
+            .collect();
+        let authored: Vec<_> = shares
+            .iter()
+            .flat_map(|share| share.authored.iter().cloned())
+            .collect();
+        let textures: Vec<_> = shares.iter().flat_map(|s| s.textures.clone()).collect();
+        let added: Vec<_> = shares.iter().flat_map(|s| s.new_textures.clone()).collect();
+        let gone: Vec<_> = shares
+            .iter()
+            .flat_map(|s| s.gone_textures.clone())
+            .collect();
+        let mut warnings = Vec::new();
+        crate::eff_export::rebuild_runtime_carrier_eff_bytes_resolving(
+            &base,
+            LIVE_CARRIER_REL,
+            &ops,
+            resolve,
+            &authored,
+            &textures,
+            &added,
+            &gone,
+            &mut warnings,
+        )
+        .map(|bytes| (bytes, warnings))
+        .map_err(|error| error.to_string())
+    }
+
     fn flush_effect_aliases(&mut self) {
         if self.carrier_push_callers.is_empty() {
             return;
@@ -36462,406 +36673,110 @@ impl VisionaryApp {
     /// Build and send the snapshot [`Self::flush_effect_aliases`] was asked for.
     fn send_effect_aliases(&mut self) {
         let caller = std::mem::take(&mut self.carrier_push_callers).join(",");
-        let mut aliases: Vec<crate::game_link::EffectAliasWire> = Vec::new();
-        // The carrier attaches to the fighter the user currently has selected — that is the
-        // one whose effects are on screen and being edited. (This was hardcoded to Kirby
-        // while the mechanism was being proven.)
-        //
-        // `carrier_owner` is whose edits ride it: the character open in the editor, a made
-        // character's own when it is one. `carrier_fighter` is the fighter the game runs for it.
-        let carrier_owner: Option<String> = self
-            .active_effect_owner()
-            .map(|owner| owner.to_lowercase())
-            .or_else(|| {
-                // No selection yet: fall back to the fighter whose eff the editor has open,
-                // so an "Apply to game" straight from the eff editor still lands.
-                self.eff_editor
-                    .loaded_rel()
-                    .map(|rel| self.eff_owner(&rel))
-                    .filter(|f| !f.is_empty())
-            });
-        let carrier_fighter: Option<String> = carrier_owner.as_ref().map(|owner| {
-            crate::character::CharacterKey::parse(owner)
-                .engine_fighter()
-                .to_owned()
-        });
-        // The costumes the carrier owner's redirects reach: a made character's own, and a
-        // fighter's own while characters made on it keep theirs.
-        let carrier_costumes: Vec<u8> = carrier_owner
-            .as_deref()
-            .map(|owner| self.eff_costumes(owner))
-            .unwrap_or_default();
-        for (owner, eff) in &self.eff_mods {
-            let fighter = crate::character::CharacterKey::parse(owner)
-                .engine_fighter()
-                .to_owned();
-            let own_rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
-            for op in &eff.transplants {
-                // Is the donor's ORIGINAL kind resident in a normal match? Same-file, same-
-                // fighter, and sys/common donors are. A FOREIGN donor (another fighter, an
-                // assist, an enemy…) is NOT — that character isn't in the match.
-                let rel = op.src_file_rel.to_lowercase();
-                let donor_resident = rel.is_empty()
-                    || rel == own_rel
-                    || op.src_set_name.to_lowercase().starts_with("sys_")
-                    || rel.starts_with(&format!("effect/fighter/{fighter}/"));
-                // The CARRIER fighter is the exception: its carrier (built below) stores every
-                // selected foreign original, so both default `<donor>_tp` and custom transplant
-                // names can safely alias onto those loaded kinds even though the donor's own eff
-                // is not resident. Any other fighter has no carrier, so a non-resident donor
-                // would alias onto a kind that does not exist and the spawn would silently die.
-                let is_carrier_fighter = carrier_owner.as_deref() == Some(owner.as_str());
-                if !donor_resident && !is_carrier_fighter {
-                    continue;
-                }
-                let to = effect_name_hash(&op.src_set_name);
-                let from = match &op.replace_entry {
-                    Some(t) => effect_name_hash(t),
-                    None => effect_name_hash(&op.new_entry_name),
-                };
-                if from == to {
-                    continue;
-                }
-                // A borrowed effect reaches only its owner's costumes; one added to a fighter's
-                // own file, every costume that shares its moves, as the export writes it.
-                let shared = op.replace_entry.is_none() && !owner.contains('#');
-                let slots = if !op.one_slot_slots.is_empty() {
-                    op.one_slot_slots.clone()
-                } else if shared {
-                    let roster = &self.roster.project;
-                    effect_costumes(owner, &self.state.fighters, roster, &|_| false)
-                } else {
-                    self.eff_costumes(owner)
-                };
-                let wire = crate::game_link::EffectAliasWire { from, to, slots };
-                if !aliases.contains(&wire) {
-                    aliases.push(wire);
-                }
-            }
+        // Whose send it is: Send's, the effect file's it is beside; else the open character's, a
+        // made character's own when it is one.
+        let of_file = self
+            .eff_editor
+            .loaded_rel()
+            .map(|rel| self.eff_owner(&rel))
+            .filter(|owner| !owner.is_empty());
+        let open_owner: Option<String> = match self.carrier_send_armed {
+            true => of_file,
+            false => self.active_effect_owner().or(of_file),
         }
-        // NOTE: aliases are SENT further down, after the authored-edit clones have added
-        // theirs. Sending here would ship a list missing every authored redirect (the plugin
-        // does a full-list replace, so a partial list silently disables them).
+        .map(|owner| owner.to_lowercase());
         const LIVE_CARRIER_REL: &str = crate::eff_editor::CARRIER_BASE_REL;
-        // EVERY transplant of the carrier fighter rides the carrier, including one sourced from
-        // that fighter's own eff.
-        //
-        // Own-eff sources used to be filtered out here, on the reasoning that the bytes are
-        // "already resident so no carrier is needed". That is false whenever the transplant
-        // introduces a new name: `kirby_dash_tp` exists in no loaded eff, so nothing can serve
-        // it. The snapshot came out empty, the deploy fell through to the merged-fighter-eff
-        // path, and that path reparses the live fighter's effect slot mid-match — the mechanism
-        // we ruled out. It froze the game.
-        //
-        // The filter is now unconditional on purpose. A narrower rule (skip own-eff REPLACE
-        // ops, which genuinely can alias onto the resident kind) left `carrier_ops` out of step
-        // with the project's transplant list, and the authored-edit pass — which searched the
-        // latter — then attached an edit to an entry the carrier never built. That failed the
-        // whole build and made an unrelated, previously working transplant invisible. One list,
-        // one rule: whatever is here is what the carrier holds.
-        let own_prefix: Option<String> = carrier_fighter
-            .as_ref()
-            .map(|f| format!("effect/fighter/{f}/"));
-        let mut carrier_ops: Vec<crate::mod_project::TransplantOp> = carrier_owner
-            .as_ref()
-            .and_then(|f| self.eff_mods.get(f))
-            .map(|eff| {
-                eff.transplants
-                    .iter()
-                    .filter(|op| rides_the_carrier(&op.src_file_rel))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        // An op the carrier cannot take has to be reported, not dropped in silence. Silence here
-        // reads as "sent" and leaves the user waiting on a carrier that was never going to exist.
-        // Nothing with a real donor path is refused today; this stays so that if a donor class is
-        // ever excluded again, it cannot be excluded quietly.
-        let skipped_donors: Vec<String> = carrier_owner
-            .as_ref()
-            .and_then(|f| self.eff_mods.get(f))
-            .map(|eff| {
-                eff.transplants
-                    .iter()
-                    .filter(|op| !op.src_file_rel.is_empty())
-                    .filter(|op| !rides_the_carrier(&op.src_file_rel))
-                    .map(|op| format!("{} ({})", op.src_set_name, op.src_file_rel))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // AUTHORED EDITS RIDE THE CARRIER TOO.
-        //
-        // The fighter's own eff cannot be hot-reloaded mid-match (`reparse_game_path` rebuilds
-        // from the resident buffer and never re-requests the file, so edited bytes were never
-        // read — `cb_game=0`). The carrier's eff IS reloadable, which is why transplants work.
-        // So an edited entry is cloned INTO the carrier under a `_tp` name with its edits baked
-        // in, and the original kind is aliased onto that clone. Same mechanism as a
-        // cross-fighter transplant; the "donor" just happens to be the fighter itself.
-        //
-        // The loop below APPENDS clone ops to `carrier_ops`, so "is this entry already
-        // transplanted?" is asked against a snapshot taken first. Asking the live vector would
-        // let one edit's clone answer for the next edit's lookup.
-        let transplant_ops = carrier_ops.clone();
-        // Texture imports ride the carrier whole: they name a pool texture, not an entry, so
-        // there is nothing to clone or alias — the carrier's pool already holds the texture
-        // under the donor's name once the transplant has copied it.
-        let carrier_textures: Vec<crate::mod_project::TextureImport> = self
-            .eff_mods
-            .iter()
-            .filter(|(owner, _)| Some(owner.to_lowercase()) == carrier_owner)
-            .flat_map(|(_, eff)| eff.textures.iter().cloned())
-            .collect();
-        // Added and removed pool textures ride along the same way. An addition also has to reach
-        // the carrier for a swap onto it to resolve, so these travel as one set.
-        let carrier_new_textures: Vec<crate::mod_project::TextureAddition> = self
-            .eff_mods
-            .iter()
-            .filter(|(owner, _)| Some(owner.to_lowercase()) == carrier_owner)
-            .flat_map(|(_, eff)| eff.textures_added.iter().cloned())
-            .collect();
-        let carrier_gone_textures: Vec<String> = self
-            .eff_mods
-            .iter()
-            .filter(|(owner, _)| Some(owner.to_lowercase()) == carrier_owner)
-            .flat_map(|(_, eff)| eff.textures_removed.iter().cloned())
-            .collect();
-        // Where donor and fighter effs may live. Built HERE rather than at the donor-stripping
-        // loop below because the texture-import pass needs to read the fighter's own eff, and
-        // that has to happen before the aliases are sent a few lines down.
+        // Where donor and fighter effs may live.
         let files = self.effect_files();
-        let mut carrier_authored: Vec<crate::eff_export::CarrierAuthored> = Vec::new();
-        let mut authored_aliases: Vec<(String, String)> = Vec::new();
-        let mut carrier_name_conflicts: Vec<String> = Vec::new();
-        for (owner, eff) in &self.eff_mods {
-            // Only the open character's edits ride the carrier: there is ONE live carrier
-            // and it is attached to that fighter's target, so folding another fighter's
-            // clones in would bloat it with entries nothing can spawn.
-            if Some(owner.to_lowercase()) != carrier_owner
-                || (eff.authored.is_empty() && eff.rosters.is_empty() && eff.entry_edits.is_empty())
-            {
-                continue;
+        // Sources legitimately live under DIFFERENT roots: the carrier is an assist eff from the
+        // vanilla dump, while a modded fighter's own eff (a `c40` costume eff, say) exists only
+        // under the mod's romfs. A made character with no file of its own has its donor's.
+        let resolve = |rel: &str| {
+            let made_root = |key: &crate::roster::RosterKey| self.roster.made_root(key);
+            files
+                .source(&rel.to_lowercase(), &self.roster.project, &made_root)
+                .filter(|path| path.is_file())
+        };
+        let parsed = std::cell::RefCell::new(HashMap::new());
+        let using_texture = |rel: &str, texture: &str| -> Vec<crate::live_carrier::Effect> {
+            let mut parsed = parsed.borrow_mut();
+            let file = parsed.entry(rel.to_lowercase()).or_insert_with(|| {
+                let bytes = std::fs::read(resolve(rel)?).ok()?;
+                effect_library::NamcoEffectFile::load(&bytes).ok()
+            });
+            file.as_ref()
+                .map(|file| crate::eff_export::entries_sampling_texture(file, texture))
+                .unwrap_or_default()
+        };
+        // Every character's edits ride the one carrier, so opening another, or sending with
+        // another open, takes none of them out of the match.
+        let uses = |share: &crate::live_carrier::Share, texture: &str| {
+            share.ops.iter().any(|op| {
+                using_texture(&op.src_file_rel, texture)
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(&op.src_set_name))
+            })
+        };
+        let (mut shares, mut left) = crate::live_carrier::together(
+            self.carrier_shares(&using_texture),
+            open_owner.as_deref(),
+            &uses,
+        );
+        // Why a character's edits can't be built into it.
+        let mut failed: Vec<(String, String)> = Vec::new();
+        shares.retain(|share| {
+            let missing = share
+                .ops
+                .iter()
+                .find(|op| resolve(&op.src_file_rel).is_none());
+            if let Some(op) = missing {
+                failed.push((
+                    share.owner.clone(),
+                    format!("not found: {}", op.src_file_rel),
+                ));
             }
-            let src_rel = if eff.source_rel.is_empty() {
-                crate::character::CharacterKey::parse(owner).effect_rel(&self.roster.project)
-            } else {
-                eff.source_rel.to_lowercase()
-            };
-            // Group this fighter's edits by the set they target — one clone per edited set,
-            // however many emitters within it were touched.
-            // Group by the ENTRY (kind) name — the unit the game spawns and the unit a
-            // transplant clones. Edits with no kind recorded (projects saved before
-            // `entry_name` existed) are SKIPPED rather than guessed: `src_set_name` resolves
-            // against `entry_names`, so passing an emitter-set name there names a kind that
-            // does not exist and ships a carrier the game's loader can hang on.
-            //
-            // An edited emitter LIST rides the same clone, and is grouped the same way: it is a
-            // change to the same entry, and shipping it separately would mean two clones of one
-            // effect racing to be the one the alias points at.
-            type CarrierGroup = (
-                String,
-                usize,
-                Vec<crate::mod_project::AuthoredEdit>,
-                Option<crate::mod_project::EmitterRoster>,
-                Option<crate::mod_project::EntryEdit>,
-            );
-            let mut by_entry: Vec<CarrierGroup> = Vec::new();
-            for edit in &eff.authored {
-                if edit.entry_name.is_empty() {
-                    continue;
-                }
-                match by_entry.iter_mut().find(|(n, ..)| *n == edit.entry_name) {
-                    Some((_, _, v, _, _)) => v.push(edit.clone()),
-                    None => by_entry.push((
-                        edit.entry_name.clone(),
-                        edit.set_idx,
-                        vec![edit.clone()],
-                        None,
-                        None,
-                    )),
-                }
-            }
-            for roster in &eff.rosters {
-                if roster.entry_name.is_empty() {
-                    continue;
-                }
-                match by_entry.iter_mut().find(|(n, ..)| *n == roster.entry_name) {
-                    Some((_, _, _, slot, _)) => *slot = Some(roster.clone()),
-                    None => by_entry.push((
-                        roster.entry_name.clone(),
-                        roster.set_idx,
-                        Vec::new(),
-                        Some(roster.clone()),
-                        None,
-                    )),
-                }
-            }
-            for header in &eff.entry_edits {
-                match by_entry
-                    .iter_mut()
-                    .find(|(name, ..)| name.eq_ignore_ascii_case(&header.entry_name))
-                {
-                    Some((_, _, _, _, slot)) => *slot = Some(header.clone()),
-                    None => by_entry.push((
-                        header.entry_name.clone(),
-                        0,
-                        Vec::new(),
-                        None,
-                        Some(header.clone()),
-                    )),
-                }
-            }
-            for (entry_name, set_idx, edits, roster, entry_edit) in by_entry {
-                let entry_lc = entry_name.to_lowercase();
-
-                // Is this edit targeting an entry that is ITSELF a transplant? The editor
-                // works on the MERGED eff, so an edited entry may be a copy the user pulled
-                // in from a donor. That copy does not exist in the fighter's vanilla eff, so
-                // cloning "from the fighter" would fail to resolve and take the whole carrier
-                // build down. The carrier already stores that donor entry (under the donor's
-                // own name) and the transplant's alias already points at it, so all this case
-                // needs is the edits applied to that existing entry — no second clone, no
-                // extra alias.
-                //
-                // Search the ops that will ACTUALLY be built, not the project's raw transplant
-                // list. Those two diverged once, and the edit then named an entry no transplant
-                // had created, which failed the whole carrier build and took every unrelated
-                // transplant down with it. And use the same stored-name rule the build uses, or
-                // the edit lands on a name the carrier does not hold.
-                let via_transplant = transplant_ops.iter().find(|t| {
-                    t.new_entry_name.eq_ignore_ascii_case(&entry_lc)
-                        || t.replace_entry
-                            .as_deref()
-                            .is_some_and(|r| r.eq_ignore_ascii_case(&entry_lc))
-                });
-                if let Some(t) = via_transplant {
-                    carrier_authored.push(crate::eff_export::CarrierAuthored {
-                        set_name: carrier_stored_name(t, own_prefix.as_deref()),
-                        edits,
-                        roster,
-                        entry_edit,
-                    });
-                    continue;
-                }
-
-                // Reserved internal namespace — NOT the transplant suffix, which the user
-                // may type themselves. See `EDIT_CLONE_PREFIX`.
-                let clone_name = format!("{}{entry_lc}", crate::mod_project::EDIT_CLONE_PREFIX);
-                carrier_ops.push(crate::mod_project::TransplantOp {
-                    new_entry_name: clone_name.clone(),
-                    src_file_rel: src_rel.clone(),
-                    // Resolved against the donor's `entry_names`: KIND name, never set name.
-                    src_set_name: entry_lc.clone(),
-                    src_set_idx: set_idx,
-                    one_slot_slots: Vec::new(),
-                    replace_entry: None,
-                });
-                // The clone's emitter set takes the transplant's new entry name, which is what
-                // `apply_authored` matches on inside the carrier.
-                carrier_authored.push(crate::eff_export::CarrierAuthored {
-                    set_name: clone_name.clone(),
-                    edits,
-                    roster,
-                    entry_edit,
-                });
-                authored_aliases.push((entry_lc, clone_name));
-            }
-        }
-
-        // A TEXTURE IMPORT HAS TO BRING ITS EFFECTS WITH IT.
-        //
-        // `apply_texture_imports` resolves the texture name against the CARRIER's pool, and the
-        // carrier only holds textures its own entries reference. So replacing a texture in the
-        // fighter's eff did nothing unless an entry sampling it happened to already be
-        // transplanted: the import was dropped with a warning and the user watched the original
-        // render in game. Clone the entries that actually sample the texture, exactly as an
-        // authored edit clones the entry it edits — the clone carries the texture into the
-        // carrier's pool, the pruner keeps it (something now samples it), and the import lands.
-        //
-        // Entries already riding the carrier are skipped: a transplant or an authored edit has
-        // brought the texture in already, and a second clone would only add a duplicate entry
-        // and a competing alias for the same kind.
-        if !carrier_textures.is_empty() {
-            if let (Some(fighter), Some(owner)) = (carrier_fighter.as_ref(), carrier_owner.as_ref())
-            {
-                let src_rel = self
-                    .eff_mods
-                    .get(owner)
-                    .filter(|eff| !eff.source_rel.is_empty())
-                    .map(|eff| eff.source_rel.to_lowercase())
-                    .unwrap_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff"));
-                let bytes = files.find(&src_rel).and_then(|p| std::fs::read(p).ok());
-                let parsed = bytes.and_then(|b| effect_library::NamcoEffectFile::load(&b).ok());
-                if let Some(file) = parsed {
-                    for import in &carrier_textures {
-                        for (entry_name, set_idx) in
-                            crate::eff_export::entries_sampling_texture(&file, &import.texture_name)
-                        {
-                            let entry_lc = entry_name.to_lowercase();
-                            // Already on the carrier, by transplant or by authored edit? Match
-                            // the SOURCE FILE too: an entry of the same name in a different eff
-                            // is a different effect sampling a different pool, and treating it
-                            // as "already carried" would skip the clone that actually brings
-                            // this texture in — the silent no-op again, just better hidden.
-                            let riding = transplant_ops.iter().any(|t| {
-                                t.src_file_rel.eq_ignore_ascii_case(&src_rel)
-                                    && t.src_set_name.eq_ignore_ascii_case(&entry_lc)
-                            }) || authored_aliases
-                                .iter()
-                                .any(|(from, _)| from.eq_ignore_ascii_case(&entry_lc));
-                            if riding {
-                                continue;
-                            }
-                            let clone_name =
-                                format!("{}{entry_lc}", crate::mod_project::EDIT_CLONE_PREFIX);
-                            if carrier_ops.iter().any(|op| op.new_entry_name == clone_name) {
-                                continue; // two imports sharing one effect
-                            }
-                            carrier_ops.push(crate::mod_project::TransplantOp {
-                                new_entry_name: clone_name.clone(),
-                                src_file_rel: src_rel.clone(),
-                                src_set_name: entry_lc.clone(),
-                                src_set_idx: set_idx,
-                                one_slot_slots: Vec::new(),
-                                replace_entry: None,
-                            });
-                            authored_aliases.push((entry_lc, clone_name));
-                        }
+            missing.is_none()
+        });
+        let mut dbg = String::new();
+        let mut built = self.build_carrier(&shares, &resolve);
+        if let Err(error) = &built {
+            // One character's edits stop the rest: the open character's first, then each that
+            // goes in with them.
+            dbg.push_str(&format!("CARRIER MULTI-FILE MERGE FAILED: {error}\n"));
+            let mut all = std::mem::take(&mut shares);
+            all.sort_by_key(|share| Some(&share.owner) != open_owner.as_ref());
+            for share in all {
+                shares.push(share);
+                match self.build_carrier(&shares, &resolve) {
+                    Ok(one) => built = Ok(one),
+                    Err(error) => {
+                        let share = shares.pop().expect("just pushed");
+                        failed.push((share.owner, error));
                     }
                 }
             }
         }
-
-        // Redirect spawns of the original kind onto the edited clone, on the owner's costumes.
-        for (from_name, to_name) in &authored_aliases {
-            let wire = crate::game_link::EffectAliasWire {
-                from: effect_name_hash(from_name),
-                to: effect_name_hash(to_name),
-                slots: carrier_costumes.clone(),
-            };
-            if wire.from == wire.to {
-                continue;
-            }
-            // One `from` may only map to ONE `to`. A transplant named `<x>_tp` and an authored
-            // clone of `<x>` compute the same name, and shipping two wires with the same `from`
-            // leaves the plugin picking arbitrarily. The transplant alias is registered first
-            // and wins; the authored edit then has nowhere to live, so say so rather than
-            // silently rendering the unedited copy.
-            if let Some(existing) = aliases.iter().find(|a| a.from == wire.from) {
-                if existing.to != wire.to {
-                    carrier_name_conflicts.push(from_name.clone());
-                }
-                continue;
-            }
-            aliases.push(wire);
-        }
-        if !carrier_name_conflicts.is_empty() {
-            self.state.status = format!(
-                "Not sent: the edit to {} has the name of a borrowed effect. Rename the \
-                 borrowed copy and send again.",
-                carrier_name_conflicts.join(", ")
-            );
-        }
+        let is_open = |owner: &str| open_owner.as_deref() == Some(owner);
+        let mut carrier_error: Option<String> = failed
+            .iter()
+            .find(|(owner, _)| is_open(owner))
+            .map(|(_, error)| error.clone());
+        left.extend(
+            failed
+                .into_iter()
+                .map(|(owner, _)| owner)
+                .filter(|o| !is_open(o)),
+        );
+        let carrier_ops: Vec<crate::mod_project::TransplantOp> =
+            shares.iter().flat_map(|share| share.ops.clone()).collect();
+        let aliases: Vec<crate::game_link::EffectAliasWire> = shares
+            .iter()
+            .flat_map(|share| share.aliases.clone())
+            .collect();
+        let carrier_name_conflicts: Vec<String> = shares
+            .iter()
+            .flat_map(|share| share.conflicts.clone())
+            .collect();
         self.game_link.send_effect_aliases(&aliases);
         // Register every name the plugin may need to resolve for display: transplant copies
         // and the authored clones.
@@ -36869,22 +36784,12 @@ impl VisionaryApp {
             .eff_mods
             .values()
             .flat_map(|eff| eff.transplants.iter().map(|op| op.new_entry_name.clone()))
-            .chain(carrier_authored.iter().map(|c| c.set_name.clone()))
+            .chain(carrier_ops.iter().map(|op| op.new_entry_name.clone()))
             .collect();
         self.game_link.send_effect_names(&names);
         let live_carrier_rel = LIVE_CARRIER_REL;
-        // Does anything need the carrier at all? An imported texture counts on its own.
-        //
-        // This used to ask `!carrier_ops.is_empty()`, which is only true for transplants and
-        // authored edits. A texture import is neither: it names a pool texture, not an entry, so
-        // it adds no op. A texture-only send therefore built no carrier and published no carrier
-        // spec — and the plugin reads a snapshot with no carrier, plus withdrawn bytes, as
-        // "retire the live carrier". Nothing replaces it, so the editor sits on "retiring the
-        // previous carrier" until the user gives up. The import has to arm the carrier itself.
-        let carrier_needed = !carrier_ops.is_empty()
-            || !carrier_textures.is_empty()
-            || !carrier_new_textures.is_empty()
-            || !carrier_gone_textures.is_empty();
+        // An empty snapshot is how the plugin is told to let its carrier go.
+        let carrier_needed = !shares.is_empty();
         // Cross-fighter donors: have the plugin co-load each donor's VANILLA eff with the
         // target fighter (system effs are always resident — no need to co-load those).
         let mut per_target: HashMap<String, Vec<String>> = HashMap::new();
@@ -36892,6 +36797,13 @@ impl VisionaryApp {
         // build the small stripped eff the plugin injects as resident data.
         let mut donor_wants: HashMap<String, Vec<String>> = HashMap::new();
         for (owner, eff) in &self.eff_mods {
+            if self.put_back.is_some()
+                || shares
+                    .iter()
+                    .any(|share| share.owner.eq_ignore_ascii_case(owner))
+            {
+                continue;
+            }
             let target = if eff.source_rel.is_empty() {
                 crate::character::CharacterKey::parse(owner).effect_rel(&self.roster.project)
             } else {
@@ -36914,6 +36826,9 @@ impl VisionaryApp {
             let Some((owner, _)) = crate::character::split_move_key(mv_key) else {
                 continue;
             };
+            if self.put_back.is_some() {
+                break;
+            }
             let fighter = crate::character::CharacterKey::parse(owner)
                 .engine_fighter()
                 .to_owned();
@@ -36942,16 +36857,13 @@ impl VisionaryApp {
                 }
             }
         }
-        // The carrier attaches to the SELECTED fighter's eff target, so the plugin co-loads it
-        // alongside whichever fighter is actually on screen.
-        let carrier_target: Option<String> = carrier_fighter
-            .as_ref()
-            .map(|f| format!("effect/fighter/{f}/ef_{f}.eff"));
-        if carrier_needed {
-            if let Some(target) = &carrier_target {
-                // The old detached co-loader is deliberately disabled: send only the selected
-                // fresh carrier path to the plugin; its bytes are built below.
-                per_target.insert(target.clone(), vec![live_carrier_rel.into()]);
+        // Any of the fighters whose edits it carries may hold it: whichever is in the match.
+        if built.is_ok() {
+            for share in &shares {
+                per_target.insert(
+                    format!("effect/fighter/{0}/ef_{0}.eff", share.fighter),
+                    vec![live_carrier_rel.into()],
+                );
             }
         }
         let mut donor_specs: Vec<crate::game_link::DonorEffWire> = Vec::new();
@@ -36968,190 +36880,75 @@ impl VisionaryApp {
         donor_specs.sort_by(|a, b| a.target.cmp(&b.target));
 
         let mut donor_bytes: Vec<crate::game_link::DonorBytesWire> = Vec::new();
-        let mut dbg = String::new();
         let mut carrier_added = false;
         let mut carrier_fingerprint: Option<u64> = None;
-        // A refused carrier build (unsafe shader container, incompatible compute variation) drops
-        // every live transplant. That must be visible, not just a line in the debug dump.
-        let mut carrier_error: Option<String> = None;
         // Authored edits the build could not place. The carrier still ships without them, so
         // these are reported separately from an outright build failure.
         let mut carrier_dropped_edits: Vec<String> = Vec::new();
-        // Two mesh-backed sources competing for the carrier's single model container.
-        let mut carrier_mesh_conflict: Option<String> = None;
         // Texture imports the carrier's pool had no texture for.
         let mut carrier_dropped_textures: Vec<String> = Vec::new();
         // Textures the build would not delete because something still samples them.
         let mut carrier_textures_in_use: Vec<String> = Vec::new();
         if carrier_needed {
-            // Sources legitimately live under DIFFERENT roots: the carrier is an assist eff from
-            // the vanilla dump, while a modded fighter's own eff (a `c40` costume eff, say) exists
-            // only under the mod's romfs. Every file — the carrier and each donor — is resolved
-            // on its own, and the builder is handed the same resolver.
-            //
-            // The builder used to take ONE donor root, chosen as "the root holding the carrier".
-            // For a modded fighter that root never holds the fighter's eff, so every authored
-            // edit failed as "donor unreadable": no carrier bytes, no spec, and the plugin sat at
-            // state 0 while the editor waited for a swap that was never requested.
-            let resolve = |rel: &str| {
-                let found = files.find(&rel.to_lowercase());
-                found.filter(|path| path.is_file())
-            };
-            let carrier_path = resolve(live_carrier_rel);
-            let missing: Vec<String> = carrier_ops
-                .iter()
-                .filter(|op| resolve(&op.src_file_rel).is_none())
-                .map(|op| op.src_file_rel.clone())
-                .collect();
-            if carrier_path.is_none() {
-                carrier_error = Some(
-                    "the unmodded game files were not found: set them under Game files on the \
-                     Effects page"
-                        .to_owned(),
-                );
-            } else if !missing.is_empty() {
-                carrier_error = Some(format!("not found: {}", missing.join(", ")));
-            }
-            if let Some(carrier_file) = carrier_path.as_ref().filter(|_| missing.is_empty()) {
-                match std::fs::read(carrier_file) {
-                    Ok(carrier_base) => {
-                        // Names the carrier must hold VERBATIM: an authored clone is a copy
-                        // of the fighter's OWN entry, so storing it under the donor name would
-                        // collide with the fighter's resident kind — and `carrier_authored`
-                        // resolves its edits by this exact name. `carrier_stored_name` is that
-                        // rule, shared with the authored-edit pass so the two cannot drift.
-                        let mut seen_names = std::collections::HashSet::new();
-                        let carrier_transplants: Vec<crate::mod_project::TransplantOp> =
-                            carrier_ops
-                                .iter()
-                                .filter_map(|op| {
-                                    let donor_rel = op.src_file_rel.to_lowercase();
-                                    let donor_name = op.src_set_name.to_lowercase();
-                                    let stored = carrier_stored_name(op, own_prefix.as_deref());
-                                    // Dedup on what actually gets stored, so an authored clone
-                                    // and a transplant can never overwrite each other.
-                                    if !seen_names.insert(stored.clone()) {
-                                        return None;
-                                    }
-                                    Some(crate::mod_project::TransplantOp {
-                                        new_entry_name: stored,
-                                        src_file_rel: donor_rel,
-                                        src_set_name: donor_name,
-                                        src_set_idx: op.src_set_idx,
-                                        one_slot_slots: Vec::new(),
-                                        replace_entry: None,
-                                    })
-                                })
-                                .collect();
-                        let mut warnings: Vec<String> = Vec::new();
-                        let carrier_bytes =
-                            crate::eff_export::rebuild_runtime_carrier_eff_bytes_resolving(
-                                &carrier_base,
-                                live_carrier_rel,
-                                &carrier_transplants,
-                                &resolve,
-                                &carrier_authored,
-                                &carrier_textures,
-                                &carrier_new_textures,
-                                &carrier_gone_textures,
-                                &mut warnings,
-                            );
-                        for w in &warnings {
-                            dbg.push_str(&format!("CARRIER WARNING: {w}\n"));
-                        }
-                        // An edit whose target was missing is not fatal — the transplants still
-                        // ship — but it did not reach the game, so it must never be counted as
-                        // sent below.
-                        let skipped_authored: Vec<String> = warnings
-                            .iter()
-                            .filter_map(|w| w.strip_prefix("edit:").map(str::to_string))
-                            .collect();
-                        carrier_authored.retain(|c| !skipped_authored.contains(&c.set_name));
-                        if !skipped_authored.is_empty() {
-                            carrier_dropped_edits = skipped_authored;
-                        }
-                        // An import whose texture is not in the CARRIER's pool. The carrier only
-                        // holds the textures its transplanted entries brought with them, so a
-                        // texture the user replaced in the fighter's own eff is absent unless
-                        // some entry sampling it also rides the carrier. Silently shipping a
-                        // carrier without it looks identical to the import not working.
-                        carrier_dropped_textures = warnings
-                            .iter()
-                            .filter_map(|w| w.strip_prefix("texture:").map(str::to_string))
-                            .collect();
-                        // A delete the build refused. The editor's own guard only sees sampler0
-                        // (its emitter model discards the other five), so a texture used as a
-                        // distortion or mask input can pass that check and still be in use here.
-                        // Without this the delete would look like it worked and quietly not have.
-                        carrier_textures_in_use = warnings
-                            .iter()
-                            .filter_map(|w| w.strip_prefix("texture-in-use:").map(str::to_string))
-                            .collect();
-                        // A model-data conflict ships a carrier whose geometry is known-wrong.
-                        // That has to reach the user directly: it is not something they can
-                        // diagnose from what they see in game.
-                        carrier_mesh_conflict = warnings
-                            .iter()
-                            .find_map(|w| w.strip_prefix("mesh-conflict:").map(str::to_string));
-                        match carrier_bytes {
-                            Ok(bytes) => {
-                                // Preserve the exact outbound carrier for post-test structural
-                                // inspection. This is cache-only and is replaced on every build.
-                                let _ = std::fs::write(
-                                    crate::scratch_dirs::app_storage_root()
-                                        .join("carrier_send_debug.eff"),
-                                    &bytes,
-                                );
-                                let stored = carrier_ops
-                                    .iter()
-                                    .map(|op| {
-                                        format!("{} from {}", op.src_set_name, op.src_file_rel)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                dbg.push_str(&format!(
-                                    "CARRIER {live_carrier_rel}: {} stored effect(s) [{stored}] = {} B\n",
-                                    carrier_ops.len(),
-                                    bytes.len()
-                                ));
-                                carrier_fingerprint = Some({
-                                    use std::hash::{Hash, Hasher};
-                                    let mut hasher =
-                                        std::collections::hash_map::DefaultHasher::new();
-                                    bytes.hash(&mut hasher);
-                                    hasher.finish()
-                                });
-                                donor_bytes.push(self.donor_payload_wire(
-                                    live_carrier_rel.into(),
-                                    &bytes,
-                                    &mut dbg,
-                                ));
-                                carrier_added = true;
-                            }
-                            Err(e) => {
-                                dbg.push_str(&format!("CARRIER MULTI-FILE MERGE FAILED: {e}\n"));
-                                carrier_error = Some(format!("{e}"));
-                            }
-                        }
+            match built {
+                Ok((bytes, warnings)) => {
+                    for w in &warnings {
+                        dbg.push_str(&format!("CARRIER WARNING: {w}\n"));
                     }
-                    Err(e) => {
-                        dbg.push_str(&format!(
-                            "CARRIER BASE READ FAILED {live_carrier_rel}: {e}\n"
-                        ));
-                        carrier_error = Some(format!("could not read {live_carrier_rel}: {e}"));
+                    // An edit whose target was missing is not fatal — the transplants still
+                    // ship — but it did not reach the game, so it must never be counted as
+                    // sent below.
+                    carrier_dropped_edits = warnings
+                        .iter()
+                        .filter_map(|w| w.strip_prefix("edit:").map(str::to_string))
+                        .collect();
+                    for share in &mut shares {
+                        share
+                            .authored
+                            .retain(|c| !carrier_dropped_edits.contains(&c.set_name));
                     }
+                    // An import whose texture is not in the CARRIER's pool. The carrier only
+                    // holds the textures its transplanted entries brought with them, so a
+                    // texture the user replaced in the fighter's own eff is absent unless
+                    // some entry sampling it also rides the carrier. Silently shipping a
+                    // carrier without it looks identical to the import not working.
+                    carrier_dropped_textures = warnings
+                        .iter()
+                        .filter_map(|w| w.strip_prefix("texture:").map(str::to_string))
+                        .collect();
+                    // A delete the build refused. The editor's own guard only sees sampler0
+                    // (its emitter model discards the other five), so a texture used as a
+                    // distortion or mask input can pass that check and still be in use here.
+                    // Without this the delete would look like it worked and quietly not have.
+                    carrier_textures_in_use = warnings
+                        .iter()
+                        .filter_map(|w| w.strip_prefix("texture-in-use:").map(str::to_string))
+                        .collect();
+                    // Preserve the exact outbound carrier for post-test structural
+                    // inspection. This is cache-only and is replaced on every build.
+                    let _ = std::fs::write(
+                        crate::scratch_dirs::app_storage_root().join("carrier_send_debug.eff"),
+                        &bytes,
+                    );
+                    let stored = carrier_ops
+                        .iter()
+                        .map(|op| format!("{} from {}", op.src_set_name, op.src_file_rel))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    dbg.push_str(&format!(
+                        "CARRIER {live_carrier_rel}: {} stored effect(s) [{stored}] = {} B\n",
+                        carrier_ops.len(),
+                        bytes.len()
+                    ));
+                    carrier_fingerprint = Some(fingerprint(&bytes));
+                    donor_bytes.push(self.donor_payload_wire(
+                        live_carrier_rel.into(),
+                        &bytes,
+                        &mut dbg,
+                    ));
+                    carrier_added = true;
                 }
-            } else {
-                dbg.push_str(&format!(
-                    "CARRIER ROOT MISS: carrier={} missing=[{}] roots={:?}\n",
-                    if carrier_path.is_some() {
-                        "found"
-                    } else {
-                        "missing"
-                    },
-                    missing.join(", "),
-                    files.roots
-                ));
+                Err(error) => dbg.push_str(&format!("CARRIER NOT BUILT: {error}\n")),
             }
         }
         for (rel, mut names) in donor_wants {
@@ -37224,23 +37021,33 @@ impl VisionaryApp {
         // game, the first question is always "was the carrier actually built and did it
         // contain the edited entry" — that used to be answerable only by reading a debug
         // file on the SD card.
-        // Ordered most-actionable first: a mesh conflict means what shipped is visibly wrong in
-        // a way nothing else will explain, so it outranks the ordinary success line.
-        //
-        // A refused transplant outranks even that. Nothing was sent for it, so every other line
-        // here would be describing a build the user's effect is not in.
-        if !skipped_donors.is_empty() {
+        let open = shares.iter().find(|share| is_open(&share.owner));
+        let sent = open.map_or(0, |share| share.authored.len());
+        // What can't be in the same carrier as the open character's edits is staged with its
+        // fighter instead, where the game has a file for it.
+        let mut what = match &open_owner {
+            Some(owner) => self.live_send_what(owner),
+            None => send_what("", 0, 0),
+        };
+        let name = |owner: &String| {
+            let key = crate::character::CharacterKey::parse(owner);
+            (
+                self.game_has_effect_file(&key.effect_rel(&self.roster.project)),
+                self.character_name(&key),
+            )
+        };
+        what.push_str(&crate::live_carrier::left_note(
+            left.iter().map(name).collect(),
+        ));
+        let connected = self.game_link.status().is_connected();
+        if carrier_error.is_some() {
+            // Said below.
+        } else if !carrier_name_conflicts.is_empty() {
             self.state.status = format!(
-                "Not sent: {} cannot go into a running match. Export the mod to use {}.",
-                skipped_donors.join(", "),
-                if skipped_donors.len() == 1 {
-                    "it"
-                } else {
-                    "them"
-                }
+                "Not sent: the edit to {} has the name of a borrowed effect. Rename the \
+                 borrowed copy and send again.",
+                carrier_name_conflicts.join(", ")
             );
-        } else if let Some(conflict) = &carrier_mesh_conflict {
-            self.state.status = format!("Sent, but a model in it may look wrong: {conflict}");
         } else if carrier_added && !carrier_textures_in_use.is_empty() {
             self.state.status = format!(
                 "Not removed: parts still use {}. Point those parts at another picture first.",
@@ -37255,21 +37062,10 @@ impl VisionaryApp {
                  again.",
                 carrier_dropped_textures.join(", ")
             );
-        } else if carrier_added && !carrier_authored.is_empty() {
+        } else if carrier_added && sent > 0 {
             // "Sent" only once the game says it took them: the resolver in `update` rewrites
             // this opening once the carrier report arrives.
-            let fighter = carrier_owner
-                .as_deref()
-                .map(|owner| self.character_name(&crate::character::CharacterKey::parse(owner)))
-                .unwrap_or_default();
-            self.state.status = send_note(
-                self.game_link.status().is_connected(),
-                &send_what(
-                    &fighter,
-                    carrier_authored.len(),
-                    carrier_ops.len() - carrier_authored.len().min(carrier_ops.len()),
-                ),
-            );
+            self.state.status = send_note(connected, &what);
         } else if carrier_added && !carrier_dropped_edits.is_empty() {
             // The carrier shipped, but every edit in it was dropped. Saying nothing here would
             // read as success.
@@ -37277,49 +37073,26 @@ impl VisionaryApp {
                 "Sent, but the edits to {} could not be placed and are not in it",
                 carrier_dropped_edits.join(", ")
             );
-        } else if carrier_added && !carrier_textures.is_empty() {
-            // Texture-only send: no authored edit and no transplant to report, so without this
-            // branch a successful send said nothing at all.
-            self.state.status = send_note(
-                self.game_link.status().is_connected(),
-                &counted(
-                    carrier_textures.len(),
-                    "replaced picture",
-                    "replaced pictures",
-                ),
-            );
-        } else if (!carrier_authored.is_empty() || !carrier_textures.is_empty()) && !carrier_added {
-            self.state.status = match &carrier_error {
-                Some(e) => format!("Not sent: the edit could not be built ({e})"),
-                None => "Not sent: the edit could not be built".to_owned(),
-            };
+        } else if carrier_added {
+            // Textures, borrowed effects or the game's own again: without this branch a
+            // successful send said nothing at all.
+            self.state.status = send_note(connected, &what);
         }
-        if carrier_needed && !carrier_added {
-            // Never arm the stable carrier path with bytes left over from an older selection.
-            if let Some(target) = &carrier_target {
-                donor_specs.retain(|spec| &spec.target != target);
-            }
-            if let Some(e) = &carrier_error {
-                self.state.status = format!("Not sent: the edit could not be built ({e})");
-            }
-            // Tell the editor's send indicator directly. Without this it waited on a game that
-            // was never sent a carrier, then reported "never staged the carrier" after 25s.
-            self.eff_editor.carrier_build_error =
-                Some(carrier_error.clone().unwrap_or_else(|| {
-                    if carrier_target.is_none() {
-                        "no character is open".to_string()
-                    } else {
-                        "see donor_send_debug.txt".to_string()
-                    }
-                }));
-        }
+        // Tell the editor's send indicator directly. Without this it waited on a game that
+        // was never sent a carrier, then reported "never staged the carrier" after 25s.
+        self.eff_editor.carrier_build_error = carrier_error.take().inspect(|error| {
+            self.state.status = format!("Not sent: the edit could not be built ({error})");
+        });
         // Bytes first: a same-path carrier replacement must be staged before the game-thread
         // receives the new spec and creates its object. Empty is meaningful and clears old data.
         donor_bytes.sort_by(|a, b| a.path.cmp(&b.path));
         let carrier_changed = carrier_fingerprint != self.last_carrier_fingerprint;
+        self.sent_owner = open_owner.clone();
+        self.carrier_fighters = shares.iter().map(|share| share.fighter.clone()).collect();
         self.last_carrier_fingerprint = carrier_fingerprint;
         if std::mem::take(&mut self.carrier_send_armed) {
             self.eff_editor.carrier_needs_new_bytes = carrier_changed && carrier_added;
+            self.eff_editor.carrier_expected = carrier_added;
         } else if carrier_changed {
             self.eff_editor.carrier_needs_new_bytes = true;
             // New edits reached the game without Send edits (on connect, or when another
@@ -37394,6 +37167,23 @@ impl VisionaryApp {
         let Some(eff) = self.eff_mods.get(fighter).cloned() else {
             return false;
         };
+        let character = crate::character::CharacterKey::parse(fighter);
+        // A made character's file stands for each of its costumes' files.
+        let mut rels = match character.authored(&self.roster.project) {
+            Some(_) => character
+                .made_slots(&self.roster.project)
+                .iter()
+                .map(|slot| crate::roster::scaffold::effect_file(character.engine_fighter(), *slot))
+                .collect(),
+            None => vec![eff.source_rel.clone()],
+        };
+        // ARCropolis takes the game down when it is asked for a path the game has no file at.
+        // The carrier alone shows those edits, in this match and the next.
+        rels.retain(|rel| self.game_has_effect_file(rel));
+        if rels.is_empty() {
+            self.live_eff_deployed.insert(fighter.to_owned(), eff);
+            return false;
+        }
         // An edit-free EffMod is intentional after the last transplant is removed: serving
         // the pristine source bytes replaces the previously merged resident file and makes
         // removal take effect immediately instead of leaving the old live payload staged.
@@ -37411,22 +37201,44 @@ impl VisionaryApp {
                 return false;
             }
         };
-        // A made character's file stands for each of its costumes' files.
-        let character = crate::character::CharacterKey::parse(fighter);
-        if character.authored(&self.roster.project).is_some() {
-            let engine = character.engine_fighter().to_owned();
-            let mut served = false;
-            for slot in character.made_slots(&self.roster.project) {
-                let rel = crate::roster::scaffold::effect_file(&engine, slot);
-                served |= self.serve_live_eff(fighter, &rel, &merged);
-            }
-            return served;
+        let using_texture = |texture: &str| {
+            effect_library::NamcoEffectFile::load(&bytes)
+                .map(|file| crate::eff_export::entries_sampling_texture(&file, texture))
+                .unwrap_or_default()
+        };
+        let changed = crate::live_carrier::changed_effects(&eff, &using_texture);
+        let mut served = false;
+        for rel in rels {
+            served |= self.serve_live_eff(&rel, &merged, changed.clone());
         }
-        self.serve_live_eff(fighter, &eff.source_rel, &merged)
+        if served {
+            self.live_eff_deployed.insert(fighter.to_owned(), eff);
+        }
+        served
     }
 
-    /// Stage `bytes` as the game's `source_rel` effect file for the fighter's next match.
-    fn serve_live_eff(&mut self, fighter: &str, source_rel: &str, merged: &[u8]) -> bool {
+    /// Whether the running game has a file at this effect path: its own, or one an installed mod
+    /// adds.
+    fn game_has_effect_file(&self, rel: &str) -> bool {
+        let game = [
+            Some(self.eff_editor.export_root().to_path_buf()),
+            self.eff_editor.vanilla_root.clone(),
+            self.state.data_root.clone(),
+        ];
+        let mut roots: Vec<PathBuf> = game.into_iter().flatten().collect();
+        roots.extend(crate::scratch_dirs::installed_mods());
+        let known = |fighter: &str| fighter_kind_id(fighter).is_some();
+        crate::eff_source::in_the_game(rel, &known, &roots)
+    }
+
+    /// Stage `merged` as the game's `source_rel` effect file for the fighter's next match.
+    /// `changed` are the effects it has that the game's own file does not.
+    fn serve_live_eff(
+        &mut self,
+        source_rel: &str,
+        merged: &[u8],
+        changed: BTreeSet<String>,
+    ) -> bool {
         // The `ultimate/` validation this used to do inline now lives in `emulator_sd_root`,
         // which is what every SD-writing path in the editor goes through.
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
@@ -37470,7 +37282,8 @@ impl VisionaryApp {
             .unwrap_or_default();
         let arc_path = source_rel.to_lowercase();
         entries.retain(|e| e.get("path").and_then(|p| p.as_str()) != Some(arc_path.as_str()));
-        entries.push(serde_json::json!({ "path": arc_path, "file": fname }));
+        let stamp = fingerprint(merged);
+        entries.push(serde_json::json!({ "path": arc_path, "file": fname, "stamp": stamp }));
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
             let _ = crate::scratch_dirs::replace_file(&mpath, json.as_bytes());
         }
@@ -37486,11 +37299,9 @@ impl VisionaryApp {
         // bytes were never read (`cb_game=0` in `effect_viewer_cb.txt`) — and driving that
         // path froze the game. Live changes go through the CARRIER instead
         // (`push_effect_aliases`), which is reloadable by design.
-        let _ = &arc_path;
-        self.live_eff_deployed.insert(fighter.to_string());
-        // Serving-chain diagnosis a few seconds later, once async re-loads settled.
-        self.live_eff_probe_due =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        let path = effect_name_hash(&arc_path);
+        self.live_eff_staged
+            .insert((path, stamp), (arc_path, changed));
         true
     }
 
@@ -37529,6 +37340,13 @@ impl VisionaryApp {
             self.game_link.send_article_probe(agent);
         }
         self.publish_live_rule_union();
+        // What an editor before this one staged is gone from the SD card.
+        self.game_link.send_live_eff_reload();
+        if self.put_back.is_some() {
+            // What was taken out of the game stays out until it is sent again.
+            self.push_effect_aliases_quietly();
+            return;
+        }
         self.sync_eff_mods_from_editor();
         // Connecting sends like the button does, so it gets the same line and outcome. Only a
         // character with effect edits has anything to report.
@@ -37545,7 +37363,39 @@ impl VisionaryApp {
         self.live_overrides.resend_tweaks(&self.game_link);
     }
 
+    /// What it means for the character a send was for that the game has taken it.
+    fn reached_outcome(&self) -> crate::eff_editor::SendOutcome {
+        let owner = self.sent_owner.as_deref().unwrap_or_default();
+        let edited =
+            self.put_back.is_none() && self.eff_mods.get(owner).is_some_and(|eff| !eff.is_empty());
+        let costumes = self.eff_costumes(owner);
+        crate::live_carrier::reached(
+            edited,
+            self.holds_unknown_effects(owner),
+            self.game_link
+                .has_gimmick_agents_snapshot()
+                .then(|| self.game_link.gimmick_agents())
+                .as_deref(),
+            crate::character::CharacterKey::parse(owner).engine_fighter(),
+            &costumes,
+        )
+    }
+
+    /// Whether the game loaded effects changed in an earlier session with `owner`'s fighter: which
+    /// ones is not known, so they can't be put back.
+    fn holds_unknown_effects(&self, owner: &str) -> bool {
+        let key = crate::character::CharacterKey::parse(owner);
+        let fighter = key.engine_fighter();
+        let own = key.effect_rel(&self.roster.project);
+        let files = [own, format!("effect/fighter/{fighter}/ef_{fighter}.eff")];
+        let paths = files.map(|rel| effect_name_hash(&rel));
+        self.staged_effects_seen
+            .iter()
+            .any(|held| paths.contains(&held.0) && !self.live_eff_staged.contains_key(held))
+    }
+
     fn apply_authored_eff_live(&mut self) -> String {
+        self.send_again();
         let Some(rel) = self.eff_editor.loaded_rel() else {
             return "no eff loaded — nothing to apply".to_string();
         };
@@ -37553,13 +37403,6 @@ impl VisionaryApp {
         // is built from `eff_mods`, not from the editor's working copy.
         self.sync_eff_mods_from_editor();
         let owner = self.eff_owner(&rel);
-        let entry = self.eff_mods.get(&owner);
-        let known = entry.is_some();
-        // The completion condition depends on what we are asking the plugin to do. A populated
-        // snapshot succeeds when a new live carrier object appears; an empty snapshot succeeds
-        // when the old object and all of its kinds are gone. Treating both as "wait for live"
-        // made a successful restore sit for 25 seconds and then report a failure.
-        self.eff_editor.carrier_expected = entry.is_some_and(|e| !e.is_empty());
         // Publish through the CARRIER, not the fighter's own eff. The fighter eff cannot be
         // reloaded mid-match (`reparse_game_path` rebuilds from the resident buffer and never
         // re-requests the file — `cb_game=0`), so edits only appeared after a full reboot. The
@@ -37572,12 +37415,21 @@ impl VisionaryApp {
         // hidden object. Gating on "has content" (as this once did, on authored edits alone)
         // would make both a transplant-only project and the last removal unsendable.
         self.push_effect_aliases();
-        // Stage the merged eff as well, whenever this fighter is one we track. The carrier
-        // covers the running match, but the fighter's OWN eff is what loads on the next match
-        // entry, and cross-fighter donor content exists only in the merged bytes. An
-        // edit-free entry is deliberate too: it serves the pristine source bytes back, which
-        // is what replaces a previously staged merged file after the last removal.
-        if known {
+        // Stage the merged effs as well. The carrier covers the running match, but a fighter's
+        // OWN eff is what loads on the next match entry, and cross-fighter donor content exists
+        // only in the merged bytes. An edit-free entry that was staged before is deliberate too:
+        // it serves the pristine source bytes back, which is what replaces the merged file after
+        // the last removal.
+        let stale: Vec<String> = self
+            .eff_mods
+            .iter()
+            .filter(|(of, eff)| match self.live_eff_deployed.get(*of) {
+                Some(staged) => **of == owner || staged != *eff,
+                None => !eff.is_empty(),
+            })
+            .map(|(of, _)| of.clone())
+            .collect();
+        for owner in stale {
             self.deploy_live_eff(&owner);
         }
         let note = send_note(
@@ -41007,16 +40859,17 @@ impl eframe::App for VisionaryApp {
                         .on_hover_text("Effect file edits need the move played again to show")
                         .clicked()
                     {
+                        self.send_again();
                         self.sync_eff_mods_from_editor();
                         self.push_effect_aliases();
                         self.eff_editor.mark_sent();
                         ui.close();
                     }
                     if ui.button("Put the game back to normal")
-                        .on_hover_text("Remove every change Visionary made in the running game. Your project keeps them.")
+                        .on_hover_text("Remove every change Visionary made in the running game, and keep them out when it connects again. Your project keeps them: Send edits or opening the project puts them all back, and editing a move puts that move back.")
                         .clicked()
                     {
-                        self.clear_all_game_edits();
+                        self.put_game_back();
                         ui.close();
                     }
                 });
@@ -41471,7 +41324,17 @@ Click to see the code, or link your own project"
             }
         }
         // Resolve "waiting for game": the plugin reports carrier readiness as it changes.
-        if let Some(since) = self.eff_editor.awaiting_game {
+        // The game has loaded its own file again, or a changed one: what the carrier puts back
+        // is another. Until a new connection reports, it holds what it held.
+        if let Some(staged) = self.game_link.staged_effects() {
+            if self.staged_effects_seen != staged {
+                self.staged_effects_seen = staged;
+                self.push_effect_aliases_quietly();
+            }
+        }
+        // It leaves in `flush_effect_aliases`, below.
+        let awaiting = self.eff_editor.awaiting_game;
+        if let Some(since) = send_to_judge(awaiting, self.carrier_send_armed) {
             let (state, kinds, reports, spawned) = self.game_link.carrier_status();
             self.eff_editor.carrier_report = (state, kinds, spawned);
             self.eff_editor.carrier_gen_now = self.game_link.carrier_gen();
@@ -41537,20 +41400,23 @@ Click to see the code, or link your own project"
             // timeout and blaming the match for it.
             let rejected = self.game_link.take_carrier_error();
             use crate::eff_editor::SendOutcome;
+            // Nobody in the match can hold the carrier, so the swap waits for one who can.
+            let absent = !live
+                && since.elapsed().as_secs() >= 3
+                && self.eff_editor.carrier_expected
+                && self.game_link.has_gimmick_agents_snapshot()
+                && crate::live_carrier::nobody_holds(
+                    &self.game_link.gimmick_agents(),
+                    &self.carrier_fighters,
+                );
             // The edit could not be built, so the game was never asked for it.
-            let not_built = if self.eff_editor.carrier_expected {
-                self.eff_editor.carrier_build_error.take()
-            } else {
-                None
-            };
-            if live || silent || stalled || rejected.is_some() || not_built.is_some() {
+            let not_built = self.eff_editor.carrier_build_error.take();
+            if live || silent || stalled || absent || rejected.is_some() || not_built.is_some() {
                 self.eff_editor.awaiting_game = None;
                 let outcome = if not_built.is_some() {
                     SendOutcome::NotBuilt
-                } else if live && self.eff_editor.carrier_expected {
-                    SendOutcome::InGame
                 } else if live {
-                    SendOutcome::Restored
+                    self.reached_outcome()
                 } else if rejected.is_some() {
                     SendOutcome::Unreadable
                 } else if silent {
@@ -41570,6 +41436,8 @@ Click to see the code, or link your own project"
                         "\nThe game could not open the file it was sent ({reason}). Check that \
                          Visionary writes to your emulator's SD folder, or set VISIONARY_SD_DIR."
                     )
+                } else if absent {
+                    "\nNo character with effect edits is in this match.".to_string()
                 } else if silent {
                     "\nNo match is reporting back: start one, then send again.".to_string()
                 } else if stalled && state == 0 {
@@ -41579,9 +41447,18 @@ Click to see the code, or link your own project"
                      match loads the edit."
                         .to_string()
                 };
+                // What an exported mod of these edits would meet, by name.
+                let key = crate::character::CharacterKey::parse(
+                    self.sent_owner.as_deref().unwrap_or_default(),
+                );
+                let rel = key.effect_rel(&self.roster.project);
+                let shadow =
+                    crate::eff_source::shadow(&rel, &crate::scratch_dirs::installed_mods())
+                        .map(|shadow| format!("\n{shadow}"))
+                        .unwrap_or_default();
                 self.eff_editor.last_carrier_result = Some(outcome.text().to_string());
                 self.eff_editor.last_carrier_detail = Some(format!(
-                    "{} after {:.1}s, edit {generation}{why}",
+                    "{} after {:.1}s, edit {generation}{why}{shadow}",
                     crate::eff_editor::carrier_numbers(state, kinds, spawned),
                     since.elapsed().as_secs_f32(),
                 ));
@@ -41639,16 +41516,6 @@ Click to see the code, or link your own project"
         }
         if asking {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-
-        // Delayed serving-chain probe after a live-eff deploy.
-        if let Some(due) = self.live_eff_probe_due {
-            if std::time::Instant::now() >= due {
-                self.live_eff_probe_due = None;
-                self.game_link.send_live_eff_probe();
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            }
         }
 
         // Param labels arriving from the background download (cache first, then GitHub).
@@ -46324,9 +46191,10 @@ mod editor_timeline_filter_tests {
 
 #[cfg(test)]
 mod carrier_send_state_tests {
-    use super::carrier_send_reached_goal;
+    use super::{carrier_send_reached_goal, held_back, send_to_judge};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+    use std::collections::HashMap;
 
     #[test]
     fn populated_snapshot_requires_its_new_live_object() {
@@ -46345,6 +46213,113 @@ mod carrier_send_state_tests {
         assert!(!carrier_send_reached_goal(false, 0, 1, false, false, true));
         assert!(!carrier_send_reached_goal(false, 0, 0, true, false, true));
         assert!(!carrier_send_reached_goal(false, 2, 5, true, true, true));
+    }
+
+    /// The status line once stayed on "Sending to the game" with "In the game" beside it: the
+    /// outcome was worked out in the frame Send was pressed, from the last report and the last
+    /// send's "no new bytes", before the send had left.
+    #[test]
+    fn a_send_is_judged_only_once_it_has_left() {
+        let since = std::time::Instant::now();
+        assert_eq!(send_to_judge(Some(since), true), None);
+        assert_eq!(send_to_judge(Some(since), false), Some(since));
+        assert_eq!(send_to_judge(None, false), None);
+        // What that judged by: the last send's live carrier, and no new bytes to wait for.
+        assert!(carrier_send_reached_goal(true, 2, 5, true, true, true));
+        let app = include_str!("app.rs");
+        let judged = app.find("send_to_judge(awaiting, self.carrier_send_armed)");
+        let reached = app.find("let live = carrier_send_reached_goal(");
+        assert!(judged.is_some() && judged < reached);
+    }
+
+    /// "Put the game back to normal" keeps every edit then in the game out of it, through a
+    /// reconnect and through opening a move, which makes the same rules again; editing the move
+    /// puts that move's back in. Sending again does all of them.
+    #[test]
+    fn what_was_taken_out_stays_out_until_it_is_edited_or_sent() {
+        let store = HashMap::from([
+            ("mario/attack_11".to_owned(), vec![1, 2]),
+            ("mario/attack_12".to_owned(), vec![3]),
+        ]);
+        let held = store.clone();
+        let goes = |store: &HashMap<String, Vec<i32>>, held: Option<&HashMap<String, Vec<i32>>>| {
+            let mut keys: Vec<String> = store
+                .iter()
+                .filter(|(key, rules)| !held_back(held, key, rules))
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(goes(&store, Some(&held)), Vec::<String>::new());
+        let mut edited = store.clone();
+        edited.insert("mario/attack_11".to_owned(), vec![1, 9]);
+        edited.insert("fox/attack_11".to_owned(), vec![4]);
+        assert_eq!(
+            goes(&edited, Some(&held)),
+            ["fox/attack_11", "mario/attack_11"]
+        );
+        assert_eq!(goes(&edited, None).len(), 3);
+
+        let app = include_str!("app.rs");
+        let body = |name: &str| {
+            app.split(name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        for (publish, union) in [
+            ("publish_hitbox_rules", "live_hitbox_rule_union"),
+            ("publish_effect_rules", "live_effect_rule_union"),
+            (
+                "publish_effect_control_rules",
+                "live_effect_control_rule_union",
+            ),
+        ] {
+            assert!(
+                body(&format!("fn {publish}(&self) {{"))
+                    .contains(&format!("self.{union}(self.put_back.as_ref())")),
+                "{publish}"
+            );
+            assert!(
+                body(&format!("fn {union}(")).contains("held_back(put_back.map("),
+                "{union}"
+            );
+            // What is kept out of the match is still exported.
+            assert!(
+                body("fn write_rule_pack(").contains(&format!("self.{union}(None)")),
+                "{union}"
+            );
+        }
+        // Reconnecting sends no edit; Send and reopening do.
+        let resend = body("fn resend_live_state(&mut self) {");
+        let stop = resend.find("if self.put_back.is_some() {").expect("stop");
+        for edits in ["self.push_effect_aliases();", "resend_tweaks"] {
+            assert!(stop < resend.find(edits).expect(edits), "{edits}");
+        }
+        let again = body("fn send_again(&mut self) {");
+        for sent in [
+            "self.put_back.take()",
+            "self.publish_live_rule_union();",
+            "resend_tweaks",
+            "hold_live(false)",
+        ] {
+            assert!(again.contains(sent), "{sent}");
+        }
+        assert!(body("fn apply_authored_eff_live(&mut self) -> String {")
+            .contains("self.send_again();"));
+        assert!(body("fn clear_all_game_edits(&mut self) {").contains("self.put_back = None;"));
+        let back = body("fn put_game_back(&mut self) {");
+        for taken in [
+            "self.put_back = Some(PutBack {",
+            "send_reset_pins()",
+            "self.publish_live_rule_union();",
+            "hold_live(true)",
+            "self.clear_staged_game_files();",
+            "self.push_effect_aliases_quietly();",
+        ] {
+            assert!(back.contains(taken), "{taken}");
+        }
     }
 }
 
@@ -50198,7 +50173,7 @@ mod live_effect_capture_tests {
         ] {
             assert!(union.contains(&format!("self.{publish}();")), "{publish}");
             assert!(
-                body(&format!("fn {publish}(&self) {{")).contains(&format!("self.{list}()")),
+                body(&format!("fn {publish}(&self) {{")).contains(&format!("self.{list}(")),
                 "{publish}"
             );
             let rules = body(&format!("fn {list}("));
@@ -50366,8 +50341,8 @@ mod live_effect_capture_tests {
             .expect("flush_effect_aliases");
         assert!(flush.contains("if !report && alias_status_is_routine(&self.state.status)"));
         for line in [
-            "self.state.status = send_note(",
-            "self.game_link.status().is_connected(),",
+            "self.state.status = send_note(connected, &what);",
+            "let connected = self.game_link.status().is_connected();",
         ] {
             assert!(push.contains(line), "{line}");
         }

@@ -586,12 +586,17 @@ static ALIASES: parking_lot::Mutex<Vec<EffectAlias>> = parking_lot::Mutex::new(V
 /// Full-list replace (idempotent, like rules). Empty clears all aliases.
 pub fn set_aliases(aliases: Vec<EffectAlias>) {
     let n = aliases.len();
-    if let Some(mut a) = ALIASES.try_lock() {
-        *a = aliases;
-        crate::slight::diag::note(format!("effect aliases replaced: {n} alias(es)"));
-    } else {
-        crate::slight::diag::note("effect aliases: lock contended, push dropped");
-    }
+    // Held only for one lookup or one swap of the list. Spin rather than park, as `stage_rules`
+    // does; a push that gave up instead left edits out of the game that the editor counted in it.
+    let mut current = loop {
+        if let Some(guard) = ALIASES.try_lock() {
+            break guard;
+        }
+        core::hint::spin_loop();
+    };
+    *current = aliases;
+    drop(current);
+    crate::slight::diag::note(format!("effect aliases replaced: {n} alias(es)"));
 }
 
 /// Cheap gate so the hooks skip the costume lookup when no aliases exist.

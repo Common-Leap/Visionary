@@ -751,17 +751,13 @@ unsafe fn rewrite_kind(lua_state: u64, from: u64, to: u64, flip: bool) {
     }
 }
 
-/// The owner fighter's costume slot (color index), or -1 when unresolvable.
+/// The costume of the fighter behind a call, its own or its object's, or -1 when unresolvable.
 unsafe fn costume_of(lua_state: u64) -> i32 {
-    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
-        as *mut smash::app::BattleObjectModuleAccessor;
+    let boma = boma_of(lua_state);
     if boma.is_null() {
         return -1;
     }
-    smash::app::lua_bind::WorkModule::get_int(
-        boma,
-        *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-    )
+    crate::slight::hitbox_viewer::acting_costume(boma)
 }
 
 /// One-time: log the CONCRETE EffectModule vtable targets (req = vtable+0x68,

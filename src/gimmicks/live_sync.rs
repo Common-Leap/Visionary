@@ -8,6 +8,8 @@ type ControllerCharts = BTreeMap<String, BTreeMap<String, crate::mod_project::Co
 
 pub struct LiveSync {
     pub enabled: bool,
+    /// What `enabled` was before the game was put back to normal, until everything is sent again.
+    pub held: Option<bool>,
     pub warnings: BTreeMap<String, Vec<String>>,
     epoch: Option<u64>,
     revision: u64,
@@ -22,6 +24,7 @@ impl Default for LiveSync {
     fn default() -> Self {
         Self {
             enabled: true,
+            held: None,
             warnings: BTreeMap::new(),
             epoch: None,
             revision: 0,
@@ -35,6 +38,17 @@ impl Default for LiveSync {
 }
 
 impl LiveSync {
+    /// Keep everything out of the running game (`hold`), or show it again as it was shown.
+    pub fn hold(&mut self, hold: bool) {
+        match hold {
+            true => {
+                self.held.get_or_insert(self.enabled);
+                self.enabled = false;
+            }
+            false => self.enabled = self.held.take().unwrap_or(self.enabled),
+        }
+    }
+
     pub fn error_for(&self, family: &str) -> Option<&str> {
         self.errors.get(family).map(String::as_str)
     }
@@ -469,6 +483,25 @@ mod tests {
         assert_eq!(request.charts[0].program.fighter, "cloud");
         assert_eq!(request.disabled_fighters, ["mario"]);
         assert!(sync.warnings["mario"][0].contains("invalid move binding"));
+    }
+
+    /// "Put the game back to normal" turns the preview off, and sending again turns it back on,
+    /// unless it was off before.
+    #[test]
+    fn putting_the_game_back_holds_gimmicks_as_they_were() {
+        for before in [true, false] {
+            let mut sync = LiveSync {
+                enabled: before,
+                ..Default::default()
+            };
+            sync.hold(true);
+            sync.hold(true);
+            assert!(!sync.enabled);
+            sync.hold(false);
+            assert_eq!(sync.enabled, before);
+            sync.hold(false);
+            assert_eq!(sync.enabled, before);
+        }
     }
 
     #[test]
