@@ -8122,8 +8122,6 @@ impl FighterEntry {
 pub struct AppState {
     /// The game's own script for this move, which live node steps compare against.
     pub source_script: AcmdScript,
-    /// Graphics the game's own effect script spawns, including inside its `if`s.
-    pub source_effect_spawns: std::collections::BTreeSet<String>,
     pub data_root: Option<PathBuf>,
     pub fighters: Vec<FighterEntry>,
     pub labels: HashMap<u64, String>,
@@ -8271,7 +8269,6 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             source_script: AcmdScript::default(),
-            source_effect_spawns: Default::default(),
             data_root: None,
             fighters: Vec::new(),
             labels: HashMap::new(),

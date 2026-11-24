@@ -684,73 +684,132 @@ pub fn newly_guarded_frames(
     frames
 }
 
-/// Every graphic a Visuals lane can spawn, including inside If and Repeat blocks.
-pub fn spawn_names(nodes: &[MoveNode], out: &mut std::collections::BTreeSet<String>) {
+/// Every graphic a Visuals lane can spawn, including inside If and Repeat blocks and in the lines
+/// it keeps as the game has them.
+fn lane_spawns(nodes: &[MoveNode], out: &mut std::collections::BTreeSet<String>) {
+    use super::model::EffectCommandSlot as Slot;
     for node in nodes {
         match &node.kind {
-            NodeKind::EffectExecute { commands } => {
-                out.extend(commands.iter().filter_map(|command| match command {
-                    crate::data::EffectMacro::Effect { effect_name, .. } => {
-                        Some(effect_name.clone())
-                    }
-                    _ => None,
-                }));
-            }
-            NodeKind::MixedEffectExecute { commands, .. } => {
-                out.extend(commands.iter().filter_map(|command| match command {
-                    super::model::EffectCommandSlot::Editable(
-                        crate::data::EffectMacro::Effect { effect_name, .. },
-                    ) => Some(effect_name.clone()),
-                    _ => None,
-                }));
-            }
+            NodeKind::EffectExecute { commands } => command_spawns(commands, out),
+            NodeKind::MixedEffectExecute { commands, .. } => command_spawns(
+                commands.iter().map(|slot| match slot {
+                    Slot::Editable(command) | Slot::Preserved(command) => command,
+                }),
+                out,
+            ),
             NodeKind::Branch {
                 then_nodes,
                 else_nodes,
                 ..
             } => {
-                spawn_names(then_nodes, out);
-                spawn_names(else_nodes, out);
+                lane_spawns(then_nodes, out);
+                lane_spawns(else_nodes, out);
             }
-            NodeKind::Repeat { body, .. } => spawn_names(body, out),
+            NodeKind::Repeat { body, .. } => lane_spawns(body, out),
+            NodeKind::BareCommand { command } => stmt_spawns([command.as_ref()], out),
+            NodeKind::Execute { commands } => stmt_spawns(commands, out),
+            NodeKind::Preserved { statement } => {
+                let lines = crate::acmd::emit_stmts(std::slice::from_ref(statement), "");
+                lines.iter().for_each(|line| line_spawns(line, out));
+            }
             _ => {}
         }
     }
 }
 
-/// The graphics the game's own effect script spawns.
-pub fn source_spawn_names(
-    script: &crate::data::EffectScript,
-) -> std::collections::BTreeSet<String> {
+fn stmt_spawns<'a>(
+    commands: impl IntoIterator<Item = &'a ExcuteStmt>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for command in commands {
+        if let ExcuteStmt::Effect(command) = command {
+            command_spawns([command.as_ref()], out);
+        }
+    }
+}
+
+fn statement_spawns(
+    stmts: &[crate::data::EffectStmt],
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::data::EffectStmt as E;
+    for stmt in stmts {
+        match stmt {
+            E::BareEffect(command) => command_spawns([command.as_ref()], out),
+            E::Excute(commands) => command_spawns(commands, out),
+            E::Loop { body, .. } | E::Cond { body, .. } => statement_spawns(body, out),
+            E::Raw(line) => line_spawns(line, out),
+            _ => {}
+        }
+    }
+}
+
+fn command_spawns<'a>(
+    commands: impl IntoIterator<Item = &'a crate::data::EffectMacro>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for command in commands {
+        match command {
+            crate::data::EffectMacro::Effect { effect_name, .. } => {
+                out.insert(effect_name.to_lowercase());
+            }
+            crate::data::EffectMacro::Raw(line) => line_spawns(line, out),
+            _ => {}
+        }
+    }
+}
+
+/// The graphics a line of code spawns. A line that only ends one names it without playing it.
+fn line_spawns(code: &str, out: &mut std::collections::BTreeSet<String>) {
+    for line in code.lines() {
+        let call = line.split_once("macros::").map_or(line, |(_, call)| call);
+        let Some((function, args)) = call.split_once('(') else {
+            continue;
+        };
+        if crate::acmd::effect_spawn_layout(function.trim()).is_none() {
+            continue;
+        }
+        if let Some((name, _)) = args
+            .split_once("Hash40::new(\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+        {
+            out.insert(name.to_lowercase());
+        }
+    }
+}
+
+/// The graphics an effect script spawns, at any depth.
+fn script_spawns(script: &crate::data::EffectScript) -> std::collections::BTreeSet<String> {
     let mut out = Default::default();
-    spawn_names(
-        &super::effects::import_for_fighter("", script).nodes,
-        &mut out,
-    );
+    statement_spawns(&script.stmts, &mut out);
     out
 }
 
-/// Source graphics this move no longer spawns anywhere. `script` is what its blocks play, when
-/// they own its effects: one no block can hold has no lane in the graph. With neither, the
-/// effects are still the source's and nothing was removed.
-pub fn removed_spawns(
-    graph: &MoveGraph,
+/// The graphics the open move's own scripts spawn and its blocks no longer do.
+pub fn removed_spawns(kept: &std::collections::BTreeSet<String>, body: &str) -> Vec<String> {
+    let source = script_spawns(&crate::acmd::parse_effect_script(body));
+    source.difference(kept).cloned().collect()
+}
+
+/// The graphics a move's blocks play, or nothing while they leave its effects to the game.
+/// `script` is what they write, when they own its effects: a move whose effects no block can hold
+/// has no lane in its graph.
+pub fn kept_spawns(
+    graph: Option<&MoveGraph>,
     script: Option<&crate::data::EffectScript>,
-    source: &std::collections::BTreeSet<String>,
-) -> Vec<String> {
-    let mut lanes = graph
+) -> Option<std::collections::BTreeSet<String>> {
+    if let Some(script) = script {
+        return Some(script_spawns(script));
+    }
+    let mut lanes = graph?
         .tracks
         .iter()
         .filter(|track| track.track == Track::Effect)
         .peekable();
-    if lanes.peek().is_none() && script.is_none() {
-        return Vec::new();
-    }
-    let mut kept = script.map(source_spawn_names).unwrap_or_default();
-    for track in lanes {
-        spawn_names(&track.nodes, &mut kept);
-    }
-    source.difference(&kept).cloned().collect()
+    lanes.peek()?;
+    let mut kept = Default::default();
+    lanes.for_each(|track| lane_spawns(&track.nodes, &mut kept));
+    Some(kept)
 }
 
 #[cfg(test)]
@@ -802,26 +861,66 @@ mod tests {
         let effects = crate::acmd::parse_effect_script(
             "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 4.0);\n    if macros::is_excute(agent) {\n        macros::EFFECT_FOLLOW(agent, Hash40::new(\"sys_attack_arc\"), Hash40::new(\"top\"), 0, 8, 0, 0, 0, 0, 1.0, true);\n    }\n}\n",
         );
-        let source = source_spawn_names(&effects);
+        let none = crate::acmd::parse_effect_script(
+            "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {\n}\n",
+        );
+        let source = script_spawns(&effects);
         assert_eq!(source.len(), 1);
-        // Blocks of the hitboxes only.
-        assert!(removed_spawns(&imported(), None, &source).is_empty());
-        // Blocks that own the effects and no longer make it: in an emptied lane, or in a script
-        // no block can hold.
+        // Blocks of the hitboxes only, and no blocks at all.
+        assert_eq!(kept_spawns(Some(&imported()), None), None);
+        assert_eq!(kept_spawns(None, None), None);
+        // Blocks that own the effects: in a lane, an emptied one, or a script no block can hold.
         let mut owned = imported();
         owned
             .tracks
             .push(crate::move_nodes::effects::import_for_fighter(
                 "mario", &effects,
             ));
-        assert!(removed_spawns(&owned, None, &source).is_empty());
-        owned.tracks.last_mut().unwrap().nodes.clear();
-        assert_eq!(removed_spawns(&owned, None, &source).len(), 1);
-        let none = crate::acmd::parse_effect_script(
-            "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {\n}\n",
+        assert_eq!(kept_spawns(Some(&owned), None), Some(source.clone()));
+        // What they write is newer than a lane that could not be made to write it.
+        assert_eq!(
+            kept_spawns(Some(&owned), Some(&none)),
+            Some(Default::default())
         );
-        assert_eq!(removed_spawns(&imported(), Some(&none), &source).len(), 1);
-        assert!(removed_spawns(&imported(), Some(&effects), &source).is_empty());
+        owned.tracks.last_mut().unwrap().nodes.clear();
+        assert_eq!(kept_spawns(Some(&owned), None), Some(Default::default()));
+        assert_eq!(
+            kept_spawns(Some(&imported()), Some(&none)),
+            Some(Default::default())
+        );
+        assert_eq!(kept_spawns(None, Some(&effects)), Some(source));
+    }
+
+    /// An effect the blocks still play under a condition no block can hold, or inside lines kept
+    /// as the game has them, is not removed; one they only end is.
+    #[test]
+    fn an_effect_is_kept_wherever_the_move_still_plays_it() {
+        let nested = crate::acmd::parse_effect_script(
+            "unsafe extern \"C\" fn effect_specials(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 4.0);\n    if !WorkModule::is_flag(agent.module_accessor, *FIGHTER_BAYONETTA_STATUS_WORK_ID_SPECIAL_S_FLAG_NEAR_CLIFF) {\n        if macros::is_excute(agent) {\n            macros::EFFECT(agent, Hash40::new(\"sys_whirlwind_l\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);\n            macros::EFFECT_OFF_KIND(agent, Hash40::new(\"sys_gone\"), false, true);\n        }\n    }\n}\n",
+        );
+        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
+        assert_eq!(script_spawns(&nested), names(&["sys_whirlwind_l"]));
+        // Nobody's fighter, so the condition is kept as the game has it.
+        let lane = crate::move_nodes::effects::import_for_fighter("", &nested);
+        let graph = MoveGraph {
+            tracks: vec![lane],
+            ..MoveGraph::default()
+        };
+        assert_eq!(
+            kept_spawns(Some(&graph), None),
+            Some(names(&["sys_whirlwind_l"]))
+        );
+        // Only what the move itself spawns can have been removed from it.
+        let body = "unsafe extern \"C\" fn effect_specials(agent: &mut L2CAgentBase) {\n    if macros::is_excute(agent) {\n        macros::EFFECT(agent, Hash40::new(\"sys_whirlwind_l\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);\n        macros::EFFECT(agent, Hash40::new(\"sys_hit\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);\n    }\n}\n";
+        let kept = names(&["sys_whirlwind_l", "another_moves"]);
+        assert_eq!(removed_spawns(&kept, body), ["sys_hit"]);
+        assert!(removed_spawns(&Default::default(), "").is_empty());
+        let mut raw = Default::default();
+        line_spawns(
+            "macros::FOOT_EFFECT(agent, Hash40::new(\"sys_Dash_smoke\"), Hash40::new(\"top\"), 0);\nmacros::EFFECT_OFF_KIND(agent, Hash40::new(\"sys_gone\"), false, true);",
+            &mut raw,
+        );
+        assert_eq!(raw, names(&["sys_dash_smoke"]));
     }
 
     #[test]

@@ -3632,6 +3632,54 @@ fn trail_capture_raw_line(func: &str, args: &[crate::game_link::LuaArgWire]) -> 
     }
 }
 
+/// The effect calls `shown`, each at the place of the one in `pristines` it was made from, and the
+/// places of those no longer in it: put back disabled, which stops them in the match. Added calls
+/// come last. Blocks can take a call out of the middle, so its place there says nothing.
+fn line_up_effects(
+    pristines: &[crate::data::EffectCall],
+    shown: Vec<crate::data::EffectCall>,
+) -> (Vec<crate::data::EffectCall>, BTreeSet<usize>) {
+    use crate::data::EffectCall;
+    let kind = |call: &EffectCall| {
+        let command = call.control.as_ref().map(|control| control.command_name());
+        let color = call.color.is_some().then(|| call.spawn_func.clone());
+        (effect_call_is_trail(call), command, color)
+    };
+    let alike = |a: &EffectCall, b: &EffectCall| {
+        kind(a) == kind(b) && a.effect_name.eq_ignore_ascii_case(&b.effect_name)
+    };
+    let at = |a: &EffectCall, b: &EffectCall| a.active_start == b.active_start;
+    // Blocks may write a condition in other words than the game's script does.
+    let under = |a: &EffectCall, b: &EffectCall| a.guard == b.guard;
+    let steps: [&dyn Fn(&EffectCall, &EffectCall) -> bool; 6] = [
+        &|a, b| a == b,
+        &|a, b| alike(a, b) && at(a, b) && under(a, b),
+        &|a, b| alike(a, b) && at(a, b),
+        &|a, b| alike(a, b) && under(a, b),
+        &|a, b| alike(a, b),
+        &|a, b| kind(a) == kind(b) && at(a, b) && under(a, b),
+    ];
+    let mut shown: Vec<_> = shown.into_iter().map(Some).collect();
+    let mut places = vec![None; pristines.len()];
+    for same in steps {
+        for (was, place) in pristines.iter().zip(&mut places) {
+            if place.is_none() {
+                let mut left = shown.iter_mut();
+                let found = left.find(|call| call.as_ref().is_some_and(|call| same(was, call)));
+                *place = found.and_then(Option::take);
+            }
+        }
+    }
+    let removed = (0..places.len()).filter(|i| places[*i].is_none()).collect();
+    let lined = places.into_iter().zip(pristines).map(|(call, was)| {
+        call.unwrap_or_else(|| EffectCall {
+            disabled: true,
+            ..was.clone()
+        })
+    });
+    (lined.chain(shown.into_iter().flatten()).collect(), removed)
+}
+
 fn effect_call_is_trail(call: &crate::data::EffectCall) -> bool {
     call.trail_command.is_some() || call.raw_line.is_some() || call.spawn_func == "AFTER_IMAGE_ON"
 }
@@ -8783,8 +8831,6 @@ impl VisionaryApp {
             if calls.is_empty() && !self.state.effects.is_empty() {
                 Some("Source has no readable effect spawns — showing the last version that did")
             } else {
-                self.state.source_effect_spawns =
-                    crate::move_nodes::live_steps::source_spawn_names(&effect_script);
                 self.state.effects_pristine = calls.clone();
                 self.state.effects = calls;
                 self.state.selected_effect_call = None;
@@ -25209,9 +25255,6 @@ impl VisionaryApp {
         self.state.script = context.game;
         self.state.hitboxes_pristine = context.hitboxes_pristine;
         self.state.hitboxes = context.hitboxes;
-        self.state.source_effect_spawns = crate::move_nodes::live_steps::source_spawn_names(
-            &crate::acmd::parse_effect_script(&context.source.body),
-        );
         self.state.effects_pristine = context.effects_pristine;
         self.state.effects = context.effects;
         self.state.sound_script = context.sound;
@@ -25863,8 +25906,6 @@ impl VisionaryApp {
             self.state.hitboxes = hitboxes;
             self.state.set_script(script);
             self.state.effect_script = crate::acmd::parse_effect_script(&body);
-            self.state.source_effect_spawns =
-                crate::move_nodes::live_steps::source_spawn_names(&self.state.effect_script);
             self.state.effects_pristine = self.state.effect_script.to_effect_calls();
             self.state.effects = self.state.effects_pristine.clone();
             self.state.sound_script = crate::acmd::parse_sound_script(&body);
@@ -38606,18 +38647,15 @@ impl VisionaryApp {
             .cloned()
             .map(crate::data::EffectCall::normalized_timing)
             .collect();
-        // A spawn the user removed stays in the list as disabled, which suppresses it live.
-        let kept = effects.len();
-        effects.extend(
-            pristines
-                .iter()
-                .skip(effects.len())
-                .cloned()
-                .map(|mut removed| {
-                    removed.disabled = true;
-                    removed
-                }),
-        );
+        let blocks = self.block_effects(&mv_key);
+        let graph = crate::character::split_move_key(&mv_key)
+            .and_then(|(owner, name)| self.move_graphs.get(owner)?.get(name));
+        let kept = crate::move_nodes::live_steps::kept_spawns(graph, blocks.as_ref());
+        // Classic keeps a call in its place and disables one that is removed.
+        let mut removed = BTreeSet::new();
+        if blocks.is_some() || effects.len() < pristines.len() {
+            (effects, removed) = line_up_effects(&pristines, effects);
+        }
         let mut rules: Vec<crate::game_link::SpawnRuleWire> = Vec::new();
         let mut missing_capture = false;
         let mut unsupported_work_int = false;
@@ -38807,10 +38845,13 @@ impl VisionaryApp {
             if ec.disabled {
                 // Script frames drift from motion frames under an animation-speed call. With no
                 // spawn of this effect left in the move, stop it wherever it comes.
-                let gone = i >= kept
-                    && !effects[..kept]
-                        .iter()
-                        .any(|other| other.effect_name == ec.effect_name);
+                let gone = removed.contains(&i)
+                    && match &kept {
+                        Some(kept) => !kept.contains(&ec.effect_name.to_lowercase()),
+                        None => !effects
+                            .iter()
+                            .any(|call| !call.disabled && call.effect_name == ec.effect_name),
+                    };
                 rules.push(crate::game_link::SpawnRuleWire {
                     eff_hash: orig_hash,
                     suppress: true,
@@ -39008,14 +39049,9 @@ impl VisionaryApp {
             self.build_effect_control_rules(&effects, &pristines, motion);
         // Spawns inside the game's own `if`s never reach the flat list above. A move that no
         // longer has one anywhere stops it for the whole motion.
-        if let Some(graph) = crate::character::split_move_key(&mv_key)
-            .and_then(|(fighter, name)| self.move_graphs.get(fighter)?.get(name))
-        {
-            for name in crate::move_nodes::live_steps::removed_spawns(
-                graph,
-                self.block_effects(&mv_key).as_ref(),
-                &self.state.source_effect_spawns,
-            ) {
+        if let Some(kept) = &kept {
+            let body = &self.state.loaded_body;
+            for name in crate::move_nodes::live_steps::removed_spawns(kept, body) {
                 let eff_hash = effect_name_hash(&name);
                 if !rules.iter().any(|rule| {
                     rule.eff_hash == eff_hash && rule.suppress && rule.frame_start.is_none()
@@ -58042,6 +58078,72 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
         assert!(project::reconcile(&mut edited).is_empty());
     }
 
+    /// Every fighter's real moves: blocks made of the move's own effects stop none of them in the
+    /// match, the way a project saved by 0.3 has them for every move. Set
+    /// `VISIONARY_SCRIPT_DUMP` to the dump's `smashline` folder to run it.
+    #[test]
+    fn every_fighters_blocks_stop_none_of_its_own_effects() {
+        use crate::move_nodes::live_steps::{kept_spawns, removed_spawns};
+        let Some(root) = std::env::var_os("VISIONARY_SCRIPT_DUMP") else {
+            return;
+        };
+        let (mut moves, mut spawns, mut problems) = (0, 0, Vec::new());
+        for kind in crate::gimmicks::registry::FIGHTER_KINDS {
+            let fighter = kind.fighter;
+            let dir = Path::new(&root)
+                .join(format!("lua2cpp_{fighter}"))
+                .join(fighter);
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let Ok(body) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let body = crate::acmd::script_source_from_body(&body);
+                let source = crate::acmd::parse_effect_script(&body);
+                let total = removed_spawns(&Default::default(), &body).len();
+                if total == 0 {
+                    continue;
+                }
+                let graph = MoveGraph {
+                    tracks: vec![crate::move_nodes::effects::import_for_fighter(
+                        fighter, &source,
+                    )],
+                    ..MoveGraph::default()
+                };
+                let Ok(written) = timeline::compile(fighter, "attack", &graph) else {
+                    continue;
+                };
+                moves += 1;
+                spawns += total;
+                let blocks = crate::acmd::parse_effect_script(
+                    &crate::acmd::preview_effect_structure_fn(&written[0].1, "attack"),
+                );
+                let name = entry.file_name().to_string_lossy().into_owned();
+                for (what, kept) in [
+                    ("lane", kept_spawns(Some(&graph), None)),
+                    ("script", kept_spawns(None, Some(&blocks))),
+                ] {
+                    let gone = removed_spawns(&kept.unwrap(), &body);
+                    if !gone.is_empty() {
+                        problems.push(format!("{fighter}/{name}: {what} stops {gone:?}"));
+                    }
+                }
+                let pristines = source.to_effect_calls();
+                let (_, removed) = line_up_effects(&pristines, blocks.to_effect_calls());
+                if !removed.is_empty() {
+                    problems.push(format!("{fighter}/{name}: {removed:?} of the list"));
+                }
+            }
+        }
+        println!("{moves} moves, {spawns} effects");
+        assert!(moves > 10_000 && spawns > 20_000, "{moves} {spawns}");
+        assert!(
+            problems.is_empty(),
+            "{} of {moves}:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
     /// Every fighter's real moves: blocks made of the move's own scripts hold every Classic
     /// hitbox edit. Set `VISIONARY_SCRIPT_DUMP` to the dump's `smashline` folder to run it.
     #[test]
@@ -59290,7 +59392,7 @@ mod character_store_tests {
 
 #[cfg(test)]
 mod follow_stop_tests {
-    use super::{effect_name_hash, follow_stop_rules, VisionaryApp};
+    use super::{effect_name_hash, follow_stop_rules, line_up_effects, BTreeSet, VisionaryApp};
     use crate::game_link::LuaArgWire;
 
     /// Mario's forward smash effect script, lifted from the script cache
@@ -59340,6 +59442,61 @@ mod follow_stop_tests {
         assert!(follow.follows_bone);
         assert_ne!(follow.active_end, crate::data::OPEN_ENDED_EFFECT_FRAME);
         follow
+    }
+
+    /// Blocks take a call out of the middle of a move's list. Paired by position, the calls after
+    /// it read as swapped: taking the arc off Mario's up tilt stopped its landing smoke too.
+    #[test]
+    fn a_call_the_blocks_removed_does_not_shift_the_ones_after_it() {
+        let game = calls();
+        let names = |calls: &[crate::data::EffectCall]| -> Vec<(String, bool)> {
+            let calls = calls.iter();
+            calls
+                .map(|call| (call.effect_name.clone(), call.disabled))
+                .collect()
+        };
+        for out in 0..game.len() {
+            let mut shown = game.clone();
+            shown.remove(out);
+            let (lined, removed) = line_up_effects(&game, shown);
+            assert_eq!(removed, BTreeSet::from([out]));
+            let mut want = game.clone();
+            want[out].disabled = true;
+            assert_eq!(names(&lined), names(&want));
+            assert_eq!(lined, want);
+        }
+        assert_eq!(
+            line_up_effects(&game, game.clone()),
+            (game.clone(), BTreeSet::new())
+        );
+        // Moved in time, turned into another effect, one gone and one added, in one edit.
+        let mut shown = game.clone();
+        shown[1].active_start += 2;
+        shown[3].effect_name = "sys_fire".into();
+        shown.remove(0);
+        let mut added = game[4].clone();
+        added.effect_name = "sys_bomb_b".into();
+        added.active_start = 40;
+        shown.push(added.clone());
+        let (lined, removed) = line_up_effects(&game, shown.clone());
+        assert_eq!(removed, BTreeSet::from([0]));
+        assert!(lined[0].disabled);
+        assert_eq!(lined[1..5], shown[0..4]);
+        assert_eq!(lined[5..], [added]);
+    }
+
+    /// What a move's own scripts spawn is read from the move that is open: kept beside it, the
+    /// list was still the last replayed move's, and stopped or kept the wrong effects.
+    #[test]
+    fn removed_spawns_are_the_open_moves() {
+        let push = include_str!("app.rs")
+            .split("fn push_effect_rules(&mut self) -> LiveReplayLimits {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("push_effect_rules");
+        assert!(push.contains("let body = &self.state.loaded_body;"));
+        assert!(push.contains("live_steps::removed_spawns(kept, body)"));
+        assert!(push.contains("if blocks.is_some() || effects.len() < pristines.len() {"));
     }
 
     /// Opening Mario's forward smash and changing nothing sends no rule for any of its effects:
