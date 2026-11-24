@@ -2499,6 +2499,7 @@ mod older_project_tests {
             let findings = project.migrate().unwrap();
             assert_eq!(project.version, 10, "{name}");
             crate::mod_export::validate_project(&project).unwrap();
+            crate::move_nodes::project::expand(&project).unwrap();
             assert_eq!(project.project_fighters, list, "{name}");
             let own = project.characters.get(&vision);
             if copied {

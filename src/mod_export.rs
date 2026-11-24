@@ -2058,6 +2058,7 @@ mod tests {
             );
 
         validate_project(&project).unwrap();
+        crate::move_nodes::project::expand(&project).unwrap();
         let portable = make_portable_project(&project, Path::new("."), "assets").unwrap();
         assert_eq!(
             portable.fighters["cloud"].controller_charts["alpha"].graph,
