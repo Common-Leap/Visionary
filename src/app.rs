@@ -2224,6 +2224,25 @@ fn adopt_captured_expressions(
 }
 
 /// Whether two parsed scripts say the same thing.
+/// Whether two versions of a move's source differ in one of `parts`. What else they differ in, or
+/// how they are written, says nothing about an edit of those.
+fn source_parts_differ(
+    parts: &[crate::move_nodes::model::Track],
+    saved: &str,
+    current: &str,
+) -> bool {
+    use crate::move_nodes::model::Track;
+    let script = |part: &Track, body: &str| match part {
+        Track::Game => serde_json::to_value(crate::acmd::parse_acmd_script(body)),
+        Track::Effect => serde_json::to_value(crate::acmd::parse_effect_script(body)),
+        Track::Sound => serde_json::to_value(crate::acmd::parse_sound_script(body)),
+        Track::Expression => serde_json::to_value(crate::acmd::parse_expression_script(body)),
+    };
+    parts
+        .iter()
+        .any(|part| script(part, saved).ok() != script(part, current).ok())
+}
+
 fn same_script(a: &crate::data::AcmdScript, b: &crate::data::AcmdScript) -> bool {
     serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
@@ -5348,6 +5367,9 @@ pub struct VisionaryApp {
     move_source_cache: HashMap<String, crate::mod_project::MoveSourceSnapshot>,
     /// Selection is held here while the source mismatch modal is open.
     source_mismatch_prompt: Option<PendingMoveSourceMismatch>,
+    /// Moves whose edits stay on the script they were made on, and the newer one that was
+    /// offered for it.
+    kept_move_sources: HashSet<(String, u64)>,
     /// The linked project's own scripts for the move whose mirror fetch is in flight, waiting
     /// to be merged back over it. `None` whenever no project defines the move, or when the
     /// project defines enough of it that no fetch was needed.
@@ -6139,6 +6161,7 @@ impl VisionaryApp {
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
             source_mismatch_prompt: None,
+            kept_move_sources: HashSet::new(),
             pending_project_script: None,
             bone_names: Vec::new(),
             hurtbox_volumes: Vec::new(),
@@ -7831,7 +7854,8 @@ impl VisionaryApp {
             if let Some(saved) = self.move_source_cache.get(&key).cloned() {
                 if let Some((body, origin)) = self.warm_source_body(&fighter_name, &move_entry.name)
                 {
-                    if body != saved.body {
+                    let kept = (key.clone(), fingerprint(body.as_bytes()));
+                    if body != saved.body && !self.kept_move_sources.contains(&kept) {
                         let captures = self.captures_for_move(
                             &fighter_name,
                             &move_entry.name,
@@ -7848,6 +7872,10 @@ impl VisionaryApp {
                             captures
                         };
                         let current = crate::mod_project::MoveSourceSnapshot { body, captures };
+                        if !self.source_is_in_conflict(&key, &saved.body, &current.body) {
+                            self.activate_move(move_entry, Some(current), origin);
+                            return;
+                        }
                         self.source_mismatch_prompt = Some(PendingMoveSourceMismatch {
                             fighter: fighter_name,
                             move_entry,
@@ -8121,7 +8149,7 @@ impl VisionaryApp {
     ) {
         let key = Self::move_key(&self.owner_spelling(fighter), move_name);
         if let Some(saved) = self.move_source_cache.get(&key).cloned() {
-            if saved.body != body {
+            if self.source_is_in_conflict(&key, &saved.body, &body) {
                 let Some(move_entry) = self
                     .state
                     .selected_move
@@ -22506,6 +22534,58 @@ impl VisionaryApp {
                 .is_some_and(|graphs| graphs.contains_key(move_name))
     }
 
+    /// The parts of the move under `key` the project edits, for the fighter or any character made
+    /// on it.
+    fn edited_parts(&self, key: &str) -> Vec<crate::move_nodes::model::Track> {
+        use crate::move_nodes::model::Track;
+        let Some((owner, move_name)) = crate::character::parse_move_key(key) else {
+            return Vec::new();
+        };
+        let engine = owner.engine_fighter();
+        let made = crate::character::made_on(engine, &self.roster.project);
+        let made = made.map(|entry| entry.key.as_str().to_owned());
+        let mut parts = Vec::new();
+        for owner in std::iter::once(engine.to_owned()).chain(made) {
+            let key = Self::move_key(&owner, move_name);
+            let graphs = self.move_graphs.get(&owner);
+            if let Some(graph) = graphs.and_then(|graphs| graphs.get(move_name)) {
+                parts.extend(graph.tracks.iter().map(|lane| lane.track));
+            }
+            let records = self.state.edit_log.entries.get(&owner);
+            let effects = self.state.effect_call_edits.get(&key);
+            for (edited, part) in [
+                (
+                    records.is_some_and(|moves| moves.contains_key(move_name)),
+                    Track::Game,
+                ),
+                (
+                    effects.is_some_and(|edits| !edits.is_empty())
+                        || self.node_effect_scripts.contains_key(&key),
+                    Track::Effect,
+                ),
+                (
+                    self.state.sound_script_edits.contains_key(&key),
+                    Track::Sound,
+                ),
+                (
+                    self.state.expression_script_edits.contains_key(&key),
+                    Track::Expression,
+                ),
+            ] {
+                if edited {
+                    parts.push(part);
+                }
+            }
+        }
+        parts
+    }
+
+    /// Whether the user has to choose between `saved`, the script the edits of the move under
+    /// `key` were made on, and `current`. Otherwise the current one is as good for them.
+    fn source_is_in_conflict(&self, key: &str, saved: &str, current: &str) -> bool {
+        source_parts_differ(&self.edited_parts(key), saved, current)
+    }
+
     /// Forget the source snapshots of moves that were only looked at.
     ///
     /// A snapshot is the baseline an edit was made against, which is worth keeping. One for a
@@ -26869,6 +26949,7 @@ impl VisionaryApp {
         self.state.capture_branch_warnings.clear();
         self.move_source_cache.clear();
         self.source_mismatch_prompt = None;
+        self.kept_move_sources.clear();
         self.eff_mods.clear();
         self.eff_stand_ins.clear();
         self.edit_files = EditFiles::default();
@@ -28820,6 +28901,7 @@ impl VisionaryApp {
         self.state.capture_branch_warnings.clear();
         self.move_source_cache.clear();
         self.source_mismatch_prompt = None;
+        self.kept_move_sources.clear();
         self.rebuilding_project_live = false;
         self.node_effect_scripts.clear();
         self.replay_live_fallback_key = None;
@@ -29263,26 +29345,41 @@ impl VisionaryApp {
             return;
         };
         let mut choice = None;
-        egui::Window::new("Move source changed")
+        let fighter = match self.fighter_row(&prompt.fighter) {
+            Some(row) => row.display_name.clone(),
+            None => prompt.fighter.clone(),
+        };
+        let move_name = crate::move_kinds::plain_name(&prompt.move_entry.name);
+        let whose = match prompt.current_origin {
+            crate::data::ScriptOrigin::MovesetSource => "your moveset's",
+            _ => "the game's",
+        };
+        egui::Window::new("Move script changed")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "The available source for {}/{} differs from the saved project snapshot.",
-                    prompt.fighter, prompt.move_entry.name
+                    "{fighter}, {move_name}: {whose} script is not the one this project's edits \
+                     were made on."
                 ));
-                ui.add_space(4.0);
-                ui.label(
-                    "Saved edits can be restored against the exported source, or kept while the \
-                     newer source becomes the new pristine baseline.",
-                );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Use saved project data").clicked() {
+                    if ui
+                        .button("Keep the script my edits use")
+                        .on_hover_text("The move stays as it is in this project")
+                        .clicked()
+                    {
                         choice = Some("saved");
                     }
-                    if ui.button("Use current source").clicked() {
+                    if ui
+                        .button("Use the new script")
+                        .on_hover_text(
+                            "Your edits stay; the parts of the move you have not edited follow \
+                             the new script",
+                        )
+                        .clicked()
+                    {
                         choice = Some("current");
                     }
                     if ui.button("Cancel").clicked() {
@@ -29298,11 +29395,19 @@ impl VisionaryApp {
         self.commit_current_edits();
         self.source_mismatch_prompt = None;
         match choice {
-            "saved" => self.activate_move(
-                prompt.move_entry,
-                Some(prompt.saved),
-                crate::data::ScriptOrigin::Saved,
-            ),
+            "saved" => {
+                let key = Self::move_key(
+                    &self.owner_spelling(&prompt.fighter),
+                    &prompt.move_entry.name,
+                );
+                let offered = fingerprint(prompt.current.body.as_bytes());
+                self.kept_move_sources.insert((key, offered));
+                self.activate_move(
+                    prompt.move_entry,
+                    Some(prompt.saved),
+                    crate::data::ScriptOrigin::Saved,
+                );
+            }
             "current" => self.activate_move(
                 prompt.move_entry,
                 Some(prompt.current),
@@ -29939,7 +30044,8 @@ impl VisionaryApp {
     /// Register newly-arrived capture lines for the open move, arming (or extending) the
     /// settle window. Cheap — only does work when the link's capture counter actually moved.
     fn note_new_captures(&mut self) {
-        if self.open_article.is_some() {
+        // A move whose script is still being fetched is empty for now, not a move without one.
+        if self.open_article.is_some() || self.fetching_acmd {
             return;
         }
         let seq = self.game_link.captures_seq();
@@ -30012,6 +30118,7 @@ impl VisionaryApp {
         // run to completion means the click still works and then self-corrects to the full
         // script instead of leaving the truncated one in place.
         if self.current_motion_hash() != Some(motion)
+            || self.fetching_acmd
             || !matches!(
                 self.state.acmd_source,
                 crate::data::ScriptOrigin::None | crate::data::ScriptOrigin::LiveCapture
@@ -59585,5 +59692,157 @@ mod follow_stop_tests {
 
         // A follow the user added has no stop of the game's.
         assert_eq!(follow_stop_rules(None, &game, Some(1)).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod move_source_tests {
+    use super::source_parts_differ;
+    use crate::move_nodes::model::Track;
+
+    /// Mario's down tilt (`script-cache/mario/AttackLw3.txt`).
+    const GAME: &str = r#"unsafe extern "C" fn game_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("kneel"), 7.0, 80, 80, 0, 35, 3.2, -1.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.4, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_KICK, *ATTACK_REGION_KICK);
+        macros::ATTACK(agent, 1, 0, Hash40::new("toel"), 5.0, 80, 80, 0, 35, 4.2, 0.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.4, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_KICK, *ATTACK_REGION_KICK);
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_LOW), false);
+    }
+    wait(agent.lua_state_agent, 3.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+    }
+}
+
+unsafe extern "C" fn effect_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) {
+        macros::FOOT_EFFECT(agent, Hash40::new("sys_run_smoke"), Hash40::new("top"), 3, 0, -3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+        macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new("sys_attack_arc"), Hash40::new("sys_attack_arc"), Hash40::new("top"), -2, 3, 4, -1, 12, -172, 0.95, true, *EF_FLIP_YZ);
+    }
+    frame(agent.lua_state_agent, 10.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_OFF_KIND(agent, Hash40::new("sys_attack_arc"), false, true);
+    }
+}
+
+unsafe extern "C" fn sound_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_m"));
+        macros::PLAY_SEQUENCE(agent, Hash40::new("seq_mario_rnd_attack"));
+    }
+}
+
+unsafe extern "C" fn expression_attacklw3(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_TOP, 3);
+    }
+    frame(agent.lua_state_agent, 3.0);
+    if macros::is_excute(agent) {
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new("rbkind_nohitm"), 0, false, *BATTLE_OBJECT_ID_INVALID as u32);
+    }
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::RUMBLE_HIT(agent, Hash40::new("rbkind_attackm"), 0);
+    }
+    frame(agent.lua_state_agent, 19.0);
+    if macros::is_excute(agent) {
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_LR, 6);
+    }
+}
+"#;
+
+    /// What a live capture of it made, as a project saved it: no hitboxes, and the same effects
+    /// and sounds in the capture's own spelling.
+    const CAPTURED: &str = r#"unsafe extern "C" fn effect_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) {
+        macros::FOOT_EFFECT(agent, Hash40::new("sys_run_smoke"), Hash40::new("top"), 3.0, 0.0, -3.0, 0.0, 0.0, 0.0, 1.0, 0, 0, 0, 0, 0, 0, false);
+        macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new("sys_attack_arc"), Hash40::new("sys_attack_arc"), Hash40::new("top"), -2.0, 3.0, 4.0, -1.0, 12.0, -172.0, 0.95, true, 1);
+    }
+    frame(agent.lua_state_agent, 10.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_OFF_KIND(agent, Hash40::new("sys_attack_arc"), false, true);
+    }
+}
+
+unsafe extern "C" fn sound_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_m"));
+        macros::PLAY_SEQUENCE(agent, Hash40::new("seq_mario_rnd_attack"));
+    }
+}
+
+unsafe extern "C" fn expression_attacklw3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 3.0);
+    if macros::is_excute(agent) {
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new_raw(0xdb2772ed7), 0, false, 1342177280);
+    }
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::RUMBLE_HIT(agent, Hash40::new_raw(0xe49ca009f), 0);
+    }
+}
+"#;
+
+    /// Only a part of the move that the project edits can be in conflict with a newer script of
+    /// it. The dialog came up while testing live over a move nothing of the user's was in.
+    #[test]
+    fn a_changed_script_is_asked_about_only_where_it_meets_an_edit() {
+        assert_ne!(GAME, CAPTURED);
+        assert!(!source_parts_differ(&[], CAPTURED, GAME));
+        assert!(!source_parts_differ(&[Track::Sound], CAPTURED, GAME));
+        assert!(source_parts_differ(&[Track::Game], CAPTURED, GAME));
+        assert!(source_parts_differ(
+            &[Track::Sound, Track::Expression],
+            CAPTURED,
+            GAME
+        ));
+        // Written another way, it is the same script.
+        let respaced = GAME.replace("    ", "\t").replace("\n}", "\n\n}");
+        assert_ne!(GAME, respaced);
+        for part in [Track::Game, Track::Effect, Track::Sound, Track::Expression] {
+            assert!(!source_parts_differ(&[part], GAME, &respaced), "{part:?}");
+        }
+        let retimed = GAME.replace(
+            "frame(agent.lua_state_agent, 10.0)",
+            "frame(agent.lua_state_agent, 11.0)",
+        );
+        assert!(source_parts_differ(&[Track::Effect], GAME, &retimed));
+        assert!(!source_parts_differ(&[Track::Game], GAME, &retimed));
+    }
+
+    /// A move whose script is being fetched is not a move without one: a capture taken in that
+    /// moment became the script its edits were made on, with no hitboxes, and the script that
+    /// came a moment later was asked about.
+    #[test]
+    fn no_capture_stands_in_for_a_script_that_is_coming() {
+        let source = include_str!("app.rs");
+        let body = |name: &str| {
+            let rest = source.split(name).nth(1).expect(name);
+            rest.split("\n    fn ").next().unwrap().to_owned()
+        };
+        let noted = body("fn note_new_captures(&mut self) {");
+        let stop = "if self.open_article.is_some() || self.fetching_acmd {";
+        assert!(noted.find(stop).unwrap() < noted.find("PendingCapture {").unwrap());
+        let settled = body("fn settle_pending_capture(&mut self, ctx: &egui::Context) {");
+        let dropped = settled.find("|| self.fetching_acmd").unwrap();
+        assert!(dropped < settled.find("self.load_from_capture();").unwrap());
+        // Both ways a newer script comes in ask only where it meets an edit.
+        for name in [
+            "fn select_script(&mut self, article: Option<String>, move_entry: MoveEntry) {",
+            "fn apply_fetched_body_with_mismatch(",
+        ] {
+            let body = body(name);
+            let asked = body
+                .find("self.source_mismatch_prompt = Some(")
+                .expect(name);
+            let checked = body
+                .find("self.source_is_in_conflict(&key, &saved.body")
+                .expect(name);
+            assert!(checked < asked, "{name}");
+        }
     }
 }
