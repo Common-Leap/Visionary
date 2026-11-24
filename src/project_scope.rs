@@ -128,7 +128,7 @@ pub fn romfs_fighter_slots(romfs: &Path) -> BTreeMap<String, BTreeSet<u8>> {
 ///
 /// `effect_dir` is left alone too: it stays the dump's or a reference mod's folder
 /// (`fighter_effect_names` already scans every root). Opening a fighter asks the romfs for
-/// its eff first all the same (`fighter_eff_path` in `app.rs`), since a slot character's
+/// its eff first all the same (`EffectFiles::of_costume`), since a slot character's
 /// effects are only in its slot's file there. The editor records that file by its game path
 /// (`mod_project::eff_game_rel`), and export writes it under the folder the user picks.
 pub fn apply_romfs_overlay(entry: &mut FighterEntry, romfs: &Path) {

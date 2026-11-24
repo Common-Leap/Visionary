@@ -1031,38 +1031,6 @@ fn own_param_files(owner: &str, own_roots: &[PathBuf], shared: &[PathBuf]) -> Ve
 }
 
 #[cfg(test)]
-mod recorded_eff_source_tests {
-    use super::recorded_eff_source;
-    use crate::mod_project::EffMod;
-
-    /// Edits made on a download's file find it again, until it is gone; the game's own otherwise.
-    #[test]
-    fn edits_find_the_file_they_were_made_on() {
-        const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("ef_mario.eff");
-        std::fs::write(&path, b"eff").unwrap();
-        let edits = [
-            EffMod {
-                source_rel: "effect/fighter/link/ef_link.eff".into(),
-                ..Default::default()
-            },
-            EffMod {
-                source_rel: MARIO.into(),
-                source_path: Some(path.clone()),
-                ..Default::default()
-            },
-        ];
-        let of = |rel: &str| recorded_eff_source(rel, edits.iter());
-        assert_eq!(of(MARIO), Some(path.clone()));
-        assert_eq!(of(&MARIO.to_uppercase()), Some(path.clone()));
-        assert_eq!(of("effect/fighter/link/ef_link.eff"), None);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(of(MARIO), None);
-    }
-}
-
-#[cfg(test)]
 mod own_param_files_tests {
     use super::*;
 
@@ -3899,41 +3867,6 @@ enum NodesReturn {
     Page(crate::character::CharacterPage),
 }
 
-/// A live rule-store key without its family suffix: `"mario#c08/attack_11#hurt"` →
-/// `"mario#c08/attack_11"`. The character part may carry a `#` of its own, so the suffix is the
-/// one after the move.
-/// Where the effect file `rel` is read from when it is a made character's own costume file:
-/// `Ok` with the file in the character's folder, or, when it has none there, `Err` with the
-/// donor's own file to look up instead (what its costumes load without one). `None` for any
-/// other file.
-fn made_effect_lookup(
-    rel: &str,
-    roster: &crate::mod_project::RosterMod,
-    made_root: impl Fn(&crate::roster::RosterKey) -> Option<PathBuf>,
-) -> Option<Result<PathBuf, String>> {
-    let rel = rel.replace('\\', "/");
-    let owner =
-        crate::character::CharacterKey::parse(&crate::character::effect_owner(&rel, roster));
-    owner.authored(roster)?;
-    let own = made_root(owner.roster_key())
-        .map(|root| root.join(&rel))
-        .filter(|path| path.is_file());
-    let fighter = owner.engine_fighter();
-    Some(own.ok_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff")))
-}
-
-/// The file the edits of effect file `rel` were made on, when that is not the one its game path
-/// leads to and it is still there.
-fn recorded_eff_source<'a>(
-    rel: &str,
-    mut edits: impl Iterator<Item = &'a crate::mod_project::EffMod>,
-) -> Option<PathBuf> {
-    edits
-        .find(|eff| eff.source_rel.eq_ignore_ascii_case(rel))
-        .and_then(|eff| eff.source_path.clone())
-        .filter(|path| path.is_file())
-}
-
 /// Whether `status` is the effect alias push's own success line, which says nothing the user
 /// acted on.
 fn alias_status_is_routine(status: &str) -> bool {
@@ -4103,18 +4036,6 @@ fn fighter_key_matches(key: &str, fighter: &str) -> bool {
         .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(fighter))
 }
 
-/// The eff a fighter row plays from `dirs` (in order of preference): its base slot's one-slot
-/// file where one exists, as ARCropolis loads `ef_pacman_c40.eff` for Pac-Man's c40, else the
-/// fighter's own `ef_<fighter>.eff`. A slot character's effects are only in its slot's file.
-fn fighter_eff_path(name: &str, base_slot: u8, dirs: &[PathBuf]) -> Option<PathBuf> {
-    let slot_file = format!("ef_{name}_c{base_slot:02}.eff");
-    let own_file = format!("ef_{name}.eff");
-    [slot_file, own_file]
-        .iter()
-        .flat_map(|file| dirs.iter().map(move |dir| dir.join(file)))
-        .find(|path| path.is_file())
-}
-
 /// True for an Arcropolis-style fighter effect path, accepting either an absolute dump path or
 /// the project-relative spelling used in `EffMod::source_rel` and live-eff manifests.
 fn path_is_fighter_eff(path: &Path, fighter: &str) -> bool {
@@ -4254,14 +4175,6 @@ fn effect_costumes(
     };
     slots.retain(|slot| !taken.contains(slot));
     crate::character::base_costumes(fighter, &slots, roster)
-}
-
-/// The effect file `rel` (a game path) under the first of `roots` that has it.
-pub(crate) fn find_effect_file(roots: &[PathBuf], rel: &str) -> Option<PathBuf> {
-    roots
-        .iter()
-        .map(|root| root.join(rel))
-        .find(|path| path.is_file())
 }
 
 /// The fighter's own row in `fighters`, or failing that any row that plays as it.
@@ -5571,6 +5484,11 @@ pub struct VisionaryApp {
     live_overrides: crate::game_link::LiveOverrides,
     /// Authored .eff edits per fighter (project store; synced from the eff editor).
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
+    /// Files opened in this session in place of a missing one an owner's edits were made on.
+    /// The project keeps naming that one.
+    eff_stand_ins: HashMap<String, PathBuf>,
+    /// Where the Edited chips' files are, and what they were looked up for.
+    edit_files: EditFiles,
     /// Entry names read from each `.eff` file, keyed by path and checked against its modified
     /// time. See [`VisionaryApp::fighter_effect_names`].
     #[allow(clippy::type_complexity)]
@@ -6174,6 +6092,8 @@ impl VisionaryApp {
             game_link: crate::game_link::GameLink::default(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
+            eff_stand_ins: HashMap::new(),
+            edit_files: EditFiles::default(),
             eff_name_cache: Default::default(),
             effect_preview_build: EffectPreviewBuild::default(),
             visibility_sets: Vec::new(),
@@ -6300,74 +6220,203 @@ impl VisionaryApp {
         app
     }
 
-    /// Resolve a project-relative eff path ("effect/fighter/mario/ef_mario.eff") to a file on
-    /// disk. The eff editor's export root (the vanilla dump) is tried first, then the data
-    /// root and every mod root — a MODDED character's eff only exists under its mod root, so
-    /// resolving against the dump alone silently produced a missing source.
-    ///
-    /// Falls back to the export-root path when nothing exists, preserving the previous
-    /// behaviour (and the previous error message) for genuinely missing files.
-    /// The project's own copy of effect file `source_rel`, or one in a folder picked for the
-    /// effects.
-    fn project_eff_source(&self, source_rel: &str) -> Option<PathBuf> {
-        let (workspace, parts) = self.project_parts_cache.as_ref()?;
-        let rel = source_rel.replace('\\', "/");
-        let picked = match rel
-            .strip_prefix("effect/fighter/")
-            .and_then(|rest| rest.split_once('/'))
-        {
-            Some((fighter, rest)) => parts
-                .link(fighter, crate::project_parts::Part::Effects, 0)
-                .map(|dir| dir.join(rest)),
-            None => rel.strip_prefix("effect/").and_then(|rest| {
-                Some(
-                    parts
-                        .link(
-                            crate::project_parts::OTHER_EFFECTS,
-                            crate::project_parts::Part::Effects,
-                            0,
-                        )?
-                        .join(rest),
-                )
+    /// Where effect files are read from, as the project and the folders stand now.
+    fn effect_files(&self) -> crate::eff_source::EffectFiles {
+        let own = self.eff_mods.iter().filter_map(|(owner, eff)| {
+            let path = match (&eff.source_path, self.eff_stand_ins.get(owner)) {
+                // The file the user opened in place of one that is missing, until it is back.
+                (Some(path), Some(stand_in)) if !path.is_file() => stand_in.clone(),
+                (Some(path), _) | (None, Some(path)) => path.clone(),
+                // A made character's is in its folder, whichever folder is asked first.
+                (None, None) => {
+                    let key = crate::character::CharacterKey::parse(owner);
+                    key.authored(&self.roster.project)?;
+                    let root = self.roster.made_root(key.roster_key())?;
+                    Some(root.join(&eff.source_rel)).filter(|path| path.is_file())?
+                }
+            };
+            Some((eff.source_rel.clone(), path))
+        });
+        crate::eff_source::EffectFiles {
+            own: own.collect(),
+            project: self.workspace().map(|at| match &self.project_parts_cache {
+                Some((of, parts)) if *of == at => (at, parts.clone()),
+                _ => {
+                    let parts = crate::project_parts::ProjectParts::load(&at);
+                    (at, parts)
+                }
             }),
-        };
-        let own = crate::project_hub::workspace_romfs(workspace).join(&rel);
-        picked.into_iter().chain([own]).find(|path| path.is_file())
+            roots: self.effect_roots(),
+        }
     }
 
-    fn resolve_eff_source(&self, source_rel: &str) -> PathBuf {
-        // A made character's own costume file comes from its own folder, else from the
-        // project's own files, never from a mod that happens to ship the same costume's file;
-        // with none, its costumes load the donor's file.
-        match made_effect_lookup(source_rel, &self.roster.project, |key| {
-            self.roster.made_root(key)
-        }) {
-            Some(Ok(own)) => return own,
-            Some(Err(donor_rel)) => {
-                return self
-                    .project_eff_source(source_rel)
-                    .unwrap_or_else(|| self.resolve_eff_source(&donor_rel));
+    /// The file on disk effect file `rel`'s edits are made on; see [`crate::eff_source`].
+    fn eff_source(&self, rel: &str) -> Option<PathBuf> {
+        let made_root = |key: &crate::roster::RosterKey| self.roster.made_root(key);
+        self.effect_files()
+            .source(rel, &self.roster.project, &made_root)
+    }
+
+    /// [`Self::eff_source`], or where the game folder would have it when nothing does.
+    fn resolve_eff_source(&self, rel: &str) -> PathBuf {
+        self.eff_source(rel)
+            .unwrap_or_else(|| self.eff_editor.export_root().join(rel))
+    }
+
+    /// The file effect file `rel`'s game path leads to, whatever its edits were made on.
+    fn unrecorded_eff_source(&self, rel: &str) -> Option<PathBuf> {
+        let made_root = |key: &crate::roster::RosterKey| self.roster.made_root(key);
+        self.effect_files()
+            .unrecorded(rel, &self.roster.project, &made_root)
+    }
+
+    /// The effect file the open character plays: its game path and where it is.
+    fn open_character_effect_file(&self) -> Option<(String, PathBuf)> {
+        let fighter = self.state.fighters.get(self.state.selected_fighter?)?;
+        match self.active_key().filter(|key| key.is_made()) {
+            Some(key) => {
+                let rel = key.effect_rel(&self.roster.project);
+                let path = self.resolve_eff_source(&rel);
+                Some((rel, path))
             }
-            None => {}
+            None => self.effect_files().of_costume(
+                &fighter.name,
+                self.active_article_slot(fighter),
+                &self.roster.project,
+            ),
         }
-        // The file the eff editor has open wins over dump/mods: an eff opened from a download
-        // or a mod records only its game path, and its edits were made against that file.
-        if let Some(open) = self.eff_editor.loaded_path_for(source_rel) {
-            return open.to_path_buf();
-        }
-        if let Some(path) = recorded_eff_source(source_rel, self.eff_mods.values()) {
-            return path;
-        }
-        self.game_eff_source(source_rel)
     }
 
-    /// The file `source_rel` alone leads to: the project's own copy, then the dump's or a mod's.
-    fn game_eff_source(&self, source_rel: &str) -> PathBuf {
-        if let Some(found) = self.project_eff_source(source_rel) {
-            return found;
+    /// Show the open character's effect file from where it comes from now: a folder was picked,
+    /// the moveset or its files changed.
+    fn follow_effect_files(&mut self) {
+        if let Some((rel, path)) = self.open_character_effect_file() {
+            let was = self.current_eff_path.clone();
+            // Another fighter's file opened over it stays.
+            let own = was.as_ref().is_none_or(|was| {
+                let was = self.eff_editor.game_path_of(was);
+                let fighter = crate::mod_project::fighter_from_source_rel;
+                fighter(&was) == fighter(&rel)
+            });
+            if own && !self.eff_editor.picked_open() && was.as_ref() != Some(&path) {
+                let shown = self.eff_editor.loaded_path();
+                let shown = shown.is_none() || shown == was.as_deref();
+                self.current_eff_path = Some(path.clone());
+                if shown {
+                    self.eff_editor.open_as(&path, rel);
+                    return;
+                }
+            }
         }
-        find_effect_file(&self.effect_roots(), source_rel)
-            .unwrap_or_else(|| self.eff_editor.export_root().join(source_rel))
+        self.follow_open_effect_file();
+    }
+
+    /// Show the file open on the Effects page from where it comes from now. One the user opened
+    /// themselves stays.
+    fn follow_open_effect_file(&mut self) {
+        let Some(rel) = self.eff_editor.loaded_rel() else {
+            return;
+        };
+        if self.eff_editor.picked_open() {
+            return;
+        }
+        let path = self.resolve_eff_source(&rel);
+        if path.is_file() && self.eff_editor.loaded_path() != Some(path.as_path()) {
+            if self.current_eff_path.as_deref() == self.eff_editor.loaded_path() {
+                self.current_eff_path = Some(path.clone());
+            }
+            self.eff_editor.open_as(&path, rel);
+        }
+    }
+
+    /// After another project opened: open what was open from where this project has it.
+    fn reopen_effect_file(&mut self) {
+        let Some(rel) = self.eff_editor.loaded_rel() else {
+            return;
+        };
+        match self.eff_source(&rel) {
+            Some(path) => self.eff_editor.load_as(&path, rel),
+            None => self.eff_editor.close_file(),
+        }
+    }
+
+    /// Open effect file `rel`: the one its edits are made on.
+    fn open_eff(&mut self, rel: String) {
+        let path = self.resolve_eff_source(&rel);
+        self.eff_editor.open_as(&path, rel);
+    }
+
+    /// Open the effect file at `path` because the user picked it. The first edit made on it
+    /// records it; edits made on another file stay there, so it is not opened over them. False,
+    /// with the reason in the status line, when it is not opened.
+    fn open_picked_eff(&mut self, path: &Path) -> bool {
+        use crate::eff_source::Picked;
+        self.sync_eff_mods_from_editor();
+        let rel = self.eff_editor.game_path_of_pick(path);
+        let owner = self.eff_owner(&rel);
+        let own = self.resolve_eff_source(&rel);
+        let edits = self.eff_mods.get(&owner).filter(|eff| !eff.is_empty());
+        match crate::eff_source::picked(edits.is_some(), &own, path) {
+            Picked::Same => self.eff_editor.open_as(&own, rel),
+            Picked::Fresh => self.eff_editor.open_picked(path, rel),
+            Picked::StandIn => {
+                let missing = edits.and_then(|eff| match crate::effects::load_effect(path) {
+                    Ok(file) => crate::eff_source::missing_from(eff, &file),
+                    Err(error) => Some(format!("effects that can be read: {error:#}")),
+                });
+                if let Some(missing) = missing {
+                    self.state.status = format!(
+                        "Not opened: {} has no {missing}, which the edits of {} change.",
+                        path.display(),
+                        self.effect_owner_name(&owner)
+                    );
+                    return false;
+                }
+                self.eff_stand_ins.insert(owner, path.to_path_buf());
+                self.eff_editor.open_as(path, rel);
+            }
+            Picked::Refused => {
+                self.state.status = format!(
+                    "Not opened: the effect edits of {} are on {}. Remove them in Tools > Changes \
+                     to edit {} instead.",
+                    self.effect_owner_name(&owner),
+                    own.display(),
+                    path.display()
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The name effect edits kept under `owner` are shown by.
+    fn effect_owner_name(&self, owner: &str) -> String {
+        if owner == "common" {
+            "Shared effects".to_owned()
+        } else {
+            self.character_name(&crate::character::CharacterKey::parse(owner))
+        }
+    }
+
+    /// The store `owner`'s effect edits are kept in, about to take one: the first, made on a
+    /// file the user opened themselves, records which.
+    fn eff_mod_to_edit(&mut self, owner: &str) -> &mut crate::mod_project::EffMod {
+        let open = self.eff_editor.loaded_rel().filter(|rel| {
+            !crate::scratch_dirs::is_transplant_preview_name(rel) && self.eff_owner(rel) == owner
+        });
+        let source_rel = open.clone().unwrap_or_else(|| {
+            crate::character::CharacterKey::parse(owner).effect_rel(&self.roster.project)
+        });
+        let game = self.unrecorded_eff_source(&source_rel);
+        let entry = self.eff_mods.entry(owner.to_owned()).or_default();
+        if entry.is_empty() {
+            let open = open.and(self.eff_editor.open_file());
+            crate::eff_source::record_first_edit(entry, open, game.as_deref());
+        }
+        if entry.source_rel.is_empty() {
+            entry.source_rel = source_rel;
+        }
+        entry
     }
 
     /// Every folder effect files are read from, in order: the project's own files and the linked
@@ -6528,21 +6577,7 @@ impl VisionaryApp {
             .as_ref()
             .map(|index| index.costume_gated.iter().cloned().collect())
             .unwrap_or_default();
-        if let Some(fighter) = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .cloned()
-        {
-            let eff_dirs = self.fighter_effect_dirs(&fighter);
-            let slot = self.active_article_slot(&fighter);
-            if let Some(eff_path) = fighter_eff_path(&fighter.name, slot, &eff_dirs) {
-                if self.current_eff_path.as_ref() != Some(&eff_path) {
-                    self.current_eff_path = Some(eff_path.clone());
-                    self.eff_editor.queue_load(&eff_path);
-                }
-            }
-        }
+        self.follow_effect_files();
         self.refresh_hurtbox_volumes();
     }
 
@@ -7063,18 +7098,15 @@ impl VisionaryApp {
         let cache_result = if clear_shared_fighter_data {
             // Remove only app-owned merged previews and overlays. The source effect file remains
             // the canonical file in the dump/mod root.
-            let source_rels: Vec<String> = self
+            let sources: Vec<(String, String)> = self
                 .eff_mods
                 .iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case(&fighter))
-                .map(|(_, eff)| eff.source_rel.clone())
+                .map(|(name, eff)| (name.clone(), eff.source_rel.clone()))
                 .collect();
-            for source_rel in source_rels {
+            for (owner, source_rel) in sources {
                 let base = self.resolve_eff_source(&source_rel);
-                self.eff_editor.set_merged_overlay(&base, None);
-                if let Some(dir) = base.parent() {
-                    crate::scratch_dirs::remove_transplant_previews(dir);
-                }
+                self.drop_merged_preview(&owner, &base);
             }
             let live_removed = self.remove_live_eff_for_fighter(&fighter);
             if live_removed {
@@ -7408,32 +7440,12 @@ impl VisionaryApp {
             &fighter.fighter_dir.join("param").join("expression_vl.prc"),
         );
 
-        // The moveset's romfs / slot-scoped eff is checked first (e.g. Shy Guy's
-        // `romfs/effect/fighter/pacman/ef_pacman_c40.eff`), then any project/linked effect folder,
-        // then the fighter's own or vanilla effect file.
-        let eff_rel = format!("effect/fighter/{0}/ef_{0}.eff", fighter.name);
-        let eff_dirs = self.fighter_effect_dirs(fighter);
-        let slot = self.active_article_slot(fighter);
-        let slot_eff = fighter_eff_path(&fighter.name, slot, &eff_dirs).filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("_c"))
-        });
-        let own_eff = Some(self.resolve_eff_source(&eff_rel))
-            .filter(|path| *path != self.eff_editor.export_root().join(&eff_rel) && path.is_file());
-        if let Some(path) = slot_eff {
-            self.current_eff_path = Some(path.clone());
-            self.eff_editor.queue_load(&path);
-        } else if let Some(path) = own_eff {
-            // The project's effect file, or one in a folder picked for it, stands for the game's.
-            self.current_eff_path = Some(path.clone());
-            self.eff_editor.load_as(&path, eff_rel);
-        } else {
-            let eff_path = fighter_eff_path(&fighter.name, slot, &eff_dirs);
-            self.current_eff_path = eff_path.clone();
-            if let Some(path) = eff_path {
-                self.eff_editor.queue_load(&path);
-            }
+        // The file its edits are made on: its slot's own (Shy Guy's `ef_pacman_c40.eff`) where
+        // there is one, else the fighter's.
+        let file = self.open_character_effect_file();
+        self.current_eff_path = file.as_ref().map(|(_, path)| path.clone());
+        if let Some((rel, path)) = file {
+            self.eff_editor.open_as(&path, rel);
         }
 
         // Build move list on a background thread — reads many .nuanmb files for frame counts
@@ -10483,8 +10495,9 @@ impl VisionaryApp {
             self.state.status = format!("Effect file not found: {}", path.display());
             return;
         }
-        self.current_eff_path = Some(path.clone());
-        self.eff_editor.queue_load(&path);
+        if self.open_picked_eff(&path) {
+            self.current_eff_path = Some(path.clone());
+        }
         if self.effect_pool.is_none() {
             if let Some(root) = self
                 .export_dir
@@ -11256,15 +11269,7 @@ impl VisionaryApp {
             self.push_effect_rules(); // discarded disabled-calls stop suppressing
         }
         if let Some(f) = clear_eff_fighter {
-            if let Some(eff) = self.eff_mods.remove(&f) {
-                // Drop the merged overlay + preview file — the base eff is canonical again.
-                let base = self.resolve_eff_source(&eff.source_rel);
-                self.eff_editor.set_merged_overlay(&base, None);
-                if let Some(dir) = base.parent() {
-                    crate::scratch_dirs::remove_transplant_previews(dir);
-                }
-                self.eff_editor.mark_unsent();
-            }
+            self.drop_effect_edits(&f);
         }
         if let Some(hash) = clear_tweak_hash {
             self.live_overrides.clear_tweak(hash);
@@ -11616,7 +11621,7 @@ impl VisionaryApp {
         let objects_rows = if self.open_article.is_some() {
             3.0
         } else {
-            0.0
+            1.0
         };
         let objects_space = match self.state.selected_fighter {
             Some(_) => row * (objects_rows + 0.5) + objects_height,
@@ -11816,9 +11821,10 @@ impl VisionaryApp {
         crate::ui::search_field(ui, "move_search", &mut self.move_search, "Search moves…");
         let move_query = self.move_search.trim().to_lowercase();
         let move_searching = !move_query.trim().is_empty();
+        let moves_height = (ui.available_height() - objects_space).max(1.0);
         ScrollArea::both()
             .id_salt("moves")
-            .max_height(half)
+            .max_height(moves_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Group the (filtered) moves into the familiar move families, sorted by name.
@@ -13173,26 +13179,11 @@ impl VisionaryApp {
             .clone()
     }
 
-    /// Effect sets out at the playhead, placed on their bones, for the game-shader preview.
-    /// The path the 3D preview draws the effect editor's open file under: the selected
-    /// fighter's own effect path when the editor has that same file open, so the move's
-    /// effects pick up the edits, otherwise the file itself.
-    ///
-    /// Same file, not just same fighter: with Pac-Man's `ef_pacman.eff` as the fighter's and
-    /// Shy Guy's `ef_pacman_c40.eff` open in the editor, drawing the fighter's path showed the
-    /// wrong file, where none of Shy Guy's own effects exist.
+    /// Whose the effect editor's open file is, and the file, which the 3D preview draws the
+    /// edits of in its place.
     fn effect_editor_draw_path(&self) -> Option<(String, PathBuf)> {
-        let rel = self.eff_editor.loaded_rel()?;
-        let owner = self.eff_owner(&rel);
-        let same_file = |own: &Path| {
-            crate::mod_project::eff_game_rel(own, Some(self.eff_editor.export_root()))
-                .eq_ignore_ascii_case(&rel)
-        };
-        let path = match (&self.current_eff_path, self.active_effect_owner()) {
-            (Some(own), Some(active)) if active == owner && same_file(own) => own.clone(),
-            _ => self.eff_editor.loaded_path()?.to_path_buf(),
-        };
-        Some((owner, path))
+        let owner = self.eff_owner(&self.eff_editor.loaded_rel()?);
+        Some((owner, self.eff_editor.loaded_path()?.to_path_buf()))
     }
 
     /// Start rebuilding the preview's copy of the editor's file after an edit, and collect a
@@ -13248,10 +13239,10 @@ impl VisionaryApp {
             return;
         };
         let source = self.resolve_eff_source(&eff.source_rel);
-        let roots = self.effect_roots();
+        let files = self.effect_files();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let donor = |rel: &str| find_effect_file(&roots, rel);
+            let donor = |rel: &str| files.find(rel);
             let rebuilt = std::fs::read(&source)
                 .map_err(anyhow::Error::from)
                 .and_then(|src| crate::eff_export::rebuild_eff_bytes_resolving(&src, &eff, &donor));
@@ -23781,7 +23772,8 @@ impl VisionaryApp {
             ..Default::default()
         };
         // Each character's effect file edits are kept under its own key, and a fighter's costumes
-        // with an effect file of their own count with the fighter.
+        // with an effect file of their own count with the fighter, or with the mod's character
+        // that plays on them.
         for (_, eff) in self
             .eff_mods
             .iter()
@@ -23991,6 +23983,12 @@ impl VisionaryApp {
         }
         if key.is_made() && self.active_character.as_ref() == Some(key) {
             self.active_character = None;
+            // Back on one of the fighter's own costumes.
+            let row = own_row_index(&self.state.fighters, key.engine_fighter());
+            if let Some(slot) = row.map(|row| self.state.fighters[row].base_slot()) {
+                self.workspace_asset_slot = slot;
+                self.show_skin(key.engine_fighter(), slot);
+            }
         }
         self.state.edit_log.entries.remove(key.as_str());
         self.state.effect_call_edits.retain(|k, _| !mine(k));
@@ -24004,7 +24002,13 @@ impl VisionaryApp {
         self.node_effect_scripts.retain(|k, _| !mine(k));
         self.move_graphs.remove(key.as_str());
         if key.is_made() {
-            self.eff_mods.remove(key.as_str());
+            // Its effect file is nobody's now; a costume's own file would go by the same key.
+            self.drop_effect_edits(key.as_str());
+            let open = self.eff_editor.loaded_rel();
+            if open.is_some_and(|rel| self.eff_owner(&rel) == key.as_str()) {
+                self.eff_editor.close_file();
+            }
+            self.follow_effect_files();
         }
         self.edit_history.retain(|k, _| !mine(k));
         self.hitbox_rules_store.retain(|k, _| !mine(k));
@@ -24101,14 +24105,14 @@ impl VisionaryApp {
             }
         }
         // The donor's effect edits, onto the character's own effect file. Effects borrowed for
-        // some of the donor's costumes are not part of the donor as a whole.
+        // some of the donor's costumes are not part of the donor as a whole. What the key held
+        // before was an effect file of the costume's, which is the character's now.
+        self.drop_effect_edits(key.as_str());
         if let Some(mut eff) = self.eff_mods.get(&donor).cloned() {
-            if !self.eff_mods.contains_key(key.as_str()) {
-                eff.set_source_rel(key.effect_rel(&self.roster.project));
-                eff.source_path = None;
-                eff.transplants.retain(|op| op.one_slot_slots.is_empty());
-                self.eff_mods.insert(key.as_str().to_owned(), eff);
-            }
+            eff.set_source_rel(key.effect_rel(&self.roster.project));
+            eff.source_path = None;
+            eff.transplants.retain(|op| op.one_slot_slots.is_empty());
+            self.eff_mods.insert(key.as_str().to_owned(), eff);
         }
     }
 
@@ -24298,9 +24302,14 @@ impl VisionaryApp {
     fn eff_costumes(&self, owner: &str) -> Vec<u8> {
         let fighter = crate::character::CharacterKey::parse(owner);
         let fighter = fighter.engine_fighter();
+        let files = self.effect_files();
         effect_costumes(owner, &self.state.fighters, &self.roster.project, &|slot| {
             let rel = crate::roster::scaffold::effect_file(fighter, slot);
-            self.resolve_eff_source(&rel).is_file()
+            files
+                .source(&rel, &self.roster.project, &|key| {
+                    self.roster.made_root(key)
+                })
+                .is_some_and(|path| path.is_file())
         })
     }
 
@@ -24317,20 +24326,12 @@ impl VisionaryApp {
     /// The edits store of the effect file open on the Effects page, for changes to the file as a
     /// whole (its textures). With none open, the open character's.
     fn open_eff_mod(&mut self) -> Option<(String, &mut crate::mod_project::EffMod)> {
-        let rel = self.eff_editor.loaded_rel();
-        let owner = rel
-            .as_deref()
-            .map(|rel| self.eff_owner(rel))
-            .or_else(|| self.active_effect_owner())?;
-        let source_rel = rel.unwrap_or_else(|| {
-            crate::character::CharacterKey::parse(&owner).effect_rel(&self.roster.project)
-        });
-        let entry = self.eff_mods.entry(owner.clone()).or_default();
-        if entry.source_rel.is_empty() {
-            entry.source_rel = source_rel;
-        }
+        let owner = match self.eff_editor.loaded_rel() {
+            Some(rel) => self.eff_owner(&rel),
+            None => self.active_effect_owner()?,
+        };
         let name = self.character_name(&crate::character::CharacterKey::parse(&owner));
-        self.eff_mods.get_mut(&owner).map(|entry| (name, entry))
+        Some((name, self.eff_mod_to_edit(&owner)))
     }
 
     /// Keep the Effects page's character list in step with the fighter list and the roster.
@@ -24377,10 +24378,9 @@ impl VisionaryApp {
         if self.eff_editor.loaded_rel().as_deref() == Some(rel.as_str()) {
             return;
         }
-        let path = self.resolve_eff_source(&rel);
-        if path.is_file() {
+        if let Some(path) = self.eff_source(&rel) {
             self.current_eff_path = Some(path.clone());
-            self.eff_editor.load_as(&path, rel);
+            self.eff_editor.open_as(&path, rel);
         } else if key.is_made() {
             self.state.status = format!(
                 "{} has no effect file of its own: {} is missing.",
@@ -25927,34 +25927,23 @@ impl VisionaryApp {
         let Some(rel) = self.eff_editor.loaded_rel() else {
             return;
         };
-        let authored = self.eff_editor.collect_authored_edits();
-        let rosters = self.eff_editor.collect_rosters();
-        let entry_edits = self.eff_editor.collect_entry_edits();
+        let edits = (
+            self.eff_editor.collect_authored_edits(),
+            self.eff_editor.collect_rosters(),
+            self.eff_editor.collect_entry_edits(),
+        );
         let owner = self.eff_owner(&rel);
-        let own_rel =
-            crate::character::CharacterKey::parse(&owner).effect_rel(&self.roster.project);
-        let is_preview = crate::scratch_dirs::is_transplant_preview_name(&rel);
-        let opened = self
-            .eff_editor
-            .loaded_path()
-            .filter(|open| {
-                !is_preview
-                    && made_effect_lookup(&rel, &self.roster.project, |_| None).is_none()
-                    && self.game_eff_source(&rel) != **open
-            })
-            .map(Path::to_path_buf);
+        // NEVER key the project to a merged preview — rebuilding from it would re-apply the
+        // transplant ops onto an already-merged file.
+        let rel = match crate::scratch_dirs::is_transplant_preview_name(&rel) {
+            true => crate::character::CharacterKey::parse(&owner).effect_rel(&self.roster.project),
+            false => rel,
+        };
+        let first = self.eff_mods.get(&owner).is_none_or(|eff| eff.is_empty());
+        let game = first.then(|| self.unrecorded_eff_source(&rel)).flatten();
         let entry = self.eff_mods.entry(owner).or_default();
-        // NEVER key the project to the transient merged preview — rebuilding from it
-        // would re-apply the transplant ops onto an already-merged file.
-        if !is_preview {
-            entry.source_rel = rel;
-            entry.source_path = opened;
-        } else if entry.source_rel.is_empty() {
-            entry.source_rel = own_rel;
-        }
-        entry.authored = authored; // transplant records are preserved as-is
-        entry.rosters = rosters;
-        entry.entry_edits = entry_edits;
+        let open = self.eff_editor.open_file();
+        crate::eff_source::fold(entry, rel, edits, open, game.as_deref());
     }
 
     fn build_project(&mut self) -> crate::mod_project::ModProjectFile {
@@ -26539,6 +26528,8 @@ impl VisionaryApp {
         self.move_source_cache.clear();
         self.source_mismatch_prompt = None;
         self.eff_mods.clear();
+        self.eff_stand_ins.clear();
+        self.edit_files = EditFiles::default();
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.roster.project = crate::mod_project::RosterMod::default();
         self.active_character = None;
@@ -26574,6 +26565,7 @@ impl VisionaryApp {
         // would commit the previous project's open move into this one.
         self.clear_fighter_selection();
         self.reindex_fighters();
+        self.reopen_effect_file();
         self.import_report = None;
         self.project_hub.show = false;
         self.state.status = format!("New project at {}.", workspace.display());
@@ -28028,7 +28020,7 @@ impl VisionaryApp {
             project_name: self.project_name.clone(),
             slug: slug.clone(),
             eff_sources,
-            eff_roots: self.effect_roots(),
+            eff_files: self.effect_files(),
             source_root: if developer {
                 dest.join("acmd_source")
             } else {
@@ -28441,10 +28433,6 @@ impl VisionaryApp {
         // cleared before the replacement has been materialized.
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
-        let previously_loaded_eff = self
-            .eff_editor
-            .loaded_rel()
-            .filter(|relative| !crate::scratch_dirs::is_transplant_preview_name(relative));
         self.eff_editor.reset_project_state();
         self.state.edit_log.entries.clear();
         self.state.effect_call_edits.clear();
@@ -28460,6 +28448,8 @@ impl VisionaryApp {
         self.node_effect_scripts.clear();
         self.replay_live_fallback_key = None;
         self.eff_mods.clear();
+        self.eff_stand_ins.clear();
+        self.edit_files = EditFiles::default();
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
         // The project's fighters and moveset link. Adopted before the edits below, which read
@@ -28500,16 +28490,12 @@ impl VisionaryApp {
             });
             self.project_fighters = rows;
         }
-        if let Some(relative) = previously_loaded_eff {
-            let base = self.resolve_eff_source(&relative);
-            if base.is_file() {
-                self.eff_editor.queue_load(&base);
-            }
-        }
         self.project_name = project.name.clone();
         // Loading is replacement here too: the roster window's edits belong to the project
         // that was open, not to the one being loaded.
         self.roster.project = std::mem::take(&mut project.roster);
+        // Its made characters' effect files are looked for below, under this project's folder.
+        self.roster.set_project_dir(self.workspace());
         self.active_character = None;
         self.known_made = None;
         self.roster.params = project
@@ -28669,8 +28655,7 @@ impl VisionaryApp {
                     + eff.entry_edits.len();
                 if let Some(path) = eff.source_path.as_ref().filter(|path| !path.is_file()) {
                     migration_findings.push(format!(
-                        "{fighter}'s effects were edited in {}, which is missing, so the game's \
-                         own file is used",
+                        "{fighter}'s effects were edited in {}, which is missing",
                         path.display()
                     ));
                 }
@@ -28699,6 +28684,7 @@ impl VisionaryApp {
             }
         }
 
+        self.reopen_effect_file();
         // Re-apply every saved move through the normal parser/rule path and push the complete
         // keyed union live. This no longer depends on whichever move happened to be selected
         // when the JSON was opened.
@@ -28745,16 +28731,14 @@ impl VisionaryApp {
         self.game_link.send_live_eff_reload();
         if let Some(owner) = self.active_effect_owner() {
             if let Some(eff) = self.eff_mods.get(&owner).cloned() {
+                // Always start a loaded project from the canonical base EFF. Applying a new
+                // project directly onto the previous project's in-memory diff compounds
+                // authored values and can leave removed structures behind.
                 let src = self.resolve_eff_source(&eff.source_rel);
-                if src.exists() {
-                    // Always start a loaded project from the canonical base EFF. Applying a new
-                    // project directly onto the previous project's in-memory diff compounds
-                    // authored values and can leave removed structures behind.
-                    self.eff_editor.queue_load(&src);
-                    self.eff_editor
-                        .queue_structure_edits(eff.rosters.clone(), eff.entry_edits.clone());
-                    self.eff_editor.queue_edits(eff.authored.clone());
-                }
+                self.eff_editor.load_as(&src, eff.source_rel.clone());
+                self.eff_editor
+                    .queue_structure_edits(eff.rosters.clone(), eff.entry_edits.clone());
+                self.eff_editor.queue_edits(eff.authored.clone());
             }
         }
         self.state.status = format!(
@@ -36115,9 +36099,35 @@ impl VisionaryApp {
             return;
         }
         let base = self.resolve_eff_source(&eff.source_rel);
-        self.eff_editor.set_merged_overlay(&base, None);
+        self.drop_merged_preview(fighter, &base);
+    }
+
+    /// Show `owner`'s effect file as it is at `base`, with no borrowed effects merged in.
+    fn drop_merged_preview(&mut self, owner: &str, base: &Path) {
+        self.edit_files = EditFiles::default();
+        self.eff_editor.set_merged_overlay(base, None);
+        let _ = std::fs::remove_file(crate::scratch_dirs::transplant_preview(owner));
         if let Some(dir) = base.parent() {
             crate::scratch_dirs::remove_transplant_previews(dir);
+        }
+    }
+
+    /// Drop `owner`'s effect edits, the Effects page's working copy of them too: folded back in,
+    /// it would return them. The game keeps what it was sent until the next send.
+    fn drop_effect_edits(&mut self, owner: &str) {
+        let base = self
+            .eff_mods
+            .get(owner)
+            .map(|eff| self.resolve_eff_source(&eff.source_rel));
+        self.eff_mods.remove(owner);
+        self.eff_stand_ins.remove(owner);
+        self.merged_build_failed.remove(owner);
+        self.eff_editor.discard_edits_of(|rel| {
+            crate::character::effect_owner(rel, &self.roster.project) == owner
+        });
+        if let Some(base) = base {
+            self.drop_merged_preview(owner, &base);
+            self.eff_editor.mark_unsent();
         }
     }
 
@@ -36196,25 +36206,20 @@ impl VisionaryApp {
         // next sync — exactly the failure the authored edits above are held back to avoid.
         eff.rosters.clear();
         eff.entry_edits.clear();
-        let root = self.eff_editor.export_root().to_path_buf();
-        // A made character's file is in its own folder; its preview would be written there and
-        // shipped with it, so it is shown unmerged until exported.
+        // A made character's effects are shown unmerged until exported.
         if crate::character::CharacterKey::parse(fighter).is_made() {
             return None;
         }
-        let src_path = root.join(&eff.source_rel);
-        let tmp = src_path
-            .parent()
-            .map(|dir| dir.join(crate::scratch_dirs::TRANSPLANT_PREVIEW_FILE))
-            .unwrap_or_else(|| {
-                crate::scratch_dirs::app_storage_root()
-                    .join(crate::scratch_dirs::TRANSPLANT_PREVIEW_FILE)
-            });
-        // A preview written by a pre-rename build sits under the old name in the same
-        // directory. Sweep it now so it isn't orphaned next to the user's dump forever.
+        self.edit_files = EditFiles::default();
+        let src_path = self.resolve_eff_source(&eff.source_rel);
+        let tmp = crate::scratch_dirs::transplant_preview(fighter);
+        // Earlier builds wrote it beside the file. Sweep that now so it isn't orphaned next to
+        // the user's dump forever.
+        if let Some(dir) = src_path.parent() {
+            crate::scratch_dirs::remove_transplant_previews(dir);
+        }
         if let Some(dir) = tmp.parent() {
-            let _ =
-                std::fs::remove_file(dir.join(crate::scratch_dirs::LEGACY_TRANSPLANT_PREVIEW_FILE));
+            let _ = std::fs::create_dir_all(dir);
         }
         let src_bytes = match std::fs::read(&src_path) {
             Ok(bytes) => bytes,
@@ -36228,8 +36233,8 @@ impl VisionaryApp {
                 return None;
             }
         };
-        let roots = self.effect_roots();
-        let donor = |rel: &str| find_effect_file(&roots, rel);
+        let files = self.effect_files();
+        let donor = |rel: &str| files.find(rel);
         match crate::eff_export::rebuild_eff_bytes_resolving(&src_bytes, &eff, &donor) {
             Ok(merged) => {
                 // Publish only a complete new preview. A failed/partial write must never leave
@@ -36272,7 +36277,7 @@ impl VisionaryApp {
         };
         // Open the base file in the eff editor — the overlay resolves it to the merged
         // view — and land on the new/replaced entry.
-        self.eff_editor.queue_load(&base);
+        self.eff_editor.open_as(&base, eff.source_rel.clone());
         if let Some(op) = eff.transplants.last() {
             let focus = op
                 .replace_entry
@@ -36545,7 +36550,7 @@ impl VisionaryApp {
         // Where donor and fighter effs may live. Built HERE rather than at the donor-stripping
         // loop below because the texture-import pass needs to read the fighter's own eff, and
         // that has to happen before the aliases are sent a few lines down.
-        let roots = self.effect_roots();
+        let files = self.effect_files();
         let mut carrier_authored: Vec<crate::eff_export::CarrierAuthored> = Vec::new();
         let mut authored_aliases: Vec<(String, String)> = Vec::new();
         let mut carrier_name_conflicts: Vec<String> = Vec::new();
@@ -36706,7 +36711,7 @@ impl VisionaryApp {
                     .filter(|eff| !eff.source_rel.is_empty())
                     .map(|eff| eff.source_rel.to_lowercase())
                     .unwrap_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff"));
-                let bytes = find_effect_file(&roots, &src_rel).and_then(|p| std::fs::read(p).ok());
+                let bytes = files.find(&src_rel).and_then(|p| std::fs::read(p).ok());
                 let parsed = bytes.and_then(|b| effect_library::NamcoEffectFile::load(&b).ok());
                 if let Some(file) = parsed {
                     for import in &carrier_textures {
@@ -36909,7 +36914,10 @@ impl VisionaryApp {
             // For a modded fighter that root never holds the fighter's eff, so every authored
             // edit failed as "donor unreadable": no carrier bytes, no spec, and the plugin sat at
             // state 0 while the editor waited for a swap that was never requested.
-            let resolve = |rel: &str| find_effect_file(&roots, &rel.to_lowercase());
+            let resolve = |rel: &str| {
+                let found = files.find(&rel.to_lowercase());
+                found.filter(|path| path.is_file())
+            };
             let carrier_path = resolve(live_carrier_rel);
             let missing: Vec<String> = carrier_ops
                 .iter()
@@ -37056,13 +37064,14 @@ impl VisionaryApp {
                 }
             } else {
                 dbg.push_str(&format!(
-                    "CARRIER ROOT MISS: carrier={} missing=[{}] roots={roots:?}\n",
+                    "CARRIER ROOT MISS: carrier={} missing=[{}] roots={:?}\n",
                     if carrier_path.is_some() {
                         "found"
                     } else {
                         "missing"
                     },
-                    missing.join(", ")
+                    missing.join(", "),
+                    files.roots
                 ));
             }
         }
@@ -37089,12 +37098,7 @@ impl VisionaryApp {
                     None
                 };
                 if found.is_none() {
-                    for r in &roots {
-                        if let Ok(b) = std::fs::read(r.join(&rel)) {
-                            found = Some(b);
-                            break;
-                        }
-                    }
+                    found = files.find(&rel).and_then(|path| std::fs::read(path).ok());
                 }
                 found
             };
@@ -37314,8 +37318,8 @@ impl VisionaryApp {
         // An edit-free EffMod is intentional after the last transplant is removed: serving
         // the pristine source bytes replaces the previously merged resident file and makes
         // removal take effect immediately instead of leaving the old live payload staged.
-        let roots = self.effect_roots();
-        let donor = |rel: &str| find_effect_file(&roots, rel);
+        let files = self.effect_files();
+        let donor = |rel: &str| files.find(rel);
         let src = self.resolve_eff_source(&eff.source_rel);
         let Ok(bytes) = std::fs::read(&src) else {
             self.state.status = format!("Live deploy: source eff missing ({})", src.display());
@@ -37543,10 +37547,7 @@ impl VisionaryApp {
         let own_rel =
             crate::character::CharacterKey::parse(fighter).effect_rel(&self.roster.project);
         self.merged_build_failed.remove(fighter);
-        let entry = self.eff_mods.entry(fighter.to_string()).or_default();
-        if entry.source_rel.is_empty() {
-            entry.source_rel = own_rel.clone();
-        }
+        let entry = self.eff_mod_to_edit(fighter);
         let replace_mode = replace.is_some();
         entry.transplants.push(crate::mod_project::TransplantOp {
             new_entry_name: new_name.to_string(),
@@ -37712,16 +37713,77 @@ impl VisionaryApp {
         });
     }
 
+    /// Keep [`Self::edit_files`] in step with the edited effect files, looking on disk when they
+    /// change and once a second, not on every paint.
+    fn look_up_edit_files(&mut self) {
+        let wanted = || self.eff_mods.iter().filter(|(_, eff)| !eff.is_empty());
+        let stands = self
+            .edit_files
+            .looked
+            .is_some_and(|at| at.elapsed().as_secs() < 1)
+            && self.edit_files.found.len() == wanted().count()
+            && wanted().all(|(owner, eff)| {
+                self.edit_files.found.get(owner).is_some_and(|file| {
+                    file.rel == eff.source_rel
+                        && file.recorded == eff.source_path
+                        && file.borrowed == eff.transplants.len()
+                })
+            });
+        if stands {
+            return;
+        }
+        let found = wanted()
+            .map(|(owner, eff)| {
+                let path = self.resolve_eff_source(&eff.source_rel);
+                // One made from another file is not this one's.
+                let before = self.edit_files.found.get(owner);
+                let moved = before.is_some_and(|before| before.path != path);
+                let merged = crate::scratch_dirs::transplant_preview(owner);
+                let merged = Some(merged).filter(|merged| {
+                    let shown = !eff.transplants.is_empty() && !owner.contains('#');
+                    shown && !moved && merged.is_file()
+                });
+                let file = EditFile {
+                    rel: eff.source_rel.clone(),
+                    recorded: eff.source_path.clone(),
+                    borrowed: eff.transplants.len(),
+                    there: path.is_file(),
+                    path,
+                    merged,
+                };
+                (owner.clone(), file)
+            })
+            .collect();
+        self.edit_files = EditFiles {
+            looked: Some(std::time::Instant::now()),
+            found,
+        };
+    }
+
     /// Keep the Effects page's "plays in" index for the fighter whose effects are open (the
     /// selected fighter for the shared file), scanning its scripts in the background.
-    /// Before the Effects page opens another file (or reloads this one), fold the open file's
-    /// edits into the project and hand the next file its own. The editor parses files pristine;
+    /// Before the Effects page opens another file (or reloads this one), make it the one its
+    /// edits are made on, fold the open file's edits into the project and hand the next file its
+    /// own. The editor parses files pristine;
     /// without this, switching to another file and back showed the effects unedited, and the
     /// next sync wrote that empty diff over the project.
     fn carry_eff_edits_across_load(&mut self) {
-        let Some(next) = self.eff_editor.load_needing_edits() else {
+        if !self.eff_editor.load_queued() {
+            return;
+        }
+        let files = self.effect_files();
+        let root = self.eff_editor.export_root().to_path_buf();
+        let Some(next) = self.eff_editor.settle_queued_load(|rel| {
+            let made_root = |key: &crate::roster::RosterKey| self.roster.made_root(key);
+            files
+                .source(rel, &self.roster.project, &made_root)
+                .unwrap_or_else(|| root.join(rel))
+        }) else {
             return;
         };
+        if !self.eff_editor.load_needs_edits() {
+            return;
+        }
         if self.eff_editor.has_loaded_effects() {
             self.sync_eff_mods_from_editor();
         }
@@ -40820,7 +40882,10 @@ impl eframe::App for VisionaryApp {
                         self.focus_transplant = true;
                         toggled = true;
                     }
-                    let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
+                    let has_log = !self.state.edit_log.is_empty()
+                        || self.eff_mods.values().any(|eff| !eff.is_empty())
+                        || self.roster.has_edits()
+                        || self.show_edit_log;
                     ui.add_enabled_ui(has_log, |ui| {
                         toggled |= ui
                             .checkbox(&mut self.show_edit_log, "Changes")
@@ -41033,12 +41098,10 @@ Click to see the code, or link your own project"
             .and_then(|i| self.state.fighters.get(i))
             .map(|f| f.name.clone());
         self.eff_editor.set_target_fighter(current_fighter.clone());
-        // Edits-first selector: hand the editor the project's edit sources. Base + alt
-        // (data-root) paths BOTH redirect to the merged build, so transplanted entries
-        // show no matter which root a load request came through.
+        // Edits-first selector: hand the editor the project's edit sources, each with the file
+        // its edits are made on.
         {
-            let root = self.eff_editor.export_root().to_path_buf();
-            let data_root = self.state.data_root.clone();
+            self.look_up_edit_files();
             // Self-heal: a slotted fighter without its merged build on disk (fresh
             // session, deleted preview) gets one rebuild attempt per session; failures
             // stay visible as the ⚠ chip instead of retrying every frame.
@@ -41049,14 +41112,11 @@ Click to see the code, or link your own project"
                     !e.transplants.is_empty()
                         && !f.contains('#')
                         && !self.merged_build_failed.contains(*f)
-                        && !root
-                            .join(&e.source_rel)
-                            .parent()
-                            .map(|d| {
-                                d.join(crate::scratch_dirs::TRANSPLANT_PREVIEW_FILE)
-                                    .exists()
-                            })
-                            .unwrap_or(false)
+                        && self
+                            .edit_files
+                            .found
+                            .get(*f)
+                            .is_some_and(|file| file.merged.is_none())
                 })
                 .map(|(f, _)| f.clone())
                 .collect();
@@ -41064,35 +41124,14 @@ Click to see the code, or link your own project"
                 if self.build_merged_preview(&f).is_none() {
                     self.merged_build_failed.insert(f);
                 }
+                self.look_up_edit_files();
             }
             let sources: Vec<crate::eff_editor::EditSource> = self
                 .eff_mods
                 .iter()
                 .filter(|(_, e)| !e.is_empty())
                 .map(|(f, e)| {
-                    // A made character's file is in its own folder, not the game's.
-                    let base = if f.contains('#') {
-                        self.resolve_eff_source(&e.source_rel)
-                    } else {
-                        root.join(&e.source_rel)
-                    };
-                    let alt_base = data_root
-                        .as_ref()
-                        .filter(|_| !f.contains('#'))
-                        .map(|r| {
-                            r.join("effect")
-                                .join("fighter")
-                                .join(f)
-                                .join(format!("ef_{f}.eff"))
-                        })
-                        .filter(|p| *p != base);
-                    let merged = if e.transplants.is_empty() || f.contains('#') {
-                        None
-                    } else {
-                        base.parent()
-                            .map(|d| d.join(crate::scratch_dirs::TRANSPLANT_PREVIEW_FILE))
-                            .filter(|p| p.exists())
-                    };
+                    let file = self.edit_files.found.get(f).cloned().unwrap_or_default();
                     let key = crate::character::CharacterKey::parse(f);
                     let row = key
                         .costume_file(&self.roster.project)
@@ -41100,14 +41139,11 @@ Click to see the code, or link your own project"
                     crate::eff_editor::EditSource {
                         fighter: f.clone(),
                         pick: row.map_or_else(|| f.clone(), fighter_pick_key),
-                        label: if f == "common" {
-                            "Shared effects".to_owned()
-                        } else {
-                            self.character_name(&crate::character::CharacterKey::parse(f))
-                        },
-                        base,
-                        alt_base,
-                        merged,
+                        label: self.effect_owner_name(f),
+                        rel: e.source_rel.clone(),
+                        base: file.path,
+                        missing: !file.there,
+                        merged: file.merged,
                         transplant_count: e.transplants.len(),
                         changed_effects: e.changed_effects(),
                         textures: e.textures.len(),
@@ -41241,9 +41277,15 @@ Click to see the code, or link your own project"
                 self.select_move(entry);
             }
         }
+        if let Some(path) = self.eff_editor.file_pick_request.take() {
+            self.open_picked_eff(&path);
+        }
+        if let Some(rel) = self.eff_editor.edit_source_request.take() {
+            self.open_eff(rel);
+        }
         self.carry_eff_edits_across_load();
         if self.eff_editor.load_queued() {
-            self.eff_editor.effect_roots = self.effect_roots();
+            self.eff_editor.effect_files = self.effect_files();
         }
         self.eff_editor.update(&ctx, &self.game_link);
         // A bar picked on the timeline stays picked only while its effect is the open one:
@@ -41718,12 +41760,6 @@ Click to see the code, or link your own project"
                 .map(|rel| self.eff_owner(&rel))
                 .or(current_fighter);
             if let Some(fighter) = owner {
-                let own_rel = crate::character::CharacterKey::parse(&fighter)
-                    .effect_rel(&self.roster.project);
-                let entry = self.eff_mods.entry(fighter.clone()).or_default();
-                if entry.source_rel.is_empty() {
-                    entry.source_rel = own_rel;
-                }
                 for op in ops {
                     self.state.status = if op.one_slot_slots.len() == 1 {
                         format!(
@@ -41736,7 +41772,7 @@ Click to see the code, or link your own project"
                             op.new_entry_name
                         )
                     };
-                    entry.transplants.push(op);
+                    self.eff_mod_to_edit(&fighter).transplants.push(op);
                 }
                 editor_transplant_fighter = Some(fighter);
             }
@@ -44947,8 +44983,8 @@ struct ExportInputs {
     slug: String,
     /// fighter → the source `.eff` to rebuild from, already resolved against the app's roots.
     eff_sources: std::collections::HashMap<String, std::path::PathBuf>,
-    /// The folders a borrowed effect or an added part is read from (`effect_roots`).
-    eff_roots: Vec<std::path::PathBuf>,
+    /// Where a borrowed effect or an added part is read from.
+    eff_files: crate::eff_source::EffectFiles,
     /// Where the generated Rust project goes: inside `dest` for a developer export, a scratch
     /// directory otherwise, since a mod folder ships the built `.nro` rather than the source.
     source_root: std::path::PathBuf,
@@ -45036,7 +45072,7 @@ fn run_export_preverified(
         project_name,
         slug,
         eff_sources,
-        eff_roots,
+        eff_files,
         source_root,
         rule_pack: _,
     } = inputs;
@@ -45067,12 +45103,12 @@ fn run_export_preverified(
         .any(|fighter| fighter.eff.as_ref().is_some_and(|eff| !eff.is_empty()));
     // A costume's own effect file loads only when the costume's directory entry lists it.
     let mut costume_effects: Vec<String> = Vec::new();
-    let effect_file = |rel: &str| find_effect_file(eff_roots, rel);
+    let effect_file = |rel: &str| eff_files.find(rel);
     let source_of = |owner: &str, rel: &str| {
         let found = eff_sources.get(owner).cloned().or_else(|| effect_file(rel));
         found.unwrap_or_else(|| rel.into())
     };
-    // Borrowed effects limited to a costume whose own effect file this project also edits: that
+    // Borrowed effects a costume whose own effect file this project also edits is to have: that
     // file is written below with both, rather than one over the other.
     let mut into_costume_files: std::collections::BTreeMap<
         crate::roster::RosterKey,
@@ -45106,6 +45142,11 @@ fn run_export_preverified(
                             .unwrap_or(file)
                     }
                 };
+                if !src_path.is_file() {
+                    let file = src_path.display();
+                    errors.push(format!("{fighter} eff: could not read {file}"));
+                    continue;
+                }
                 let write_variant = |slot: Option<u8>| -> anyhow::Result<()> {
                     let bytes = std::fs::read(&src_path)?;
                     let rebuilt = crate::eff_export::rebuild_eff_bytes_for_slot(
@@ -45530,6 +45571,25 @@ impl ViewFiles {
             && self.extra_roots == extra_roots
             && self.project == *project
     }
+}
+
+/// One edited effect file on disk, and what it was looked up for.
+#[derive(Debug, Clone, Default)]
+struct EditFile {
+    rel: String,
+    recorded: Option<PathBuf>,
+    borrowed: usize,
+    path: PathBuf,
+    there: bool,
+    /// Its preview with the borrowed effects merged in, when there is one.
+    merged: Option<PathBuf>,
+}
+
+/// The edited effect files, by whose they are, as last looked up.
+#[derive(Debug, Default)]
+struct EditFiles {
+    looked: Option<std::time::Instant>,
+    found: HashMap<String, EditFile>,
 }
 
 /// The trail textures found for one fighter row's costume, by texture name.
@@ -46288,7 +46348,7 @@ mod motion_animation_tests {
 
 #[cfg(test)]
 mod fighter_forget_key_tests {
-    use super::{fighter_eff_path, fighter_key_matches, path_is_fighter_eff};
+    use super::{fighter_key_matches, path_is_fighter_eff};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
     use std::path::Path;
@@ -46315,38 +46375,6 @@ mod fighter_forget_key_tests {
             Path::new("effect/fighter/mariod/ef_mariod.eff"),
             "mario"
         ));
-    }
-
-    /// Shy Guy plays on Pac-Man's c40: his effects exist only in the project's
-    /// `ef_pacman_c40.eff`, while the dump has Pac-Man's own `ef_pacman.eff`.
-    #[test]
-    fn a_slot_character_plays_its_slot_file_before_the_fighters_own() {
-        let tmp = tempfile::tempdir().unwrap();
-        let romfs = tmp.path().join("romfs/effect/fighter/pacman");
-        let dump = tmp.path().join("dump/effect/fighter/pacman");
-        std::fs::create_dir_all(&romfs).unwrap();
-        std::fs::create_dir_all(&dump).unwrap();
-        std::fs::write(romfs.join("ef_pacman_c40.eff"), b"").unwrap();
-        std::fs::write(dump.join("ef_pacman.eff"), b"").unwrap();
-        let dirs = [romfs.clone(), dump.clone()];
-        assert_eq!(
-            fighter_eff_path("pacman", 40, &dirs),
-            Some(romfs.join("ef_pacman_c40.eff"))
-        );
-        // Pac-Man himself has no slot file and keeps the dump's.
-        assert_eq!(
-            fighter_eff_path("pacman", 0, &dirs),
-            Some(dump.join("ef_pacman.eff"))
-        );
-        // A slot file anywhere beats the fighter's own file in an earlier folder.
-        std::fs::write(romfs.join("ef_pacman.eff"), b"").unwrap();
-        std::fs::remove_file(romfs.join("ef_pacman_c40.eff")).unwrap();
-        std::fs::write(dump.join("ef_pacman_c40.eff"), b"").unwrap();
-        assert_eq!(
-            fighter_eff_path("pacman", 40, &dirs),
-            Some(dump.join("ef_pacman_c40.eff"))
-        );
-        assert_eq!(fighter_eff_path("mario", 0, &dirs), None);
     }
 }
 
@@ -49800,42 +49828,67 @@ mod live_effect_capture_tests {
         assert_eq!(runs, 3);
     }
 
-    /// Review finding 10: Vision's effect file is read from Vision's folder, never from another
-    /// mod's copy of the c08 file; without one there, from Mario's own file. Mario's files and
-    /// a base costume's file take the ordinary lookup.
+    /// The effect files a project opens are found after its records of them are in; before, the
+    /// game's copy that happened to be open took a downloaded file's place. Its made characters'
+    /// folders and the borrow preview are found the same way, and no caller names the game
+    /// folder's copy of an edited file itself.
     #[test]
-    fn a_made_characters_effect_file_comes_from_its_own_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut roster = crate::mod_project::RosterMod::default();
-        roster.authored.push(crate::mod_project::AuthoredEntry {
-            key: crate::roster::RosterKey::slot("mario", 8),
-            donor: "mario".into(),
-            slot: 8,
-            slots: (9..=15).collect(),
-            display_name: "Vision".into(),
-            name_id: "vision".into(),
-            moveset_scaffolded: false,
-            files_root: None,
-        });
-        let rel = "effect/fighter/mario/ef_mario_c08.eff";
-        let root = dir.path().join("characters/vision");
-        let folder = |_: &crate::roster::RosterKey| Some(root.clone());
-        assert_eq!(
-            made_effect_lookup(rel, &roster, folder),
-            Some(Err("effect/fighter/mario/ef_mario.eff".to_string()))
-        );
-        std::fs::create_dir_all(root.join("effect/fighter/mario")).unwrap();
-        std::fs::write(root.join(rel), b"eff").unwrap();
-        assert_eq!(
-            made_effect_lookup(rel, &roster, folder),
-            Some(Ok(root.join(rel)))
-        );
-        for other in [
-            "effect/fighter/mario/ef_mario.eff",
-            "effect/fighter/mario/ef_mario_c03.eff",
+    fn a_project_opens_the_files_its_edits_are_made_on() {
+        let source = include_str!("app.rs");
+        let body = |name: &str| {
+            let rest = source
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}"));
+            rest.split("\n    fn ").next().unwrap().to_owned()
+        };
+        let load = body("fn load_project_from(");
+        let at = |what: &str| load.find(what).unwrap_or_else(|| panic!("{what}"));
+        let records = at("self.eff_mods.entry(owner).or_insert(eff)");
+        assert!(at("self.eff_mods.clear()") < records);
+        assert!(at("self.roster.set_project_dir(self.workspace())") < records);
+        assert!(records < at("self.reopen_effect_file()"));
+        assert!(records < at("self.build_merged_preview(&f)"));
+        for name in [
+            "fn build_merged_preview(",
+            "fn deploy_live_eff(",
+            "fn poll_effect_preview_build(",
+            "fn look_up_edit_files(",
         ] {
-            assert_eq!(made_effect_lookup(other, &roster, folder), None, "{other}");
+            let body = body(name);
+            assert!(body.contains("self.resolve_eff_source("), "{name}");
+            assert!(!body.contains("export_root"), "{name}");
         }
+        assert!(body("fn refresh_acmd_src_fighters(").contains("self.follow_effect_files()"));
+    }
+
+    /// Removing a made character takes its effect edits, the Effects page's working copy of them
+    /// too; making one starts from its donor's, whatever an effect file of the costume's left
+    /// under the same key.
+    #[test]
+    fn a_made_characters_effect_edits_come_and_go_with_it() {
+        let source = include_str!("app.rs");
+        let body = |name: &str| {
+            let rest = source
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}"));
+            rest.split("\n    fn ").next().unwrap().to_owned()
+        };
+        let removed = body("fn remove_character_edits(");
+        let drop = removed.find("self.drop_effect_edits(key.as_str())");
+        let close = removed.find("self.eff_editor.close_file()");
+        assert!(drop.is_some() && drop < close);
+        let made = body("fn fork_donor_edits(");
+        let drop = made.find("self.drop_effect_edits(key.as_str())");
+        assert!(drop.is_some() && drop < made.find("self.eff_mods.insert(key"));
+        let dropped = body("fn drop_effect_edits(");
+        assert!(dropped.contains("self.eff_mods.remove(owner)"));
+        assert!(dropped.contains("self.eff_editor.discard_edits_of("));
+        // "Remove" in Changes goes the same way.
+        assert!(source.contains(
+            "if let Some(f) = clear_eff_fighter {\n            self.drop_effect_edits(&f);"
+        ));
     }
 
     /// Review finding 12: removing a made character published Mario's rules while Vision was
@@ -50117,6 +50170,7 @@ mod live_effect_capture_tests {
         let held = frame.find("ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose)");
         assert!(asked.is_some() && asked < held);
         let prompt = body("fn draw_object_leave_prompt(&mut self, ctx: &egui::Context) {");
+        assert!(prompt.contains("ctx.send_viewport_cmd(egui::ViewportCommand::Close)"));
         let dropped = prompt
             .find("if choice == LeaveChoice::Discard {\n            self.discard_object_edits();")
             .expect("dropped");
@@ -55716,7 +55770,7 @@ mod blocked_export_writes_nothing_tests {
             project_name: "test mod".into(),
             slug: "test_mod".into(),
             eff_sources: Default::default(),
-            eff_roots: Vec::new(),
+            eff_files: Default::default(),
             source_root: source_root.to_path_buf(),
             rule_pack: false,
         }
@@ -55814,7 +55868,7 @@ mod blocked_export_writes_nothing_tests {
         });
         let dest = dir.path().join("mod");
         let mut input = inputs(&dest, &dir.path().join("source"));
-        input.eff_roots = vec![root];
+        input.eff_files.roots = vec![root];
         let outcome =
             run_export_preverified(&project, &input, None, false, None, Vec::new()).unwrap();
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -55896,7 +55950,7 @@ mod blocked_export_writes_nothing_tests {
         );
         let dest = dir.path().join("mod");
         let mut input = inputs(&dest, &dir.path().join("source"));
-        input.eff_roots = vec![mod_root, root];
+        input.eff_files.roots = vec![mod_root, root];
         let outcome =
             run_export_preverified(&project, &input, None, false, None, Vec::new()).unwrap();
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -56316,7 +56370,7 @@ mod blocked_export_writes_nothing_tests {
         let eff_inputs = |dest: &std::path::Path, source: &std::path::Path| {
             let mut inputs = inputs(dest, source);
             inputs.eff_sources.insert("mario".into(), src_eff.clone());
-            inputs.eff_roots = vec![root.clone()];
+            inputs.eff_files.roots = vec![root.clone()];
             inputs
         };
 
@@ -56414,7 +56468,7 @@ mod blocked_export_writes_nothing_tests {
             let source = tempfile::tempdir().unwrap();
             let mut inputs = inputs(dest.path(), source.path());
             inputs.eff_sources.insert("mario#c08".into(), own.clone());
-            inputs.eff_roots = vec![root.clone()];
+            inputs.eff_files.roots = vec![root.clone()];
             let outcome = run_export(project, &inputs).expect("must export");
             assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
             (dest, outcome)
@@ -56539,7 +56593,7 @@ mod blocked_export_writes_nothing_tests {
         });
         let mut inputs = inputs(dest.path(), source.path());
         inputs.eff_sources.insert("mario".into(), src_eff.clone());
-        inputs.eff_roots = vec![root.clone()];
+        inputs.eff_files.roots = vec![root.clone()];
 
         let outcome = run_export(&project, &inputs).expect("nothing here should refuse");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);

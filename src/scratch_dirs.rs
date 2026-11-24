@@ -3,10 +3,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Scratch .eff the editor writes NEXT TO a fighter's source eff: the source with every
-/// recorded transplant merged in, used as the eff editor's pristine baseline and as the
-/// bytes deployed to the running game.
+/// The name of the scratch .eff earlier builds wrote NEXT TO a fighter's source eff. Files left
+/// by them are hidden from the source lists and deleted.
 pub const TRANSPLANT_PREVIEW_FILE: &str = "_transplant_preview.eff";
+
+/// The effect file `owner`'s borrowed effects are shown in: its source with every recorded
+/// transplant merged in, the eff editor's pristine baseline. Kept in the editor's own folder,
+/// since the source can be a file of the project's or of a mod's, which would ship it.
+pub fn transplant_preview(owner: &str) -> PathBuf {
+    app_storage_root()
+        .join("borrowed")
+        .join(format!("{owner}{TRANSPLANT_PREVIEW_FILE}"))
+}
 
 /// The pre-rename name of [`TRANSPLANT_PREVIEW_FILE`]. Kept so stale files written by
 /// older builds are still hidden from the source lists and still deleted alongside the

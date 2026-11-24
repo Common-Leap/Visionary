@@ -453,9 +453,11 @@ impl EffEditor {
         self.start_reading_shared();
     }
 
-    /// The shared file's path in the game folder.
-    fn shared_path(&self) -> PathBuf {
-        self.export_root.join(SHARED_FILE_REL)
+    /// Where effect file `rel` is on disk.
+    fn file_of(&self, rel: &str) -> PathBuf {
+        self.effect_files
+            .find(rel)
+            .unwrap_or_else(|| self.export_root.join(rel))
     }
 
     /// Whether the open file is the shared file, whose parts are already "this file".
@@ -467,7 +469,7 @@ impl EffEditor {
         if !matches!(self.shared_parts, SharedFile::NotRead) {
             return;
         }
-        let path = self.shared_path();
+        let path = self.file_of(SHARED_FILE_REL);
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = send.send(PartFile::read(&path, SHARED_FILE_REL.to_owned()));
@@ -507,8 +509,7 @@ impl EffEditor {
         }
         // Found as the export and the live carrier find it: a part added from a costume's own
         // effect file is in the mod's files, not in the game folder.
-        let path = crate::app::find_effect_file(&self.effect_roots, rel)
-            .unwrap_or_else(|| self.export_root.join(rel));
+        let path = self.file_of(rel);
         PartFile::read(&path, rel.to_owned()).ok().map(Arc::new)
     }
 
@@ -1702,7 +1703,7 @@ mod tests {
             ..Default::default()
         };
         assert!(editor.part_file(COSTUME).is_none(), "only the mod has it");
-        editor.effect_roots = vec![root, mod_root.path().to_path_buf()];
+        editor.effect_files.roots = vec![root, mod_root.path().to_path_buf()];
         assert!(editor.part_file(COSTUME).is_some());
     }
 

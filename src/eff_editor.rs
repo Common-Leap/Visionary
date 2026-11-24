@@ -396,7 +396,7 @@ fn effect_entries(index: &crate::effects::EffIndex, sets: usize) -> Vec<EffEntry
 
 /// One edited fighter (from the app's project state) — the primary unit the editor's
 /// selector is organized around. `merged` is the transplants-applied build to parse when
-/// present; `alt_base` covers the data-root path when it differs from the export root.
+/// present.
 #[derive(Clone, PartialEq)]
 pub struct EditSource {
     /// The key the project keeps these edits under: a fighter, or a made character's key.
@@ -405,8 +405,11 @@ pub struct EditSource {
     pub pick: String,
     /// The name it is shown by.
     pub label: String,
+    /// The game path of the edited file, and the file its edits are made on.
+    pub rel: String,
     pub base: PathBuf,
-    pub alt_base: Option<PathBuf>,
+    /// That file is not there.
+    pub missing: bool,
     pub merged: Option<PathBuf>,
     pub transplant_count: usize,
     /// How many effects differ from the file, by [`crate::mod_project::EffMod::changed_effects`].
@@ -517,11 +520,21 @@ pub struct EffEditor {
     scan_error: Option<String>,
 
     loaded_path: Option<PathBuf>,
+    /// The game path the open file was opened as. One file can be opened as two: a made
+    /// character with no effect file of its own plays its donor's.
+    loaded_as: Option<String>,
     /// Game paths of files opened from outside the game folder. See [`Self::load_as`].
     game_paths: std::collections::HashMap<PathBuf, String>,
+    /// The file the user opened themselves, when it is not the one its game path's edits are
+    /// made on. See [`Self::open_picked`].
+    picked: Option<PathBuf>,
+    /// A file picked in the File list, and the game path of a clicked Edited chip, for the app
+    /// to open: it knows which file that character's edits are made on.
+    pub file_pick_request: Option<PathBuf>,
+    pub edit_source_request: Option<String>,
     /// Base eff path → merged (transplants applied) file to ACTUALLY parse when that base
     /// is opened. Makes the merged view character-centric: picking ef_kirby.eff shows
-    /// kirby WITH its transplants, wherever it's opened from.
+    /// kirby WITH its transplants.
     merged_overlays: std::collections::HashMap<PathBuf, PathBuf>,
     /// The currently loaded view came from a merged overlay (shown in the header).
     loaded_is_merged: bool,
@@ -732,9 +745,8 @@ pub struct EffEditor {
     /// The vanilla effect dump, always searched when building the live carrier. Independent of
     /// `export_root`, which is usually the mod being edited and never holds the carrier base.
     pub vanilla_root: Option<PathBuf>,
-    /// Every folder effect files are read from, in order, as the app's `effect_roots` was when a
-    /// file was last loaded.
-    pub effect_roots: Vec<PathBuf>,
+    /// Where effect files are read from, as it was when a file was last loaded.
+    pub effect_files: crate::eff_source::EffectFiles,
     /// The carrier rebuild is synchronous on the UI thread, so servicing the request in the
     /// same frame as the click would block before the spinner ever painted. Hold the request
     /// for one frame so the "sending" state is visible.
@@ -742,9 +754,10 @@ pub struct EffEditor {
     last_sent_note: Option<String>,
     /// Undo and redo for effect edits on this page.
     history: EffHistory,
-    /// The history of each file opened before, with the file's fingerprint when it was put
-    /// aside (see [`Self::file_fingerprint`]) and what its added parts put beside its data.
-    history_store: Vec<(PathBuf, u64, EffHistory, AddedData)>,
+    /// The history of each file opened before, by the file and the game path it was opened as,
+    /// with the file's fingerprint when it was put aside (see [`Self::file_fingerprint`]) and
+    /// what its added parts put beside its data.
+    history_store: Vec<((PathBuf, String), u64, EffHistory, AddedData)>,
 }
 
 impl Default for EffEditor {
@@ -763,6 +776,10 @@ impl Default for EffEditor {
             file_filter: String::new(),
             scan_error: None,
             loaded_path: None,
+            loaded_as: None,
+            picked: None,
+            file_pick_request: None,
+            edit_source_request: None,
             game_paths: Default::default(),
             merged_overlays: std::collections::HashMap::new(),
             loaded_is_merged: false,
@@ -853,7 +870,7 @@ impl Default for EffEditor {
             carrier_ok: false,
             carrier_build_error: None,
             vanilla_root: crate::app::load_config_path(crate::app::VANILLA_ROOT_CONFIG_KEY),
-            effect_roots: Vec::new(),
+            effect_files: Default::default(),
             deploy_defer: false,
             last_sent_note: None,
             history: EffHistory::default(),
@@ -2590,7 +2607,8 @@ impl EffEditor {
         self.texture_pool = loaded.texture_pool;
         self.texture_note = None;
         self.loaded_path = Some(path.to_path_buf());
-        self.restore_history(path);
+        self.loaded_as = Some(self.game_path_of(path));
+        self.restore_history();
         // The queued edits for it, if any, are applied right after this.
         self.working_stale = false;
         // Back on a file: the effect and part that were open in it are again.
@@ -2625,14 +2643,22 @@ impl EffEditor {
     /// The loaded eff's game path (project `source_rel`), wherever the file was opened from.
     /// See [`crate::mod_project::eff_game_rel`].
     pub fn loaded_rel(&self) -> Option<String> {
-        Some(self.game_path_of(self.loaded_path.as_ref()?))
+        let path = self.loaded_path.as_ref()?;
+        Some(match &self.loaded_as {
+            Some(rel) => rel.clone(),
+            None => self.game_path_of(path),
+        })
     }
 
-    /// The file on disk the editor has open, when it is the eff recorded as `source_rel`.
-    pub fn loaded_path_for(&self, source_rel: &str) -> Option<&Path> {
-        self.loaded_rel()
-            .filter(|rel| rel.eq_ignore_ascii_case(source_rel))
-            .and(self.loaded_path.as_deref())
+    /// The open file, and whether the user opened it themselves over the one its game path's
+    /// edits are made on.
+    pub fn open_file(&self) -> Option<(&Path, bool)> {
+        Some((self.loaded_path.as_deref()?, self.picked_open()))
+    }
+
+    pub fn picked_open(&self) -> bool {
+        let open = self.pending_load.as_ref().or(self.loaded_path.as_ref());
+        open.is_some() && open == self.picked.as_ref()
     }
 
     /// The game path a file on disk stands for: the one it was given when opened from a project
@@ -2644,12 +2670,62 @@ impl EffEditor {
         crate::mod_project::eff_game_rel(path, Some(&self.export_root))
     }
 
+    /// The game path of a file the user picked: its place on disk where that is one, whatever
+    /// it was last opened as (a made character with no effect file of its own plays its donor's).
+    pub fn game_path_of_pick(&self, path: &Path) -> String {
+        let rel = crate::mod_project::eff_game_rel(path, Some(&self.export_root));
+        let on_disk = path.to_string_lossy().replace('\\', "/").to_lowercase();
+        if on_disk.ends_with(&rel.to_lowercase()) {
+            rel
+        } else {
+            self.game_path_of(path)
+        }
+    }
+
     /// Open `path` as the game's `rel` (e.g. `effect/fighter/pickel/ef_pickel.eff`), so edits
     /// to an effect file kept outside the game folder are keyed and exported as that file.
     /// Opens it again even when it is already open, as a changed file needs.
     pub fn load_as(&mut self, path: &Path, rel: String) {
-        self.game_paths.insert(path.to_path_buf(), rel);
+        self.name_file(path, rel);
         self.replace_pending_load(path);
+    }
+
+    /// Say `path` stands for the game's `rel`. Edits queued for it as another file were that
+    /// file's.
+    fn name_file(&mut self, path: &Path, rel: String) {
+        if self.pending_load.as_deref() == Some(path) && self.game_path_of(path) != rel {
+            self.pending_edits = None;
+            self.pending_structure = None;
+            self.pending_edits_push_live = false;
+        }
+        self.game_paths.insert(path.to_path_buf(), rel);
+    }
+
+    /// [`Self::load_as`], leaving it as it is when it is already open.
+    pub fn open_as(&mut self, path: &Path, rel: String) {
+        self.name_file(path, rel);
+        self.queue_load(path);
+    }
+
+    /// Open `path` as the game's `rel` because the user picked it, though it is not the file
+    /// `rel`'s edits would be made on: the first edit made on it makes it that.
+    pub fn open_picked(&mut self, path: &Path, rel: String) {
+        self.open_as(path, rel);
+        self.picked = Some(path.to_path_buf());
+    }
+
+    /// Point a queued load at the file its game path's edits are made on, whoever queued it and
+    /// whichever copy they named, unless the user picked that copy themselves. Its game path.
+    pub fn settle_queued_load(&mut self, own: impl FnOnce(&str) -> PathBuf) -> Option<String> {
+        let path = self.pending_load.clone()?;
+        let rel = self.game_path_of(&path);
+        if !self.picked_open() {
+            let own = own(&rel);
+            if own != path {
+                self.load_as(&own, rel.clone());
+            }
+        }
+        Some(rel)
     }
 
     /// Queue `path` to load next. Edits queued for another file that has not loaded yet were
@@ -2664,6 +2740,9 @@ impl EffEditor {
             self.pending_edits = None;
             self.pending_structure = None;
             self.pending_edits_push_live = false;
+        }
+        if self.picked.as_deref() != Some(path) {
+            self.picked = None;
         }
         self.pending_load = Some(path.to_path_buf());
     }
@@ -2715,15 +2794,11 @@ impl EffEditor {
         self.pending_load.is_some()
     }
 
-    /// The file a queued load is about to open (its game path, as [`Self::loaded_rel`] records
-    /// it) when nothing has queued its edits yet. The app answers with
+    /// Whether nothing has queued a queued load's edits yet. The app answers with
     /// [`Self::queue_carried_edits`], so a file switched away from and back to opens with its
     /// edits instead of pristine.
-    pub fn load_needing_edits(&self) -> Option<String> {
-        if self.pending_edits.is_some() || self.pending_structure.is_some() {
-            return None;
-        }
-        Some(self.game_path_of(self.pending_load.as_ref()?))
+    pub fn load_needs_edits(&self) -> bool {
+        self.load_queued() && self.pending_edits.is_none() && self.pending_structure.is_none()
     }
 
     /// The project's edits for the file a queued load opens. Applied without sending anything
@@ -2852,6 +2927,9 @@ impl EffEditor {
         self.texture_imports.clear();
         self.merged_overlays.clear();
         self.edit_sources.clear();
+        // The shared effects' file may be another one in the next project.
+        self.shared_parts = SharedFile::NotRead;
+        self.picked = None;
     }
 
     /// Pool textures added since the last drain (the app owns the project store).
@@ -2947,10 +3025,10 @@ impl EffEditor {
 
     fn current_edit_source(&self) -> Option<&EditSource> {
         let loaded = self.loaded_path.as_ref()?;
+        let rel = self.loaded_rel();
         self.edit_sources.iter().find(|source| {
-            loaded == &source.base
-                || source.alt_base.as_ref() == Some(loaded)
-                || source.merged.as_ref() == Some(loaded)
+            let same = Some(&source.rel) == rel.as_ref() && loaded == &source.base;
+            same || source.merged.as_ref() == Some(loaded)
         })
     }
 
@@ -3815,30 +3893,37 @@ impl EffEditor {
     /// Put the open file's history aside, to come back when the file does.
     fn stash_history(&mut self) {
         let mut history = std::mem::take(&mut self.history);
-        let (Some(path), Some(_)) = (self.loaded_path.clone(), self.ptcl.as_ref()) else {
+        let (Some(file), Some(_)) = (self.history_key(), self.ptcl.as_ref()) else {
             return;
         };
         if history.undo.is_empty() && history.redo.is_empty() {
             return;
         }
         let key = self.file_fingerprint();
-        self.history_store.retain(|(p, ..)| *p != path);
+        self.history_store.retain(|(f, ..)| *f != file);
         let Some(added) = self.added_data() else {
             return;
         };
         history.baseline = None;
         history.open_since = None;
         history.cleared = None;
-        self.history_store.push((path, key, history, added));
+        self.history_store.push((file, key, history, added));
         if self.history_store.len() > HISTORY_FILES {
             self.history_store.remove(0);
         }
     }
 
-    /// Take back the history `path` had, when the file is still the one it was taken in.
-    fn restore_history(&mut self, path: &Path) {
+    fn history_key(&self) -> Option<(PathBuf, String)> {
+        Some((self.loaded_path.clone()?, self.loaded_rel()?))
+    }
+
+    /// Take back the history the open file had, when it is still the one it was taken in.
+    fn restore_history(&mut self) {
+        let Some(file) = self.history_key() else {
+            return;
+        };
         let key = self.file_fingerprint();
-        if let Some(at) = self.history_store.iter().position(|(p, ..)| p == path) {
+        if let Some(at) = self.history_store.iter().position(|(f, ..)| *f == file) {
             let (_, was, history, added) = self.history_store.remove(at);
             if was == key && self.restore_added_data(added) {
                 self.history = history;
@@ -4232,6 +4317,7 @@ impl EffEditor {
         // reload — e.g. a merged overlay just changed under the loaded file — survives.)
         // A working copy from before another project opened loads again, with this one's edits.
         if self.loaded_path.as_deref() == Some(path)
+            && self.loaded_rel() == Some(self.game_path_of(path))
             && self.pending_load.is_none()
             && !self.working_stale
         {
@@ -4242,16 +4328,12 @@ impl EffEditor {
 
     /// Replace the edit-source list (the app's per-fighter eff mods). This is the single
     /// source of truth for the "Editing:" selector AND the overlay map — every base path
-    /// (export-root AND data-root variants) redirects to the fighter's merged build, so
-    /// transplanted entries show no matter which path a load request used.
+    /// redirects to the fighter's merged build, so transplanted entries show.
     pub fn set_edit_sources(&mut self, sources: Vec<EditSource>) {
         let mut overlays = std::collections::HashMap::new();
         for s in &sources {
             if let Some(m) = &s.merged {
                 overlays.insert(s.base.clone(), m.clone());
-                if let Some(alt) = &s.alt_base {
-                    overlays.insert(alt.clone(), m.clone());
-                }
             }
         }
         // If the overlay for the currently loaded base just appeared/changed, reload so
@@ -4273,15 +4355,18 @@ impl EffEditor {
     /// side clears the corresponding overlay, edit-source row, and any loaded/queued view so a
     /// forgotten fighter cannot remain visible in the standalone editor window.
     pub fn forget_fighter(&mut self, fighter: &str) {
+        let prefix = format!("effect/fighter/{}/", fighter.to_lowercase());
+        // By what the file is the game's: one opened from elsewhere is under no such folder.
         let belongs = |path: &Path| {
-            let path = path.to_string_lossy().replace('\\', "/").to_lowercase();
-            let prefix = format!("effect/fighter/{}/", fighter.to_lowercase());
-            path.starts_with(&prefix) || path.contains(&format!("/{prefix}"))
+            let rel = self.game_path_of(path).replace('\\', "/").to_lowercase();
+            rel.starts_with(&prefix)
         };
         let loaded_belongs = self.loaded_path.as_deref().is_some_and(belongs);
         let pending_belongs = self.pending_load.as_deref().is_some_and(belongs);
-
-        self.merged_overlays.retain(|base, _| !belongs(base));
+        let bases = self.merged_overlays.keys().filter(|base| belongs(base));
+        for base in bases.cloned().collect::<Vec<_>>() {
+            self.merged_overlays.remove(&base);
+        }
         self.edit_sources
             .retain(|source| !source.fighter.eq_ignore_ascii_case(fighter));
         if pending_belongs {
@@ -4290,6 +4375,32 @@ impl EffEditor {
         if loaded_belongs {
             self.clear_loaded_view();
         }
+    }
+
+    /// Put the open file back as it is on disk when `gone` says the edits of its game path were
+    /// dropped, and forget what was done to it: undone, it would return them.
+    pub fn discard_edits_of(&mut self, gone: impl Fn(&str) -> bool) {
+        let is_gone = |path: &PathBuf| gone(&self.game_path_of(path));
+        let queued = self.pending_load.as_ref().is_some_and(is_gone);
+        let open = self.loaded_rel().is_some_and(|rel| gone(&rel));
+        self.history_store.retain(|((_, rel), ..)| !gone(rel));
+        if queued {
+            self.pending_edits = None;
+            self.pending_structure = None;
+        }
+        if open {
+            self.history = EffHistory::default();
+            self.working_stale = true;
+            if self.pending_load.is_none() {
+                self.pending_load = self.loaded_path.clone();
+            }
+        }
+    }
+
+    /// Show no file: the open one is nobody's any more.
+    pub fn close_file(&mut self) {
+        self.history = EffHistory::default();
+        self.clear_loaded_view();
     }
 
     /// Clear the parsed effect view after its source has been forgotten. The window itself stays
@@ -4301,6 +4412,7 @@ impl EffEditor {
         self.pending_structure = None;
         self.pending_edits_push_live = false;
         self.loaded_path = None;
+        self.loaded_as = None;
         self.loaded_is_merged = false;
         self.load_error = None;
         self.ptcl = None;
@@ -4365,7 +4477,9 @@ impl EffEditor {
             //
             // Not `queue_edits`: this reload is ours, not a project open, so it must not also
             // deploy to the running game.
-            if self.pending_edits.is_none() {
+            //
+            // Nor from a working copy of another project's: the app hands this one its own.
+            if self.pending_edits.is_none() && !self.working_stale {
                 let carried = self.collect_authored_edits();
                 if !carried.is_empty() {
                     self.pending_edits = Some(carried);
@@ -4374,7 +4488,7 @@ impl EffEditor {
             }
             // The emitter lists and spawn structures go the same way and for the same reason:
             // the merged baseline has neither baked in, so a reload would drop them.
-            if self.pending_structure.is_none() {
+            if self.pending_structure.is_none() && !self.working_stale {
                 self.queue_structure_edits(self.collect_rosters(), self.collect_entry_edits());
             }
             self.pending_load = Some(base.to_path_buf());
@@ -4430,26 +4544,7 @@ impl EffEditor {
         if self.eff_files.is_empty() && self.scan_error.is_none() {
             self.rescan();
         }
-        if let Some(path) = self.pending_load.take() {
-            if path.exists() {
-                self.load_eff(&path);
-                if let Some((rosters, entry_edits)) = self.pending_structure.take() {
-                    self.apply_structure_edits(&rosters, &entry_edits);
-                }
-                if let Some(edits) = self.pending_edits.take() {
-                    let had_edits = !edits.is_empty();
-                    let push_live = std::mem::take(&mut self.pending_edits_push_live);
-                    self.apply_authored_edits(&edits);
-                    // Project just loaded: get the game showing it. Rebuild-and-reload, so
-                    // every emitter lands where the project says — not an averaged tint.
-                    // Edits merely carried across a reload we caused push nothing.
-                    if had_edits && push_live && link.status().is_connected() {
-                        self.request_live_apply();
-                    }
-                }
-                self.apply_pending_select();
-            }
-        }
+        self.take_queued_load(link.status().is_connected());
         if self.pending_select.is_some() {
             self.apply_pending_select();
         }
@@ -4461,6 +4556,37 @@ impl EffEditor {
 
         // Live values change while the game runs: keep the page fresh.
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    fn take_queued_load(&mut self, connected: bool) {
+        let Some(path) = self.pending_load.take() else {
+            return;
+        };
+        if !path.exists() {
+            // Nothing else may stand for it.
+            self.remember_picks();
+            self.history_close_step();
+            self.stash_history();
+            self.clear_loaded_view();
+            self.load_error = Some(format!("{} is missing", path.display()));
+            return;
+        }
+        self.load_eff(&path);
+        if let Some((rosters, entry_edits)) = self.pending_structure.take() {
+            self.apply_structure_edits(&rosters, &entry_edits);
+        }
+        if let Some(edits) = self.pending_edits.take() {
+            let had_edits = !edits.is_empty();
+            let push_live = std::mem::take(&mut self.pending_edits_push_live);
+            self.apply_authored_edits(&edits);
+            // Project just loaded: get the game showing it. Rebuild-and-reload, so
+            // every emitter lands where the project says — not an averaged tint.
+            // Edits merely carried across a reload we caused push nothing.
+            if had_edits && push_live && connected {
+                self.request_live_apply();
+            }
+        }
+        self.apply_pending_select();
     }
 
     /// The strip across the top of the Effects page: game connection, Send, and which file.
@@ -4929,9 +5055,9 @@ impl EffEditor {
                             .to_string();
                         let selected = self.loaded_path.as_deref() == Some(path.as_path());
                         if ui.selectable_label(selected, label).clicked() {
-                            // Queued, not loaded here, so the app first keeps the open file's
-                            // edits and hands this one its own.
-                            self.pending_load = Some(path.clone());
+                            // Opened by the app, which first keeps the open file's edits and
+                            // hands this one its own.
+                            self.file_pick_request = Some(path.clone());
                             self.file_filter.clear();
                             ui.close();
                         }
@@ -5002,9 +5128,9 @@ impl EffEditor {
         {
             let sources = self.edit_sources.clone();
             for src in &sources {
-                let selected = self.loaded_path.as_deref() == Some(src.base.as_path())
-                    || (src.alt_base.is_some()
-                        && self.loaded_path.as_deref() == src.alt_base.as_deref());
+                let selected = self
+                    .current_edit_source()
+                    .is_some_and(|open| open.fighter == src.fighter);
                 let mut badges: Vec<String> = Vec::new();
                 if src.transplant_count > 0 {
                     badges.push(format!("{} borrowed", src.transplant_count));
@@ -5031,7 +5157,7 @@ impl EffEditor {
                 // A slotted fighter whose merged build is missing signals a failed merge —
                 // surface it instead of silently showing the base file.
                 let broken = src.transplant_count > 0 && src.merged.is_none();
-                let text = if broken {
+                let text = if broken || src.missing {
                     egui::RichText::new(format!("⚠ {label}"))
                         .color(egui::Color32::from_rgb(230, 190, 80))
                 } else {
@@ -5044,7 +5170,9 @@ impl EffEditor {
                 } else {
                     ui.button(text)
                 };
-                let resp = chip.on_hover_text(if broken {
+                let resp = chip.on_hover_text(if src.missing {
+                    format!("{} is missing", src.base.display())
+                } else if broken {
                     "Its borrowed effects couldn't be put together. The status bar says why; borrow them again"
                         .to_string()
                 } else {
@@ -5073,7 +5201,7 @@ impl EffEditor {
             self.fighter_request = Some(src.pick.clone());
             self.only_open_move = false;
         } else {
-            self.pending_load = Some(src.base.clone());
+            self.edit_source_request = Some(src.rel.clone());
         }
     }
 
@@ -9768,13 +9896,13 @@ mod tests {
         editor.history_close_step();
         editor.stash_history();
         editor.loaded_path = Some(PathBuf::from("/fx/ef_mario.eff"));
-        editor.restore_history(Path::new("/fx/ef_mario.eff"));
+        editor.restore_history();
         assert!(!editor.can_undo());
 
         // Back, as loaded before: the step is there and undoes.
         editor.stash_history();
         editor.loaded_path = Some(kirby.clone());
-        editor.restore_history(&kirby);
+        editor.restore_history();
         assert!(editor.can_undo());
         editor.undo();
         assert_eq!(tuned(&editor), 1.0);
@@ -9784,7 +9912,7 @@ mod tests {
         // Back with another set list (a borrowed effect added): dropped, and said.
         editor.stash_history();
         editor.ptcl.as_mut().unwrap().emitter_sets[0].name = "P_Other".into();
-        editor.restore_history(&kirby);
+        editor.restore_history();
         assert!(!editor.can_undo() && !editor.can_redo());
         assert!(editor.history.cleared.is_some());
     }
@@ -10047,8 +10175,9 @@ mod tests {
             pick: "bayonetta".into(),
             fighter: "bayonetta".into(),
             label: "Bayonetta".into(),
+            rel: "effect/fighter/bayonetta/ef_bayonetta.eff".into(),
             base: PathBuf::from("/fx/ef_bayonetta.eff"),
-            alt_base: None,
+            missing: false,
             merged: None,
             transplant_count: 1,
             changed_effects: 2,
@@ -10074,7 +10203,7 @@ mod tests {
         };
         editor.open_edit_source(&source);
         assert!(editor.fighter_request.is_none());
-        assert_eq!(editor.pending_load, Some(source.base.clone()));
+        assert_eq!(editor.edit_source_request, Some(source.rel.clone()));
     }
 
     /// A file loaded before a project opened holds none of that project's edits: reading its
@@ -10117,6 +10246,166 @@ mod tests {
             editor.pending_edits.is_none(),
             "Mario's edits went to Bayonetta's file"
         );
+    }
+
+    /// Whatever queues a load, and whichever copy it names, the file that opens is the one the
+    /// edits are made on: an Edited chip, a borrow and a moveset refresh each named the game
+    /// folder's. A copy the user picked is not taken from them.
+    #[test]
+    fn a_queued_load_opens_the_file_its_edits_are_made_on() {
+        const PICKEL: &str = "effect/fighter/pickel/ef_pickel.eff";
+        let game = Path::new("/dump").join(PICKEL);
+        let own = PathBuf::from("/picked/fx/ef_pickel.eff");
+        let mut editor = EffEditor {
+            export_root: "/dump".into(),
+            ..Default::default()
+        };
+        assert_eq!(editor.settle_queued_load(|_| unreachable!()), None);
+        editor.queue_load(&game);
+        let rel = editor.settle_queued_load(|rel| {
+            assert_eq!(rel, PICKEL);
+            own.clone()
+        });
+        assert_eq!(rel.as_deref(), Some(PICKEL));
+        assert_eq!(editor.pending_load.as_ref(), Some(&own));
+        assert_eq!(editor.game_path_of(&own), PICKEL);
+        // Edits queued for the file it is stay queued.
+        editor.queue_edits(Vec::new());
+        editor.settle_queued_load(|_| own.clone());
+        assert!(editor.pending_edits.is_some());
+        // The same copy, picked by the user.
+        editor.open_picked(&game, PICKEL.into());
+        assert!(editor.picked_open());
+        editor.settle_queued_load(|_| own.clone());
+        assert_eq!(editor.pending_load.as_ref(), Some(&game));
+        // Opened by anything else afterwards, it is the edits' file again.
+        editor.queue_load(&own);
+        editor.queue_load(&game);
+        assert!(!editor.picked_open());
+        editor.settle_queued_load(|_| own.clone());
+        assert_eq!(editor.pending_load.as_ref(), Some(&own));
+    }
+
+    /// A made character with no effect file of its own plays its donor's: the one file, opened
+    /// as each, is each one's, with each one's edits and undo history.
+    #[test]
+    fn one_file_opened_as_two_is_each_ones() {
+        const DONOR: &str = "/dump/effect/fighter/mario/ef_mario.eff";
+        const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+        const VISION: &str = "effect/fighter/mario/ef_mario_c08.eff";
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut editor = editor_with_one_emitter(DONOR);
+        editor.export_root = "/dump".into();
+        editor.loaded_as = Some(VISION.into());
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, ms(0), false, None);
+        history_frame(&mut editor, ms(10), false, Some(2.0));
+        history_frame(&mut editor, ms(2000), false, None);
+        assert!(editor.can_undo());
+        // Mario is opened: until his file loads, what is open is Vision's still.
+        editor.open_as(Path::new(DONOR), MARIO.into());
+        assert_eq!(editor.loaded_rel().as_deref(), Some(VISION));
+        assert_eq!(editor.pending_load.as_deref(), Some(Path::new(DONOR)));
+        let next = editor.settle_queued_load(|_| DONOR.into());
+        assert_eq!(next.as_deref(), Some(MARIO));
+        // Vision's steps wait for Vision.
+        editor.stash_history();
+        editor.loaded_as = Some(MARIO.into());
+        editor.restore_history();
+        assert!(!editor.can_undo());
+        editor.stash_history();
+        editor.loaded_as = Some(VISION.into());
+        editor.restore_history();
+        assert!(editor.can_undo());
+        // Nor do edits queued for one reach the other.
+        editor.queue_edits(Vec::new());
+        editor.open_as(Path::new(DONOR), VISION.into());
+        assert!(editor.pending_edits.is_none());
+        // Open as Vision's already, it is not loaded again.
+        editor.pending_load = None;
+        editor.open_as(Path::new(DONOR), VISION.into());
+        assert!(editor.pending_load.is_none());
+    }
+
+    /// The file the edits were made on is missing: it is shown as missing, with nothing open in
+    /// its place, so nothing can be read back over them. Paired: one that is there opens.
+    #[test]
+    fn a_missing_file_opens_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("ef_mario.eff");
+        let mut editor = editor_with_one_emitter("/fx/ef_link.eff");
+        editor.queue_load(&gone);
+        editor.queue_carried_edits(Vec::new(), Vec::new(), Vec::new());
+        editor.take_queued_load(false);
+        assert!(editor.loaded_rel().is_none() && !editor.has_loaded_effects());
+        assert!(editor.collect_authored_edits().is_empty());
+        let said = editor.load_error.clone().unwrap_or_default();
+        assert_eq!(said, format!("{} is missing", gone.display()));
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped half: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        std::fs::copy(root.join("effect/fighter/mario/ef_mario.eff"), &gone).unwrap();
+        editor.queue_load(&gone);
+        editor.take_queued_load(false);
+        assert_eq!(editor.loaded_path(), Some(gone.as_path()));
+        assert!(editor.has_loaded_effects() && editor.load_error.is_none());
+    }
+
+    /// Edits dropped from the project leave the working copy too, or the next sync would put
+    /// them back. Paired: another file's are kept.
+    #[test]
+    fn dropped_edits_are_not_read_back() {
+        const FILE: &str = "/characters/vision/effect/fighter/mario/ef_mario_c08.eff";
+        const REL: &str = "effect/fighter/mario/ef_mario_c08.eff";
+        let open = || {
+            let mut editor = editor_with_one_emitter(FILE);
+            tune(&mut editor, 2.5);
+            assert_eq!(editor.collect_authored_edits().len(), 1);
+            editor
+        };
+        let mut editor = open();
+        editor.discard_edits_of(|rel| rel == "effect/fighter/mario/ef_mario.eff");
+        assert!(editor.working_is_current() && editor.pending_load.is_none());
+        let mut editor = open();
+        editor.discard_edits_of(|rel| rel == REL);
+        assert!(!editor.working_is_current());
+        assert_eq!(editor.pending_load.as_deref(), Some(Path::new(FILE)));
+        // Closed, there is nothing to read at all.
+        let mut editor = open();
+        editor.close_file();
+        assert!(editor.loaded_rel().is_none() && editor.collect_authored_edits().is_empty());
+        // A load of it still queued loses the edits it was to apply.
+        let mut editor = EffEditor::default();
+        editor.queue_load(Path::new(FILE));
+        editor.queue_edits(Vec::new());
+        editor.discard_edits_of(|rel| rel == REL);
+        assert!(editor.pending_edits.is_none());
+    }
+
+    /// Forgetting a fighter closes its effect file wherever it was opened from.
+    #[test]
+    fn forgetting_a_fighter_closes_a_file_opened_from_elsewhere() {
+        for (fighter, open) in [("mario", false), ("link", true)] {
+            let mut editor = editor_with_one_emitter("/downloads/ef_mario.eff");
+            editor.forget_fighter(fighter);
+            assert_eq!(editor.loaded_path().is_some(), open, "{fighter}");
+        }
+    }
+
+    /// Opening a project whose borrowed effects are in the open file reloads it without what the
+    /// project before had done to it. Paired with `transplanting_carries_emitter_edits_across`.
+    #[test]
+    fn another_projects_edits_are_not_carried_into_a_merged_reload() {
+        let base = PathBuf::from("effect/fighter/kirby/ef_kirby.eff");
+        let mut editor = editor_with_one_emitter("effect/fighter/kirby/ef_kirby.eff");
+        tune(&mut editor, 2.5);
+        editor.reset_project_state();
+        editor.set_merged_overlay(&base, Some(Path::new("merged.eff")));
+        assert!(editor.pending_edits.is_none());
+        assert_eq!(editor.pending_load, Some(base));
     }
 
     /// The attribute these tests move to make the fixture "edited".
@@ -10711,8 +11000,7 @@ mod tests {
         assert!(editor.pending_edits.is_some());
         assert!(editor.pending_edits_push_live);
     }
-    /// File → Open Effect File… on a mod's eff: the project records the game path, and the
-    /// open file (not the dump's copy) is what that path resolves to while it is open.
+    /// File → Open Effect File… on a mod's eff: the project records the game path.
     #[test]
     fn an_eff_opened_outside_the_root_records_its_game_path() {
         let opened = PathBuf::from("C:/Users/me/mods/x/effect/fighter/mario/ef_mario.eff");
@@ -10723,10 +11011,6 @@ mod tests {
         };
         let rel = editor.loaded_rel().unwrap();
         assert_eq!(rel, "effect/fighter/mario/ef_mario.eff");
-        assert_eq!(editor.loaded_path_for(&rel), Some(opened.as_path()));
-        assert_eq!(
-            editor.loaded_path_for("effect/fighter/link/ef_link.eff"),
-            None
-        );
+        assert_eq!(editor.game_path_of_pick(&opened), rel);
     }
 }

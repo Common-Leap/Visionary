@@ -2333,14 +2333,14 @@ impl VisionaryApp {
                 };
                 self.change_parts(|parts| parts.set_link(&fighter, part, slot, Some(folder)));
                 if part == Part::Effects {
-                    self.reopen_fighter_effects(&fighter);
+                    self.follow_effect_files();
                 }
                 forget_cached(ctx);
             }
             PageAction::ForgetFolder(fighter, part, slot) => {
                 self.change_parts(|parts| parts.set_link(&fighter, part, slot, None));
                 if part == Part::Effects {
-                    self.reopen_fighter_effects(&fighter);
+                    self.follow_effect_files();
                 }
                 forget_cached(ctx);
             }
@@ -2351,8 +2351,7 @@ impl VisionaryApp {
                 }
             }
             PageAction::EditOtherEffect(rel) => {
-                let path = self.resolve_eff_source(&rel);
-                self.eff_editor.load_as(&path, rel);
+                self.open_eff(rel);
                 self.open_effects_page();
             }
             PageAction::OpenEffectFile => {
@@ -2556,38 +2555,26 @@ impl VisionaryApp {
         };
     }
 
-    /// Open the fighter's effect file again from wherever it now comes from.
-    fn reopen_fighter_effects(&mut self, fighter: &str) {
-        let rel = if fighter == OTHER_EFFECTS {
-            match self.eff_editor.loaded_rel() {
-                Some(rel) if !rel.starts_with("effect/fighter/") => rel,
-                _ => return,
-            }
-        } else {
-            format!("effect/fighter/{fighter}/ef_{fighter}.eff")
-        };
-        let path = self.resolve_eff_source(&rel);
-        if path.is_file() {
-            self.current_eff_path = Some(path.clone());
-            self.eff_editor.load_as(&path, rel);
-        }
-    }
-
     /// Reload the open effect file when it changes on disk in the project or a picked folder:
     /// here at once, and in the game from the next match.
     pub(super) fn reload_changed_effect_file(&mut self) {
         let Some(rel) = self.eff_editor.loaded_rel() else {
             return;
         };
-        let path = self.resolve_eff_source(&rel);
+        self.follow_open_effect_file();
+        let Some(path) = self.eff_editor.loaded_path().map(Path::to_path_buf) else {
+            return;
+        };
         let primary = self.eff_editor.export_root().join(&rel);
         if path == primary {
             self.effect_file_stamp = None;
             return;
         }
-        let stamp = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .ok();
+        // Gone while another tool writes it: looked at again when it is back.
+        let Ok(stamp) = std::fs::metadata(&path).and_then(|meta| meta.modified()) else {
+            return;
+        };
+        let stamp = Some(stamp);
         let before = self.effect_file_stamp.replace((path.clone(), stamp));
         if before.as_ref().is_none_or(|(was, _)| *was != path)
             || before.as_ref().map(|(_, at)| *at) == Some(stamp)
@@ -2597,6 +2584,8 @@ impl VisionaryApp {
         self.eff_editor.load_as(&path, rel.clone());
         // Whose file it is: a made character's costume file is its own.
         let owner = self.eff_owner(&rel);
+        // Shown with the borrowed effects put into it as it is now.
+        self.build_merged_preview(&owner);
         let staged = if self.eff_mods.get(&owner).is_some_and(|eff| !eff.is_empty()) {
             self.deploy_live_eff(&owner)
         } else {
