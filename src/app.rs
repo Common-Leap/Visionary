@@ -5685,7 +5685,7 @@ pub struct VisionaryApp {
     hub_pending: Option<crate::project_hub::HubAction>,
     /// Last mod-import report, shown until dismissed.
     import_report: Option<crate::mod_import::ImportReport>,
-    /// What opening the project changed, shown until it is closed.
+    /// What opening the project changed or could not read, shown until it is closed.
     load_notes: Vec<String>,
     /// Kept so background workers can wake the (reactive) UI when their result lands.
     egui_ctx: egui::Context,
@@ -27459,7 +27459,7 @@ impl VisionaryApp {
             return;
         }
         let mut close = false;
-        egui::Window::new("Changed while opening")
+        egui::Window::new("Noted while opening")
             .collapsible(false)
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -28677,9 +28677,13 @@ impl VisionaryApp {
             .collect();
         match crate::move_nodes::project::expand(&project) {
             Ok(expanded) => project = expanded,
-            // Blocks that no longer work, after a gimmick they use was taken away, must not keep
-            // the rest of the project shut: their moves play the scripts last written.
-            Err(errors) => migration_findings.extend(errors.iter().map(ToString::to_string)),
+            // Blocks that no longer compile must not keep the rest of the project shut: their
+            // moves play the scripts last written, and export names the reason.
+            Err(errors) => migration_findings.extend(
+                errors
+                    .iter()
+                    .map(|error| crate::move_nodes::plain::error_words(&error.to_string())),
+            ),
         }
 
         // Loading is replacement, not an undocumented merge. Clear the previous project's
@@ -29002,6 +29006,7 @@ impl VisionaryApp {
             self.project_name
         );
         self.state.status.push_str(&live_report.status_suffix());
+        migration_findings.dedup();
         self.load_notes = migration_findings;
         // Effect edits and borrowed effects from a saved project have not been sent to the game
         // in this session, so Send edits says so.

@@ -3224,8 +3224,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&project).unwrap(), before);
     }
 
-    /// Blocks that stopped working, as a gimmick taken away on the Gimmicks page leaves them, keep
-    /// their move out of an export and nothing out of reach: the file opens, with the blocks.
+    /// Blocks that no longer compile, their gimmick missing from the file, keep their move out of
+    /// an export and nothing out of reach: the file opens, with the blocks.
     #[test]
     fn a_project_whose_blocks_no_longer_work_still_opens() {
         let mut project = project_with_gimmick_event("begin", false, true);
