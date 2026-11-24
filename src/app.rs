@@ -2243,6 +2243,19 @@ fn source_parts_differ(
         .any(|part| script(part, saved).ok() != script(part, current).ok())
 }
 
+/// Whether a search shows a fighter's row: it, or a character made on it, has the name.
+fn fighter_row_matches(
+    fighter: &crate::data::FighterEntry,
+    made: impl IntoIterator<Item = String>,
+    query: &str,
+) -> bool {
+    VisionaryApp::fighter_matches_query(fighter, query)
+        || (fighter.custom_name.is_none()
+            && made
+                .into_iter()
+                .any(|name| name.to_lowercase().contains(query)))
+}
+
 fn same_script(a: &crate::data::AcmdScript, b: &crate::data::AcmdScript) -> bool {
     serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
@@ -11889,7 +11902,15 @@ impl VisionaryApp {
                     .fighters
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| Self::fighter_matches_query(f, &fighter_query))
+                    .filter(|(_, f)| {
+                        // The characters made on a fighter are listed under it.
+                        let made = crate::character::made_on(&f.name, &self.roster.project);
+                        let made = made.map(|entry| {
+                            let key = crate::character::CharacterKey::made(entry.key.clone());
+                            self.character_name(&key)
+                        });
+                        fighter_row_matches(f, made, &fighter_query)
+                    })
                     .map(|(i, f)| FighterRow {
                         idx: i,
                         name: f.name.clone(),
@@ -56651,6 +56672,24 @@ mod blocked_export_writes_nothing_tests {
             source: crate::data::FighterSource::DataRoot,
             custom_name: custom.map(str::to_owned),
         }
+    }
+
+    /// A character made on a fighter is listed under it, so searching for its name shows them.
+    #[test]
+    fn searching_for_a_made_character_finds_it() {
+        let mario = row("mario", None, &[0]);
+        let shy_guy = row("pacman", Some("Shy Guy"), &[40]);
+        let made = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let found = |fighter, names: &[&str], query| {
+            super::fighter_row_matches(fighter, made(names), query)
+        };
+        assert!(found(&mario, &["Vision"], "vis"));
+        assert!(found(&mario, &["Vision"], "mario"));
+        assert!(found(&mario, &["Vision"], ""));
+        assert!(!found(&mario, &["Vision"], "luigi"));
+        assert!(!found(&mario, &[], "vis"));
+        // A mod's character on the fighter's costumes has a row of its own.
+        assert!(!found(&shy_guy, &["Vision"], "vis"));
     }
 
     /// An effect edit reaches the costumes that play its file and no others.

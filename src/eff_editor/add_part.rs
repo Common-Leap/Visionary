@@ -69,6 +69,18 @@ pub(super) struct Starter {
     pub set: &'static str,
     pub part: &'static str,
     pub index: usize,
+    /// The preview draws it. It draws no stripes yet.
+    pub drawn: bool,
+}
+
+impl Starter {
+    fn hover(&self) -> String {
+        let from = format!("{} of the shared effects ({})", self.part, self.set);
+        match self.drawn {
+            true => from,
+            false => format!("{from}\nThe preview does not draw trails yet; the game does"),
+        }
+    }
 }
 
 /// The shared effects file every fighter plays, relative to the game folder.
@@ -92,6 +104,7 @@ pub(super) const STARTERS: &[Starter] = &[
         set: "P_CmnMuzzleflash",
         part: "flare1",
         index: 6,
+        drawn: true,
     },
     Starter {
         label: "Sparks",
@@ -99,6 +112,7 @@ pub(super) const STARTERS: &[Starter] = &[
         set: "P_CmnSlipSpark",
         part: "spark1",
         index: 1,
+        drawn: true,
     },
     Starter {
         label: "Smoke",
@@ -106,6 +120,7 @@ pub(super) const STARTERS: &[Starter] = &[
         set: "P_CmnDashSmoke",
         part: "smoke1",
         index: 3,
+        drawn: true,
     },
     Starter {
         label: "Ring",
@@ -113,6 +128,7 @@ pub(super) const STARTERS: &[Starter] = &[
         set: "P_CmnFlash",
         part: "ring1",
         index: 1,
+        drawn: true,
     },
     Starter {
         label: "Flash",
@@ -120,6 +136,7 @@ pub(super) const STARTERS: &[Starter] = &[
         set: "P_CmnFlash",
         part: "flash1",
         index: 2,
+        drawn: true,
     },
     Starter {
         label: "Trail",
@@ -127,6 +144,7 @@ pub(super) const STARTERS: &[Starter] = &[
         set: "P_CmnRecovery",
         part: "spline1",
         index: 2,
+        drawn: false,
     },
 ];
 
@@ -1124,10 +1142,7 @@ impl EffEditor {
                     for (i, starter) in STARTERS.iter().enumerate() {
                         if ui
                             .button(starter.label)
-                            .on_hover_text(format!(
-                                "{} of the shared effects ({})",
-                                starter.part, starter.set
-                            ))
+                            .on_hover_text(starter.hover())
                             .clicked()
                         {
                             picked = Some(Picked::Starter(i));
@@ -1842,6 +1857,16 @@ mod tests {
                 .get(starter.index)
                 .unwrap_or_else(|| panic!("{}: no part {}", starter.label, starter.index));
             assert_eq!(em.name, starter.part, "{}", starter.label);
+            // One the preview shows nothing of says so before it is picked.
+            let mut magics = em.subsections.iter().map(|section| section.magic.as_str());
+            let stripe = magics.any(|magic| matches!(magic, "EP01" | "EP02" | "EP03"));
+            assert_eq!(starter.drawn, !stripe, "{}", starter.label);
+            assert_eq!(
+                starter.hover().contains("preview"),
+                stripe,
+                "{}",
+                starter.label
+            );
             assert!(
                 attr(em, "emission.is_one_time").is_some_and(|v| v.as_bool()),
                 "{} never stops",
