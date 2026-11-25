@@ -44,16 +44,6 @@ def main() -> None:
     shutil.copy2(nro, output / nro.name)
     print(f"Built: {nro} ({nro.stat().st_size} bytes)")
 
-    # The copy exported mods carry: the same runtime without the editor connection.
-    exported_dir = target_dir / "exported"
-    exported_env = dict(environment, CARGO_TARGET_DIR=str(exported_dir))
-    subprocess.run(
-        [*command, "--features", "exported"], cwd=plugin_root, env=exported_env, check=True
-    )
-    exported = exported_dir / "aarch64-skyline-switch" / "release" / "lib_effect_viewer.nro"
-    shutil.copy2(exported, output / "lib_visionary_mod.nro")
-    print(f"Built: {exported} ({exported.stat().st_size} bytes)")
-
     # The source an exported mod's own plugin is built from: only the files the mod flavour
     # compiles, as one crate with nothing outside it.
     mod_dir = target_dir / "mod_plugin"

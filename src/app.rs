@@ -1,4 +1,3 @@
-use crate::console::NoConsoleWindow;
 use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::move_kinds::plain_name as format_move_name;
 use crate::renderer::{HitboxRenderState, ViewportCallback};
@@ -1128,37 +1127,8 @@ const VISUAL_EFFECTS_DESCRIPTION: &str =
 const WORK_FLAGS_DESCRIPTION: &str =
     "Work flags are named on/off switches stored by the game for this fighter. Move and status scripts use them to remember or signal conditions such as enabling a combo or marking a move phase; the flag's authored name identifies its exact purpose.";
 
-/// Only the viewport's own response can authorize a pick. Raw pointer clicks also belong
-/// to floating inspectors, dialogs and popups drawn over the model.
 /// The plugin source a mod export compiles: the folder used last, the copy shipped beside
 /// the editor, or the repository the editor was built in. None asks the user.
-/// Name the plugin looks for in each mod folder at boot. **Must match the plugin's value.**
-const RULE_PACK_FILE: &str = "visionary_rules.jsonl";
-
-/// Whether this machine can compile an exported mod.
-fn rust_toolchain_available() -> bool {
-    std::env::var_os("VISIONARY_EXPORT_WITHOUT_RUST").is_none()
-        && std::process::Command::new("cargo")
-            .args(["skyline", "--version"])
-            .output()
-            .is_ok_and(|output| output.status.success())
-}
-
-/// The plugin beside the editor in a release, or the local build in a checkout.
-/// The plugin copy exported mods carry: Visionary's runtime without the editor connection.
-fn find_prebuilt_plugin(exe: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
-    const CANDIDATES: [&str; 2] = [
-        "plugin/lib_visionary_mod.nro",
-        "plugins/slight_replica/target/output/lib_visionary_mod.nro",
-    ];
-    exe?.ancestors().find_map(|folder| {
-        CANDIDATES
-            .iter()
-            .map(|candidate| folder.join(candidate))
-            .find(|path| path.is_file())
-    })
-}
-
 fn find_plugin_source(
     saved: Option<std::path::PathBuf>,
     exe: Option<std::path::PathBuf>,
@@ -1178,6 +1148,8 @@ fn find_plugin_source(
         .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("src").is_dir())
 }
 
+/// Only the viewport's own response can authorize a pick. Raw pointer clicks also belong
+/// to floating inspectors, dialogs and popups drawn over the model.
 fn viewport_pick_position(response: &egui::Response) -> Option<egui::Pos2> {
     response
         .clicked_by(egui::PointerButton::Primary)
@@ -5859,6 +5831,8 @@ pub struct VisionaryApp {
     import_report: Option<crate::mod_import::ImportReport>,
     /// What opening the project changed or could not read, shown until it is closed.
     load_notes: Vec<String>,
+    /// What has to be installed before the mod can be exported.
+    rust_needed: Vec<crate::rust_tools::Tool>,
     /// Kept so background workers can wake the (reactive) UI when their result lands.
     egui_ctx: egui::Context,
     /// Saved window geometry (`"main"`, `"transplant"`, `"edits"`), persisted between runs.
@@ -6392,6 +6366,7 @@ impl VisionaryApp {
             hub_pending: None,
             import_report: None,
             load_notes: Vec::new(),
+            rust_needed: Vec::new(),
             egui_ctx: cc.egui_ctx.clone(),
             window_geometry: load_window_geometry(),
             geometry_dirty: false,
@@ -27744,6 +27719,15 @@ impl VisionaryApp {
         }
     }
 
+    fn draw_rust_needed(&mut self, ctx: &egui::Context) {
+        use crate::rust_tools::Answer;
+        match crate::rust_tools::window(ctx, &self.rust_needed) {
+            Some(Answer::ExportAgain) => self.export_full_mod(),
+            Some(Answer::Close) => self.rust_needed.clear(),
+            None => {}
+        }
+    }
+
     fn draw_import_report(&mut self, ctx: &egui::Context) {
         let Some(report) = self.import_report.clone() else {
             return;
@@ -28352,38 +28336,6 @@ impl VisionaryApp {
         self.export_mod(true);
     }
 
-    /// Writes the live rules and the prebuilt plugin into a mod folder.
-    fn write_rule_pack(&mut self, dest: &std::path::Path) -> anyhow::Result<()> {
-        let plugin = find_prebuilt_plugin(std::env::current_exe().ok())
-            .ok_or_else(|| anyhow::anyhow!("lib_visionary_mod.nro, the plugin exported mods carry, is missing from Visionary's plugin folder"))?;
-        std::fs::create_dir_all(dest)?;
-        std::fs::copy(plugin, dest.join("plugin.nro"))?;
-        // An object's script is not part of the project, so its live edits are not exported.
-        let mut hitboxes = self.live_hitbox_rule_union(None);
-        hitboxes.retain(|rule| rule.agent.is_none());
-        let mut effects = self.live_effect_rule_union(None);
-        effects.retain(|rule| rule.agent.is_none());
-        let mut controls = self.live_effect_control_rule_union(None);
-        controls.retain(|rule| rule.agent.is_none());
-        let mut messages = vec![
-            serde_json::json!({ "hitbox_rules": hitboxes }).to_string(),
-            serde_json::json!({ "spawn_rules": effects }).to_string(),
-            serde_json::json!({ "effect_control_rules": controls }).to_string(),
-        ];
-        messages.extend(
-            self.gimmicks_editor
-                .pack_messages(
-                    &self.roster.params,
-                    &self.roster.behaviors,
-                    &self.roster.controller_charts,
-                    &self.roster.project,
-                )
-                .map_err(anyhow::Error::msg)?,
-        );
-        std::fs::write(dest.join(RULE_PACK_FILE), messages.join("\n"))?;
-        Ok(())
-    }
-
     fn export_mod(&mut self, developer: bool) {
         if self.workspace_copy_rx.is_some() {
             self.state.status =
@@ -28406,7 +28358,6 @@ impl VisionaryApp {
         let planned_source;
         let planned_warnings;
         let planned_has_source;
-        let rule_pack;
         // Export source code writes the same plugin source Export mod builds.
         let mut source_runtime = None;
         {
@@ -28439,24 +28390,17 @@ impl VisionaryApp {
                             .iter()
                             .any(|file| file.contents.contains("crate::slight::"))
                     });
-            // No Rust here: the mod carries the rules the editor sends live, and the shipped
-            // plugin replays them at boot. What the user tested is what ships.
-            rule_pack = !developer
-                && needs_runtime
-                && (!rust_toolchain_available()
-                    || find_plugin_source(
-                        load_config_path("mod_plugin_template"),
-                        std::env::current_exe().ok(),
-                    )
-                    .is_none());
-            let plan = if rule_pack {
-                crate::mod_export::NormalExportPlan {
-                    generated_source: None,
-                    gimmick_runtime: None,
-                    warnings: Vec::new(),
-                    has_acmd_source: false,
+            let builds_plugin = needs_runtime
+                || legacy_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.generated_source.is_some());
+            if builds_plugin && !developer {
+                self.rust_needed = crate::rust_tools::missing();
+                if !self.rust_needed.is_empty() {
+                    return;
                 }
-            } else if needs_runtime {
+            }
+            let plan = if needs_runtime {
                 let plugin_root = match find_plugin_source(
                     load_config_path("mod_plugin_template"),
                     std::env::current_exe().ok(),
@@ -28554,7 +28498,6 @@ impl VisionaryApp {
                     .join("export-source")
                     .join(&plugin_name)
             },
-            rule_pack,
         };
         let outcome = match run_export_preverified(
             &project,
@@ -28578,11 +28521,6 @@ impl VisionaryApp {
             has_source,
         } = outcome;
 
-        if rule_pack {
-            if let Err(error) = self.write_rule_pack(&dest) {
-                errors.push(format!("mod rules: {error}"));
-            }
-        }
         if let Some(runtime) = &source_runtime {
             let source = dest.join(&plugin_name);
             match runtime.write_source(&source) {
@@ -28845,8 +28783,7 @@ impl VisionaryApp {
         }));
         self.export_build = Some(state.clone());
         std::thread::spawn(move || {
-            let out = std::process::Command::new("cargo")
-                .no_console_window()
+            let out = crate::rust_tools::command("cargo")
                 .args(["skyline", "build", "--release"])
                 .current_dir(&src_root)
                 .output();
@@ -42138,6 +42075,7 @@ Click to see the code, or link your own project"
         self.draw_hub_pending_modal(&ctx);
         self.draw_import_report(&ctx);
         self.draw_load_notes(&ctx);
+        self.draw_rust_needed(&ctx);
         self.draw_workspace_panel(&ctx);
         let t = self.perf.start();
         self.draw_transplant_studio(&ctx);
@@ -45549,9 +45487,6 @@ struct ExportInputs {
     /// Where the generated Rust project goes: inside `dest` for a developer export, a scratch
     /// directory otherwise, since a mod folder ships the built `.nro` rather than the source.
     source_root: std::path::PathBuf,
-    /// The mod carries the editor's live rules in a rule pack for the shipped plugin. The pack
-    /// holds the gimmick charts in the same bundle the editor sends live, so they ship.
-    rule_pack: bool,
 }
 
 /// What an export produced, for the caller to turn into a status line and a plugin build.
@@ -45622,7 +45557,6 @@ fn run_export_preverified(
             .validate_for_project(project)
             .map_err(|error| error.to_string())?,
         (true, None) => {}
-        (false, None) if inputs.rule_pack => {}
         (false, None) => crate::mod_export::refuse_uninstalled_controller_charts(project)
             .map_err(|error| error.to_string())?,
     }
@@ -45635,7 +45569,6 @@ fn run_export_preverified(
         eff_sources,
         eff_files,
         source_root,
-        rule_pack: _,
     } = inputs;
     let developer = *developer;
 
@@ -46896,11 +46829,6 @@ mod carrier_send_state_tests {
             );
             assert!(
                 body(&format!("fn {union}(")).contains("held_back(put_back.map("),
-                "{union}"
-            );
-            // What is kept out of the match is still exported.
-            assert!(
-                body("fn write_rule_pack(").contains(&format!("self.{union}(None)")),
                 "{union}"
             );
         }
@@ -56491,33 +56419,6 @@ mod blocked_export_writes_nothing_tests {
             eff_sources: Default::default(),
             eff_files: Default::default(),
             source_root: source_root.to_path_buf(),
-            rule_pack: false,
-        }
-    }
-
-    /// The same chart that refuses a plain mod export ships in a rule pack: the pack carries
-    /// the charts in the bundle the editor sends live.
-    #[test]
-    fn a_rule_pack_export_carries_charts_the_plain_export_refuses() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut project = ModProjectFile::default();
-        project
-            .fighters
-            .entry("mario".into())
-            .or_default()
-            .controller_charts
-            .insert(
-                "extra".into(),
-                crate::mod_project::ControllerChart::default(),
-            );
-        let dest = dir.path().join("mod");
-        let mut input = inputs(&dest, &dir.path().join("missing-source"));
-        let refused = run_export_preverified(&project, &input, None, false, None, Vec::new());
-        assert!(refused.unwrap_err().contains("mario/extra"));
-        input.rule_pack = true;
-        if let Err(error) = run_export_preverified(&project, &input, None, false, None, Vec::new())
-        {
-            assert!(!error.contains("mario/extra"), "{error}");
         }
     }
 

@@ -17,10 +17,7 @@ impl Facade for DebuggableServerFacade {
     }
     fn install(&mut self) {
         skyline::println!("[SLight] Installing facade Debuggable Server");
-        // A mod's copy plays its saved edits and never talks to the editor.
-        if !cfg!(feature = "exported") {
-            crate::rust_extender::debuggable_server::init();
-        }
+        crate::rust_extender::debuggable_server::init();
     }
     fn global_only(&self) -> bool {
         true

@@ -7,7 +7,6 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::acmd_adapter::RenderedAcmdAdapter;
 use super::adapter::{self, RenderedAdapter};
@@ -265,7 +264,7 @@ fn build_plugin(tree: &Path, target: &Path, name: &str) -> Result<PathBuf, Packa
     let temp = crate::scratch_dirs::app_storage_root().join("export-plugin-tmp");
     std::fs::create_dir_all(&temp)
         .map_err(|e| error("plugin build", format!("creating {}: {e}", temp.display())))?;
-    let output = Command::new("cargo")
+    let output = crate::rust_tools::command("cargo")
         .args(["skyline", "build", "--release"])
         .current_dir(tree)
         .env("CARGO_TARGET_DIR", target)

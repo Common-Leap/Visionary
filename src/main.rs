@@ -64,6 +64,7 @@ mod project_parts;
 mod project_scope;
 mod renderer;
 mod roster;
+mod rust_tools;
 mod scratch_dirs;
 mod source_style;
 mod source_timing;

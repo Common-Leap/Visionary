@@ -118,30 +118,6 @@ impl LiveSync {
         );
     }
 
-    /// The messages an exported mod replays at boot: the same ones a connected editor sends.
-    pub fn pack_messages(
-        &mut self,
-        params: &BTreeMap<String, ParamMod>,
-        graphs: &BTreeMap<String, BehaviorGraph>,
-        charts: &ControllerCharts,
-        roster: &RosterMod,
-    ) -> Result<Vec<String>, String> {
-        let mut behavior = self.prepare_controller_snapshot(graphs, charts, roster)?;
-        behavior["revision"] = 1.into();
-        let mut edits = Vec::new();
-        for (fighter, personal) in params {
-            for (path, value) in super::params::personal_edits(personal, fighter) {
-                if let Ok(edit) = parameter(fighter, path, *value) {
-                    edits.push(edit);
-                }
-            }
-        }
-        Ok(vec![
-            serde_json::json!({ "gimmick_behavior": behavior }).to_string(),
-            serde_json::json!({ "gimmick_parameters": {"version":1,"revision":1,"enabled":true,"edits":edits} }).to_string(),
-        ])
-    }
-
     /// Compile each complete owner or disable it, never send main while silently
     /// omitting that owner's additional charts. Global overflow refuses the
     /// entire outgoing snapshot instead of truncating it. Each character's gimmick is its own
@@ -675,17 +651,6 @@ mod tests {
         assert_ne!(mario.vars, *charge);
         // Two gimmicks of one fighter, installed as two coordinators.
         assert_eq!(request.coordinators().unwrap()["mario"].len(), 2);
-        // The exported mod replays exactly the same snapshot.
-        let packed = sync
-            .pack_messages(
-                &BTreeMap::new(),
-                &graphs,
-                &BTreeMap::new(),
-                &roster_with_vision(),
-            )
-            .unwrap();
-        let replayed = super::super::controller_protocol::decode_request(&packed[0]).unwrap();
-        assert_eq!(replayed.charts, request.charts);
     }
 
     /// The paired control: with no made character, Mario's gimmick goes out exactly as before,

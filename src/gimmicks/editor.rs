@@ -275,16 +275,6 @@ impl GimmicksEditor {
         self.live.update(params, graphs, roster, link);
     }
 
-    pub fn pack_messages(
-        &mut self,
-        params: &BTreeMap<String, ParamMod>,
-        graphs: &BTreeMap<String, BehaviorGraph>,
-        charts: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
-        roster: &crate::mod_project::RosterMod,
-    ) -> Result<Vec<String>, String> {
-        self.live.pack_messages(params, graphs, charts, roster)
-    }
-
     pub fn sync_live_controllers(
         &mut self,
         params: &BTreeMap<String, ParamMod>,

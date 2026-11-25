@@ -383,8 +383,7 @@ struct IncomingEdit {
     updates: Vec<PathUpdate>,
 }
 
-/// RPM edits sent over TCP (plain JSON or framed envelope body).
-/// File an exported mod keeps its rules in. Must match the editor's value.
+/// The file a mod exported without Rust by Visionary 0.4.0 or earlier keeps its edits in.
 const RULE_PACK_FILE: &str = "visionary_rules.jsonl";
 
 /// Replays every installed mod's rules once, as if an editor had sent them. Rule lists from
@@ -425,6 +424,7 @@ fn load_rule_packs() {
     }
 }
 
+/// RPM edits sent over TCP (plain JSON or framed envelope body).
 pub fn poll_tcp_edits() -> Vec<ParsedEdit> {
     static RULE_PACKS: std::sync::Once = std::sync::Once::new();
     RULE_PACKS.call_once(load_rule_packs);
