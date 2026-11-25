@@ -121,9 +121,9 @@ An **If** block has three outputs: **Yes** and **No** say what runs for each ans
 **Everything updates live.** With the game connected, each finished edit reaches the match by
 itself, with no restart and no export. **● Updates live** at the top confirms it; if a block
 can't go live yet, that label names it. To keep a move, use **Project → Export Mod Folder**. The
-folder it makes is a complete mod: drop it in your mods folder and it works without the editor,
-exactly as you tested it. You don't need Rust. Keep only one copy of the plugin installed, so remove
-any other copy from Skyline's plugins folder.
+folder it makes is a complete mod: drop it in your mods folder and it works without the editor.
+Exporting edited moves or gimmicks needs Rust, and Visionary lists what to install. Keep only one
+copy of the plugin installed, so remove any other copy from Skyline's plugins folder.
 
 **Make a gimmick**
 
