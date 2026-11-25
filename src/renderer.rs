@@ -265,6 +265,7 @@ pub struct HitboxRenderState {
     pub vfx: crate::vfx_preview::VfxPreview,
     /// The scene's colour and depth as the effects find it, for refraction and floor decals.
     scene_copy: eff_wgpu::scene::SceneCopy,
+    distortion: eff_wgpu::scene::Distortion,
     /// Weapon swing trails.
     trails: crate::preview_trail::PreviewTrails,
     /// The data folder and stage (`None`: no stage, training lighting) the preview shows.
@@ -351,6 +352,11 @@ impl HitboxRenderState {
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
             ),
             scene_copy: eff_wgpu::scene::SceneCopy::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            distortion: eff_wgpu::scene::Distortion::new(
                 device,
                 ssbh_wgpu::RGBA_COLOR_FORMAT,
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
@@ -1992,6 +1998,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 .trails
                 .prepare(device, queue, t.mvp_matrix, &self.trails);
             let vfx = &state.vfx;
+            if vfx.has_offsets() {
+                state
+                    .distortion
+                    .fit(device, state.current_width, state.current_height);
+            }
+            let distortion = &state.distortion;
             let scene_copy = &state.scene_copy;
             let trails = &state.trails;
             // An effect alone has no floor, except one with floor decals to show on it.
@@ -2024,6 +2036,15 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     }
                     vfx.paint(&mut pass);
                     trails.draw(&mut pass);
+                    drop(pass);
+                    // What moves the picture moves all of it, so it comes last, as in the
+                    // game's final pass.
+                    if vfx.has_offsets() {
+                        if let Some(mut pass) = distortion.begin(encoder, scene.depth) {
+                            vfx.paint_offsets(&mut pass);
+                        }
+                        distortion.bend(device, encoder, scene.color, scene.resolve);
+                    }
                 },
             );
             state.stage_models = state.render_models.split_off(fighter_models);

@@ -194,6 +194,7 @@ fn effect_loop(emitters: &[Emitter]) -> Loop {
     let mut length = kill.unwrap_or(1);
     for emitter in emitters {
         let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+        s.set_anims(sim::Anims::of(&emitter.raw.attributes));
         for step in 1..=CAP + kill.unwrap_or(0) {
             if kill.is_some_and(|kill| step > kill) {
                 s.kill();
@@ -285,6 +286,8 @@ pub struct VfxPreview {
     scene: Option<(wgpu::TextureView, wgpu::TextureView)>,
     files: HashMap<PathBuf, Slot>,
     prepared: Vec<(Arc<EffectFile>, render::PreparedDraw)>,
+    /// The draws that move the picture behind them instead of drawing on it.
+    offsets: Vec<(Arc<EffectFile>, render::PreparedDraw)>,
     workers: Option<Workers>,
     /// Jobs already handed to the warm thread, by file.
     queued: HashSet<(PathBuf, Job)>,
@@ -320,6 +323,7 @@ impl VfxPreview {
             scene: None,
             files: HashMap::new(),
             prepared: Vec::new(),
+            offsets: Vec::new(),
             workers: None,
             queued: HashSet::new(),
             waiting: false,
@@ -567,6 +571,7 @@ impl VfxPreview {
         draws: &[EffectDraw],
     ) {
         self.prepared.clear();
+        self.offsets.clear();
         self.looped = None;
         self.looped_on_floor = false;
         self.collect_loaded();
@@ -732,6 +737,9 @@ impl VfxPreview {
         draw: &EffectDraw,
         custom2: &[u8],
     ) {
+        let Some(state) = render_state(emitter) else {
+            return;
+        };
         let streams = s.streams();
         if std::env::var_os("VFX_DUMP").is_some() {
             let name = emitter.data.name.clone().unwrap_or_default();
@@ -785,7 +793,7 @@ impl VfxPreview {
         drop(textures);
         let draw_info = render::EmitterDraw {
             program: program(emitter),
-            state: render_state(emitter),
+            state,
             static_block: &statics,
             dynamic_block: &dynamic,
             custom0_block: custom0.as_deref(),
@@ -798,7 +806,11 @@ impl VfxPreview {
             mesh,
         };
         if let Some(prepared) = file.renderer.prepare(queue, &draw_info) {
-            self.prepared.push((file.clone(), prepared));
+            let draws = match state.output {
+                render::Output::Colour => &mut self.prepared,
+                render::Output::Offsets => &mut self.offsets,
+            };
+            draws.push((file.clone(), prepared));
         }
     }
 
@@ -816,6 +828,18 @@ impl VfxPreview {
 
     pub fn paint(&self, pass: &mut wgpu::RenderPass<'_>) {
         for (file, prepared) in &self.prepared {
+            file.renderer.draw(pass, prepared);
+        }
+    }
+
+    /// Whether anything moves the picture behind it (see [`Self::paint_offsets`]).
+    pub fn has_offsets(&self) -> bool {
+        !self.offsets.is_empty()
+    }
+
+    /// Draw what moves the picture into the offsets pass of `eff_wgpu::scene::Distortion`.
+    pub fn paint_offsets(&self, pass: &mut wgpu::RenderPass<'_>) {
+        for (file, prepared) in &self.offsets {
             file.renderer.draw(pass, prepared);
         }
     }
@@ -845,11 +869,10 @@ impl EffectFile {
     /// What an emitter needs built before it can draw: its pipeline and its textures.
     fn jobs(&self, emitter: &Emitter) -> Vec<Job> {
         let mesh = mesh_id(emitter) != u64::MAX;
-        let mut jobs = vec![Job::Pipeline((
-            program(emitter),
-            render_state(emitter),
-            mesh,
-        ))];
+        let mut jobs: Vec<Job> = render_state(emitter)
+            .map(|state| Job::Pipeline((program(emitter), state, mesh)))
+            .into_iter()
+            .collect();
         for sampler in samplers(emitter).into_iter().flatten() {
             jobs.extend(self.texture_index(sampler).map(Job::Texture));
         }
@@ -1043,12 +1066,20 @@ fn solo_part(emitters: &[Emitter], part: usize) -> Option<(usize, Option<usize>)
 /// charge sparks in).
 fn emitter_sim<'a>(emitter: &'a Emitter, seeds: &EmitterSeeds) -> sim::EmitterSim<'a> {
     let mut s = sim::EmitterSim::with_seed(&emitter.data, &emitter.fixed, seeds.own);
-    s.set_fields(sim::Fields::of(&emitter.raw.attributes));
+    set_sections(&mut s, emitter);
     for (child, seed) in emitter.children.iter().zip(&seeds.children) {
-        s.add_child_with_seed(&child.data, &child.fixed, *seed)
-            .set_fields(sim::Fields::of(&child.raw.attributes));
+        set_sections(
+            s.add_child_with_seed(&child.data, &child.fixed, *seed),
+            child,
+        );
     }
     s
+}
+
+/// What an emitter's attribute sections add to its simulation: fields and animations.
+fn set_sections(s: &mut sim::EmitterSim, emitter: &Emitter) {
+    s.set_fields(sim::Fields::of(&emitter.raw.attributes));
+    s.set_anims(sim::Anims::of(&emitter.raw.attributes));
 }
 
 /// Every set's emitters: parsed, raw and with the runtime's load-time fixes.
@@ -1101,9 +1132,11 @@ fn program(emitter: &Emitter) -> usize {
     emitter.data.shader_references.shader_index.max(0) as usize
 }
 
-fn render_state(emitter: &Emitter) -> render::RenderState {
+/// `None` for an emitter that draws nothing here (see `render::Output::of_draw_path`).
+fn render_state(emitter: &Emitter) -> Option<render::RenderState> {
     let rs = &emitter.data.render_state;
-    render::RenderState {
+    Some(render::RenderState {
+        output: render::Output::of_draw_path(emitter.data.emitter_info.draw_path as u8)?,
         blend: render::Blend::from_type(rs.is_blend_enable, rs.blend_type),
         depth_test: rs.is_depth_test,
         depth_write: rs.is_depth_mask,
@@ -1112,7 +1145,7 @@ fn render_state(emitter: &Emitter) -> render::RenderState {
         // corpus emitters, nearly all meshes: an arc's inside and outside are often two
         // emitters, each drawn on its own side).
         display_side: rs.display_side,
-    }
+    })
 }
 
 fn samplers(emitter: &Emitter) -> [Option<&effect_library::emitter::TextureSampler>; 3] {
@@ -1723,12 +1756,74 @@ mod tests {
             .map(|e| {
                 (
                     e.data.name.clone().unwrap_or_default(),
-                    render_state(e).display_side,
+                    render_state(e).unwrap().display_side,
                 )
             })
             .collect();
         assert!(sides.contains(&("arc1".to_owned(), 1)), "{sides:?}");
         assert!(sides.contains(&("arc2".to_owned(), 0)), "{sides:?}");
+    }
+
+    /// What the parts of an effect draw into, by name: a part that moves the picture behind it
+    /// draws no colour (it was a black sheet), and a radial blur draws nothing here.
+    #[test]
+    fn parts_that_move_or_blur_the_picture_draw_no_colour() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let outputs = |fighter: &str, set: &str| {
+            let path = root.join(format!("effect/fighter/{fighter}/ef_{fighter}.eff"));
+            let file =
+                effect_library::NamcoEffectFile::load(&std::fs::read(path).unwrap()).unwrap();
+            let ptcl_file = file.ptcl_file.as_ref().unwrap();
+            let sets = &ptcl_file.emitter_list.emitter_sets;
+            let at = sets.iter().position(|s| s.name == set).unwrap();
+            set_emitters(ptcl_file)[at]
+                .iter()
+                .map(|e| {
+                    let name = e.data.name.clone().unwrap_or_default();
+                    (name, render_state(e).map(|state| state.output))
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        use render::Output::{Colour, Offsets};
+        let ryu = outputs("ryu", "P_RyuFinalShinkuhadoBullet2");
+        assert_eq!(ryu["wind_circle1_rif"], Some(Offsets));
+        assert_eq!(ryu["ring1"], Some(Colour));
+        let edge = outputs("edge", "P_EdgeThrowLwGravity");
+        assert_eq!(edge["line2_rf"], Some(Offsets));
+        assert_eq!(edge["line2_a"], Some(Colour));
+        let kazuya = outputs("demon", "P_DemonImpact");
+        assert_eq!(kazuya["radialblur1"], None);
+    }
+
+    /// The preview runs a part's animations: the Witch Time hand, which nothing else turns, makes
+    /// a quarter turn in 15 frames.
+    #[test]
+    fn a_parts_own_animation_turns_it() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let path = root.join("effect/fighter/bayonetta/ef_bayonetta.eff");
+        let file = effect_library::NamcoEffectFile::load(&std::fs::read(path).unwrap()).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let sets = &ptcl_file.emitter_list.emitter_sets;
+        let at = sets
+            .iter()
+            .position(|s| s.name == "P_BayonettaWitchTimeClock")
+            .unwrap();
+        let emitters = &set_emitters(ptcl_file)[at];
+        let seeds = set_seeds(emitters, 0);
+        let mut s = emitter_sim(&emitters[0], &seeds[0]);
+        for _ in 0..16 {
+            s.step_at(&Mat4::IDENTITY);
+        }
+        let x = s.emitter_srt(&Mat4::IDENTITY).x_axis.truncate();
+        assert!(x.abs_diff_eq(glam::Vec3::Y, 1e-4), "{x}");
     }
 
     /// An effect the script plays at another rate (`LAST_EFFECT_SET_RATE`, 282 vanilla calls)
