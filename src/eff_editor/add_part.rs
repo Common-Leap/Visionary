@@ -1414,6 +1414,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            shaders: Default::default(),
         };
         set_attr(&mut em, "particle_scale.scale_x", AttrValue::Float(scale));
         em

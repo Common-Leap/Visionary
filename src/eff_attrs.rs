@@ -562,7 +562,12 @@ macro_rules! cmb_wide_fg {
 }
 
 pub const WRAP_MODES: &[&str] = &["Mirror", "Repeat", "ClampEdge", "MirrorOnce"];
-pub const COLOR_TYPES: &[&str] = &["Constant", "Random", "Animated 8-key"];
+pub const COLOR_TYPES: &[&str] = &[
+    "Constant",
+    "Random",
+    "Over its life",
+    "One key per particle",
+];
 /// How a part mixes with what is behind it, as eff_wgpu's renderer reads the value
 /// (`Blend::from_type`, src/render.rs).
 pub const BLEND_TYPES: &[&str] = &["Normal", "Add", "Subtract", "Multiply", "Screen"];
@@ -2041,42 +2046,42 @@ fn rotation_and_motion() -> Vec<Attr> {
             G_ANIM_RATES,
             "emitter_static.num_color0_keys",
             "Colour 0 key count",
-            "How many of the eight colour 0 keyframes are live",
+            "How many keys this runs through over each particle's life, eight at most",
             emitter_static.num_color0_keys
         ),
         it!(
             G_ANIM_RATES,
             "emitter_static.num_alpha0_keys",
             "Alpha 0 key count",
-            "How many of the eight alpha 0 keyframes are live",
+            "How many keys this runs through over each particle's life, eight at most",
             emitter_static.num_alpha0_keys
         ),
         it!(
             G_ANIM_RATES,
             "emitter_static.num_color1_keys",
             "Colour 1 key count",
-            "How many of the eight colour 1 keyframes are live",
+            "How many keys this runs through over each particle's life, eight at most",
             emitter_static.num_color1_keys
         ),
         it!(
             G_ANIM_RATES,
             "emitter_static.num_alpha1_keys",
             "Alpha 1 key count",
-            "How many of the eight alpha 1 keyframes are live",
+            "How many keys this runs through over each particle's life, eight at most",
             emitter_static.num_alpha1_keys
         ),
         it!(
             G_ANIM_RATES,
             "emitter_static.num_scale_keys",
             "Scale key count",
-            "How many of the eight scale keyframes are live",
+            "How many keys this runs through over each particle's life, eight at most",
             emitter_static.num_scale_keys
         ),
         it!(
             G_ANIM_RATES,
             "emitter_static.num_param_keys",
             "Shader coefficient key count",
-            "How many of the eight shader-coefficient keyframes are live",
+            "How many of the eight shader-coefficient keyframes are live. Fixed by the part's shader.",
             emitter_static.num_param_keys
         ),
         fl!(

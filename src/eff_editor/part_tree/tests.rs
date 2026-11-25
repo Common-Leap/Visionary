@@ -16,6 +16,7 @@ pub(in crate::eff_editor) fn part(name: &str, source_idx: usize, depth: u8) -> E
         color1: Vec::new(),
         alpha0_keys: Vec::new(),
         texture_index: None,
+        shaders: Default::default(),
     }
 }
 

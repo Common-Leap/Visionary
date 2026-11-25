@@ -42,6 +42,7 @@ pub fn base_eff_has_content(eff: &EffMod) -> bool {
         || !eff.textures.is_empty()
         || !eff.textures_added.is_empty()
         || !eff.textures_removed.is_empty()
+        || !eff.models.is_empty()
         || !eff.rosters.is_empty()
         || !eff.entry_edits.is_empty()
         || eff
@@ -1298,6 +1299,31 @@ pub fn make_portable_project(
             copy_asset(&source, &project_dir.join(&relative))?;
             texture.png_path = relative.to_string_lossy().replace('\\', "/");
         }
+        for (index, model) in eff.models.iter_mut().enumerate() {
+            if model.path.is_empty() {
+                continue;
+            }
+            let source = PathBuf::from(&model.path);
+            let extension = source
+                .extension()
+                .and_then(|part| part.to_str())
+                .unwrap_or("glb");
+            let relative = asset_relative
+                .join(portable_component(fighter))
+                .join(format!(
+                    "model_{index}_{}.{}",
+                    portable_component(&model.name),
+                    extension
+                ));
+            if !used_destinations.insert(relative.clone()) {
+                bail!(
+                    "duplicate project asset destination: {}",
+                    relative.display()
+                );
+            }
+            copy_asset(&source, &project_dir.join(&relative))?;
+            model.path = relative.to_string_lossy().replace('\\', "/");
+        }
         for (index, texture) in eff.textures_added.iter_mut().enumerate() {
             if texture.png_path.is_empty() {
                 continue;
@@ -1397,6 +1423,7 @@ pub fn resolve_project_assets(project: &mut ModProjectFile, project_path: &Path)
                     .iter_mut()
                     .map(|texture| &mut texture.png_path),
             )
+            .chain(eff.models.iter_mut().map(|model| &mut model.path))
         {
             if path.is_empty() {
                 continue;

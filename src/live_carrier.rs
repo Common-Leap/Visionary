@@ -8,12 +8,19 @@ use crate::eff_editor::SendOutcome;
 use crate::eff_export::CarrierAuthored;
 use crate::game_link::{EffectAliasWire, LiveGimmickAgent};
 use crate::mod_project::{
-    AuthoredEdit, EffMod, EmitterRoster, EntryEdit, TextureAddition, TextureImport, TransplantOp,
-    EDIT_CLONE_PREFIX, EDIT_COPY_PREFIX,
+    AuthoredEdit, EffMod, EmitterRoster, EntryEdit, ModelImport, TextureAddition, TextureImport,
+    TransplantOp, EDIT_CLONE_PREFIX, EDIT_COPY_PREFIX,
 };
 
 /// An effect of a file, and its set.
 pub type Effect = (String, usize);
+
+/// A texture or a model of an effect file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asset<'a> {
+    Texture(&'a str),
+    Model(u64),
+}
 
 /// One character's part of the carrier.
 #[derive(Default)]
@@ -29,6 +36,7 @@ pub struct Share {
     pub textures: Vec<TextureImport>,
     pub new_textures: Vec<TextureAddition>,
     pub gone_textures: Vec<String>,
+    pub models: Vec<ModelImport>,
     /// Edits to an effect that has the name of a borrowed one.
     pub conflicts: Vec<String>,
 }
@@ -44,8 +52,8 @@ pub struct ShareOf<'a> {
     pub costumes: &'a [u8],
     /// The costumes one of its borrowed effects reaches.
     pub borrowed_costumes: &'a dyn Fn(&TransplantOp) -> Vec<u8>,
-    /// The effects of its file that use a texture, and their sets.
-    pub using_texture: &'a dyn Fn(&str) -> Vec<Effect>,
+    /// The effects of its file that use a texture or a model, and their sets.
+    pub using: &'a dyn Fn(Asset) -> Vec<Effect>,
     /// Effects the running game loaded changed that the character no longer changes.
     pub restore: &'a BTreeSet<String>,
 }
@@ -120,17 +128,21 @@ fn edited_effects(eff: &EffMod) -> Vec<(String, Edits)> {
 }
 
 /// The effects `eff` changes in the file the game loads for its fighter, by lowercase name.
-pub fn changed_effects(
-    eff: &EffMod,
-    using_texture: &dyn Fn(&str) -> Vec<Effect>,
-) -> BTreeSet<String> {
+pub fn changed_effects(eff: &EffMod, using: &dyn Fn(Asset) -> Vec<Effect>) -> BTreeSet<String> {
     let edited = edited_effects(eff).into_iter().map(|(name, _)| name);
     let replaced = eff.transplants.iter().filter_map(|op| {
         let name = op.replace_entry.as_ref()?;
         Some(name.to_lowercase())
     });
-    let textures = eff.textures.iter().map(|import| &import.texture_name);
-    let shown = textures.flat_map(|name| using_texture(name));
+    let textures = eff
+        .textures
+        .iter()
+        .map(|import| Asset::Texture(&import.texture_name));
+    let models = eff
+        .models
+        .iter()
+        .map(|import| Asset::Model(import.model_id));
+    let shown = textures.chain(models).flat_map(using);
     edited
         .chain(replaced)
         .chain(shown.map(|(name, _)| name.to_lowercase()))
@@ -153,6 +165,7 @@ impl Share {
             textures: eff.textures.clone(),
             new_textures: eff.textures_added.clone(),
             gone_textures: eff.textures_removed.clone(),
+            models: eff.models.clone(),
             ..Self::default()
         };
         let edited = edited_effects(eff);
@@ -228,10 +241,13 @@ impl Share {
                 entry_edit,
             });
         }
-        // A replaced texture brings every effect that uses it: the carrier's pool only holds the
-        // textures its own effects reference.
+        // A replaced texture or model brings every effect that uses it: the carrier only holds
+        // the ones its own effects reference.
         for import in &share.textures {
-            redirects.extend((from.using_texture)(&import.texture_name));
+            redirects.extend((from.using)(Asset::Texture(&import.texture_name)));
+        }
+        for import in &share.models {
+            redirects.extend((from.using)(Asset::Model(import.model_id)));
         }
         // The game's own again, where it loaded a changed one with the fighter.
         redirects.extend(from.restore.iter().map(|name| (name.clone(), 0)));
@@ -290,14 +306,17 @@ impl Share {
             && self.textures.is_empty()
             && self.new_textures.is_empty()
             && self.gone_textures.is_empty()
+            && self.models.is_empty()
     }
 
-    /// The textures it changes: the carrier has one pool, so each name is one picture in it.
-    pub fn changed_textures(&self) -> impl Iterator<Item = &str> {
+    /// The textures and models it changes: the carrier has one pool of each, so each is one
+    /// picture or shape in it.
+    pub fn changed_assets(&self) -> impl Iterator<Item = Asset<'_>> {
         let replaced = self.textures.iter().map(|t| t.texture_name.as_str());
         let added = self.new_textures.iter().map(|t| t.texture_name.as_str());
         let gone = self.gone_textures.iter().map(String::as_str);
-        replaced.chain(added).chain(gone)
+        let textures = replaced.chain(added).chain(gone).map(Asset::Texture);
+        textures.chain(self.models.iter().map(|m| Asset::Model(m.model_id)))
     }
 
     fn rename(&mut self, from: &str, to: &str) {
@@ -323,12 +342,12 @@ fn clash(a: &EffectAliasWire, b: &EffectAliasWire) -> bool {
 }
 
 /// The shares that go into one carrier, in an order that does not change with the open character,
-/// and the owners of those that can't go in with them: `first`'s always does. `uses(share, name)`
-/// says whether a share's effects use a texture.
+/// and the owners of those that can't go in with them: `first`'s always does. `uses(share, asset)`
+/// says whether a share's effects use a texture or a model.
 pub fn together(
     mut shares: Vec<Share>,
     first: Option<&str>,
-    uses: &dyn Fn(&Share, &str) -> bool,
+    uses: &dyn Fn(&Share, Asset) -> bool,
 ) -> (Vec<Share>, Vec<String>) {
     let mut taken: Vec<Share> = Vec::new();
     let mut left = Vec::new();
@@ -336,8 +355,8 @@ pub fn together(
     for share in shares {
         let fits = taken.iter().all(|other| {
             let picture = |a: &Share, b: &Share| {
-                a.changed_textures()
-                    .any(|name| b.changed_textures().any(|n| n == name) || uses(b, name))
+                a.changed_assets()
+                    .any(|asset| b.changed_assets().any(|a| a == asset) || uses(b, asset))
             };
             !picture(other, &share)
                 && !picture(&share, other)
@@ -532,7 +551,7 @@ mod tests {
             source_rel: &eff.source_rel,
             costumes,
             borrowed_costumes: &|_| costumes.to_vec(),
-            using_texture: &|_| vec![(format!("{owner}_flash"), 0)],
+            using: &|_| vec![(format!("{owner}_flash"), 0)],
             restore: &restore.iter().map(|name| name.to_string()).collect(),
         })
     }
@@ -641,7 +660,9 @@ mod tests {
         };
         // Fox's effects don't use it: both.
         assert_eq!(both(shares(), Some("fox")).1, Vec::<String>::new());
-        let uses = |share: &Share, name: &str| share.owner == "fox" && name == "ef_cmn_smoke";
+        let uses = |share: &Share, asset: Asset| {
+            share.owner == "fox" && asset == Asset::Texture("ef_cmn_smoke")
+        };
         for (open, left) in [("fox", "mario"), ("mario", "fox")] {
             let (taken, named) = together(shares(), Some(open), &uses);
             assert_eq!(named, [left]);

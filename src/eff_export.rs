@@ -137,6 +137,7 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
         textures,
         added_textures,
         removed_textures,
+        &[],
         warnings,
     )
 }
@@ -158,6 +159,7 @@ pub fn rebuild_runtime_carrier_eff_bytes_resolving(
     textures: &[TextureImport],
     added_textures: &[crate::mod_project::TextureAddition],
     removed_textures: &[String],
+    models: &[crate::mod_project::ModelImport],
     warnings: &mut Vec<String>,
 ) -> Result<Vec<u8>> {
     // A carrier-native selection needs no transplant. The runtime remap already turns an `_os`
@@ -169,6 +171,7 @@ pub fn rebuild_runtime_carrier_eff_bytes_resolving(
         && textures.is_empty()
         && added_textures.is_empty()
         && removed_textures.is_empty()
+        && models.is_empty()
         && !ops.is_empty()
         && ops
             .iter()
@@ -390,6 +393,7 @@ pub fn rebuild_runtime_carrier_eff_bytes_resolving(
             .ptcl_file
             .as_mut()
             .context("carrier has no ptcl section — cannot apply authored edits")?;
+        let mut rekeyed = std::collections::BTreeSet::new();
         for entry in authored {
             let idx = ptcl
                 .emitter_list
@@ -417,10 +421,15 @@ pub fn rebuild_runtime_carrier_eff_bytes_resolving(
                 edit.set_name = entry.set_name.clone();
                 edit.set_idx = idx;
                 apply_authored(ptcl, &edit)?;
+                if crate::eff_keys::changes_keys(&edit) {
+                    rekeyed.insert(idx);
+                }
             }
         }
+        crate::eff_keys::widen(ptcl, &rekeyed, warnings)?;
     }
 
+    crate::model_import::apply(carrier.ptcl_file.as_mut(), models, warnings)?;
     apply_texture_imports(&mut carrier, textures, warnings)?;
     // Removals last: the swaps that moved emitters off these textures have now been applied.
     apply_texture_removals(&mut carrier, removed_textures, warnings)?;
@@ -906,25 +915,32 @@ fn clear_empty_emitter_set_references(file: &mut effect_library::NamcoEffectFile
 /// Entry (kind) names in `file` whose emitters sample the named pool texture, with the emitter
 /// set each one owns.
 ///
-/// A texture import names a texture, not an effect, but the carrier can only hold textures its
+/// An import names a texture or a model, not an effect, but the carrier can only hold those its
 /// own entries reference. This is how the live-carrier build turns "replace this texture" into
 /// "and therefore clone these effects", so the pool the import lands on actually contains it.
 /// All six sampler slots are checked, not just `sampler0` — a texture used only as a distortion
 /// or mask input is still a texture the user can replace.
-pub fn entries_sampling_texture(
+pub fn entries_using(
     file: &effect_library::NamcoEffectFile,
-    texture_name: &str,
+    asset: crate::live_carrier::Asset,
 ) -> Vec<(String, usize)> {
+    use crate::live_carrier::Asset;
     let Some(ptcl) = file.ptcl_file.as_ref() else {
         return Vec::new();
     };
-    let Some(id) = ptcl
-        .texture_info
-        .as_ref()
-        .and_then(|info| info.descriptors.iter().find(|d| d.name == texture_name))
-        .map(|d| d.id)
-    else {
-        return Vec::new();
+    let texture = match asset {
+        Asset::Texture(name) => {
+            let id = ptcl
+                .texture_info
+                .as_ref()
+                .and_then(|info| info.descriptors.iter().find(|d| d.name == name))
+                .map(|d| d.id);
+            if id.is_none() {
+                return Vec::new();
+            }
+            id
+        }
+        Asset::Model(_) => None,
     };
     let mut out = Vec::new();
     for (index, name) in file.entry_names.iter().enumerate() {
@@ -934,22 +950,30 @@ pub fn entries_sampling_texture(
         let Some(set) = ptcl.emitter_list.emitter_sets.get(set_idx) else {
             continue;
         };
-        let mut samples = false;
+        let mut used = false;
         visit_emitters_ref(&set.emitters, &mut |em| {
             let d = &em.data;
-            samples |= [
-                d.sampler0.as_ref().map(|s| s.texture_id),
-                d.sampler1.as_ref().map(|s| s.texture_id),
-                d.sampler2.as_ref().map(|s| s.texture_id),
-                d.sampler3.as_ref().map(|s| s.texture_id),
-                d.sampler4.as_ref().map(|s| s.texture_id),
-                d.sampler5.as_ref().map(|s| s.texture_id),
-            ]
-            .iter()
-            .flatten()
-            .any(|tid| *tid == id);
+            used |= match asset {
+                Asset::Texture(_) => [
+                    d.sampler0.as_ref().map(|s| s.texture_id),
+                    d.sampler1.as_ref().map(|s| s.texture_id),
+                    d.sampler2.as_ref().map(|s| s.texture_id),
+                    d.sampler3.as_ref().map(|s| s.texture_id),
+                    d.sampler4.as_ref().map(|s| s.texture_id),
+                    d.sampler5.as_ref().map(|s| s.texture_id),
+                ]
+                .iter()
+                .flatten()
+                .any(|id| Some(*id) == texture),
+                Asset::Model(id) => [
+                    d.particle_data.primitive_id,
+                    d.particle_data.primitive_ex_id,
+                    d.shape_info.primitive_index,
+                ]
+                .contains(&id),
+            };
         });
-        if samples {
+        if used {
             out.push((name.clone(), set_idx));
         }
     }
@@ -1519,9 +1543,14 @@ fn rebuild_eff_bytes_filtered(
             .ptcl_file
             .as_mut()
             .ok_or_else(|| anyhow!("source .eff has no embedded PTCL"))?;
+        let mut rekeyed = std::collections::BTreeSet::new();
         for edit in &eff.authored {
-            apply_authored(ptcl, edit)?;
+            let set = apply_authored(ptcl, edit)?;
+            if crate::eff_keys::changes_keys(edit) {
+                rekeyed.insert(set);
+            }
         }
+        crate::eff_keys::widen(ptcl, &rekeyed, &mut warnings)?;
     }
     // Spawn structure last of the eff's own edits: it resolves emitter sets by name, so every
     // set a transplant was going to add is in place by now.
@@ -1531,6 +1560,7 @@ fn rebuild_eff_bytes_filtered(
     // Apply this after spawn edits too: an entry edit can deliberately repoint a kind or part
     // at the roster-cleared set, and that must not reintroduce the unsafe zero-emitter handle.
     clear_empty_emitter_set_references(&mut namco);
+    crate::model_import::apply(namco.ptcl_file.as_mut(), &eff.models, &mut warnings)?;
     apply_texture_imports(&mut namco, &eff.textures, &mut warnings)?;
     apply_texture_removals(&mut namco, &eff.textures_removed, &mut warnings)?;
     for warning in &warnings {
@@ -2270,7 +2300,8 @@ fn visit_emitters_ref<F: FnMut(&effect_library::structs::Emitter)>(
     }
 }
 
-fn apply_authored(ptcl: &mut effect_library::PtclFile, edit: &AuthoredEdit) -> Result<()> {
+/// Put one part's edits on it, and say which set it is in.
+fn apply_authored(ptcl: &mut effect_library::PtclFile, edit: &AuthoredEdit) -> Result<usize> {
     // A texture swap names the pool texture; the emitter addresses textures by GUID. Resolve
     // it here, while the descriptor table is still reachable — `sets` borrows `ptcl` mutably
     // below.
@@ -2371,7 +2402,7 @@ fn apply_authored(ptcl: &mut effect_library::PtclFile, edit: &AuthoredEdit) -> R
             }
         }
     });
-    Ok(())
+    Ok(set_idx)
 }
 
 /// Depth-first, parent-before-children traversal with a running flat index.
@@ -2529,8 +2560,37 @@ fn apply_fields(em: &mut effect_library::structs::Emitter, f: &EmitterFieldEdits
             }
         }
     }
+    if let Some(slots) = &f.sections {
+        em.subsections = section_list(&em.subsections, slots, &d.display_name());
+    }
     // Serializer prefers the cached EMTR blob; clearing it forces a re-encode of `data`.
     em.cached_binary = None;
+}
+
+/// A part's sections after some were added, removed or replaced.
+fn section_list(
+    source: &[effect_library::structs::EmitterSubSection],
+    slots: &[crate::mod_project::SectionSlot],
+    part: &str,
+) -> Vec<effect_library::structs::EmitterSubSection> {
+    let mut list: Vec<effect_library::structs::EmitterSubSection> = Vec::new();
+    for slot in slots {
+        match slot.source {
+            None => list.push(effect_library::structs::EmitterSubSection {
+                magic: slot.magic.clone(),
+                data: slot.data.clone(),
+            }),
+            Some(index) => match source.get(index).filter(|s| s.magic == slot.magic) {
+                Some(section) => list.push(section.clone()),
+                None => eprintln!(
+                    "[EFF-EXPORT] warning: emitter '{part}' has no subsection {index} '{}': \
+                     skipped",
+                    slot.magic
+                ),
+            },
+        }
+    }
+    list
 }
 
 /// The parts each roster adds from another effect or file, made at home in `namco`: indexed like
@@ -4603,6 +4663,7 @@ pub(crate) mod tests {
             &[],
             &[],
             &[],
+            &[],
             &mut Vec::new(),
         )
         .expect("carrier builds with the donor resolved from the mod root");
@@ -4781,7 +4842,7 @@ pub(crate) mod tests {
 
         let mut checked = 0;
         for (name, id) in descriptors.iter().take(12) {
-            let entries = super::entries_sampling_texture(&file, name);
+            let entries = super::entries_using(&file, crate::live_carrier::Asset::Texture(name));
             if entries.is_empty() {
                 continue; // an unsampled texture has no effects to clone — nothing to assert
             }

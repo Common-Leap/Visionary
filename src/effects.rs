@@ -3,8 +3,9 @@
 //! Particle simulation and rendering live in the game through slight_replica. This module only
 //! exposes the fields the desktop editor needs and converts them from EffectLibraryRust.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -66,12 +67,99 @@ pub struct EmitterDef {
     /// used to fall back to 0, which showed every textureless emitter as sampling the pool's
     /// first texture and offered a swap that had nothing to swap.
     pub texture_index: Option<u32>,
+    /// The shaders of the file this part is from, which its shader index counts in.
+    pub shaders: PartShaders,
+}
+
+/// What a part's shader reads of its settings.
+#[derive(Debug, Clone, Default)]
+pub struct ShaderUse {
+    /// How it uses each animated value, by [`eff_wgpu::maxwell::keys::Table`].
+    pub keys: [eff_wgpu::maxwell::keys::KeysRead; 5],
+    /// The byte offsets it reads of the part's custom shader data.
+    pub custom: BTreeSet<u32>,
+}
+
+/// The shaders of one file, read when a part's are first asked about.
+#[derive(Debug)]
+struct ShaderPool {
+    binary: Vec<u8>,
+    file: OnceLock<Option<eff_wgpu::bnsh::ShaderFile>>,
+    uses: Mutex<HashMap<usize, Option<Arc<ShaderUse>>>>,
+}
+
+/// The shaders of the file a part is from. Two parts that differ only in this are the same part.
+#[derive(Debug, Clone, Default)]
+pub struct PartShaders(Option<Arc<ShaderPool>>);
+
+impl PartialEq for PartShaders {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl PartShaders {
+    pub fn of(file: &effect_library::PtclFile) -> Self {
+        let binary = file
+            .shader_info
+            .as_ref()
+            .and_then(|info| info.binary_data.clone());
+        Self(binary.map(|binary| {
+            Arc::new(ShaderPool {
+                binary,
+                file: OnceLock::new(),
+                uses: Mutex::default(),
+            })
+        }))
+    }
+
+    /// What shader `index` of the file reads, when it can be told.
+    fn program(&self, index: usize) -> Option<Arc<ShaderUse>> {
+        use eff_wgpu::{bnsh, maxwell::keys};
+        let pool = self.0.as_ref()?;
+        let mut uses = pool.uses.lock().unwrap_or_else(|e| e.into_inner());
+        uses.entry(index)
+            .or_insert_with(|| {
+                let file = pool
+                    .file
+                    .get_or_init(|| bnsh::ShaderFile::read(&pool.binary).ok());
+                let program = file.as_ref()?.programs.get(index)?;
+                let code = |stage: usize| {
+                    program.stages[stage]
+                        .as_ref()
+                        .map_or(&[][..], |s| s.code.as_slice())
+                };
+                let stages = [code(bnsh::STAGE_VERTEX), code(bnsh::STAGE_FRAGMENT)];
+                Some(Arc::new(ShaderUse {
+                    keys: keys::keys_read(stages[0]),
+                    custom: stages
+                        .iter()
+                        .flat_map(|code| keys::words_read(code, CUSTOM_DATA_BANK))
+                        .collect(),
+                }))
+            })
+            .clone()
+    }
+}
+
+/// The constant bank a part's shader reads its custom shader data from.
+const CUSTOM_DATA_BANK: u8 = 13;
+
+impl EmitterDef {
+    /// What this part's shader reads, when it can be told.
+    pub fn shader_use(&self) -> Option<Arc<ShaderUse>> {
+        let at = crate::eff_attrs::index_of("shader_references.shader_index")?;
+        let index = self.attrs.get(at).copied().flatten()?.as_i64();
+        self.shaders.program(usize::try_from(index).ok()?)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmitterSubsectionDef {
     pub magic: String,
     pub data: Vec<u8>,
+    /// Which of the file's sections of the part this is; `None` for one added in the editor.
+    pub source: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +235,8 @@ pub struct LoadedEffect {
     /// The file's BNTX pool, verbatim. Kept so the editor can decode a texture to PNG for
     /// editing — `PtclFile` only carries what a texture IS, not its pixels.
     pub texture_pool: Option<Vec<u8>>,
+    /// The file's models, to show what a part draws and to replace it.
+    pub models: Option<crate::model_import::ModelPool>,
 }
 
 /// Entry name (as written and lower case) to its emitter set index, -1 for none.
@@ -200,12 +290,17 @@ pub fn load_effect(path: &Path) -> Result<LoadedEffect> {
         .as_ref()
         .and_then(|p| p.texture_info.as_ref())
         .and_then(|info| info.binary_data.clone());
+    let models = file
+        .ptcl_file
+        .as_ref()
+        .and_then(crate::model_import::ModelPool::of);
     let entries = read_entries(&file);
     Ok(LoadedEffect {
         index: EffIndex { handles },
         ptcl,
         entries,
         texture_pool,
+        models,
     })
 }
 
@@ -288,13 +383,14 @@ fn convert_ptcl(source: &effect_library::PtclFile) -> PtclFile {
         })
         .collect();
 
+    let shaders = PartShaders::of(source);
     let emitter_sets = source
         .emitter_list
         .emitter_sets
         .iter()
         .map(|set| {
             let mut emitters = Vec::new();
-            flatten_emitters(&set.emitters, descriptors, 0, &mut emitters);
+            flatten_emitters(&set.emitters, descriptors, &shaders, 0, &mut emitters);
             EmitterSet {
                 name: set.name.clone(),
                 emitters,
@@ -311,19 +407,27 @@ fn convert_ptcl(source: &effect_library::PtclFile) -> PtclFile {
 fn flatten_emitters(
     source: &[effect_library::Emitter],
     textures: &[effect_library::ptcl_file::TextureDescriptor],
+    shaders: &PartShaders,
     depth: u8,
     output: &mut Vec<EmitterDef>,
 ) {
     for emitter in source {
         let index = output.len();
-        output.push(convert_emitter(emitter, textures, depth, index));
-        flatten_emitters(&emitter.children, textures, depth.saturating_add(1), output);
+        output.push(convert_emitter(emitter, textures, shaders, depth, index));
+        flatten_emitters(
+            &emitter.children,
+            textures,
+            shaders,
+            depth.saturating_add(1),
+            output,
+        );
     }
 }
 
 fn convert_emitter(
     emitter: &effect_library::Emitter,
     textures: &[effect_library::ptcl_file::TextureDescriptor],
+    shaders: &PartShaders,
     depth: u8,
     index: usize,
 ) -> EmitterDef {
@@ -344,9 +448,11 @@ fn convert_emitter(
         subsections: emitter
             .subsections
             .iter()
-            .map(|section| EmitterSubsectionDef {
+            .enumerate()
+            .map(|(index, section)| EmitterSubsectionDef {
                 magic: section.magic.clone(),
                 data: section.data.clone(),
+                source: Some(index),
             })
             .collect(),
         depth,
@@ -355,6 +461,7 @@ fn convert_emitter(
         color1: color_keys(data, 1),
         alpha0_keys: alpha_keys(data),
         texture_index,
+        shaders: shaders.clone(),
     }
 }
 

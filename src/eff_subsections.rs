@@ -7,6 +7,9 @@ use egui::Ui;
 
 use crate::effects::{EmitterDef, EmitterSubsectionDef};
 
+mod custom_shader;
+mod sections;
+
 #[derive(Clone, Copy)]
 enum Kind {
     U8,
@@ -542,6 +545,7 @@ fn draw_animation(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
     let count = read_u32(&section.data, 4).unwrap_or(0) as usize;
     let available = section.data.len().saturating_sub(12) / 16;
     let count = count.min(available);
+    let mut removed = None;
     ui.label(
         egui::RichText::new(format!("{count} keyframe(s)"))
             .small()
@@ -570,10 +574,61 @@ fn draw_animation(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
                         changed |= write_f32(&mut section.data, offset, value);
                     }
                 }
+                if count > 1
+                    && ui
+                        .small_button("✖")
+                        .on_hover_text("Remove this key")
+                        .clicked()
+                {
+                    removed = Some(key);
+                }
                 ui.end_row();
             }
         });
+    if let Some(key) = removed {
+        remove_animation_key(&mut section.data, count, key);
+        changed = true;
+    }
+    let add = ui.add_enabled(
+        count > 0 && count < MAX_ANIMATION_KEYS,
+        egui::Button::new("Add key").small(),
+    );
+    if add.clicked() {
+        add_animation_key(&mut section.data, count);
+        changed = true;
+    }
     changed
+}
+
+/// The most keys an animation of the game's files has.
+const MAX_ANIMATION_KEYS: usize = 32;
+
+fn animation_key(key: usize) -> std::ops::Range<usize> {
+    12 + key * 16..28 + key * 16
+}
+
+/// Add a key after the last, as far on from it as it is from the one before.
+fn add_animation_key(data: &mut Vec<u8>, count: usize) {
+    let frame = |data: &[u8], key: usize| read_f32(data, animation_key(key).start + 12);
+    let last = count - 1;
+    let at = frame(data, last).unwrap_or(0.0);
+    let step = last
+        .checked_sub(1)
+        .and_then(|before| frame(data, before))
+        .map(|before| at - before)
+        .filter(|step| *step > 0.0)
+        .unwrap_or(10.0);
+    let key = data[animation_key(last)].to_vec();
+    let place = animation_key(count).start;
+    data.truncate(place);
+    data.extend(key);
+    write_f32(data, place + 12, at + step);
+    write_u32(data, 4, count as u32 + 1);
+}
+
+fn remove_animation_key(data: &mut Vec<u8>, count: usize, key: usize) {
+    data.drain(animation_key(key));
+    write_u32(data, 4, count as u32 - 1);
 }
 
 fn raw_editor(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
@@ -606,19 +661,45 @@ fn raw_editor(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
 /// Draw every subsection on an emitter. Known layouts get named controls; every block retains
 /// an advanced byte editor so newly discovered and intentionally opaque fields remain editable.
 pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> bool {
-    if emitter.subsections.is_empty() {
-        return false;
-    }
     let mut changed = false;
     ui.add_space(10.0);
     ui.separator();
-    ui.label(egui::RichText::new("Animations & extra settings").strong());
+    let mut added = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Animations & extra settings").strong());
+        ui.menu_button("Add", |ui| {
+            for (group, list) in sections::offered() {
+                ui.menu_button(group, |ui| {
+                    for (magic, title) in list {
+                        let blocked = sections::add_block(emitter, magic);
+                        let button = ui.add_enabled(blocked.is_none(), egui::Button::new(title));
+                        if button
+                            .on_hover_text(format!("Stored in the file as {magic}"))
+                            .on_disabled_hover_text(blocked.unwrap_or_default())
+                            .clicked()
+                        {
+                            added = Some(magic);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+    });
+    if let Some(magic) = added {
+        sections::add(emitter, magic);
+        changed = true;
+    }
+    let mut removed = None;
+    let reads = custom_shader::Reads::of(emitter);
     for index in 0..emitter.subsections.len() {
         let magic = emitter.subsections[index].magic.clone();
-        let was_edited = pristine
-            .subsections
-            .get(index)
-            .is_some_and(|p| p.magic == magic && p.data != emitter.subsections[index].data);
+        let own = emitter.subsections[index]
+            .source
+            .and_then(|at| pristine.subsections.get(at))
+            .filter(|p| p.magic == magic);
+        let was_edited = own.is_none_or(|p| p.data != emitter.subsections[index].data);
+        let blocked = sections::remove_block(emitter, &magic);
         let title = section_title(&magic);
         let heading = if was_edited {
             format!("{title} •")
@@ -628,16 +709,18 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
         // Keyed by the part as well: the caller pushes the part's id, so one part's open
         // sections do not open another part's section at the same position.
         egui::CollapsingHeader::new(heading)
-            .id_salt(("subsection", index, &magic))
+            .id_salt(("subsection", &magic))
             .default_open(was_edited)
             .show(ui, |ui| {
                 let section = &mut emitter.subsections[index];
                 if magic.starts_with("EA") {
                     changed |= draw_animation(ui, section);
+                } else if magic == "CSDP" {
+                    changed |= custom_shader::draw(ui, &mut section.data, &reads);
                 } else {
                     let fields = documented_fields(&magic);
                     if !fields.is_empty() {
-                        egui::Grid::new(("subsection_fields", index))
+                        egui::Grid::new(("subsection_fields", &magic))
                             .num_columns(2)
                             .striped(true)
                             .show(ui, |ui| {
@@ -655,23 +738,61 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
                     }
                 }
                 egui::CollapsingHeader::new("Raw bytes")
-                    .id_salt(("raw", index))
+                    .id_salt(("raw", &magic))
                     .show(ui, |ui| {
                         changed |= raw_editor(ui, section);
                     })
                     .header_response
                     .on_hover_text("Change only values whose binary meaning you know");
-                if was_edited && ui.small_button("Reset section").clicked() {
-                    if let Some(original) =
-                        pristine.subsections.get(index).filter(|p| p.magic == magic)
-                    {
-                        section.data = original.data.clone();
-                        changed = true;
+                ui.horizontal(|ui| {
+                    if let Some(own) = own.filter(|_| was_edited) {
+                        if ui.small_button("Reset section").clicked() {
+                            section.data = own.data.clone();
+                            changed = true;
+                        }
                     }
-                }
+                    let remove =
+                        ui.add_enabled(blocked.is_none(), egui::Button::new("Remove").small());
+                    if remove
+                        .on_disabled_hover_text(blocked.unwrap_or_default())
+                        .clicked()
+                    {
+                        removed = Some(index);
+                    }
+                });
             })
             .header_response
             .on_hover_text(format!("Stored in the file as {magic}"));
+    }
+    if let Some(index) = removed {
+        emitter.subsections.remove(index);
+        changed = true;
+    }
+    // What the file has that was taken off, to put back.
+    let gone: Vec<usize> = (0..pristine.subsections.len())
+        .filter(|at| {
+            let magic = &pristine.subsections[*at].magic;
+            !emitter.subsections.iter().any(|s| s.magic == *magic)
+        })
+        .collect();
+    for at in gone {
+        let section = &pristine.subsections[at];
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(section_title(&section.magic))
+                    .strikethrough()
+                    .weak(),
+            );
+            if ui.small_button("Put back").clicked() {
+                let place = emitter
+                    .subsections
+                    .iter()
+                    .position(|s| s.source.is_some_and(|other| other > at))
+                    .unwrap_or(emitter.subsections.len());
+                emitter.subsections.insert(place, section.clone());
+                changed = true;
+            }
+        });
     }
     changed
 }

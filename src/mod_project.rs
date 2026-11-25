@@ -1135,6 +1135,9 @@ pub struct EffMod {
     /// Names of pool textures the user removed.
     #[serde(default)]
     pub textures_removed: Vec<String>,
+    /// Models the user replaced with one of their own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelImport>,
     /// Emitter sets whose emitter LIST the user changed — emitters removed, duplicated or
     /// re-ordered. Recorded per set, and only for sets that differ from the source.
     #[serde(default)]
@@ -1198,6 +1201,7 @@ impl EffMod {
             && self.textures.is_empty()
             && self.textures_added.is_empty()
             && self.textures_removed.is_empty()
+            && self.models.is_empty()
             && self.rosters.is_empty()
             && self.entry_edits.is_empty()
     }
@@ -1330,6 +1334,17 @@ pub struct TextureImport {
     pub raw: bool,
 }
 
+/// One model of the file replaced by the user's own, read from its file each time the effect
+/// file is written, as a replaced texture is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelImport {
+    /// What parts name the model by.
+    pub model_id: u64,
+    pub name: String,
+    /// The `.glb` or `.obj` put in its place. Empty from the editor means the file's own again.
+    pub path: String,
+}
+
 /// A pool texture the user ADDED, on top of the ones the eff shipped with.
 ///
 /// This is how one effect gets a texture of its own. A pool texture is shared by every emitter
@@ -1392,6 +1407,10 @@ pub struct EmitterFieldEdits {
     /// subsection blobs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subsections: Vec<SubsectionEdit>,
+    /// The part's sections in order, when some were added, removed or made longer or shorter.
+    /// [`Self::subsections`] are changes of the file's own, by their place in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<SectionSlot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emission_rate: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1419,6 +1438,16 @@ pub struct EmitterFieldEdits {
     pub texture_name: Option<String>,
 }
 
+/// One section of a part: the file's own by its place in it, or one with data of its own.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SectionSlot {
+    pub magic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubsectionEdit {
     pub index: usize,
@@ -1431,6 +1460,7 @@ impl EmitterFieldEdits {
     pub fn is_empty(&self) -> bool {
         self.attrs.is_empty()
             && self.subsections.is_empty()
+            && self.sections.is_none()
             && self.emission_rate.is_none()
             && self.lifetime.is_none()
             && self.scale.is_none()
@@ -1451,6 +1481,7 @@ impl EmitterFieldEdits {
                 .map(|section| section.bytes.len())
                 .sum::<usize>()
             + [
+                self.sections.is_some(),
                 self.emission_rate.is_some(),
                 self.lifetime.is_some(),
                 self.scale.is_some(),

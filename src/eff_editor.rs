@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use eff_wgpu::maxwell::keys::Table;
 use egui::Ui;
 
 use crate::eff_attrs::{AttrKind, AttrValue};
@@ -39,6 +40,8 @@ use crate::mod_project::{AuthoredEdit, EmitterFieldEdits, TransplantOp};
 
 mod add_part;
 mod part_clip;
+mod part_keys;
+mod part_model;
 mod part_tree;
 pub(crate) use add_part::SHARED_FILE_REL;
 use add_part::{AddPartPicker, AddedData, PartOrigin, SharedFile};
@@ -90,6 +93,7 @@ struct EmitterSnapshot {
     color1: Vec<ColorKey>,
     alpha0_keys: Vec<ColorKey>,
     texture_index: Option<u32>,
+    shaders: crate::effects::PartShaders,
 }
 
 impl EmitterSnapshot {
@@ -107,6 +111,7 @@ impl EmitterSnapshot {
             color1: e.color1.clone(),
             alpha0_keys: e.alpha0_keys.clone(),
             texture_index: e.texture_index,
+            shaders: e.shaders.clone(),
         }
     }
 
@@ -135,6 +140,7 @@ impl EmitterSnapshot {
             color1: self.color1.clone(),
             alpha0_keys: self.alpha0_keys.clone(),
             texture_index: self.texture_index,
+            shaders: self.shaders.clone(),
         }
     }
 }
@@ -317,99 +323,84 @@ fn effective_keys_to_attrs(emitter: &mut EmitterDef) {
     }
 }
 
+/// The colours and opacities the friendly controls show, from the attribute table: as many keys
+/// as the table has, or the one constant.
 fn attrs_to_effective_keys(emitter: &mut EmitterDef) {
-    let color0_animated = attr(emitter, "emitter_static.num_color0_keys")
-        .is_some_and(|v| v.as_i64() > 0)
-        && attr(emitter, "particle_color.color0_type").is_some_and(|v| v.as_i64() != 0);
-    let color1_animated = attr(emitter, "emitter_static.num_color1_keys")
-        .is_some_and(|v| v.as_i64() > 0)
-        && attr(emitter, "particle_color.color1_type").is_some_and(|v| v.as_i64() != 0);
-    let alpha0_animated = attr(emitter, "emitter_static.num_alpha0_keys")
-        .is_some_and(|v| v.as_i64() > 0)
-        && attr(emitter, "particle_color.alpha0_type").is_some_and(|v| v.as_i64() != 0);
-
-    if color0_animated {
-        for i in 0..emitter.color0.len() {
-            if let Some(value) = key_component(emitter, "color0", i, "x") {
-                emitter.color0[i].r = value;
-            }
-            if let Some(value) = key_component(emitter, "color0", i, "y") {
-                emitter.color0[i].g = value;
-            }
-            if let Some(value) = key_component(emitter, "color0", i, "z") {
-                emitter.color0[i].b = value;
-            }
-            if let Some(value) = key_component(emitter, "color0", i, "time") {
-                emitter.color0[i].frame = value;
-            }
-        }
-    } else {
-        let prefix = if attr(emitter, "particle_color.color0_type").is_some_and(|v| v.as_i64() == 0)
-        {
-            "particle_color.color0_"
+    let animated = |em: &EmitterDef, channel: &str| {
+        let keys = attr(em, &format!("emitter_static.num_{channel}_keys")).map_or(0, |v| {
+            v.as_i64().clamp(0, crate::eff_attrs::KEY_SLOTS as i64)
+        });
+        let constant =
+            attr(em, &format!("particle_color.{channel}_type")).is_some_and(|v| v.as_i64() == 0);
+        if constant {
+            0
         } else {
-            "emitter_info.color0_"
-        };
-        let rgb = [
-            attr_f32(emitter, &format!("{prefix}r")),
-            attr_f32(emitter, &format!("{prefix}g")),
-            attr_f32(emitter, &format!("{prefix}b")),
-        ];
-        if let Some(key) = emitter.color0.first_mut() {
-            [key.r, key.g, key.b] = rgb;
+            keys as usize
         }
-    }
-    if color1_animated {
-        for i in 0..emitter.color1.len() {
-            if let Some(value) = key_component(emitter, "color1", i, "x") {
-                emitter.color1[i].r = value;
-            }
-            if let Some(value) = key_component(emitter, "color1", i, "y") {
-                emitter.color1[i].g = value;
-            }
-            if let Some(value) = key_component(emitter, "color1", i, "z") {
-                emitter.color1[i].b = value;
-            }
-            if let Some(value) = key_component(emitter, "color1", i, "time") {
-                emitter.color1[i].frame = value;
-            }
+    };
+    // A constant is read from the part's colour settings when its type says so, and from the
+    // emitter's own otherwise.
+    let constant = |em: &EmitterDef, channel: &str| {
+        attr(em, &format!("particle_color.{channel}_type")).is_some_and(|v| v.as_i64() == 0)
+    };
+    let colours = |em: &EmitterDef, channel: &str, old: &[ColorKey]| -> Vec<ColorKey> {
+        let keys = animated(em, channel);
+        if keys > 0 {
+            return (0..keys)
+                .map(|i| {
+                    let part =
+                        |component: &str| key_component(em, channel, i, component).unwrap_or(0.0);
+                    ColorKey {
+                        frame: part("time"),
+                        r: part("x"),
+                        g: part("y"),
+                        b: part("z"),
+                        a: old.get(i).map_or(1.0, |k| k.a),
+                    }
+                })
+                .collect();
         }
-    } else {
-        let prefix = if attr(emitter, "particle_color.color1_type").is_some_and(|v| v.as_i64() == 0)
-        {
-            "particle_color.color1_"
+        let prefix = if constant(em, channel) {
+            "particle_color"
         } else {
-            "emitter_info.color1_"
+            "emitter_info"
         };
-        let rgb = [
-            attr_f32(emitter, &format!("{prefix}r")),
-            attr_f32(emitter, &format!("{prefix}g")),
-            attr_f32(emitter, &format!("{prefix}b")),
-        ];
-        if let Some(key) = emitter.color1.first_mut() {
-            [key.r, key.g, key.b] = rgb;
-        }
-    }
-    if alpha0_animated {
-        for i in 0..emitter.alpha0_keys.len() {
-            if let Some(value) = key_component(emitter, "alpha0", i, "x") {
-                emitter.alpha0_keys[i].r = value;
-            }
-            if let Some(value) = key_component(emitter, "alpha0", i, "time") {
-                emitter.alpha0_keys[i].frame = value;
-            }
-        }
+        let [r, g, b] = ["r", "g", "b"].map(|c| attr_f32(em, &format!("{prefix}.{channel}_{c}")));
+        let first = old.first().copied();
+        vec![ColorKey {
+            frame: first.filter(|_| old.len() == 1).map_or(0.0, |k| k.frame),
+            r,
+            g,
+            b,
+            a: first.map_or(1.0, |k| k.a),
+        }]
+    };
+    emitter.color0 = colours(emitter, "color0", &emitter.color0);
+    emitter.color1 = colours(emitter, "color1", &emitter.color1);
+    let keys = animated(emitter, "alpha0");
+    let solid = |value: f32, frame: f32| ColorKey {
+        frame,
+        r: value,
+        g: value,
+        b: value,
+        a: value,
+    };
+    emitter.alpha0_keys = if keys > 0 {
+        (0..keys)
+            .map(|i| {
+                let part =
+                    |component: &str| key_component(emitter, "alpha0", i, component).unwrap_or(0.0);
+                solid(part("x"), part("time"))
+            })
+            .collect()
     } else {
-        let id = if attr(emitter, "particle_color.alpha0_type").is_some_and(|v| v.as_i64() == 0) {
+        let id = if constant(emitter, "alpha0") {
             "particle_color.alpha0"
         } else {
             "emitter_info.color0_a"
         };
-        let value = attr_f32(emitter, id);
-        if let Some(key) = emitter.alpha0_keys.first_mut() {
-            key.r = value;
-        }
-    }
+        vec![solid(attr_f32(emitter, id), 0.0)]
+    };
 }
 
 /// Which view the emitter column is showing.
@@ -608,6 +599,8 @@ pub struct EffEditor {
     /// The loaded eff's BNTX pool, verbatim — what "Export PNG" decodes from. `ptcl` carries
     /// only what each texture IS (name, size, format), never its pixels.
     texture_pool: Option<Vec<u8>>,
+    /// The file's models, the replaced ones, and what the last model button did.
+    models: part_model::Models,
     /// Texture replacements the user picked, drained by the app into the project store.
     pending_texture_imports: Vec<crate::mod_project::TextureImport>,
     /// Pool textures the user added, drained by the app into the project store.
@@ -764,6 +757,8 @@ pub struct EffEditor {
     /// (`take_live_deploy_request`) and services it by rebuilding this fighter's eff and
     /// hot-reloading it — the only per-emitter-exact path there is.
     live_deploy_request: bool,
+    /// Set by Export .eff; the app saves the file.
+    export_request: bool,
     /// When the app last serviced a deploy request — drives `REDEPLOY_MIN_GAP_MS`.
     live_deploy_at: Option<Instant>,
     /// True from clicking Send until the app has finished building + sending the carrier.
@@ -858,6 +853,7 @@ impl Default for EffEditor {
             load_error: None,
             ptcl: None,
             texture_pool: None,
+            models: Default::default(),
             pending_texture_imports: Vec::new(),
             pending_texture_additions: Vec::new(),
             pending_texture_removals: Vec::new(),
@@ -930,6 +926,7 @@ impl Default for EffEditor {
             edit_rev: 0,
             scroll_to_selected: false,
             live_deploy_request: false,
+            export_request: false,
             live_deploy_at: None,
             sending: false,
             gen_at_send: 0,
@@ -1088,13 +1085,10 @@ fn field_edits(em: &EmitterDef, pr: &EmitterSnapshot, tex_names: &[String]) -> E
         }
         f.attrs.insert(attr.id.to_string(), now);
     }
-    for (index, now) in em.subsections.iter().enumerate() {
-        let Some(was) = pr.subsections.get(index) else {
+    for now in &em.subsections {
+        let Some((index, was)) = own_section(now, pr) else {
             continue;
         };
-        if now.magic != was.magic {
-            continue;
-        }
         let bytes: std::collections::BTreeMap<usize, u8> = now
             .data
             .iter()
@@ -1109,6 +1103,27 @@ fn field_edits(em: &EmitterDef, pr: &EmitterSnapshot, tex_names: &[String]) -> E
                 bytes,
             });
         }
+    }
+    let own: Vec<Option<usize>> = em
+        .subsections
+        .iter()
+        .map(|now| own_section(now, pr).map(|(index, _)| index))
+        .collect();
+    if own.len() != pr.subsections.len() || own.iter().enumerate().any(|(i, at)| *at != Some(i)) {
+        f.sections = Some(
+            em.subsections
+                .iter()
+                .zip(own)
+                .map(|(now, source)| crate::mod_project::SectionSlot {
+                    magic: now.magic.clone(),
+                    source,
+                    data: match source {
+                        Some(_) => Vec::new(),
+                        None => now.data.clone(),
+                    },
+                })
+                .collect(),
+        );
     }
     let keys_differ = |a: &[ColorKey], b: &[ColorKey]| {
         a.len() != b.len()
@@ -1132,6 +1147,17 @@ fn field_edits(em: &EmitterDef, pr: &EmitterSnapshot, tex_names: &[String]) -> E
         f.alpha0 = Some(em.alpha0_keys.iter().map(|k| [k.r, k.frame]).collect());
     }
     f
+}
+
+/// The file's section one of the part's is, and its place in the file, unless it was added or
+/// its length changed.
+fn own_section<'a>(
+    now: &crate::effects::EmitterSubsectionDef,
+    pr: &'a EmitterSnapshot,
+) -> Option<(usize, &'a crate::effects::EmitterSubsectionDef)> {
+    let index = now.source?;
+    let was = pr.subsections.get(index)?;
+    (was.magic == now.magic && was.data.len() == now.data.len()).then_some((index, was))
 }
 
 /// Put a part's saved edits on it. `tex_names` are the file's pool textures, in pool order.
@@ -1192,6 +1218,27 @@ fn apply_field_edits(em: &mut EmitterDef, f: &EmitterFieldEdits, tex_names: &[St
                 *byte = value;
             }
         }
+    }
+    if let Some(slots) = &f.sections {
+        let own = std::mem::take(&mut em.subsections);
+        em.subsections = slots
+            .iter()
+            .filter_map(|slot| match slot.source {
+                Some(index) => own
+                    .get(index)
+                    .filter(|section| section.magic == slot.magic)
+                    .cloned(),
+                None => Some(crate::effects::EmitterSubsectionDef {
+                    magic: slot.magic.clone(),
+                    data: slot.data.clone(),
+                    source: None,
+                }),
+            })
+            .collect();
+    }
+    // The edits may have given a table more or fewer keys than the file's.
+    if f.attrs.keys().any(|id| part_keys::sets_keys(id)) {
+        attrs_to_effective_keys(em);
     }
     let apply_keys = |dst: &mut Vec<ColorKey>, rows: &Vec<[f32; 4]>| {
         for (k, row) in dst.iter_mut().zip(rows) {
@@ -2332,8 +2379,13 @@ fn attr_grid_rows(
         let orig = pr.attrs.get(i).copied().flatten();
         let edited = orig.is_some_and(|o| !o.same(value));
         // A row the part's shader does nothing with is shown greyed, and says why.
-        let idle =
-            (attr.group == crate::eff_attrs::G_PTCL_ROTATE && !spins).then(|| idle_spin_reason(em));
+        let idle = (attr.group == crate::eff_attrs::G_PTCL_ROTATE && !spins)
+            .then(|| idle_spin_reason(em))
+            .or_else(|| part_keys::idle_reason(em, attr.id))
+            .or_else(|| {
+                (attr.id == "emitter_static.num_param_keys")
+                    .then_some("Fixed by this part's shader.")
+            });
 
         let label = if edited {
             egui::RichText::new(attr.label).color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
@@ -2367,7 +2419,9 @@ fn attr_grid_rows(
                 control.response.on_disabled_hover_text(reason);
             }
             if control.inner {
-                em.attrs[i] = Some(value);
+                if let Some(was) = em.attrs[i].replace(value) {
+                    part_keys::follow(em, pr, attr.id, was);
+                }
                 spin_follows(em, pr, attr.id);
                 changed = true;
             }
@@ -2403,6 +2457,7 @@ fn attr_grid_rows(
                         .clicked()
                 {
                     em.attrs[i] = Some(orig);
+                    part_keys::reset(em, pr, attr.id);
                     spin_follows(em, pr, attr.id);
                     changed = true;
                 }
@@ -2819,6 +2874,7 @@ impl EffEditor {
         self.entry_info = loaded.entries;
         self.ptcl = Some(ptcl);
         self.texture_pool = loaded.texture_pool;
+        self.models.load(loaded.models);
         self.texture_note = None;
         self.loaded_path = Some(path.to_path_buf());
         self.loaded_as = Some(self.game_path_of(path));
@@ -4540,6 +4596,7 @@ impl EffEditor {
         self.load_error = None;
         self.ptcl = None;
         self.texture_pool = None;
+        self.models = Default::default();
         self.pending_texture_imports.clear();
         self.pending_texture_additions.clear();
         self.pending_texture_removals.clear();
@@ -4792,7 +4849,21 @@ impl EffEditor {
         });
         ui.horizontal_wrapped(|ui| {
             self.draw_file_picker(ui);
+            let open = self.loaded_path.is_some();
+            let export = ui.add_enabled(open, egui::Button::new("Export .eff"));
+            if export
+                .on_hover_text("Save this effect file with its edits, without the rest of the mod")
+                .on_disabled_hover_text("No effect file is open")
+                .clicked()
+            {
+                self.export_request = true;
+            }
         });
+    }
+
+    /// Whether the open effect file was asked to be saved to a file of its own.
+    pub fn take_export_request(&mut self) -> bool {
+        std::mem::take(&mut self.export_request)
     }
 
     /// The ONLY send control, in the header so it is reachable from every panel, with the
@@ -6311,13 +6382,16 @@ impl EffEditor {
                     changed |= part_tree::draw_taken(ui, em, pr, parent, &textures);
                 }
 
-                let mut key_table = |ui: &mut Ui,
-                                     label: &str,
-                                     hover: &str,
-                                     keys: &mut Vec<ColorKey>,
-                                     orig: &[ColorKey]| {
+                let key_table = |changed: &mut bool,
+                                 ui: &mut Ui,
+                                 label: &str,
+                                 hover: &str,
+                                 keys: &mut Vec<ColorKey>,
+                                 orig: &[ColorKey]| {
+                    let mut removed = None;
+                    let count = keys.len();
                     if keys.is_empty() {
-                        return;
+                        return removed;
                     }
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new(label).strong())
@@ -6336,13 +6410,13 @@ impl EffEditor {
                                 k.r = rgb[0];
                                 k.g = rgb[1];
                                 k.b = rgb[2];
-                                changed = true;
+                                *changed = true;
                             }
                             ui.label("at").on_hover_text(
                                 "When in the particle's life this colour is reached: 0% when \
                                  it appears, 100% when it is gone",
                             );
-                            changed |= life_time_field(ui, &mut k.frame);
+                            *changed |= life_time_field(ui, &mut k.frame);
                             if let Some(o) = orig.get(i) {
                                 if (o.r, o.g, o.b) != (k.r, k.g, k.b) {
                                     // The colour before the edit, as a narrow swatch: with
@@ -6362,14 +6436,19 @@ impl EffEditor {
                                     ));
                                     if before.clicked() {
                                         (k.r, k.g, k.b) = (o.r, o.g, o.b);
-                                        changed = true;
+                                        *changed = true;
                                     }
                                 }
                             }
+                            if part_keys::remove_button(ui, count) {
+                                removed = Some(i);
+                            }
                         });
                     }
+                    removed
                 };
-                key_table(
+                let removed = key_table(
+                    &mut changed,
                     ui,
                     "Colour over its life",
                     "The part's colour from the start of each particle's life to its end. How \
@@ -6378,7 +6457,9 @@ impl EffEditor {
                     &mut em.color0,
                     &pr.color0,
                 );
-                key_table(
+                changed |= part_keys::end_table(ui, em, Table::Colour0, removed);
+                let removed = key_table(
+                    &mut changed,
                     ui,
                     "Second colour over its life",
                     "A second colour the part's shader can use, over each particle's life. \
@@ -6387,8 +6468,11 @@ impl EffEditor {
                     &mut em.color1,
                     &pr.color1,
                 );
+                changed |= part_keys::end_table(ui, em, Table::Colour1, removed);
 
                 if !em.alpha0_keys.is_empty() {
+                    let mut removed = None;
+                    let count = em.alpha0_keys.len();
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Opacity over its life").strong())
                         .on_hover_text(
@@ -6420,8 +6504,15 @@ impl EffEditor {
                                     );
                                 }
                             }
+                            if part_keys::remove_button(ui, count) {
+                                removed = Some(i);
+                            }
                         });
                     }
+                    changed |= part_keys::end_table(ui, em, Table::Alpha0, removed);
+                }
+                for table in [Table::Alpha1, Table::Scale] {
+                    changed |= part_keys::draw(ui, em, pr, table);
                 }
 
                 // The textures this part samples, in their own section of this scroll: as a
@@ -6443,6 +6534,7 @@ impl EffEditor {
                     .id_salt("part_texture")
                     .default_open(true)
                     .show(ui, |ui| self.draw_texture_panel(ui));
+                self.draw_model_panel(ui, set_idx, ei);
                 let Some((em, pr)) = part_mut(&mut self.ptcl, &self.pristine, set_idx, ei) else {
                     return;
                 };
@@ -8660,6 +8752,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            shaders: Default::default(),
         };
         // Slot 2 samples nothing (the all-ones id), slot 3 samples a texture.
         set_attr(&mut em, "sampler1.texture_id", AttrValue::UInt(u64::MAX));
@@ -9005,6 +9098,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            shaders: Default::default(),
         };
         // A blank emitter is all zeros; give the one value these tests tune a baseline of its
         // own so "put it back to 1.0" is genuinely a return to pristine.
@@ -10919,6 +11013,7 @@ mod tests {
         em.subsections.push(crate::effects::EmitterSubsectionDef {
             magic: "EAER".into(),
             data: Vec::new(),
+            source: None,
         });
         assert!(idle_spin_reason(em).contains("Part rotation animation"));
         // Dragging the row of a part that cannot spin changes nothing; of one that can, it does.
@@ -11051,6 +11146,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            shaders: Default::default(),
         };
         //  0  A
         //  1    A1
@@ -11117,6 +11213,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            shaders: Default::default(),
         };
         // X, A(A1(A1a), A2), B. Nesting A under X must shift A's entire subtree.
         let mut list: Vec<_> = [0u8, 0, 1, 2, 1, 0].iter().map(|d| at(*d)).collect();

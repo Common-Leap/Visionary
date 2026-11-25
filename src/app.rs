@@ -3994,7 +3994,12 @@ fn send_what_of(owner: &str, eff: Option<&crate::mod_project::EffMod>) -> String
         count(|e| e.changed_effects()),
         count(|e| e.transplants.len()),
     );
+    let models = count(|e| e.models.len());
     match count(|e| e.textures.len() + e.textures_added.len() + e.textures_removed.len()) {
+        0 if models > 0 && edited + borrowed == 0 => format!(
+            "{owner}, {}",
+            counted(models, "edited model", "edited models")
+        ),
         0 => send_what(owner, edited, borrowed),
         _ if edited + borrowed > 0 => send_what(owner, edited, borrowed),
         n => format!(
@@ -13481,6 +13486,63 @@ impl VisionaryApp {
         Some((owner, self.eff_editor.loaded_path()?.to_path_buf()))
     }
 
+    /// Ask where to save the effect file open on the Effects page, and save it there with its
+    /// edits.
+    fn export_effect_file(&mut self) {
+        let Some((_, path)) = self.effect_editor_draw_path() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "effect.eff".into());
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title("Export effect file")
+            .add_filter("Effect file", &["eff"])
+            .set_file_name(&name)
+            .save_file()
+        else {
+            return;
+        };
+        self.state.status = match self.write_effect_file(&dest) {
+            Ok(()) => format!("Saved {}", dest.display()),
+            Err(e) => format!("Couldn't save the effect file: {e:#}"),
+        };
+    }
+
+    /// Write the effect file open on the Effects page, with its edits, to `dest`.
+    fn write_effect_file(&mut self, dest: &Path) -> anyhow::Result<()> {
+        use anyhow::Context;
+        self.sync_eff_mods_from_editor();
+        let (owner, path) = self
+            .effect_editor_draw_path()
+            .context("no effect file is open")?;
+        let rel = self.eff_editor.loaded_rel().unwrap_or_default();
+        let eff = self
+            .eff_mods
+            .get(&owner)
+            .filter(|eff| !eff.is_empty() && eff.source_rel.eq_ignore_ascii_case(&rel));
+        let source = eff.map_or(path, |eff| self.resolve_eff_source(&eff.source_rel));
+        // The edits are made on the source: written over it, they would be made twice.
+        if matches!(
+            (std::fs::canonicalize(&source), std::fs::canonicalize(dest)),
+            (Ok(source), Ok(dest)) if source == dest
+        ) {
+            anyhow::bail!("that is the file the edits are made on; choose another place");
+        }
+        let bytes = std::fs::read(&source)
+            .with_context(|| format!("couldn't read {}", source.display()))?;
+        let bytes = match eff {
+            Some(eff) => {
+                let files = self.effect_files();
+                let donor = |rel: &str| files.find(rel);
+                crate::eff_export::rebuild_eff_bytes_resolving(&bytes, eff, &donor)?
+            }
+            None => bytes,
+        };
+        std::fs::write(dest, bytes).with_context(|| format!("couldn't write {}", dest.display()))
+    }
+
     /// Start rebuilding the preview's copy of the editor's file after an edit, and collect a
     /// finished rebuild.
     fn poll_effect_preview_build(&mut self, ctx: &egui::Context) {
@@ -13504,7 +13566,7 @@ impl VisionaryApp {
         let (transplants, textures) = self
             .eff_mods
             .get(&fighter)
-            .map(|e| (e.transplants.len(), e.textures.len()))
+            .map(|e| (e.transplants.len(), e.textures.len() + e.models.len()))
             .unwrap_or_default();
         let key = (
             path.clone(),
@@ -24207,6 +24269,7 @@ impl VisionaryApp {
             counts.borrowed_effects += eff.transplants.len();
             counts.textures +=
                 eff.textures.len() + eff.textures_added.len() + eff.textures_removed.len();
+            counts.authored_effects += eff.models.len();
         }
         // Each character's gimmick and meters are its own; values are the fighter's.
         counts.gimmicks = usize::from(
@@ -29191,6 +29254,7 @@ impl VisionaryApp {
                     + eff.textures.len()
                     + eff.textures_added.len()
                     + eff.textures_removed.len()
+                    + eff.models.len()
                     + eff.rosters.len()
                     + eff.entry_edits.len();
                 if let Some(path) = eff.source_path.as_ref().filter(|path| !path.is_file()) {
@@ -36961,7 +37025,7 @@ impl VisionaryApp {
     /// back to normal" only the game's own effects.
     fn carrier_shares(
         &self,
-        using_texture: &dyn Fn(&str, &str) -> Vec<crate::live_carrier::Effect>,
+        using: &dyn Fn(&str, crate::live_carrier::Asset) -> Vec<crate::live_carrier::Effect>,
     ) -> Vec<crate::live_carrier::Share> {
         let nothing = crate::mod_project::EffMod::default();
         let edits = |owner: &str| match &self.put_back {
@@ -36985,7 +37049,7 @@ impl VisionaryApp {
                 true => key.effect_rel(&self.roster.project),
                 false => eff.source_rel.to_lowercase(),
             };
-            let using = |texture: &str| using_texture(&source_rel, texture);
+            let using = |asset: crate::live_carrier::Asset| using(&source_rel, asset);
             let changed = crate::live_carrier::changed_effects(eff, &using);
             // The file the game has for it: its own, or with none the fighter's.
             let file = match self.game_has_effect_file(&source_rel) {
@@ -37020,7 +37084,7 @@ impl VisionaryApp {
                 source_rel: &source_rel,
                 costumes: &costumes,
                 borrowed_costumes: &borrowed_costumes,
-                using_texture: &using,
+                using: &using,
                 restore: &restore,
             })
         });
@@ -37071,6 +37135,7 @@ impl VisionaryApp {
             .iter()
             .flat_map(|s| s.gone_textures.clone())
             .collect();
+        let models: Vec<_> = shares.iter().flat_map(|s| s.models.clone()).collect();
         let mut warnings = Vec::new();
         crate::eff_export::rebuild_runtime_carrier_eff_bytes_resolving(
             &base,
@@ -37081,6 +37146,7 @@ impl VisionaryApp {
             &textures,
             &added,
             &gone,
+            &models,
             &mut warnings,
         )
         .map(|bytes| (bytes, warnings))
@@ -37129,27 +37195,28 @@ impl VisionaryApp {
                 .filter(|path| path.is_file())
         };
         let parsed = std::cell::RefCell::new(HashMap::new());
-        let using_texture = |rel: &str, texture: &str| -> Vec<crate::live_carrier::Effect> {
+        type Asset<'a> = crate::live_carrier::Asset<'a>;
+        let using = |rel: &str, asset: Asset| -> Vec<crate::live_carrier::Effect> {
             let mut parsed = parsed.borrow_mut();
             let file = parsed.entry(rel.to_lowercase()).or_insert_with(|| {
                 let bytes = std::fs::read(resolve(rel)?).ok()?;
                 effect_library::NamcoEffectFile::load(&bytes).ok()
             });
             file.as_ref()
-                .map(|file| crate::eff_export::entries_sampling_texture(file, texture))
+                .map(|file| crate::eff_export::entries_using(file, asset))
                 .unwrap_or_default()
         };
         // Every character's edits ride the one carrier, so opening another, or sending with
         // another open, takes none of them out of the match.
-        let uses = |share: &crate::live_carrier::Share, texture: &str| {
+        let uses = |share: &crate::live_carrier::Share, asset: Asset| {
             share.ops.iter().any(|op| {
-                using_texture(&op.src_file_rel, texture)
+                using(&op.src_file_rel, asset)
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case(&op.src_set_name))
             })
         };
         let (mut shares, mut left) = crate::live_carrier::together(
-            self.carrier_shares(&using_texture),
+            self.carrier_shares(&using),
             open_owner.as_deref(),
             &uses,
         );
@@ -37347,7 +37414,11 @@ impl VisionaryApp {
                     // carrier without it looks identical to the import not working.
                     carrier_dropped_textures = warnings
                         .iter()
-                        .filter_map(|w| w.strip_prefix("texture:").map(str::to_string))
+                        .filter_map(|w| {
+                            w.strip_prefix("texture:")
+                                .or_else(|| w.strip_prefix("model:"))
+                                .map(str::to_string)
+                        })
                         .collect();
                     // A delete the build refused. The editor's own guard only sees sampler0
                     // (its emitter model discards the other five), so a texture used as a
@@ -37622,12 +37693,12 @@ impl VisionaryApp {
                 return false;
             }
         };
-        let using_texture = |texture: &str| {
+        let using = |asset: crate::live_carrier::Asset| {
             effect_library::NamcoEffectFile::load(&bytes)
-                .map(|file| crate::eff_export::entries_sampling_texture(&file, texture))
+                .map(|file| crate::eff_export::entries_using(&file, asset))
                 .unwrap_or_default()
         };
-        let changed = crate::live_carrier::changed_effects(&eff, &using_texture);
+        let changed = crate::live_carrier::changed_effects(&eff, &using);
         let mut served = false;
         for rel in rels {
             served |= self.serve_live_eff(&rel, &merged, changed.clone());
@@ -41294,6 +41365,16 @@ impl eframe::App for VisionaryApp {
                         }
                         ui.close();
                     }
+                    let effect_open = self.eff_editor.loaded_path().is_some();
+                    if ui
+                        .add_enabled(effect_open, egui::Button::new("Export effect file"))
+                        .on_hover_text("Save the effect file open on the Effects page with its edits, without the rest of the mod")
+                        .on_disabled_hover_text("No effect file is open on the Effects page")
+                        .clicked()
+                    {
+                        self.export_effect_file();
+                        ui.close();
+                    }
                     if !self.recent_effs.is_empty() {
                         ui.menu_button("Recent effect files", |ui| {
                             let recents = self.recent_effs.clone();
@@ -41631,6 +41712,13 @@ Click to see the code, or link your own project"
                 .map(|e| e.textures.clone())
                 .unwrap_or_default();
             self.eff_editor.set_texture_imports(imports);
+            let models = self
+                .eff_mods
+                .values()
+                .find(|e| e.source_rel.eq_ignore_ascii_case(&loaded_rel))
+                .map(|e| e.models.clone())
+                .unwrap_or_default();
+            self.eff_editor.set_model_imports(models);
         }
         let t = self.perf.start();
         // Only the open fighter's own effects and the shared ones exist for its moves in game.
@@ -41799,6 +41887,9 @@ Click to see the code, or link your own project"
         self.perf.end("eff_editor", t);
         for removal in self.eff_editor.take_transplant_removals() {
             self.remove_transplant_from_editor(removal);
+        }
+        if self.eff_editor.take_export_request() {
+            self.export_effect_file();
         }
         // Authored eff edits reaching the game: rebuild + hot-reload (see below). The editor
         // debounces the request; this side just services it.
@@ -42197,6 +42288,31 @@ Click to see the code, or link your own project"
                     "Select a fighter before replacing a texture — the replacement has to be \
                      recorded against one."
                         .to_string();
+            }
+        }
+
+        // Replaced models, the same way.
+        let model_imports = self.eff_editor.take_model_imports();
+        if !model_imports.is_empty() {
+            if let Some((fighter, entry)) = self.open_eff_mod() {
+                let mut status = String::new();
+                for import in model_imports {
+                    entry.models.retain(|m| m.model_id != import.model_id);
+                    let done = if import.path.is_empty() {
+                        "restored"
+                    } else {
+                        "replaced"
+                    };
+                    status = format!("Model '{}' {done} for {fighter}", import.name);
+                    if !import.path.is_empty() {
+                        entry.models.push(import);
+                    }
+                }
+                self.state.status = status;
+                self.eff_editor.mark_unsent();
+                self.effect_preview_build.built_for = None;
+            } else {
+                self.state.status = "Open a fighter before replacing a model.".to_string();
             }
         }
 
