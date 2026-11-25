@@ -40741,6 +40741,10 @@ impl eframe::App for VisionaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let frame_t = self.perf.start();
         let ctx = ui.ctx().clone();
+        // The parser keeps every text it has read on this thread, for the places its errors name,
+        // and painting reads the open move's calls again: a move with object calls grew the
+        // editor by megabytes a second. Nothing parsed in one frame is kept to the next.
+        proc_macro2::extra::invalidate_current_thread_spans();
         // Background workers and game reports must be polled even without pointer or keyboard
         // events. This deadline also keeps an unfocused window's progress/status current.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));

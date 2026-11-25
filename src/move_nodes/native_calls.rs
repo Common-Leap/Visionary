@@ -19,18 +19,14 @@ pub struct NativeCall {
     pub written: WrittenLine,
 }
 
-/// The original text of a parsed statement. It compares equal to every other value, so two
-/// calls that differ only in how they were spelled are the same call.
+/// The original text of a parsed statement, and the call it reads as. It compares equal to every
+/// other value, so two calls that differ only in how they were spelled are the same call.
 #[derive(Debug, Clone, Default)]
-pub struct WrittenLine(Option<String>);
+pub struct WrittenLine(Option<Box<(String, NativeCall)>>);
 
 impl WrittenLine {
-    pub fn new(line: &str) -> Self {
-        Self(Some(line.trim().to_owned()))
-    }
-
-    pub fn get(&self) -> Option<&str> {
-        self.0.as_deref()
+    fn new(line: &str, call: &NativeCall) -> Self {
+        Self(Some(Box::new((line.trim().to_owned(), call.clone()))))
     }
 }
 
@@ -46,8 +42,8 @@ impl NativeCall {
     /// The statement as written, if it still spells exactly this call. An edited call no
     /// longer matches its original text, and then `None` is returned.
     pub fn written_source(&self) -> Option<&str> {
-        let line = self.written.get()?;
-        (parse(line).as_ref() == Some(self)).then_some(line)
+        let (line, read) = self.written.0.as_deref()?;
+        (read == self).then_some(line)
     }
 }
 
@@ -1804,7 +1800,7 @@ pub fn contains_supported_call(source: &str) -> bool {
 
 pub fn parse(source: &str) -> Option<NativeCall> {
     parse_unwritten(source).map(|call| NativeCall {
-        written: WrittenLine::new(source),
+        written: WrittenLine::new(source, &call),
         ..call
     })
 }
