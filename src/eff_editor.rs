@@ -93,6 +93,10 @@ struct EmitterSnapshot {
 }
 
 impl EmitterSnapshot {
+    fn attr(&self, id: &str) -> Option<AttrValue> {
+        crate::eff_attrs::index_of(id).and_then(|i| self.attrs.get(i).copied().flatten())
+    }
+
     fn of(e: &EmitterDef) -> Self {
         Self {
             attrs: e.attrs.clone(),
@@ -154,6 +158,55 @@ fn set_attr(e: &mut EmitterDef, id: &str, value: AttrValue) {
             }
         }
     }
+}
+
+/// The switches of the axes a part's particles spin about.
+const SPIN_SWITCHES: [&str; 3] = [
+    "particle_data.is_rotate_x",
+    "particle_data.is_rotate_y",
+    "particle_data.is_rotate_z",
+];
+
+/// The Spin rows that have one for each axis, without the axis.
+const SPIN_ROWS: [&str; 5] = [
+    "emitter_static.rotate_init_",
+    "emitter_static.rotate_init_rand_",
+    "emitter_static.rotate_add_",
+    "emitter_static.rotate_add_rand_",
+    "particle_data.rot_rev_rand_",
+];
+
+/// The switch of the axis a Spin row is about: the game zeroes the row as it loads the part while
+/// that is off.
+fn spin_switch(id: &str) -> Option<&'static str> {
+    let axis = ["x", "y", "z"].iter().position(|axis| id.ends_with(axis))?;
+    SPIN_ROWS
+        .contains(&&id[..id.len() - 1])
+        .then_some(SPIN_SWITCHES[axis])
+}
+
+/// Whether a part's shader can spin its particles: some axis is on in the file. The shader of a
+/// part with every axis off was made without (11,531 parts, all of the fighter and system files'),
+/// and no setting adds it.
+fn can_spin(pr: &EmitterSnapshot) -> bool {
+    SPIN_SWITCHES
+        .iter()
+        .any(|id| pr.attr(id).is_some_and(AttrValue::as_bool))
+}
+
+/// Turn the axis of the Spin row `id` on while any of its rows is edited, and back to the file's
+/// setting once none is.
+fn spin_follows(em: &mut EmitterDef, pr: &EmitterSnapshot, id: &str) {
+    let Some(switch) = spin_switch(id) else {
+        return;
+    };
+    let axis = &switch[switch.len() - 1..];
+    let edited = SPIN_ROWS.iter().any(|row| {
+        let id = format!("{row}{axis}");
+        matches!((attr(em, &id), pr.attr(&id)), (Some(now), Some(was)) if !now.same(was))
+    });
+    let on = edited || pr.attr(switch).is_some_and(AttrValue::as_bool);
+    set_attr(em, switch, AttrValue::Int(i64::from(on)));
 }
 
 fn set_key_component(
@@ -2271,19 +2324,24 @@ fn attr_grid_rows(
 ) -> bool {
     let table = crate::eff_attrs::table();
     let mut changed = false;
+    let spins = can_spin(pr);
     for &i in indices {
         let (Some(attr), Some(Some(mut value))) = (table.get(i), em.attrs.get(i).copied()) else {
             continue;
         };
         let orig = pr.attrs.get(i).copied().flatten();
         let edited = orig.is_some_and(|o| !o.same(value));
+        // A row the part's shader does nothing with is shown greyed, and says why.
+        let idle =
+            (attr.group == crate::eff_attrs::G_PTCL_ROTATE && !spins).then(|| idle_spin_reason(em));
 
         let label = if edited {
             egui::RichText::new(attr.label).color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
         } else {
             egui::RichText::new(attr.label)
         };
-        column_label(ui, label).on_hover_text(format!("{}\n\n{}", attr.doc, attr.id));
+        let doc = idle.unwrap_or(attr.doc);
+        column_label(ui, label).on_hover_text(format!("{doc}\n\n{}", attr.id));
 
         // A texture id that names a texture in this file reads as that texture; the Texture
         // section is where it is changed.
@@ -2303,9 +2361,16 @@ fn attr_grid_rows(
                 "Texture id {}. Pick another in the Texture section.",
                 value.as_u64()
             ));
-        } else if attr_widget(ui, attr, &mut value) {
-            em.attrs[i] = Some(value);
-            changed = true;
+        } else {
+            let control = ui.add_enabled_ui(idle.is_none(), |ui| attr_widget(ui, attr, &mut value));
+            if let Some(reason) = idle {
+                control.response.on_disabled_hover_text(reason);
+            }
+            if control.inner {
+                em.attrs[i] = Some(value);
+                spin_follows(em, pr, attr.id);
+                changed = true;
+            }
         }
 
         if edited {
@@ -2338,6 +2403,7 @@ fn attr_grid_rows(
                         .clicked()
                 {
                     em.attrs[i] = Some(orig);
+                    spin_follows(em, pr, attr.id);
                     changed = true;
                 }
             }
@@ -2345,6 +2411,16 @@ fn attr_grid_rows(
         ui.end_row();
     }
     changed
+}
+
+/// Why the Spin rows of a part whose shader has none are greyed.
+fn idle_spin_reason(em: &EmitterDef) -> &'static str {
+    if em.subsections.iter().any(|s| s.magic == "EAER") {
+        "This part's shader cannot spin, so the game ignores this. Its Part rotation animation, \
+         under Animations & extra settings, is what turns it."
+    } else {
+        "This part's shader cannot spin, so the game ignores this."
+    }
 }
 
 /// The attribute groups of texture slots 2 and 3 when the part samples no texture through them:
@@ -10729,6 +10805,171 @@ mod tests {
         attrs_to_effective_keys(em);
         assert_eq!(em.color0[0].frame, 19.0);
         assert_eq!(em.color0[0].r, 0.9);
+    }
+
+    /// Editing a Spin row turns its axis on, and putting every row of it back turns it off again;
+    /// an axis the file has on stays on.
+    #[test]
+    fn a_spin_row_turns_its_axis_on() {
+        assert_eq!(
+            spin_switch("emitter_static.rotate_add_z"),
+            Some("particle_data.is_rotate_z")
+        );
+        assert_eq!(
+            spin_switch("emitter_static.rotate_init_rand_y"),
+            Some("particle_data.is_rotate_y")
+        );
+        for other in [
+            "emitter_info.rotate_x",
+            "emitter_static.rotate_regist",
+            "particle_data.is_rotate_x",
+        ] {
+            assert_eq!(spin_switch(other), None, "{other}");
+        }
+        for id in SPIN_ROWS
+            .iter()
+            .flat_map(|row| ["x", "y", "z"].map(|a| format!("{row}{a}")))
+            .chain(SPIN_SWITCHES.map(str::to_owned))
+        {
+            assert!(crate::eff_attrs::index_of(&id).is_some(), "{id}");
+        }
+        let mut editor = editor_with_one_emitter("effect/fighter/kirby/ef_kirby.eff");
+        let em = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0].emitters[0];
+        let (x, z) = ("particle_data.is_rotate_x", "particle_data.is_rotate_z");
+        for (id, on) in [(x, 1), ("particle_data.is_rotate_y", 0), (z, 0)] {
+            set_attr(em, id, AttrValue::Int(on));
+        }
+        let pr = EmitterSnapshot::of(em);
+        assert!(can_spin(&pr));
+        let on = |em: &EmitterDef, id: &str| attr(em, id).unwrap().as_bool();
+        let (speed, start) = (
+            "emitter_static.rotate_add_z",
+            "emitter_static.rotate_init_z",
+        );
+        let was = attr(em, speed).unwrap();
+        for id in [speed, start] {
+            set_attr(em, id, AttrValue::Float(2.63));
+            spin_follows(em, &pr, id);
+            assert!(on(em, z) && on(em, x));
+        }
+        set_attr(em, speed, was);
+        spin_follows(em, &pr, speed);
+        assert!(on(em, z), "its start is still edited");
+        set_attr(em, start, pr.attr(start).unwrap());
+        spin_follows(em, &pr, start);
+        assert!(!on(em, z) && on(em, x));
+        // A part with every axis off cannot spin.
+        set_attr(em, x, AttrValue::Int(0));
+        assert!(!can_spin(&EmitterSnapshot::of(em)));
+    }
+
+    /// The rule the greyed Spin rows go by, against the game's own shaders: a part with every
+    /// axis off has a shader that takes no rotation, and any other (but a stripe's) has one that
+    /// does.
+    #[test]
+    fn a_part_spins_when_its_shader_takes_a_rotation() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let (mut spin, mut still) = (0, 0);
+        for fighter in ["bayonetta", "edge", "ryu"] {
+            let path = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
+            let bytes = std::fs::read(root.join(path)).unwrap();
+            let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+            let ptcl = file.ptcl_file.as_ref().unwrap();
+            let shaders = ptcl.shader_info.as_ref().unwrap();
+            let shaders =
+                eff_wgpu::bnsh::ShaderFile::read(shaders.binary_data.as_ref().unwrap()).unwrap();
+            for emitter in ptcl
+                .emitter_list
+                .emitter_sets
+                .iter()
+                .flat_map(|s| &s.emitters)
+            {
+                let data = &emitter.data.particle_data;
+                let on = data.is_rotate_x || data.is_rotate_y || data.is_rotate_z != 0;
+                let index = emitter.data.shader_references.shader_index as usize;
+                let vertex = shaders.programs[index].stages[eff_wgpu::bnsh::STAGE_VERTEX]
+                    .as_ref()
+                    .unwrap();
+                let takes = vertex
+                    .reflection
+                    .inputs
+                    .iter()
+                    .any(|input| input.name == "sysInitRotateAttr");
+                assert!(on || !takes, "{fighter} {:?}", emitter.data.name);
+                *(if takes { &mut spin } else { &mut still }) += 1;
+            }
+        }
+        assert!(spin > 500 && still > 500, "{spin} spin, {still} do not");
+    }
+
+    /// The Witch Time clock hand: its Spin rows are greyed and say what turns it, and a part that
+    /// can spin has its own.
+    #[test]
+    fn spin_rows_of_a_part_that_cannot_spin_are_greyed() {
+        let mut editor = editor_with_one_emitter("effect/fighter/kirby/ef_kirby.eff");
+        let em = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0].emitters[0];
+        for id in SPIN_SWITCHES {
+            set_attr(em, id, AttrValue::Int(0));
+        }
+        assert!(!idle_spin_reason(em).contains("Part rotation animation"));
+        em.subsections.push(crate::effects::EmitterSubsectionDef {
+            magic: "EAER".into(),
+            data: Vec::new(),
+        });
+        assert!(idle_spin_reason(em).contains("Part rotation animation"));
+        // Dragging the row of a part that cannot spin changes nothing; of one that can, it does.
+        let row = crate::eff_attrs::index_of("emitter_static.rotate_add_z").unwrap();
+        for (spins, changes) in [(false, false), (true, true)] {
+            set_attr(em, SPIN_SWITCHES[0], AttrValue::Int(i64::from(spins)));
+            let pr = EmitterSnapshot::of(em);
+            let before = em.attrs[row];
+            let ctx = egui::Context::default();
+            let mut pos = None;
+            for step in 0..6 {
+                let mut events = Vec::new();
+                if let Some(at) = pos {
+                    let at: egui::Pos2 = at;
+                    let button = |pos, pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    match step {
+                        2 => events = vec![egui::Event::PointerMoved(at), button(at, true)],
+                        3 => events = vec![egui::Event::PointerMoved(at + egui::vec2(60.0, 0.0))],
+                        4 => events = vec![button(at + egui::vec2(60.0, 0.0), false)],
+                        _ => {}
+                    }
+                }
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let output = ctx.run_test_ui(input, |ui| {
+                    attr_rows_by_index(ui, "spin", em, &pr, &[row], &[]);
+                });
+                let shown = attr_text(&crate::eff_attrs::table()[row], before.unwrap());
+                pos = pos.or_else(|| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| text_position(&shape.shape, &shown))
+                });
+            }
+            assert!(pos.is_some(), "the row's value is drawn");
+            let changed = em.attrs[row].unwrap().as_f32() != before.unwrap().as_f32();
+            assert_eq!(changed, changes, "spins {spins}");
+            em.attrs[row] = before;
+        }
     }
 
     /// The Opacity row of a part whose opacity is constant is that constant, both ways: the key

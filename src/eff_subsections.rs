@@ -154,11 +154,13 @@ fn section_title(magic: &str) -> String {
         "EAA1" => "Second opacity animation",
         "EAC0" => "Colour animation",
         "EAC1" => "Second colour animation",
-        "EATR" => "Position animation",
-        "EARO" => "Rotation animation",
-        "EASL" => "Size animation",
-        "EAER" => "Spawn rate animation",
+        "EAES" => "Part size animation",
+        "EAER" => "Part rotation animation",
+        "EAET" => "Part position animation",
+        "EATR" => "Spawn rate animation",
         "EAPL" => "Particle life animation",
+        "EASL" => "Particle size animation",
+        "EASS" => "Spawn area size animation",
         "EAOV" => "Outward speed animation",
         "EADV" => "Speed along direction animation",
         "EAGV" => "Gravity animation",
@@ -166,6 +168,20 @@ fn section_title(magic: &str) -> String {
         _ => "Extra data",
     };
     named.to_owned()
+}
+
+/// What the columns of a part animation's keys are: one for each number the game reads.
+fn animation_columns(magic: &str) -> &'static [&'static str] {
+    match magic {
+        "EAER" => &["X °", "Y °", "Z °"],
+        "EAC0" | "EAC1" => &["R", "G", "B"],
+        "EATR" => &["Particles"],
+        "EAPL" => &["Frames"],
+        "EAA0" | "EAA1" => &["Opacity"],
+        "EAOV" | "EADV" => &["Speed"],
+        "EAGV" => &["Gravity"],
+        _ => &["X", "Y", "Z"],
+    }
 }
 
 /// A field value animated over each particle's life (ResAnim8KeyParamSet): enabled, loop and
@@ -534,15 +550,16 @@ fn draw_animation(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
     egui::Grid::new(("ea_keys", &section.magic))
         .striped(true)
         .show(ui, |ui| {
+            let columns = animation_columns(&section.magic);
             ui.label("Key");
-            ui.label("X");
-            ui.label("Y");
-            ui.label("Z");
+            for column in columns {
+                ui.label(*column);
+            }
             ui.label("Frame");
             ui.end_row();
             for key in 0..count {
-                ui.label(key.to_string());
-                for component in 0..4 {
+                ui.label((key + 1).to_string());
+                for component in (0..columns.len()).chain([3]) {
                     let offset = 12 + key * 16 + component * 4;
                     let mut value = read_f32(&section.data, offset).unwrap_or(0.0);
                     if ui
@@ -676,6 +693,31 @@ mod tests {
         assert_eq!(read_f32(&data, 16), Some(-2.5));
         assert!(write_f32(&mut data, 16, 6.5));
         assert_eq!(read_f32(&data, 16), Some(6.5));
+    }
+
+    /// Every part animation the game's files hold has its own name, and a column for each number
+    /// the game reads of its keys. Rotation and spawn rate had each other's and position's names.
+    #[test]
+    fn part_animations_are_named_by_what_they_drive() {
+        for (magic, title, columns) in [
+            ("EAES", "Part size animation", 3),
+            ("EAER", "Part rotation animation", 3),
+            ("EAET", "Part position animation", 3),
+            ("EAC0", "Colour animation", 3),
+            ("EAC1", "Second colour animation", 3),
+            ("EATR", "Spawn rate animation", 1),
+            ("EAPL", "Particle life animation", 1),
+            ("EAA0", "Opacity animation", 1),
+            ("EAA1", "Second opacity animation", 1),
+            ("EAOV", "Outward speed animation", 1),
+            ("EADV", "Speed along direction animation", 1),
+            ("EASL", "Particle size animation", 3),
+            ("EASS", "Spawn area size animation", 3),
+            ("EAGV", "Gravity animation", 1),
+        ] {
+            assert_eq!(section_title(magic), title);
+            assert_eq!(animation_columns(magic).len(), columns, "{magic}");
+        }
     }
 
     fn fspn(keys: &[[f32; 4]]) -> Vec<u8> {
