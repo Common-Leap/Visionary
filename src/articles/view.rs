@@ -112,6 +112,19 @@ pub fn script_move_name(script: &str) -> &str {
     script
 }
 
+/// The fighter and object `article` is in the game's own tables: a clone is its source, which the
+/// game still makes it from.
+pub fn made_from(article: &Article) -> Option<(String, String)> {
+    match &article.origin {
+        ArticleOrigin::Clone(decl) => {
+            let owner = decl.src_owner.clone()?;
+            let name = source_article_name(&decl.src_kind, Some(&owner));
+            Some((owner, name))
+        }
+        _ => Some((article.owner.clone(), article.name.clone())),
+    }
+}
+
 pub fn badge(article: &Article) -> String {
     match &article.origin {
         ArticleOrigin::Vanilla => "Game's".into(),

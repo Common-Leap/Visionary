@@ -12478,6 +12478,9 @@ impl VisionaryApp {
                 removed: None,
                 shot: None,
                 hand: None,
+                since: FIRST_GAME_FRAME,
+                from: 0.0,
+                rate: 1.0,
                 age: animation_frame_for_game_frame(self.state.current_frame),
                 placement: glam::Mat4::from_scale(glam::Vec3::splat(scale)),
             }];
@@ -12563,6 +12566,15 @@ impl VisionaryApp {
                 })
                 .max_by_key(|effect| effect.active_start)
                 .map(|effect| effect.bone_name.clone());
+            let motions = plan
+                .changes
+                .iter()
+                .map(|(at, motion)| {
+                    let kind = kind.clone();
+                    let kind = self.object_in_motion(&fighter, &plan.name, kind, motion);
+                    (*at, kind)
+                })
+                .collect();
             spawns.push(crate::article_preview::Spawn {
                 kind,
                 hand,
@@ -12570,6 +12582,8 @@ impl VisionaryApp {
                 spawned: plan.spawned,
                 removed: plan.removed,
                 shot: plan.shot,
+                motions,
+                timing: plan.timing,
             });
         }
         // Objects the fighter's status code creates for a special, final smash, entrance, taunt
@@ -12688,16 +12702,25 @@ impl VisionaryApp {
         let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() else {
             return Vec::new();
         };
-        let mut placed =
-            crate::article_preview::place(&spawns, self.state.current_frame as f32, &|at| {
-                rs.joint_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
-            });
+        let clock = MoveClock::new(&self.state.script);
+        let mut placed = crate::article_preview::place(
+            &spawns,
+            self.state.current_frame as f32,
+            &|from, to| clock.ticks_between(from, to),
+            &|at| rs.joint_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32)),
+        );
         if !stowed.is_empty() {
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
             let bones = rs.joint_matrices_at(animation_frame);
             for kind in stowed {
                 let bone = format!("{}b", kind.name);
-                if let Some(at) = bones.get(&bone) {
+                let out = crate::article_preview::taken_out(
+                    &call_refs,
+                    &kind.name,
+                    self.state.current_frame,
+                );
+                let hand = kind.link.and_then(|(_, joint)| bones.get(joint));
+                if let Some(at) = hand.filter(|_| out).or_else(|| bones.get(&bone)) {
                     // The object hangs by its `Have` joint (its grip), as the game attaches
                     // it, not by its root.
                     let have = kind
@@ -12720,6 +12743,9 @@ impl VisionaryApp {
                         removed: None,
                         shot: None,
                         hand: None,
+                        since: 0,
+                        from: 0.0,
+                        rate: 1.0,
                         age: 0.0,
                         placement: *at * have.inverse(),
                     });
@@ -12751,6 +12777,9 @@ impl VisionaryApp {
                     removed: None,
                     shot: None,
                     hand: None,
+                    since: 0,
+                    from: 0.0,
+                    rate: 1.0,
                     age: 0.0,
                     placement: *hand * grip.inverse(),
                 });
@@ -12786,6 +12815,9 @@ impl VisionaryApp {
                     removed: None,
                     shot: None,
                     hand: None,
+                    since: 0,
+                    from: 0.0,
+                    rate: 1.0,
                     age: animation_frame,
                     placement,
                 });
@@ -13023,6 +13055,17 @@ impl VisionaryApp {
                         .as_ref()
                         .map(|a| a.owner.clone())
                         .unwrap_or_else(|| fighter.name.clone());
+                    let made_from = match &catalog_article {
+                        Some(article) => crate::articles::view::made_from(article),
+                        None => Some((fighter.name.clone(), name.clone())),
+                    };
+                    let link = made_from
+                        .as_ref()
+                        .and_then(|(owner, name)| crate::article_links::link(owner, name));
+                    // A clone's own fighter has none of the parameters its source starts by.
+                    let start = made_from
+                        .filter(|(from, _)| *from == owner)
+                        .and_then(|(owner, name)| crate::article_links::start(&owner, &name));
                     let mut extra_scripts: Vec<String> = Vec::new();
                     if let Some(article) = &catalog_article {
                         // Prefer game_ scripts first so hitbox scripts win over effect-only ones.
@@ -13102,6 +13145,7 @@ impl VisionaryApp {
                                     } if *block != own_block => Some(block.clone()),
                                     _ => None,
                                 })
+                                .chain(start.map(|start| start.block.to_owned()))
                                 .collect::<BTreeSet<String>>()
                                 .into_iter()
                                 .filter_map(|full| {
@@ -13115,6 +13159,8 @@ impl VisionaryApp {
                             params: Some(&params),
                             other_blocks: Some(&other_blocks),
                             settings: &settings,
+                            link,
+                            start,
                         };
                         let kind = crate::article_preview::load_kind_resolved(
                             &fighter.fighter_dir,
@@ -13992,8 +14038,19 @@ impl VisionaryApp {
         // open, because `self.state.effects` above already renders its live editable effects.
         for object in objects.iter().filter(|_| self.open_article.is_none()) {
             let object_frame = object.age.floor() as u32 + 1;
+            // The move's frame at each of the object's own.
+            let move_frames: Vec<u32> = if object.kind.synced {
+                (object.since..=frame_num).collect()
+            } else {
+                clock.frames_by_tick(object.since, frame_num)
+            };
             let object_at = |age_frame: u32| {
-                let at = object.spawned + age_frame.saturating_sub(1);
+                let passed = (age_frame as f32 - 1.0 - object.from) / object.rate;
+                let at = move_frames
+                    .get(passed.max(0.0) as usize)
+                    .or(move_frames.last())
+                    .copied()
+                    .unwrap_or(object.since);
                 crate::article_preview::place(
                     &[crate::article_preview::Spawn {
                         kind: object.kind.clone(),
@@ -14002,8 +14059,20 @@ impl VisionaryApp {
                         shot: object.shot,
                         shown: Vec::new(),
                         hand: object.hand.clone(),
+                        motions: vec![(object.since, object.kind.clone())],
+                        timing: vec![
+                            (
+                                object.since,
+                                crate::article_preview::Timing::Frame(object.from),
+                            ),
+                            (
+                                object.since,
+                                crate::article_preview::Timing::Rate(object.rate),
+                            ),
+                        ],
                     }],
                     at as f32,
+                    &|from, to| clock.ticks_between(from, to),
                     &|f| bones_at(f.max(1.0) as u32),
                 )
                 .into_iter()

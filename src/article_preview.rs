@@ -382,6 +382,10 @@ pub struct ObjectKind {
     /// The animation is one of those motions, made in step with the fighter's and in the
     /// fighter's space, so the object rides the fighter's `top` rather than a hand.
     pub synced: bool,
+    /// The joint of its own the game keeps at one of the fighter's, and that joint.
+    pub link: Option<crate::article_links::Link>,
+    /// Where the game makes it.
+    pub start: Option<crate::article_links::Started>,
 }
 
 impl Default for ObjectKind {
@@ -397,7 +401,54 @@ impl Default for ObjectKind {
             scale: 1.0,
             motions: Vec::new(),
             synced: false,
+            link: None,
+            start: None,
         }
+    }
+}
+
+impl ObjectKind {
+    /// Where it stands at its `age` when the game keeps it on the fighter: its own joint exactly
+    /// at the fighter's. `None` when it isn't kept on one, or the fighter has no such joint.
+    fn held_at(
+        &self,
+        bones: &HashMap<String, glam::Mat4>,
+        age: f32,
+        scale: f32,
+    ) -> Option<glam::Mat4> {
+        let (own, joint) = self.link?;
+        let (_, turn, at) = bones.get(joint)?.to_scale_rotation_translation();
+        let grip = self
+            .skel
+            .as_deref()
+            .and_then(|skel| {
+                crate::renderer::compute_bone_world_matrices(
+                    skel,
+                    self.anim.as_deref(),
+                    None,
+                    &[],
+                    age,
+                )
+                .get(own)
+                .copied()
+            })
+            .unwrap_or(glam::Mat4::IDENTITY);
+        let (_, grip_turn, grip_at) = grip.to_scale_rotation_translation();
+        let grip = glam::Mat4::from_rotation_translation(grip_turn, grip_at * scale);
+        Some(glam::Mat4::from_rotation_translation(turn, at) * grip.inverse())
+    }
+
+    /// Whether it leaves the fighter on its own.
+    fn flies(&self) -> bool {
+        self.flight.speed != 0.0 || (self.flight.start_ahead != 0.0 && self.link.is_none())
+    }
+
+    /// Whether the fighter has it by a grip, so it stays until the move throws it: Link's arrow
+    /// is on the string from the start of his bow's special and leaves in another move. One tied
+    /// by its origin, or by the joint named after it (Duck Hunt's can), is made there and goes.
+    fn gripped(&self) -> bool {
+        self.link
+            .is_some_and(|(own, _)| own != "top" && own != self.name)
     }
 }
 
@@ -535,7 +586,14 @@ pub struct PlacedObject {
     /// The frame the move throws it, when it is held first (Link's boomerang).
     pub shot: Option<u32>,
     pub hand: Option<String>,
-    /// Frames since it was spawned, from 0.
+    /// The frame it took the motion it is in, or the last one the move set that motion's frame or
+    /// rate on.
+    pub since: u32,
+    /// The frame of that motion it was on then.
+    pub from: f32,
+    /// How many of that motion's frames it runs a tick.
+    pub rate: f32,
+    /// The frame of that motion it is on.
     pub age: f32,
     /// Object space to world space.
     pub placement: glam::Mat4,
@@ -666,6 +724,11 @@ fn flight_from_listed(listed: &[(&str, f32)]) -> Flight {
     }
     if values.contains_key("bound_count_max") {
         flight.bounce = first(&["bounded_speed_y_min", "bound_speed_y"]).or(Some(flight.speed));
+    }
+    // A cord (a hookshot, a whip, a fishing line) is reeled out from the fighter: its speeds are
+    // how fast its end goes. Only cords say how they spring back.
+    if values.contains_key("restitution_rate") {
+        flight.speed = 0.0;
     }
     flight
 }
@@ -810,6 +873,10 @@ pub struct ResolvedArticleInputs<'a> {
     pub other_blocks: Option<&'a HashMap<String, crate::articles::params::ParamBlock>>,
     /// Resolved status settings from `crate::articles::settings_for`.
     pub settings: &'a [crate::articles::settings::Setting],
+    /// The joint the game keeps it on.
+    pub link: Option<crate::article_links::Link>,
+    /// Where the game makes it.
+    pub start: Option<&'static crate::article_links::Start>,
 }
 
 /// Loads an object's model, skeleton, animation, hitboxes and flight. `script` gives the body of
@@ -829,7 +896,15 @@ pub fn load_kind(
         slot,
         name,
         labels,
-        &ResolvedArticleInputs::default(),
+        &ResolvedArticleInputs {
+            link: fighter_dir
+                .file_name()
+                .and_then(|fighter| crate::article_links::link(fighter.to_str()?, name)),
+            start: fighter_dir
+                .file_name()
+                .and_then(|fighter| crate::article_links::start(fighter.to_str()?, name)),
+            ..Default::default()
+        },
         script,
     )
 }
@@ -971,6 +1046,29 @@ pub fn load_kind_resolved(
         }
         _ => base_flight.with_settings(inputs.settings, params_ref),
     };
+    let start = inputs.start.and_then(|start| {
+        let known = inputs
+            .other_blocks
+            .and_then(|blocks| blocks.get(start.block));
+        match known {
+            Some(block) => start.read(block),
+            None => start.read(&crate::articles::params::param_block(
+                &[param_path.to_path_buf()],
+                &[],
+                start.block.trim_start_matches("param_"),
+                labels,
+            )),
+        }
+    });
+    let flight = match start {
+        // Where it starts is said here, and not by the distance of its own the flight reads.
+        Some(start) => Flight {
+            speed: start.speed.unwrap_or(flight.speed),
+            start_ahead: 0.0,
+            ..flight
+        },
+        None => flight,
+    };
     let scale = match inputs.other_blocks {
         Some(others) if !others.is_empty() => {
             scale_from_settings_and_blocks(inputs.settings, params_ref, others)
@@ -991,6 +1089,8 @@ pub fn load_kind_resolved(
         scale,
         motions,
         synced: false,
+        link: inputs.link,
+        start,
     })
 }
 
@@ -1111,30 +1211,6 @@ fn pascal(motion: &str) -> String {
         .collect()
 }
 
-/// Objects that don't fly but are held, by name: they ride the fighter's hand.
-fn held(name: &str) -> bool {
-    [
-        "gun", "blaster", "hammer", "sword", "weapon", "kassar", "umbrella", "bat", "club", "bow",
-        "fan", "racket", "pan", "staff", "tome", "book",
-    ]
-    .iter()
-    .any(|part| name.contains(part))
-}
-
-/// The bone an object that doesn't fly rides on.
-fn ride_bone(bones: &HashMap<String, glam::Mat4>, name: &str) -> glam::Mat4 {
-    let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
-    if held(name) {
-        for bone in ["haver", "havel"] {
-            if let Some(matrix) = bones.get(bone) {
-                return *matrix;
-            }
-        }
-    }
-    let (_, rotation, position) = top.to_scale_rotation_translation();
-    glam::Mat4::from_rotation_translation(rotation, position)
-}
-
 /// Where the object starts: the fighter's hand for things that fly, its centre otherwise.
 /// `hand` is the hand the move plays an effect on as it creates the object, when it does.
 fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool, hand: Option<&str>) -> glam::Vec3 {
@@ -1154,8 +1230,17 @@ fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool, hand: Option<&s
     top
 }
 
+/// What a move sets of the motion an object is in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Timing {
+    /// The frame of it that it is on (`ArticleModule::set_frame`).
+    Frame(f32),
+    /// How many of its frames it runs a tick (`ArticleModule::set_rate`).
+    Rate(f32),
+}
+
 /// One object a move creates.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Spawn {
     pub kind: Arc<ObjectKind>,
     /// The frame it is created on.
@@ -1170,6 +1255,29 @@ pub struct Spawn {
     pub shown: Vec<(u32, bool)>,
     /// The hand it leaves from, when the move plays an effect on one as it creates it.
     pub hand: Option<String>,
+    /// Where the move gives it another motion, and the object in it, in order. Young Link's
+    /// hookshot hand appears on frame 6 of his grab, shoots from 12 and comes back from 46.
+    pub motions: Vec<(u32, Arc<ObjectKind>)>,
+    /// Where the move sets that motion's frame or rate, in order. Corrin's spear hand appears on
+    /// frame 9 of a forward smash already on frame 8 of its thrust, where Corrin is.
+    pub timing: Vec<(u32, Timing)>,
+}
+
+/// On the move's first frame, as an object the fighter's own code creates is: the game's frames
+/// are counted from 1.
+impl Default for Spawn {
+    fn default() -> Self {
+        Self {
+            kind: Arc::default(),
+            spawned: 1,
+            removed: None,
+            shot: None,
+            shown: Vec::new(),
+            hand: None,
+            motions: Vec::new(),
+            timing: Vec::new(),
+        }
+    }
 }
 
 /// The hands an object can leave from.
@@ -1177,14 +1285,19 @@ pub const HANDS: [&str; 4] = ["havel", "haver", "handl", "handr"];
 
 /// Planned lifecycle for one spawned copy of an article, built from typed
 /// [`crate::data::ArticleCall`]s while honoring `ArticleTarget::All`, `First`, and `Last`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpawnPlan {
     pub name: String,
     pub spawned: u32,
     pub removed: Option<u32>,
     pub shot: Option<u32>,
     pub shown: Vec<(u32, bool)>,
+    /// The motion it is created in, when the move gives it one.
     pub motion: Option<String>,
+    /// The motions the move gives it later, and the frames it does.
+    pub changes: Vec<(u32, String)>,
+    /// Where the move sets the frame or rate of the motion it is in.
+    pub timing: Vec<(u32, Timing)>,
 }
 
 fn target_live_indices(
@@ -1207,6 +1320,32 @@ fn target_live_indices(
         ArticleTarget::First => live.first().copied().into_iter().collect(),
         ArticleTarget::Last | ArticleTarget::Term => live.last().copied().into_iter().collect(),
         ArticleTarget::None => Vec::new(),
+    }
+}
+
+/// Whether the fighter has the object they carry in hand at `frame`: a move puts Link's bow in
+/// his hand, and back, by its status. Before a move's first call it is where the call takes it
+/// from.
+pub fn taken_out(calls: &[(u32, &crate::data::ArticleCall)], name: &str, frame: u32) -> bool {
+    use crate::data::ArticleOp;
+    let mut moves: Vec<(u32, bool)> = calls
+        .iter()
+        .filter(|(_, call)| {
+            matches!(
+                call.op,
+                ArticleOp::ChangeStatus | ArticleOp::ChangeStatusExist
+            ) && article_name(&call.article).as_deref() == Some(name)
+        })
+        .filter_map(|(at, call)| {
+            let status = call.args.first()?.trim();
+            let out = status.ends_with("_STATUS_KIND_HAVE");
+            (out || status.ends_with("_STATUS_KIND_BACK")).then_some((*at, out))
+        })
+        .collect();
+    moves.sort_by_key(|(at, _)| *at);
+    match moves.iter().rev().find(|(at, _)| *at <= frame) {
+        Some((_, out)) => *out,
+        None => moves.first().is_some_and(|(_, out)| !out),
     }
 }
 
@@ -1254,6 +1393,8 @@ pub fn plan_spawns_from_calls(
                     shot: None,
                     shown: Vec::new(),
                     motion: None,
+                    changes: Vec::new(),
+                    timing: Vec::new(),
                 });
             }
             ArticleOp::Remove | ArticleOp::RemoveExist => {
@@ -1285,10 +1426,29 @@ pub fn plan_spawns_from_calls(
             ArticleOp::ChangeMotion => {
                 if let Some(motion) = call.args.first().and_then(|arg| parse_quoted_motion(arg)) {
                     for idx in target_live_indices(&plans, &name, frame, call.target) {
-                        if plans[idx].motion.is_none() {
-                            plans[idx].motion = Some(motion.clone());
+                        let plan = &mut plans[idx];
+                        if plan.spawned < frame {
+                            // Two on one frame are the arms of a condition: the first is shown.
+                            if plan.changes.last().is_none_or(|(at, _)| *at < frame) {
+                                plan.changes.push((frame, motion.clone()));
+                            }
+                        } else if plan.motion.is_none() {
+                            plan.motion = Some(motion.clone());
                         }
                     }
+                }
+            }
+            ArticleOp::SetFrame | ArticleOp::SetRate => {
+                // Inkling's set the squid's to their own, which it is on as it is.
+                let Some(value) = call.args.first().and_then(|arg| arg.trim().parse().ok()) else {
+                    continue;
+                };
+                let set = match call.op {
+                    ArticleOp::SetFrame => Timing::Frame(value),
+                    _ => Timing::Rate(value),
+                };
+                for idx in target_live_indices(&plans, &name, frame, call.target) {
+                    plans[idx].timing.push((frame, set));
                 }
             }
             _ => {}
@@ -1436,6 +1596,8 @@ fn wrapper_spawn_from_line(
             shot: None,
             shown: Vec::new(),
             motion: None,
+            changes: Vec::new(),
+            timing: Vec::new(),
         });
     }
     // Carrier match: prefer `game_` scripts over `effect_`/`sound_` ones so hitbox scripts win.
@@ -1474,6 +1636,8 @@ fn wrapper_spawn_from_line(
                     shot: None,
                     shown: Vec::new(),
                     motion: Some(motion),
+                    changes: Vec::new(),
+                    timing: Vec::new(),
                 });
             }
         }
@@ -1626,6 +1790,8 @@ fn scan_status_body_spawns(
                         shot: None,
                         shown: Vec::new(),
                         motion: None,
+                        changes: Vec::new(),
+                        timing: Vec::new(),
                     })
             } else {
                 None
@@ -1645,12 +1811,16 @@ fn scan_status_body_spawns(
 }
 
 /// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
-/// matrices at a game frame.
+/// matrices at a game frame, and `ticks` the game ticks from the start of one frame to the start
+/// of another: a move that plays faster or slower (`FT_MOTION_RATE`) does not take the objects
+/// it made along. One animated in step with the fighter keeps to the fighter's frames.
 pub fn place(
     spawns: &[Spawn],
     frame: f32,
+    ticks: &dyn Fn(u32, u32) -> f32,
     bones_at: &dyn Fn(f32) -> crate::renderer::Pose,
 ) -> Vec<PlacedObject> {
+    let elapsed = |from: u32| ticks(from, frame.max(0.0) as u32) + frame.fract();
     let mut placed = Vec::new();
     for Spawn {
         kind,
@@ -1659,12 +1829,41 @@ pub fn place(
         shot,
         shown,
         hand,
+        motions,
+        timing,
     } in spawns
     {
-        let age = frame - *spawned as f32;
-        if age < 0.0 || removed.is_some_and(|removed| frame >= removed as f32) {
+        if frame < *spawned as f32 || removed.is_some_and(|removed| frame >= removed as f32) {
             continue;
         }
+        let (since, kind) = motions
+            .iter()
+            .rev()
+            .find(|(at, _)| *at as f32 <= frame)
+            .map_or((*spawned, kind), |(at, kind)| (*at, kind));
+        let frames_since = |from: u32| {
+            if kind.synced {
+                frame - from as f32
+            } else {
+                elapsed(from)
+            }
+        };
+        let (mut since, mut from, mut rate) = (since, 0.0, 1.0);
+        for (at, set) in timing {
+            if *at < since || *at as f32 > frame {
+                continue;
+            }
+            let passed = frames_since(since) - frames_since(*at);
+            from = match set {
+                Timing::Frame(frame) => *frame,
+                Timing::Rate(_) => from + rate * passed,
+            };
+            if let Timing::Rate(set) = set {
+                rate = *set;
+            }
+            since = *at;
+        }
+        let age = from + rate * frames_since(since);
         let hidden = shown
             .iter()
             .rev()
@@ -1679,35 +1878,34 @@ pub fn place(
             1.0
         };
         let scale_mat = glam::Mat4::from_scale(glam::Vec3::splat(scale));
-        let flies = !(kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0);
+        let flies = kind.flies();
         // Something that doesn't fly rides the fighter until the move removes it; something
         // thrown later is held in the hand until it is.
-        let held_until_shot = shot.is_some_and(|shot| frame < shot as f32);
+        let held_until_shot = match shot {
+            Some(shot) => frame < *shot as f32,
+            None => kind.gripped(),
+        };
         if !flies || held_until_shot {
             let bones = bones_at(frame);
-            let placement = if flies {
-                let (_, rotation, _) = bones
-                    .get("top")
-                    .copied()
-                    .unwrap_or(glam::Mat4::IDENTITY)
-                    .to_scale_rotation_translation();
-                glam::Mat4::from_rotation_translation(
-                    rotation,
-                    spawn_point(&bones, true, hand.as_deref()),
-                )
-            } else if kind.synced {
+            let placement = kind.held_at(&bones, age, scale).unwrap_or_else(|| {
                 let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
-                let (_, rotation, position) = top.to_scale_rotation_translation();
-                glam::Mat4::from_rotation_translation(rotation, position)
-            } else {
-                ride_bone(&bones, &kind.name)
-            } * scale_mat;
+                let (_, turn, at) = top.to_scale_rotation_translation();
+                let at = if flies {
+                    spawn_point(&bones, true, hand.as_deref())
+                } else {
+                    at
+                };
+                glam::Mat4::from_rotation_translation(turn, at)
+            }) * scale_mat;
             placed.push(PlacedObject {
                 kind: kind.clone(),
                 spawned: *spawned,
                 removed: *removed,
                 shot: *shot,
                 hand: hand.clone(),
+                since,
+                from,
+                rate,
                 age,
                 placement,
             });
@@ -1715,7 +1913,7 @@ pub fn place(
         }
         // In flight: from where it leaves the fighter, counted from then.
         let launched = shot.unwrap_or(*spawned);
-        let flight_age = frame - launched as f32;
+        let flight_age = elapsed(launched);
         if flight_age > kind.flight.life {
             continue;
         }
@@ -1725,7 +1923,16 @@ pub fn place(
         let mut forward = top.z_axis.truncate();
         forward.y = 0.0;
         let forward = forward.try_normalize().unwrap_or(glam::Vec3::Z);
-        let start = spawn_point(&bones, kind.flight.speed > 0.0, hand.as_deref());
+        // It leaves from where the game makes it, or where it is kept until then.
+        let joint_at = |joint: &str| Some(bones.get(joint)?.col(3).truncate());
+        let start = kind
+            .start
+            .and_then(|start| {
+                let offset = forward * start.ahead + glam::Vec3::Y * start.up;
+                Some(joint_at(start.joint)? + offset)
+            })
+            .or_else(|| joint_at(kind.link?.1))
+            .unwrap_or_else(|| spawn_point(&bones, kind.flight.speed > 0.0, hand.as_deref()));
         let (ahead, up) = kind.flight.offset(flight_age, start.y - top_position.y);
         let position = start + forward * ahead + glam::Vec3::Y * up;
         placed.push(PlacedObject {
@@ -1734,6 +1941,9 @@ pub fn place(
             removed: *removed,
             shot: *shot,
             hand: hand.clone(),
+            since,
+            from,
+            rate,
             age,
             placement: glam::Mat4::from_rotation_translation(rotation, position) * scale_mat,
         });
@@ -1825,6 +2035,12 @@ pub fn placement_layer(object: &PlacedObject) -> Option<AnimData> {
     })
 }
 
+/// A move with no motion rate: a tick a frame.
+#[cfg(test)]
+fn every_tick(from: u32, to: u32) -> f32 {
+    to as f32 - from as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1906,7 +2122,10 @@ mod tests {
                 hand: hand.map(str::to_owned),
                 ..Spawn::default()
             };
-            place(&[spawn], 0.0, &bones)[0].placement.col(3).truncate()
+            place(&[spawn], 1.0, &every_tick, &bones)[0]
+                .placement
+                .col(3)
+                .truncate()
         };
         assert_eq!(
             start(None),
@@ -2068,8 +2287,9 @@ mod tests {
                             shot: None,
                             shown: Vec::new(),
                             hand: None,
+                            ..Spawn::default()
                         };
-                        for object in place(&[spawn], frame, &bones) {
+                        for object in place(&[spawn], frame, &every_tick, &bones) {
                             let _ = object_bones(&object);
                             let _ = placement_layer(&object);
                         }
@@ -2178,6 +2398,349 @@ mod thrown_object_tests {
         );
     }
 
+    fn at_origin(_: f32) -> crate::renderer::Pose {
+        HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]).into()
+    }
+
+    /// An object the fighter's own code creates starts with the move: on frame 1 both are at the
+    /// start of their animations (it was a frame ahead).
+    #[test]
+    fn an_object_made_with_the_move_starts_with_it() {
+        let kind = Arc::new(ObjectKind {
+            synced: true,
+            ..ObjectKind::default()
+        });
+        let spawn = Spawn {
+            kind,
+            ..Spawn::default()
+        };
+        for frame in [1u32, 2, 30] {
+            let placed = place(
+                std::slice::from_ref(&spawn),
+                frame as f32,
+                &every_tick,
+                &at_origin,
+            );
+            assert_eq!(placed[0].age, crate::data::script_to_motion_frame(frame));
+        }
+    }
+
+    /// Young Link's hookshot hand: out on frame 6, shooting from 12, coming back from 46. Each
+    /// motion runs from the frame the move gives it.
+    #[test]
+    fn a_motion_given_later_starts_on_its_own_frame() {
+        let calls = [
+            (6, "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_YOUNGLINK_GENERATE_ARTICLE_HOOKSHOT_HAND, false, -1);"),
+            (12, "ArticleModule::change_motion(agent.module_accessor, *FIGHTER_YOUNGLINK_GENERATE_ARTICLE_HOOKSHOT_HAND, Hash40::new(\"shoot\"), false, -1.0);"),
+            (46, "ArticleModule::change_motion(agent.module_accessor, *FIGHTER_YOUNGLINK_GENERATE_ARTICLE_HOOKSHOT_HAND, Hash40::new(\"back\"), false, -1.0);"),
+        ]
+        .map(|(frame, line)| (frame, crate::data::ArticleCall::parse(line).expect(line)));
+        let calls: Vec<_> = calls.iter().map(|(frame, call)| (*frame, call)).collect();
+        let plans = plan_spawns_from_calls(&calls, &|call| article_name(&call.article));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].motion, None);
+        let changes = [(12, "shoot".to_owned()), (46, "back".to_owned())];
+        assert_eq!(plans[0].changes, changes);
+
+        let named = |name: &str| {
+            Arc::new(ObjectKind {
+                name: name.into(),
+                ..ObjectKind::default()
+            })
+        };
+        let spawn = Spawn {
+            kind: named("hand"),
+            spawned: plans[0].spawned,
+            motions: changes
+                .iter()
+                .map(|(at, motion)| (*at, named(motion)))
+                .collect(),
+            ..Spawn::default()
+        };
+        for (frame, motion, age) in [
+            (6.0, "hand", 0.0),
+            (11.0, "hand", 5.0),
+            (12.0, "shoot", 0.0),
+            (45.0, "shoot", 33.0),
+            (46.0, "back", 0.0),
+            (50.0, "back", 4.0),
+        ] {
+            let placed = place(std::slice::from_ref(&spawn), frame, &every_tick, &at_origin);
+            assert_eq!(
+                (placed[0].kind.name.as_str(), placed[0].age),
+                (motion, age),
+                "frame {frame}"
+            );
+        }
+    }
+
+    fn joint(name: &str, parent: Option<usize>, at: [f32; 3]) -> ssbh_data::skel_data::BoneData {
+        ssbh_data::skel_data::BoneData {
+            name: name.into(),
+            transform: glam::Mat4::from_translation(at.into()),
+            parent_index: parent,
+            billboard_type: ssbh_data::skel_data::BillboardType::Disabled,
+        }
+    }
+
+    /// Young Link's hookshot hand was drawn at his feet: the game keeps its `have` joint at his
+    /// `haver`, place and turn, wherever the swing takes the hand.
+    #[test]
+    fn an_object_is_kept_by_its_own_joint_on_the_fighters() {
+        let grip = glam::Vec3::new(1.0, 2.0, 3.0);
+        let kind = ObjectKind {
+            skel: Some(Arc::new(SkelData {
+                major_version: 1,
+                minor_version: 0,
+                bones: vec![
+                    joint("Root", None, [0.0; 3]),
+                    joint("Have", Some(0), grip.into()),
+                ],
+            })),
+            flight: Flight {
+                start_ahead: 7.0,
+                ..Flight::default()
+            },
+            scale: 2.0,
+            link: crate::article_links::link("younglink", "hookshothand"),
+            ..ObjectKind::default()
+        };
+        let spawn = Spawn {
+            kind: Arc::new(kind),
+            ..Spawn::default()
+        };
+        let hand = |frame: f32| {
+            glam::Mat4::from_rotation_translation(
+                glam::Quat::from_rotation_y(frame * 0.1),
+                glam::Vec3::new(frame, 10.0, 0.0),
+            )
+        };
+        let bones =
+            |frame: f32| crate::renderer::Pose::new(HashMap::from([("haver".into(), hand(frame))]));
+        for frame in [1.0, 9.0] {
+            let placed = place(std::slice::from_ref(&spawn), frame, &every_tick, &bones);
+            let have = object_bones(&placed[0])["have"];
+            let (scale, turn, at) = have.to_scale_rotation_translation();
+            let (_, hand_turn, hand_at) = hand(frame).to_scale_rotation_translation();
+            assert!(at.distance(hand_at) < 1e-4, "{frame}: {at}");
+            assert!(turn.angle_between(hand_turn) < 1e-3, "{frame}: {turn}");
+            assert!((scale.x - 2.0).abs() < 1e-4, "{scale}");
+        }
+        // Without the joint it is at the fighter's origin, as one that isn't kept on anything is.
+        let placed = place(&[spawn], 1.0, &every_tick, &at_origin);
+        assert!(placed[0].placement.col(3).truncate().length() < 1e-4);
+    }
+
+    /// Fox's bullets leave his blaster, at the speed his special gives them; they lay still on the
+    /// ground ahead of him.
+    #[test]
+    fn a_projectile_starts_where_the_game_makes_it() {
+        use crate::articles::params::{ParamBlock, ParamValue};
+        let field = |name: &str, value| {
+            let value = (ParamValue::Float(value), PathBuf::new());
+            (name.to_owned(), value)
+        };
+        let block = ParamBlock {
+            present: true,
+            fields: [
+                field("blaster_shoot_x", 6.0),
+                field("blaster_shoot_y", 1.5),
+                field("blaster_shoot_speed", 7.0),
+            ]
+            .into_iter()
+            .collect(),
+            ..ParamBlock::default()
+        };
+        let start = crate::article_links::start("fox", "blaster_bullet").unwrap();
+        let blocks = HashMap::from([(start.block.to_owned(), block)]);
+        let kind = load_kind_resolved(
+            Path::new("nowhere/fox"),
+            Path::new("nowhere/vl.prc"),
+            0,
+            "blaster_bullet",
+            &HashMap::new(),
+            &ResolvedArticleInputs {
+                other_blocks: Some(&blocks),
+                start: Some(start),
+                ..Default::default()
+            },
+            &|_| None,
+        )
+        .expect("it has a speed");
+        let spawn = Spawn {
+            kind: Arc::new(kind),
+            ..Spawn::default()
+        };
+        let bones = |_: f32| {
+            let hand = glam::Mat4::from_translation(glam::Vec3::new(1.0, 9.0, 4.0));
+            crate::renderer::Pose::new(HashMap::from([("haver".into(), hand)]))
+        };
+        for (frame, z) in [(1.0, 10.0), (3.0, 24.0)] {
+            let placed = place(std::slice::from_ref(&spawn), frame, &every_tick, &bones);
+            let at = placed[0].placement.col(3).truncate();
+            assert!(
+                at.distance(glam::Vec3::new(1.0, 10.5, z)) < 1e-3,
+                "{frame}: {at}"
+            );
+        }
+    }
+
+    /// A thrown object leaves from the joint it is kept on until then.
+    #[test]
+    fn a_thrown_object_leaves_the_joint_it_was_kept_on() {
+        let spawn = Spawn {
+            kind: Arc::new(ObjectKind {
+                flight: Flight {
+                    speed: 2.0,
+                    ..Flight::default()
+                },
+                link: crate::article_links::link("link", "boomerang"),
+                ..ObjectKind::default()
+            }),
+            shot: Some(5),
+            ..Spawn::default()
+        };
+        let bones = |_: f32| {
+            let at = |x, y, z| glam::Mat4::from_translation(glam::Vec3::new(x, y, z));
+            crate::renderer::Pose::new(HashMap::from([
+                ("havel".into(), at(9.0, 9.0, 9.0)),
+                ("haver".into(), at(1.0, 12.0, 4.0)),
+            ]))
+        };
+        for (frame, z) in [(1.0, 4.0), (5.0, 4.0), (7.0, 8.0)] {
+            let placed = place(std::slice::from_ref(&spawn), frame, &every_tick, &bones);
+            let at = placed[0].placement.col(3).truncate();
+            assert!(
+                at.distance(glam::Vec3::new(1.0, 12.0, z)) < 1e-3,
+                "{frame}: {at}"
+            );
+        }
+    }
+
+    /// Link's arrow has a speed, but his bow's special starts with it on the string: it stays in
+    /// his hand in a move that doesn't throw it. Duck Hunt's can goes as it is made.
+    #[test]
+    fn a_gripped_object_stays_until_it_is_thrown() {
+        let gone = |fighter: &str, name: &str| {
+            let spawn = Spawn {
+                kind: Arc::new(ObjectKind {
+                    name: name.into(),
+                    flight: Flight {
+                        speed: 2.0,
+                        ..Flight::default()
+                    },
+                    link: crate::article_links::link(fighter, name),
+                    ..ObjectKind::default()
+                }),
+                ..Spawn::default()
+            };
+            let placed = place(&[spawn], 5.0, &every_tick, &at_origin);
+            placed[0].placement.col(3).z
+        };
+        let start = spawn_point(&at_origin(1.0), true, None).z;
+        assert_eq!(gone("link", "bowarrow"), start);
+        assert_eq!(gone("duckhunt", "can"), start + 8.0);
+        assert_eq!(gone("mario", "fireball"), start + 8.0);
+    }
+
+    /// Link's bow is taken out as its special starts, and put back in the one that ends it.
+    #[test]
+    fn a_stowed_object_is_taken_out_and_put_back() {
+        let call = |status: &str| {
+            crate::data::ArticleCall::parse(&format!("ArticleModule::change_status_exist(agent.module_accessor, *FIGHTER_LINK_GENERATE_ARTICLE_BOW, *WN_LINK_BOW_STATUS_KIND_{status});")).unwrap()
+        };
+        let (have, back) = (call("HAVE"), call("BACK"));
+        let start = [(4, &have)];
+        assert!(!taken_out(&start, "bow", 3));
+        assert!(taken_out(&start, "bow", 4));
+        assert!(!taken_out(&start, "bowarrow", 4));
+        let end = [(20, &back)];
+        assert!(taken_out(&end, "bow", 19));
+        assert!(!taken_out(&end, "bow", 20));
+        assert!(!taken_out(&[], "bow", 20));
+    }
+
+    #[test]
+    fn a_cord_does_not_fly() {
+        let hookshot = [
+            ("shoot_speed", 3.6),
+            ("restitution_rate", 0.4),
+            ("speed", 1.0),
+        ];
+        assert_eq!(flight_from_listed(&hookshot).speed, 0.0);
+        assert_eq!(flight_from_listed(&hookshot[2..]).speed, 1.0);
+    }
+
+    /// Corrin's forward smash makes the spear hand on frame 9 and puts it on frame 8 of its
+    /// thrust, where Corrin is; it ran eight frames behind. A rate counts from where it was set.
+    #[test]
+    fn a_move_sets_the_frame_and_rate_of_its_object() {
+        let calls = [
+            (9, "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_KAMUI_GENERATE_ARTICLE_SPEARHAND, false, -1);"),
+            (9, "ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KAMUI_GENERATE_ARTICLE_SPEARHAND, Hash40::new(\"attack_s4_s\"), false, -1.0);"),
+            (9, "ArticleModule::set_frame(agent.module_accessor, *FIGHTER_KAMUI_GENERATE_ARTICLE_SPEARHAND, 8);"),
+            (12, "ArticleModule::set_rate(agent.module_accessor, *FIGHTER_KAMUI_GENERATE_ARTICLE_SPEARHAND, 0.5);"),
+            (13, "ArticleModule::set_frame(agent.module_accessor, *FIGHTER_KAMUI_GENERATE_ARTICLE_SPEARHAND, frame);"),
+        ]
+        .map(|(frame, line)| (frame, crate::data::ArticleCall::parse(line).expect(line)));
+        let calls: Vec<_> = calls.iter().map(|(frame, call)| (*frame, call)).collect();
+        let mut plans = plan_spawns_from_calls(&calls, &|call| article_name(&call.article));
+        let plan = plans.remove(0);
+        assert_eq!(plan.motion.as_deref(), Some("attack_s4_s"));
+        assert_eq!(
+            plan.timing,
+            [(9, Timing::Frame(8.0)), (12, Timing::Rate(0.5))]
+        );
+        let spawn = Spawn {
+            spawned: plan.spawned,
+            timing: plan.timing,
+            ..Spawn::default()
+        };
+        for (frame, since, age) in [
+            (9.0, 9, 8.0),
+            (11.0, 9, 10.0),
+            (12.0, 12, 11.0),
+            (16.0, 12, 13.0),
+        ] {
+            let placed = place(std::slice::from_ref(&spawn), frame, &every_tick, &at_origin);
+            assert_eq!((placed[0].since, placed[0].age), (since, age), "{frame}");
+        }
+    }
+
+    /// A move at half speed (two ticks a frame) shows its projectile two of its own frames
+    /// further on each frame; an object animated in step with the fighter keeps to the frames.
+    #[test]
+    fn objects_run_on_game_time_and_synced_ones_on_the_fighters_frames() {
+        let half_speed = |from: u32, to: u32| 2.0 * every_tick(from, to);
+        let kind = |synced: bool| {
+            Arc::new(ObjectKind {
+                synced,
+                flight: Flight {
+                    life: 60.0,
+                    speed: if synced { 0.0 } else { 3.0 },
+                    ..Flight::default()
+                },
+                ..ObjectKind::default()
+            })
+        };
+        let at = |synced: bool| {
+            let spawn = Spawn {
+                kind: kind(synced),
+                spawned: 5,
+                ..Spawn::default()
+            };
+            place(&[spawn], 10.0, &half_speed, &at_origin)
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let flying = at(false);
+        assert_eq!(flying.age, 10.0);
+        let gone = flying.placement.col(3).z;
+        assert!((gone - 30.0).abs() < 1e-3, "{gone}");
+        assert_eq!(at(true).age, 5.0);
+    }
+
     #[test]
     fn a_held_object_stays_in_the_hand_until_it_is_thrown() {
         let kind = Arc::new(ObjectKind {
@@ -2199,13 +2762,11 @@ mod thrown_object_tests {
         let spawn = Spawn {
             kind,
             spawned: 5,
-            removed: None,
             shot: Some(27),
-            shown: Vec::new(),
-            hand: None,
+            ..Spawn::default()
         };
         let at = |frame: f32| {
-            place(std::slice::from_ref(&spawn), frame, &bones)[0]
+            place(std::slice::from_ref(&spawn), frame, &every_tick, &bones)[0]
                 .placement
                 .col(3)
                 .truncate()
@@ -2403,7 +2964,7 @@ mod resolved_settings_preview_tests {
             ..Spawn::default()
         };
         let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]).into();
-        let placed = place(&[spawn], 5.0, &bones);
+        let placed = place(&[spawn], 5.0, &every_tick, &bones);
         assert_eq!(placed.len(), 1);
         let bx = placed[0].placement.x_axis.truncate().length();
         let by = placed[0].placement.y_axis.truncate().length();

@@ -7,6 +7,7 @@ mod acmd_src;
 mod acmd_verify;
 mod app;
 mod app_icon;
+mod article_links;
 mod article_preview;
 mod articles;
 mod asset_snapshots;
