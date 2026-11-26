@@ -155,6 +155,27 @@ pub fn hint_text(hint: &ModHint) -> String {
     }
 }
 
+/// Why a hint says the folder is a mod and not a game dump, and what to do about it, for the
+/// hover of the line [`hint_text`] is on.
+pub fn hint_reason(hint: &ModHint) -> String {
+    match hint {
+        ModHint::InfoToml => "It has an info.toml, which mods ship and dumps don't.".into(),
+        ModHint::Plugin => "It contains a plugin (.nro file), which a game dump never does.".into(),
+        ModHint::RomfsWrapper => {
+            "It is, or contains, a romfs folder: pick the folder that contains fighter/ and \
+             effect/."
+                .into()
+        }
+        ModHint::FewFighters(n) => {
+            format!("It holds only {n} fighters. A full dump has about 90.")
+        }
+        ModHint::NotVanilla => format!(
+            "It is missing {CARRIER_BASE_REL}, a file every full dump has, so it won't be used \
+             to fill in files a partial romfs copy leaves out."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

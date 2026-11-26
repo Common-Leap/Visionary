@@ -5582,6 +5582,9 @@ pub struct VisionaryApp {
     sources_focus: Option<SourceRow>,
     /// Scroll `sources_focus` into view once, on the first frame after `open_sources`.
     sources_scroll: bool,
+    /// A picked folder that does not look like a game dump, waiting on the user's answer in the
+    /// Sources window before it is used.
+    pending_dump: Option<(PathBuf, crate::sources::DumpCheck)>,
     /// The current dump's check, so the window doesn't walk the folder every frame.
     dump_status: Option<(PathBuf, crate::sources::DumpCheck)>,
     /// Costume slot targeted by Project Files model/motion imports. Session-only: the imported
@@ -6361,6 +6364,7 @@ impl VisionaryApp {
             show_sources: false,
             sources_focus: None,
             sources_scroll: false,
+            pending_dump: None,
             dump_status: None,
             workspace_asset_slot: 0,
             move_has_no_script: false,
@@ -6432,7 +6436,8 @@ impl VisionaryApp {
             use_scan: None,
             fighter_search: String::new(),
             fighter_groups: FighterGroups::default(),
-            objects_open: config_path(OBJECTS_OPEN_CONFIG_KEY).is_some_and(|path| path.is_file()),
+            objects_open: !config_path(OBJECTS_CLOSED_CONFIG_KEY)
+                .is_some_and(|path| path.is_file()),
             add_fighter_popup: None,
             add_fighter_search: String::new(),
             move_search: String::new(),
@@ -6568,6 +6573,13 @@ impl VisionaryApp {
         // Re-link the user's own ACMD source. Resuming a project later replaces this with the
         // project's own link.
         app.relink_global_acmd_source();
+
+        // First run: the dump comes before the Projects window, which would cover the button
+        // that sets it and start a project with nothing to read. `apply_game_dump` brings the
+        // window up once a dump is set.
+        if app.state.data_root.is_none() {
+            app.project_hub.show = false;
+        }
 
         // Profiling helper: preselect a fighter by internal name so a `VISIONARY_PROFILE` run
         // measures the loaded-model path (3D viewport, bone overlays) instead of the empty
@@ -12619,7 +12631,9 @@ impl VisionaryApp {
                         }
                         if n == 0 {
                             if group.is_empty() && !fighter_searching {
-                                ui.weak("No fighters");
+                                ui.weak("No fighters").on_hover_text(
+                                    "Use Add fighter, or right-click a fighter in the list below.",
+                                );
                             }
                             if ui
                                 .small_button("Add fighter")
@@ -16073,7 +16087,10 @@ impl VisionaryApp {
             // Graphs, the edit log and the export are all keyed by fighter; an object's script
             // saved there would land on the fighter's move of the same name.
             ui.weak(format!("{agent}: an object's script"))
-                .on_hover_text("Move nodes don't edit object scripts. The Classic editor does.");
+                .on_hover_text(
+                    "Move nodes don't edit object scripts yet. Edit it in the Classic editor: \
+                     syncing saves its changes into the linked source.",
+                );
             return;
         }
         if self.fetching_acmd {
@@ -20923,7 +20940,12 @@ impl VisionaryApp {
                             format!("{name} {:.3} from {set_by}", scale.value)
                         });
                         ui.label(RichText::new(text.join(" · ")).small().weak())
-                            .on_hover_text(from.join("\n"));
+                            .on_hover_text(format!(
+                                "{}\n\nA call in the fighter's frame callback (on_line) wins over \
+                                 the fighter_param scale. Branches that only run on the results \
+                                 screen or on entry are skipped.",
+                                from.join("\n")
+                            ));
                     }
                     if throw {
                         separate(ui);
@@ -23838,10 +23860,10 @@ impl VisionaryApp {
             );
         if heading.clicked() {
             self.objects_open = !self.objects_open;
-            if self.objects_open {
-                save_config_path(OBJECTS_OPEN_CONFIG_KEY, Path::new("open"));
+            if !self.objects_open {
+                save_config_path(OBJECTS_CLOSED_CONFIG_KEY, Path::new("closed"));
             } else {
-                clear_config_path(OBJECTS_OPEN_CONFIG_KEY);
+                clear_config_path(OBJECTS_CLOSED_CONFIG_KEY);
             }
         }
         if let Some(agent) = &self.open_article {
@@ -24195,7 +24217,10 @@ impl VisionaryApp {
                     })
                     .collect();
                 if rows.is_empty() && extra.is_empty() {
-                    ui.weak("No settings found");
+                    ui.weak("No settings found").on_hover_text(
+                        "Nothing in the linked source or the param files sets this object's \
+                         size, speed or life.",
+                    );
                 }
                 ScrollArea::vertical()
                     .id_salt("article_settings_rows")
@@ -27960,8 +27985,19 @@ impl VisionaryApp {
         self.dump_status = None;
     }
 
-    /// Pick a folder as the ArcExplorer dump and use it. One that lacks something a dump has is
-    /// used all the same: the Sources window then shows what.
+    /// Use a dump the user has accepted. The first one set with no project open is the first
+    /// step of setting up, so the second follows: the Projects window.
+    fn apply_game_dump(&mut self, path: PathBuf) {
+        let first_run = self.state.data_root.is_none() && self.project_path.is_none();
+        self.set_data_root(path);
+        if first_run && self.state.data_root.is_some() {
+            self.project_hub.show = true;
+        }
+    }
+
+    /// Pick a folder as the ArcExplorer dump. One that passes `check_dump` is used straight
+    /// away. Any other is held in `pending_dump` and asked about in the Sources window: a mod
+    /// folder used as the dump is read as the game's own files, and never written again.
     fn pick_game_dump(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Choose your ArcExplorer dump")
@@ -27969,17 +28005,23 @@ impl VisionaryApp {
         else {
             return;
         };
-        if crate::sources::check_dump(&path) != crate::sources::DumpCheck::Ok {
-            self.open_sources(SourceRow::Dump);
+        match crate::sources::check_dump(&path) {
+            crate::sources::DumpCheck::Ok => {
+                self.pending_dump = None;
+                self.apply_game_dump(path);
+            }
+            other => {
+                self.pending_dump = Some((path, other));
+                self.open_sources(SourceRow::Dump);
+            }
         }
-        self.set_data_root(path);
     }
 
     fn draw_sources_window(&mut self, ctx: &egui::Context) {
         if !self.show_sources {
             return;
         }
-        use crate::sources::{hint_text, DumpCheck};
+        use crate::sources::{hint_reason, hint_text, DumpCheck};
         if let Some(root) = self.state.data_root.clone() {
             if self.dump_status.as_ref().map(|(p, _)| p) != Some(&root) {
                 let check = crate::sources::check_dump(&root);
@@ -27998,6 +28040,7 @@ impl VisionaryApp {
         };
         let dump_path = self.state.data_root.clone();
         let dump_status = self.dump_status.clone();
+        let pending = self.pending_dump.clone();
         let mods_total = self.roster.library.mods.len();
         let mods_enabled = self.roster.library.enabled().count();
         let fighters_with_files = self.project_romfs_slots.len();
@@ -28011,6 +28054,7 @@ impl VisionaryApp {
         let mut open = true;
         let mut change_dump = false;
         let mut use_dump: Option<PathBuf> = None;
+        let mut drop_pending = false;
         let mut reveal_path: Option<PathBuf> = None;
         let mut open_library = false;
         let mut open_workspace = false;
@@ -28095,6 +28139,8 @@ impl VisionaryApp {
                                             }
                                         }
                                         DumpCheck::LooksLikeMod(hints) => {
+                                            let reasons: Vec<String> =
+                                                hints.iter().map(hint_reason).collect();
                                             let hints: Vec<String> =
                                                 hints.iter().map(hint_text).collect();
                                             ui.label(
@@ -28104,13 +28150,74 @@ impl VisionaryApp {
                                                 ))
                                                 .small()
                                                 .color(warn),
-                                            );
+                                            )
+                                            .on_hover_text(reasons.join("\n"));
                                         }
                                     }
                                 }
                                 _ => {
                                     ui.label(RichText::new("not set").small().color(weak));
                                 }
+                            }
+                            if let Some((picked, check)) = &pending {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(picked.display().to_string()).monospace().small(),
+                                );
+                                let better = match check {
+                                    DumpCheck::Missing { fighter, effect, suggestion } => {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Not used yet: missing {}",
+                                                missing_text(*fighter, *effect)
+                                            ))
+                                            .small()
+                                            .color(warn),
+                                        );
+                                        suggestion.clone()
+                                    }
+                                    DumpCheck::LooksLikeMod(hints) => {
+                                        let reasons: Vec<String> =
+                                            hints.iter().map(hint_reason).collect();
+                                        let hints: Vec<String> =
+                                            hints.iter().map(hint_text).collect();
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Not used yet: looks like a mod ({})",
+                                                hints.join(", ")
+                                            ))
+                                            .small()
+                                            .color(warn),
+                                        )
+                                        .on_hover_text(reasons.join("\n"));
+                                        None
+                                    }
+                                    DumpCheck::Ok => None,
+                                };
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(better) = better {
+                                        if ui.button(format!("Use {}", better.display())).clicked() {
+                                            use_dump = Some(better);
+                                        }
+                                    }
+                                    if ui
+                                        .button("Use anyway")
+                                        .on_hover_text(
+                                            "Read this folder as the game's own files. Visionary \
+                                             never writes into the folder set as the game dump.",
+                                        )
+                                        .clicked()
+                                    {
+                                        use_dump = Some(picked.clone());
+                                    }
+                                    if ui.button("Pick another").clicked() {
+                                        change_dump = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        drop_pending = true;
+                                    }
+                                });
+                                ui.separator();
                             }
                             ui.horizontal(|ui| {
                                 if ui.button("Change").clicked() {
@@ -28228,11 +28335,17 @@ impl VisionaryApp {
         if !open {
             self.show_sources = false;
             self.sources_focus = None;
+            self.pending_dump = None;
+        }
+        if drop_pending {
+            self.pending_dump = None;
         }
         if let Some(path) = use_dump {
-            self.set_data_root(path);
+            self.pending_dump = None;
+            self.apply_game_dump(path);
         }
         if change_dump {
+            self.pending_dump = None;
             self.pick_game_dump();
         }
         if let Some(path) = reveal_path {
@@ -47184,8 +47297,8 @@ pub(crate) enum SourceRow {
     MovesetCode,
 }
 
-/// There while the Classic sidebar's Objects section is open.
-const OBJECTS_OPEN_CONFIG_KEY: &str = "objects_open";
+/// There while the Classic sidebar's Objects section is closed: it starts open.
+const OBJECTS_CLOSED_CONFIG_KEY: &str = "objects_closed";
 
 /// Config key for the user's own ACMD source project — the smashline crate that builds their
 /// plugin. When set, its scripts are read in preference to the dumped-script mirror.
