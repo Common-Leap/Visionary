@@ -48,6 +48,7 @@ mod motion_list_editor;
 mod motion_scripts;
 mod move_kinds;
 mod move_nodes;
+mod moveset_build;
 mod object_motions;
 mod orientation_widget;
 mod param_labels;

@@ -755,6 +755,83 @@ enum ArticleJobResult {
     Failed(String),
 }
 
+/// What the linked moveset's build worker last finished.
+enum MovesetBuildStep {
+    Planned(anyhow::Result<crate::moveset_build::Plan>),
+    Built(crate::moveset_build::Outcome),
+}
+
+/// The places a build found, waiting on the user's yes or no to each.
+struct DeployPrompt {
+    plan: crate::moveset_build::Plan,
+    rows: Vec<(crate::moveset_build::Place, bool)>,
+}
+
+/// Where a linked moveset's built plugin is copied, as the user has answered: only `approved`
+/// places are ever written, and `declined` ones are not asked about again.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DeployPlaces {
+    approved: Vec<PathBuf>,
+    declined: Vec<PathBuf>,
+}
+
+impl DeployPlaces {
+    /// One place a line, `+` before a yes and `-` before a no. A line with neither is the one
+    /// place an older build kept, which the user picked themselves.
+    fn parse(text: &str) -> Self {
+        let mut places = Self::default();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            match (line.strip_prefix('+'), line.strip_prefix('-')) {
+                (Some(path), _) => places.approved.push(PathBuf::from(path)),
+                (_, Some(path)) => places.declined.push(PathBuf::from(path)),
+                _ => places.approved.push(PathBuf::from(line)),
+            }
+        }
+        places
+    }
+
+    fn text(&self) -> String {
+        let line = |sign: char, path: &PathBuf| format!("{sign}{}\n", path.display());
+        let yes = self.approved.iter().map(|path| line('+', path));
+        let no = self.declined.iter().map(|path| line('-', path));
+        yes.chain(no).collect()
+    }
+
+    fn approve(&mut self, path: PathBuf) {
+        self.declined.retain(|known| *known != path);
+        if !self.approved.contains(&path) {
+            self.approved.push(path);
+        }
+    }
+
+    fn decline(&mut self, path: PathBuf) {
+        self.approved.retain(|known| *known != path);
+        if !self.declined.contains(&path) {
+            self.declined.push(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod deploy_places_tests {
+    use super::*;
+
+    #[test]
+    fn answers_are_kept_and_an_older_single_place_is_a_yes() {
+        let mut places = DeployPlaces::parse("/sd/mods/Mine/plugin.nro\n");
+        assert_eq!(places.approved, [PathBuf::from("/sd/mods/Mine/plugin.nro")]);
+        places.decline(PathBuf::from("/sd/mods/Other/plugin.nro"));
+        places.approve(PathBuf::from("/sd/skyline/plugins/libmine.nro"));
+        assert_eq!(DeployPlaces::parse(&places.text()), places);
+        // Changing an answer leaves the place under one of them only.
+        places.approve(PathBuf::from("/sd/mods/Other/plugin.nro"));
+        assert!(places.declined.is_empty());
+        places.decline(PathBuf::from("/sd/mods/Mine/plugin.nro"));
+        assert_eq!(places.approved.len(), 2);
+        assert_eq!(places.declined, [PathBuf::from("/sd/mods/Mine/plugin.nro")]);
+    }
+}
+
 /// Where the user was going when an object script with unsynced changes was open: every
 /// user action that replaces the editor's state, run as it was asked once the prompt allows it.
 enum PendingLeave {
@@ -5544,6 +5621,13 @@ pub struct VisionaryApp {
     /// Background cargo-skyline build for a normal export or explicit gimmick package.
     /// Only one build owns this slot at a time; status is polled in `update`.
     export_build: Option<std::sync::Arc<std::sync::Mutex<ExportBuildState>>>,
+    /// The linked moveset's own plugin build (`None` inside while a step runs). See
+    /// [`crate::moveset_build`].
+    moveset_build: Option<std::sync::Arc<std::sync::Mutex<Option<MovesetBuildStep>>>>,
+    /// The places a build found that the user has not said yes or no to yet.
+    moveset_deploy_prompt: Option<DeployPrompt>,
+    /// [`Self::moveset_deploy_places`]: the linked moveset's key and what was last read for it.
+    moveset_deploy_known: Option<(String, DeployPlaces)>,
     /// Connection the pin-sync check last ran for (plugin client id).
     pin_sync_client: Option<u64>,
     /// Set on new connection; when the settle window elapses, untracked game pins prompt.
@@ -6317,6 +6401,9 @@ impl VisionaryApp {
             motion_list_editor: None,
             motion_list_anims: Vec::new(),
             motion_list_found: None,
+            moveset_build: None,
+            moveset_deploy_prompt: None,
+            moveset_deploy_known: None,
             motion_list_close_ok: false,
             acmd_src_buffer: None,
             acmd_src_view: SourceView::Source,
@@ -10336,6 +10423,206 @@ impl VisionaryApp {
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
     /// that script in place, and push editor edits back into it.
+    /// Config key for the places the linked project's plugin is copied to.
+    fn moveset_deploy_key(&self) -> Option<String> {
+        let root = self
+            .acmd_src
+            .as_ref()?
+            .root
+            .to_string_lossy()
+            .to_lowercase();
+        Some(format!("moveset_deploy_{:010x}", hash40::hash40(&root).0))
+    }
+
+    /// Where the user has said the linked moveset's plugin goes, read once per moveset.
+    fn moveset_deploy_places(&mut self) -> DeployPlaces {
+        let Some(key) = self.moveset_deploy_key() else {
+            return DeployPlaces::default();
+        };
+        match &self.moveset_deploy_known {
+            Some((known, places)) if *known == key => places.clone(),
+            _ => {
+                let places = config_path(&key)
+                    .and_then(|file| std::fs::read_to_string(file).ok())
+                    .map(|text| DeployPlaces::parse(&text))
+                    .unwrap_or_default();
+                self.moveset_deploy_known = Some((key, places.clone()));
+                places
+            }
+        }
+    }
+
+    fn save_moveset_deploy_places(&mut self, places: DeployPlaces) {
+        let Some(key) = self.moveset_deploy_key() else {
+            return;
+        };
+        if let Some(dest) = config_path(&key) {
+            save_config(&dest, places.text());
+        }
+        self.moveset_deploy_known = Some((key, places));
+    }
+
+    /// Whether a step of the linked moveset's build is running.
+    fn moveset_build_running(&self) -> bool {
+        self.moveset_build
+            .as_ref()
+            .is_some_and(|state| state.lock().map_or(false, |step| step.is_none()))
+    }
+
+    /// Start a build: first find, on a worker, what would be built and where copies of it are.
+    fn spawn_moveset_build(&mut self) {
+        let Some(files) = self.acmd_src.as_ref().map(|index| index.files.clone()) else {
+            self.state.status = "Build & Deploy: no source project is linked".into();
+            return;
+        };
+        self.state.status = "Build & Deploy: reading the linked moveset".into();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.moveset_build = Some(state.clone());
+        std::thread::spawn(move || {
+            let sources: Vec<String> = files
+                .iter()
+                .filter_map(|file| std::fs::read_to_string(file).ok())
+                .collect();
+            let plan = crate::moveset_build::plan(
+                &files,
+                &sources,
+                crate::scratch_dirs::emulator_sd_root().as_deref(),
+            );
+            if let Ok(mut slot) = state.lock() {
+                *slot = Some(MovesetBuildStep::Planned(plan));
+            }
+        });
+    }
+
+    /// Build `plan` on a worker and copy the plugin to `targets`, the places the user approved.
+    fn run_moveset_build(&mut self, plan: crate::moveset_build::Plan, targets: Vec<PathBuf>) {
+        self.state.status = format!("Building {}", plan.nro_name);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.moveset_build = Some(state.clone());
+        std::thread::spawn(move || {
+            let keep = crate::moveset_build::keep_dir();
+            let outcome = crate::moveset_build::run(&plan, &targets, &keep);
+            if let Ok(mut slot) = state.lock() {
+                *slot = Some(MovesetBuildStep::Built(outcome));
+            }
+        });
+    }
+
+    /// Take the build worker's last step: ask about places not answered yet, build, or report.
+    fn poll_moveset_build(&mut self) {
+        let Some(state) = self.moveset_build.as_ref() else {
+            return;
+        };
+        let Some(step) = state.lock().ok().and_then(|mut slot| slot.take()) else {
+            return;
+        };
+        self.moveset_build = None;
+        match step {
+            MovesetBuildStep::Planned(Err(error)) => {
+                self.state.status = format!("Build & Deploy: {error:#}");
+            }
+            MovesetBuildStep::Planned(Ok(plan)) => {
+                let places = self.moveset_deploy_places();
+                let rows: Vec<_> =
+                    crate::moveset_build::unasked(&plan.found, &places.approved, &places.declined)
+                        .into_iter()
+                        .map(|place| {
+                            // A guess is offered unticked: the user ticks what is theirs.
+                            let sure = place.why != crate::moveset_build::Why::BuiltFromThisSource;
+                            (place.clone(), sure)
+                        })
+                        .collect();
+                if rows.is_empty() {
+                    self.run_moveset_build(plan, places.approved);
+                } else {
+                    self.state.status = "Build & Deploy: choose where the plugin goes".into();
+                    self.moveset_deploy_prompt = Some(DeployPrompt { plan, rows });
+                }
+            }
+            MovesetBuildStep::Built(outcome) => {
+                let log = outcome
+                    .log
+                    .as_ref()
+                    .map(|log| format!(" (full output: {})", log.display()))
+                    .unwrap_or_default();
+                self.state.status = format!("Build & Deploy: {}{log}", outcome.message);
+            }
+        }
+    }
+
+    /// Ask which of the places a build found get the plugin. The answers are kept for the
+    /// moveset, so each place is asked about once.
+    fn draw_moveset_deploy_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.moveset_deploy_prompt.take() else {
+            return;
+        };
+        let mut build = false;
+        let mut cancel = false;
+        egui::Window::new("Build & Deploy")
+            .id(egui::Id::unique("moveset_deploy_prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Copy {} over these on every build?",
+                    prompt.plan.nro_name
+                ));
+                for (place, yes) in &mut prompt.rows {
+                    ui.checkbox(yes, place.path.display().to_string())
+                        .on_hover_text(place.why.words());
+                }
+                ui.horizontal(|ui| {
+                    build = ui
+                        .button("Build")
+                        .on_hover_text(
+                            "Build, and copy the plugin to the ticked places and the ones chosen \
+                             before. The file each one held is kept in Visionary's own folder.",
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            self.state.status = "Build & Deploy: cancelled".into();
+        } else if build {
+            let mut places = self.moveset_deploy_places();
+            for (place, yes) in prompt.rows {
+                if yes {
+                    places.approve(place.path);
+                } else {
+                    places.decline(place.path);
+                }
+            }
+            self.save_moveset_deploy_places(places.clone());
+            self.run_moveset_build(prompt.plan, places.approved);
+        } else {
+            self.moveset_deploy_prompt = Some(prompt);
+        }
+    }
+
+    /// Pick a place for the built plugin by hand: a mod folder a build cannot find on its own.
+    fn choose_moveset_deploy_target(&mut self) {
+        if self.moveset_deploy_key().is_none() {
+            self.state.status = "Deploy to: link the moveset's source project first".into();
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Where should the built plugin go?")
+            .add_filter("Plugin", &["nro"])
+            .set_file_name("plugin.nro");
+        if let Some(sd) = crate::scratch_dirs::emulator_sd_root() {
+            dialog = dialog.set_directory(sd.join("ultimate").join("mods"));
+        }
+        if let Some(path) = dialog.save_file() {
+            let mut places = self.moveset_deploy_places();
+            places.approve(path.clone());
+            self.save_moveset_deploy_places(places);
+            self.state.status =
+                format!("Build & Deploy will copy the plugin to {}", path.display());
+        }
+    }
+
     /// The Motion List window. It follows the selected fighter's costume folder, unless the open
     /// list has unsaved edits, which keep it open until they are saved or discarded.
     fn draw_motion_list_window(&mut self, ctx: &egui::Context) {
@@ -10525,6 +10812,10 @@ impl VisionaryApp {
         // which the borrow of `self.acmd_src` for display rules out inside it.
         let mut open_moveset_sources = false;
         let mut rescan = false;
+        let mut build_plugin = false;
+        let mut choose_deploy = false;
+        let mut stop_deploy: Option<PathBuf> = None;
+        let deploy_places = self.moveset_deploy_places();
         let mut unlink = false;
         let mut checkout: Option<&'static str> = None;
         let mut save = false;
@@ -10635,6 +10926,58 @@ impl VisionaryApp {
                         {
                             rescan = true;
                         }
+                        let building = self.moveset_build_running();
+                        if ui
+                            .add_enabled(
+                                !building,
+                                egui::Button::new(if building {
+                                    "Building"
+                                } else {
+                                    "Build & Deploy"
+                                })
+                                .small(),
+                            )
+                            .on_hover_text(
+                                "Run `cargo skyline build --release` on this project and copy its \
+                                 plugin where you have said it goes. Copies found on the emulator \
+                                 SD are offered the first time, and nothing is replaced unasked. \
+                                 If the plugin exports `smashline_install`, smashline's \
+                                 development.nro is offered too: press L + R + D-pad Up in the \
+                                 game's menus to reload it without restarting. The game loads any \
+                                 other copy when it starts.",
+                            )
+                            .clicked()
+                        {
+                            build_plugin = true;
+                        }
+                        ui.menu_button(egui::RichText::new("Deploy to").small(), |ui| {
+                            for path in &deploy_places.approved {
+                                if ui
+                                    .button(format!("✖  {}", path.display()))
+                                    .on_hover_text("Stop copying the plugin here")
+                                    .clicked()
+                                {
+                                    stop_deploy = Some(path.clone());
+                                    ui.close();
+                                }
+                            }
+                            if !deploy_places.approved.is_empty() {
+                                ui.separator();
+                            }
+                            if ui
+                                .button("Choose a place")
+                                .on_hover_text(
+                                    "Choose where this project's built plugin is copied, for a \
+                                     mod folder Build & Deploy cannot find on its own",
+                                )
+                                .clicked()
+                            {
+                                choose_deploy = true;
+                                ui.close();
+                            }
+                        })
+                        .response
+                        .on_hover_text("Where Build & Deploy copies the plugin");
                         if ui.small_button("Unlink").clicked() {
                             unlink = true;
                         }
@@ -10869,6 +11212,17 @@ impl VisionaryApp {
 
         if open_moveset_sources {
             self.open_sources(SourceRow::MovesetCode);
+        }
+        if build_plugin {
+            self.spawn_moveset_build();
+        }
+        if choose_deploy {
+            self.choose_moveset_deploy_target();
+        }
+        if let Some(path) = stop_deploy {
+            let mut places = self.moveset_deploy_places();
+            places.decline(path);
+            self.save_moveset_deploy_places(places);
         }
         if rescan {
             self.rescan_acmd_source();
@@ -41352,6 +41706,9 @@ impl eframe::App for VisionaryApp {
         if self.show_motion_list {
             self.draw_motion_list_window(&ctx);
         }
+        // Outside the source window: a build goes on, and asks, with that window closed.
+        self.poll_moveset_build();
+        self.draw_moveset_deploy_prompt(&ctx);
 
         if self.article_settings.is_some() {
             self.draw_article_settings_window(&ctx);

@@ -1,9 +1,11 @@
 //! The Cargo layout of a linked moveset, as `cargo metadata` reports it.
 //!
 //! Moveset repositories are laid out every way there is: the crate at the root, under
-//! `plugin/`, one crate per fighter in a workspace, a `[lib] path` pointing somewhere unusual.
-//! Guessing from folder names got each of those wrong somewhere. Cargo already knows the answer,
-//! so ask it: which packages the workspace builds, and which file is each crate's root.
+//! `plugin/`, one crate per fighter in a workspace, a `[lib] path` pointing somewhere unusual, a
+//! `CARGO_TARGET_DIR` or `.cargo/config.toml` moving the build output. Guessing from folder names
+//! got each of those wrong somewhere. Cargo already knows the answer, so ask it: which packages
+//! the workspace builds, which file is each crate's root, which package is the `cdylib` plugin,
+//! and where its output lands.
 //!
 //! Everything here is a refinement. When cargo is missing or the folder is not inside a
 //! workspace, [`CargoProject::discover`] returns `None` and callers keep their folder heuristics.
@@ -22,16 +24,27 @@ use serde::Deserialize;
 /// One workspace, as cargo sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CargoProject {
-    workspace_root: PathBuf,
-    packages: Vec<CargoPackage>,
+    pub workspace_root: PathBuf,
+    pub target_dir: PathBuf,
+    pub packages: Vec<CargoPackage>,
 }
 
 /// One workspace member.
 #[derive(Debug, Clone, PartialEq)]
-struct CargoPackage {
-    manifest: PathBuf,
+pub struct CargoPackage {
+    pub name: String,
+    pub manifest: PathBuf,
     /// Root source file of each library and binary target (`src/lib.rs`, a custom `[lib] path`).
-    crate_roots: Vec<PathBuf>,
+    pub crate_roots: Vec<PathBuf>,
+    /// Crate name of the `cdylib` target, when the package builds one: the plugin is
+    /// `lib<name>.nro`.
+    pub cdylib: Option<String>,
+}
+
+impl CargoPackage {
+    pub fn dir(&self) -> &Path {
+        self.manifest.parent().unwrap_or(&self.manifest)
+    }
 }
 
 /// How long cargo may take to answer. It only reads manifests, so one that takes longer is stuck.
@@ -136,18 +149,36 @@ impl CargoProject {
         (project, Some(worker))
     }
 
-    /// Ask cargo, for at most [`TIMEOUT`].
+    /// Ask cargo, for at most [`TIMEOUT`] a try.
     ///
-    /// The manifest is named instead of running in its folder, and nothing is fetched: a linked
+    /// First with the manifest named from outside its folder, and never fetching: a linked
     /// moveset's `rust-toolchain.toml` would have rustup install that toolchain first, and its
-    /// `.cargo/config.toml` can name programs to run.
+    /// `.cargo/config.toml` can name programs to run. Cargo run that way is the machine's default
+    /// one, which may be none at all, or too old for a manifest its own toolchain reads. So when
+    /// that fails cargo is asked inside the folder, as a build of the moveset runs it.
     fn ask(dir: &Path) -> Option<Self> {
         #[cfg(test)]
         tests::ASKED.lock().unwrap().push(dir.to_path_buf());
+        Self::ask_from(dir, false).or_else(|| Self::ask_from(dir, true))
+    }
+
+    /// Ask cargo inside the moveset's folder and wait for it: what a build there will do, with
+    /// its own toolchain and its `.cargo/config.toml`, which can move the build's output. For
+    /// a build the user asked for; `None` when cargo cannot say.
+    pub fn ask_as_a_build_does(dir: &Path) -> Option<Self> {
+        Self::ask_from(dir, true)
+    }
+
+    fn ask_from(dir: &Path, inside: bool) -> Option<Self> {
         let manifest = dir
             .ancestors()
             .map(|dir| dir.join("Cargo.toml"))
             .find(|manifest| manifest.is_file())?;
+        let folder = if inside {
+            manifest.parent()?
+        } else {
+            dir.ancestors().last()?
+        };
         let mut cargo = std::process::Command::new("cargo");
         cargo
             .args([
@@ -158,8 +189,8 @@ impl CargoProject {
                 "1",
             ])
             .arg("--manifest-path")
-            .arg(manifest)
-            .current_dir(dir.ancestors().last()?)
+            .arg(&manifest)
+            .current_dir(folder)
             .env("RUSTUP_AUTO_INSTALL", "0");
         Self::from_metadata(&output_within(cargo, TIMEOUT)?)
     }
@@ -169,19 +200,24 @@ impl CargoProject {
         #[derive(Deserialize)]
         struct Metadata {
             workspace_root: PathBuf,
+            target_directory: PathBuf,
             #[serde(default)]
             packages: Vec<Package>,
         }
         #[derive(Deserialize)]
         struct Package {
+            name: String,
             manifest_path: PathBuf,
             #[serde(default)]
             targets: Vec<Target>,
         }
         #[derive(Deserialize)]
         struct Target {
+            name: String,
             #[serde(default)]
             kind: Vec<String>,
+            #[serde(default)]
+            crate_types: Vec<String>,
             src_path: PathBuf,
         }
         let meta: Metadata = serde_json::from_slice(json).ok()?;
@@ -202,14 +238,22 @@ impl CargoProject {
                     })
                     .map(|target| target.src_path.clone())
                     .collect();
+                let cdylib = package
+                    .targets
+                    .iter()
+                    .find(|target| target.crate_types.iter().any(|kind| kind == "cdylib"))
+                    .map(|target| target.name.replace('-', "_"));
                 CargoPackage {
+                    name: package.name,
                     manifest: package.manifest_path,
                     crate_roots,
+                    cdylib,
                 }
             })
             .collect();
         Some(Self {
             workspace_root: meta.workspace_root,
+            target_dir: meta.target_directory,
             packages,
         })
     }
@@ -219,6 +263,45 @@ impl CargoProject {
         self.packages
             .iter()
             .flat_map(|package| package.crate_roots.iter())
+    }
+
+    /// The plugin package: the workspace's only `cdylib`, or, when there are several, the one
+    /// most of `files` belong to. `None` when no package builds a `cdylib`, or the tie between
+    /// several cannot be broken.
+    pub fn plugin_for(&self, files: &[PathBuf]) -> Option<&CargoPackage> {
+        let plugins: Vec<&CargoPackage> = self
+            .packages
+            .iter()
+            .filter(|p| p.cdylib.is_some())
+            .collect();
+        if plugins.len() <= 1 {
+            return plugins.first().copied();
+        }
+        let mut counts: Vec<(usize, &CargoPackage)> = plugins
+            .iter()
+            .map(|package| {
+                (
+                    files
+                        .iter()
+                        .filter(|file| file.starts_with(package.dir()))
+                        .count(),
+                    *package,
+                )
+            })
+            .collect();
+        counts.sort_by(|a, b| b.0.cmp(&a.0));
+        (counts[0].0 > 0 && counts[0].0 > counts[1].0).then_some(counts[0].1)
+    }
+
+    /// Where `cargo skyline build` with `profile` writes `package`'s plugin.
+    pub fn built_plugin(&self, package: &CargoPackage, profile: &str) -> Option<PathBuf> {
+        let folder = if profile == "dev" { "debug" } else { profile };
+        Some(
+            self.target_dir
+                .join("aarch64-skyline-switch")
+                .join(folder)
+                .join(format!("lib{}.nro", package.cdylib.as_ref()?)),
+        )
     }
 }
 
@@ -429,7 +512,7 @@ pub(crate) mod tests {
     }"#;
 
     #[test]
-    fn metadata_gives_crate_roots() {
+    fn metadata_gives_crate_roots_and_the_plugin() {
         let project = CargoProject::from_metadata(WORKSPACE.as_bytes()).unwrap();
         let roots: Vec<_> = project.crate_roots().cloned().collect();
         assert_eq!(
@@ -439,6 +522,28 @@ pub(crate) mod tests {
                 PathBuf::from("/ws/crates/helper/src/lib.rs")
             ]
         );
+        let plugin = project.plugin_for(&[]).unwrap();
+        assert_eq!(plugin.name, "my-mod");
+        assert_eq!(plugin.dir(), Path::new("/ws/plugin"));
+        assert_eq!(
+            project.built_plugin(plugin, "release").unwrap(),
+            Path::new("/ws/target/aarch64-skyline-switch/release/libmy_mod.nro")
+        );
+    }
+
+    #[test]
+    fn several_plugins_are_told_apart_by_the_linked_files() {
+        let mut project = CargoProject::from_metadata(WORKSPACE.as_bytes()).unwrap();
+        let mut second = project.packages[0].clone();
+        second.name = "other".into();
+        second.manifest = PathBuf::from("/ws/other/Cargo.toml");
+        project.packages.push(second);
+        assert!(project.plugin_for(&[]).is_none(), "no evidence, no guess");
+        let files = [
+            PathBuf::from("/ws/other/src/lib.rs"),
+            PathBuf::from("/ws/other/src/acmd.rs"),
+        ];
+        assert_eq!(project.plugin_for(&files).unwrap().name, "other");
     }
 
     #[test]
@@ -458,11 +563,16 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::fs::write(root.join("code/mod/src/entry.rs"), "").unwrap();
-        let project = CargoProject::discover(&root.join("code/mod/src")).expect("cargo metadata");
-        let roots: Vec<_> = project.crate_roots().collect();
+        let Some(project) = CargoProject::discover(&root.join("code/mod/src")) else {
+            eprintln!("cargo unavailable; skipping");
+            return;
+        };
+        let plugin = project.plugin_for(&[]).unwrap();
+        assert_eq!(plugin.cdylib.as_deref(), Some("deep_mod"));
         assert!(
-            matches!(roots[..], [root] if root.ends_with("code/mod/src/entry.rs")),
-            "{roots:?}"
+            plugin.crate_roots[0].ends_with("entry.rs"),
+            "{:?}",
+            plugin.crate_roots
         );
     }
 }
