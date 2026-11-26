@@ -365,7 +365,7 @@ The toolbar in the viewport's top-left corner holds the display options:
 
 ### Motion List
 
-**File → Motion list** (ported from SSBH Editor) edits every field of the
+**Tools → Motion list** (ported from SSBH Editor) edits every field of the
 selected fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game
 and other scripts, up to three animations picked from the folder's `.nuanmb`
 files, flags, blend frames, cancel frames and intangibility frames. Motions can
