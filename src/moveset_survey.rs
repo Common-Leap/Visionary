@@ -187,7 +187,7 @@ fn moveset_survey() {
         }
     }
     let mut sorted: Vec<_> = raw_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1 .0));
     println!("\n== untyped lines by leading call ==");
     for (key, (count, samples)) in sorted.iter().take(150) {
         println!("{count:6}  {key}");

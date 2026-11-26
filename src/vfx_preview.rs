@@ -700,7 +700,7 @@ impl VfxPreview {
                     let Some(state) = render_state(emitter) else {
                         continue;
                     };
-                    let start = emitter.data.emission.start.max(0) as usize;
+                    let start = emitter.data.emission.start as usize;
                     let tint = [
                         draw.colour[0] * draw.particle_colour[0],
                         draw.colour[1] * draw.particle_colour[1],
@@ -1492,7 +1492,9 @@ pub(crate) fn build_stripe_vertices(
     } else {
         1.0
     };
-    let mut edges: Vec<([f32; 3], [f32; 3], f32, [f32; 4])> = Vec::with_capacity(m);
+    // The two sides of the ribbon at one sample, how far along it is, and its colour.
+    type Edge = ([f32; 3], [f32; 3], f32, [f32; 4]);
+    let mut edges: Vec<Edge> = Vec::with_capacity(m);
     for (i, &(pos, scale)) in samples.iter().enumerate() {
         let tangent = if i == 0 {
             samples[1].0 - pos

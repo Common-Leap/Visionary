@@ -474,7 +474,7 @@ mod tests {
             }
             walk(Path::new(&src), &mut sources);
         }
-        let mut names = moveset_names(&sources, &[romfs.clone()]);
+        let mut names = moveset_names(&sources, std::slice::from_ref(&romfs));
         let labels =
             std::fs::read_to_string(dirs::cache_dir().unwrap().join("visionary/ParamLabels.csv"))
                 .map(|csv| crate::param_labels::parse_csv(&csv))

@@ -10536,7 +10536,7 @@ impl VisionaryApp {
     fn moveset_build_running(&self) -> bool {
         self.moveset_build
             .as_ref()
-            .is_some_and(|state| state.lock().map_or(false, |step| step.is_none()))
+            .is_some_and(|state| state.lock().is_ok_and(|step| step.is_none()))
     }
 
     /// Start a build: first find, on a worker, what would be built and where copies of it are.

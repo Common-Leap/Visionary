@@ -289,7 +289,7 @@ impl CargoProject {
                 )
             })
             .collect();
-        counts.sort_by(|a, b| b.0.cmp(&a.0));
+        counts.sort_by_key(|count| std::cmp::Reverse(count.0));
         (counts[0].0 > 0 && counts[0].0 > counts[1].0).then_some(counts[0].1)
     }
 

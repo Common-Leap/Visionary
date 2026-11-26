@@ -426,7 +426,7 @@ fn fingerprinted_plugin(sd: &Path, crate_dir: &Path, files: &[PathBuf]) -> Optio
             scored.push((score, plugin));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|score| std::cmp::Reverse(score.0));
     match scored.as_slice() {
         [(best, path)] if *best >= 3 => Some(path.clone()),
         [(best, path), (second, _), ..] if *best >= 3 && *best >= second * 2 => Some(path.clone()),
