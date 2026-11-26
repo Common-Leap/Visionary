@@ -271,7 +271,7 @@ mod tests {
                     let response = ui.allocate_rect(screen, egui::Sense::click_and_drag());
                     let input = ui.input(|input| input.clone());
                     let controls = Controls {
-                        scheme: NavigationScheme::default(),
+                        scheme: NavigationScheme::Visionary,
                         emulate_three_button_mouse: false,
                     };
                     navigate(camera, &response, &input, controls, 600.0, &mut nav, true);
@@ -320,7 +320,7 @@ mod tests {
         camera.orbit(0.0, -10.0);
         assert!((camera.rotation.x - (std::f32::consts::FRAC_PI_2 - 0.1)).abs() < 1e-5);
         // A scroll step moved a twentieth of a tenth of the distance.
-        assert!((scroll_speed(NavigationScheme::default()) - 0.05 * 0.1).abs() < 1e-8);
+        assert!((scroll_speed(NavigationScheme::Visionary) - 0.05 * 0.1).abs() < 1e-8);
     }
 
     /// Camera keys act only over the viewport and never while a text field has the keyboard.

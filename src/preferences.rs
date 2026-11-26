@@ -14,9 +14,9 @@ const FLOOR_LINEAR: [f32; 3] = [0.028, 0.028, 0.055];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NavigationScheme {
     /// Left drag pans; right or middle drag turns around the fighter, short of straight down.
-    #[default]
     Visionary,
     /// Left drag orbits; right or middle drag pans.
+    #[default]
     Ssbh,
     /// Middle drag orbits, Shift + middle pans and Ctrl + middle zooms.
     Blender,
@@ -26,10 +26,10 @@ pub enum NavigationScheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NavigationWidget {
     /// Coloured axis balls, like Blender's navigation gizmo.
+    #[default]
     Axes,
     /// A labelled cube with turn arrows.
     Cube,
-    #[default]
     Hidden,
 }
 
@@ -139,16 +139,17 @@ mod tests {
         assert!(!preferences.floor_grid);
         // Fields newer than the file take their defaults too.
         assert!(preferences.bloom);
-        assert_eq!(preferences.navigation_scheme, NavigationScheme::Visionary);
+        assert_eq!(preferences.navigation_scheme, NavigationScheme::Ssbh);
         assert_eq!(
             preferences.home_camera(),
             crate::renderer::CameraView::default()
         );
     }
 
-    /// With no preferences file the view looks and moves as it did before there was one.
+    /// With no preferences file the view looks as it did before there was one, and moves the
+    /// way SSBH Studio's does, with the direction widget showing.
     #[test]
-    fn the_defaults_are_the_view_as_it_was() {
+    fn the_defaults_are_the_look_as_it_was_and_ssbh_controls() {
         let preferences = Preferences::default();
         assert!(preferences.bloom);
         assert!(!preferences.floor_grid && !preferences.world_axes);
@@ -156,8 +157,8 @@ mod tests {
             preferences.viewport_colors(),
             ([0.05, 0.05, 0.1], [0.028, 0.028, 0.055])
         );
-        assert_eq!(preferences.navigation_scheme, NavigationScheme::Visionary);
-        assert_eq!(preferences.navigation_widget, NavigationWidget::Hidden);
+        assert_eq!(preferences.navigation_scheme, NavigationScheme::Ssbh);
+        assert_eq!(preferences.navigation_widget, NavigationWidget::Axes);
     }
 
     #[test]

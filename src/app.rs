@@ -20878,7 +20878,7 @@ impl VisionaryApp {
     }
 
     /// The viewport toolbar: what the open move or costume adds to the view, and the way back
-    /// to the default view once the camera has moved. Not drawn with nothing to show.
+    /// to the default view, greyed until the camera has moved.
     fn draw_viewport_toolbar(
         &mut self,
         ui: &mut Ui,
@@ -20905,11 +20905,6 @@ impl VisionaryApp {
         .filter_map(|(name, scale)| Some((name, scale, scale.set_by.as_ref()?)))
         .collect();
         let throw = self.selected_move_is_throw();
-        if !camera_moved && scaled.is_empty() && !throw && self.viewport_file_sources.is_empty() {
-            self.viewport_toolbar_rect = None;
-            self.viewport_overlays.toolbar = None;
-            return;
-        }
         let area = egui::Rect::from_min_max(
             at,
             viewport.max - egui::Vec2::splat(crate::viewport_overlays::MARGIN),
@@ -20960,18 +20955,20 @@ impl VisionaryApp {
                         )
                         .on_hover_text(source.detail.as_str());
                     }
-                    // Last, so the rest of the row stays put when the camera moves.
-                    if camera_moved {
-                        separate(ui);
-                        let reset = ui.button("⟲").on_hover_text(format!(
-                            "Reset view\n\n{}.\n1, 3 and 7 look from the front, right and top. \
-                             Home frames the fighter and Period the selected hitbox.",
-                            navigation_hint(&self.preferences)
-                        ));
-                        if reset.clicked() {
-                            reset_viewport_camera(frame, &home);
-                            ui.ctx().request_repaint();
-                        }
+                    // Always there, last: greyed until the camera has moved.
+                    separate(ui);
+                    let hover = format!(
+                        "Reset view\n\n{}.\n1, 3 and 7 look from the front, right and top. \
+                         Home frames the fighter and Period the selected hitbox.",
+                        navigation_hint(&self.preferences)
+                    );
+                    let reset = ui
+                        .add_enabled(camera_moved, egui::Button::new("⟲"))
+                        .on_hover_text(hover.as_str())
+                        .on_disabled_hover_text(hover.as_str());
+                    if reset.clicked() {
+                        reset_viewport_camera(frame, &home);
+                        ui.ctx().request_repaint();
                     }
                 });
             });
