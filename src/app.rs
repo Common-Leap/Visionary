@@ -4618,7 +4618,10 @@ fn trail_edge_point(
 }
 
 /// Outline the selected trail in the viewport: the swept edges over the visible stretch of
-/// swing, or, outside its window, where its edges are now, as a dashed segment.
+/// swing, or, outside its window, where its edges are now, as a dashed segment. A trail the
+/// preview has no picture for (`plain`: its textures were not found, or its call could not be
+/// read) is painted as a flat ribbon fading toward the tail, with the blade at its head, so it
+/// still shows; one that is drawn with its own texture is not painted over.
 ///
 /// Returns the screen distance from `click_pos` to the head segment when the click is close
 /// enough to pick the trail.
@@ -4632,12 +4635,17 @@ fn draw_trail_preview(
     geometry: &crate::trail_preview::TrailGeometry,
     frame_num: u32,
     selected: bool,
+    plain: bool,
     click_pos: Option<egui::Pos2>,
 ) -> Option<f32> {
-    if !selected && click_pos.is_none() {
+    if !selected && !plain && click_pos.is_none() {
         return None;
     }
-    let color = egui::Color32::from_rgb(255, 205, 120);
+    let color = if selected || !plain {
+        egui::Color32::from_rgb(255, 205, 120)
+    } else {
+        egui::Color32::from_rgb(240, 160, 60)
+    };
     let edges_in = |matrices: &std::collections::HashMap<String, glam::Mat4>| {
         let a = trail_edge_point(matrices, &geometry.bone1, geometry.offset1)?;
         let b = trail_edge_point(matrices, &geometry.bone2, geometry.offset2)?;
@@ -4658,19 +4666,54 @@ fn draw_trail_preview(
         frame_num as f32,
     );
     let (a, b) = match span {
-        Some((tail, head)) if selected => {
+        Some((tail, head)) if selected || plain => {
             let edges: Vec<_> = crate::trail_preview::sample_frames(tail, head)
                 .into_iter()
                 .map(edges_at)
                 .collect();
-            let swept: Vec<_> = edges.iter().copied().flatten().collect();
-            let outline = (swept.iter().map(|edge| edge.0))
-                .chain(swept.iter().rev().map(|edge| edge.1))
-                .collect();
-            painter.add(egui::Shape::closed_line(
-                outline,
-                egui::Stroke::new(2.5, color),
-            ));
+            if plain {
+                let mut mesh = egui::Mesh::default();
+                let last = edges.len().saturating_sub(1).max(1) as f32;
+                let peak = if selected { 150.0 } else { 110.0 };
+                for (k, pair) in edges.windows(2).enumerate() {
+                    let (Some((a0, b0)), Some((a1, b1))) = (pair[0], pair[1]) else {
+                        continue;
+                    };
+                    let tint = |at: usize| {
+                        let alpha = (peak * at as f32 / last) as u8;
+                        egui::Color32::from_rgba_unmultiplied(
+                            color.r(),
+                            color.g(),
+                            color.b(),
+                            alpha,
+                        )
+                    };
+                    let base = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(a0, tint(k));
+                    mesh.colored_vertex(b0, tint(k));
+                    mesh.colored_vertex(a1, tint(k + 1));
+                    mesh.colored_vertex(b1, tint(k + 1));
+                    mesh.add_triangle(base, base + 1, base + 2);
+                    mesh.add_triangle(base + 1, base + 3, base + 2);
+                }
+                if !mesh.is_empty() {
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+                if let Some((a, b)) = edges.last().copied().flatten() {
+                    let width = if selected { 2.5 } else { 1.5 };
+                    painter.line_segment([a, b], egui::Stroke::new(width, color));
+                }
+            }
+            if selected {
+                let swept: Vec<_> = edges.iter().copied().flatten().collect();
+                let outline = (swept.iter().map(|edge| edge.0))
+                    .chain(swept.iter().rev().map(|edge| edge.1))
+                    .collect();
+                painter.add(egui::Shape::closed_line(
+                    outline,
+                    egui::Stroke::new(2.5, color),
+                ));
+            }
             edges.last().copied().flatten()?
         }
         Some((_, head)) => edges_at(head)?,
@@ -4686,7 +4729,7 @@ fn draw_trail_preview(
         }
         None => return None,
     };
-    if selected {
+    if selected || (plain && span.is_some()) {
         painter.text(
             b + egui::vec2(4.0, 0.0),
             egui::Align2::LEFT_CENTER,
@@ -13400,17 +13443,7 @@ impl VisionaryApp {
         if calls.is_empty() {
             return Vec::new();
         }
-        let selected_fighter = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i));
-        let slot = selected_fighter
-            .map(|fighter| self.active_article_slot(fighter))
-            .or_else(|| {
-                self.current_eff_path
-                    .as_deref()
-                    .and_then(crate::preview_trail::slot_from_eff_path)
-            });
+        let slot = self.trail_slot();
         let Some(wgpu_state) = frame.wgpu_render_state() else {
             return Vec::new();
         };
@@ -13471,6 +13504,32 @@ impl VisionaryApp {
             });
         }
         out
+    }
+
+    /// The costume the open row's trail textures are looked up for.
+    fn trail_slot(&self) -> Option<u8> {
+        self.state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|fighter| self.active_article_slot(fighter))
+            .or_else(|| {
+                self.current_eff_path
+                    .as_deref()
+                    .and_then(crate::preview_trail::slot_from_eff_path)
+            })
+    }
+
+    /// Whether [`Self::preview_trails`] draws `call`'s trail with its own textures: its call
+    /// reads and both textures were found.
+    fn trail_has_picture(&self, call: &crate::data::EffectCall) -> bool {
+        let slot = self.trail_slot();
+        call.raw_line
+            .as_deref()
+            .and_then(crate::preview_trail::parse)
+            .is_some_and(|spec| {
+                self.trail_texture(slot, &spec.texture).is_some()
+                    && self.trail_texture(slot, &spec.fade).is_some()
+            })
     }
 
     /// Where the open row's trail texture `name` is, looked up on disk once while [`ViewFiles`],
@@ -15717,6 +15776,7 @@ impl VisionaryApp {
                                     &geometry,
                                     frame_num,
                                     self.state.selected_effect_call == Some(i),
+                                    !self.trail_has_picture(ec),
                                     click_pos,
                                 );
                                 self.perf.end("trail_preview", t);
