@@ -401,10 +401,12 @@ pub fn workspace_moveset(dir: &Path) -> Option<PathBuf> {
         .map(|_| dir.to_path_buf())
 }
 
-/// The moveset a just-read project uses: the one it records (`stored`, resolved), else the one
-/// its page kept in `parts.json` before projects recorded one, else the crate the project is kept
-/// in, else, for a project from before projects kept a link (`keeps_scope`), this machine's: its
-/// scripts must not turn vanilla because the link now belongs to the project.
+/// The moveset a just-read project uses: the one it records (`stored`, resolved) when that
+/// folder is there, else the one its page kept in `parts.json`, else the crate the project is
+/// kept in, else, for a project from before projects kept a link (`keeps_scope`), this machine's:
+/// its scripts must not turn vanilla because the link now belongs to the project. A recorded
+/// folder that is gone is the answer only when none of the others is: it is kept, so the next
+/// save does not unlink it, and shown as the folder that could not be opened.
 pub fn moveset_of_project(
     stored: Option<PathBuf>,
     dir: Option<&Path>,
@@ -412,15 +414,22 @@ pub fn moveset_of_project(
     keeps_scope: bool,
     global: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    stored
-        .or_else(|| {
-            let dir = dir.filter(|_| version < 10)?;
+    if stored.as_ref().is_some_and(|folder| folder.is_dir()) {
+        return stored;
+    }
+    // The page's own link: all a project had before version 10, and the one that is right when
+    // the recorded folder has moved since.
+    let page = dir
+        .filter(|_| version < 10 || stored.is_some())
+        .and_then(|dir| {
             crate::project_parts::ProjectParts::load(dir)
                 .link("", crate::project_parts::Part::Moves, 0)
                 .map(|folder| crate::project_parts::project_absolute(dir, folder))
-        })
-        .or_else(|| dir.and_then(workspace_moveset))
+                .filter(|folder| stored.is_none() || folder.is_dir())
+        });
+    page.or_else(|| dir.and_then(workspace_moveset))
         .or_else(|| (!keeps_scope).then(global).flatten())
+        .or(stored)
 }
 
 /// Re-open a loaded project's moveset link with `build`. Returns the path to keep, the index
@@ -473,6 +482,19 @@ mod tests {
         assert_eq!(of(None, 8, false), Some(page));
         assert_eq!(of(None, 10, true), None);
         assert_eq!(of(Some("/mine"), 8, true), Some(PathBuf::from("/mine")));
+        // A recorded folder that is still there wins over the page's.
+        let mine = dir.join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        let recorded = mine.to_str().unwrap();
+        assert_eq!(of(Some(recorded), 10, true), Some(mine));
+        // One that is gone gives way to the page's folder when that is there, at any version,
+        // and is kept when nothing else is, so the next save does not unlink it.
+        assert_eq!(of(Some("/gone"), 10, true), Some(PathBuf::from("/gone")));
+        std::fs::create_dir_all(dir.join("elsewhere").join("page")).unwrap();
+        assert_eq!(
+            of(Some("/gone"), 10, true),
+            Some(dir.join("elsewhere").join("page"))
+        );
     }
     use crate::data::FighterSource;
     use std::path::PathBuf;

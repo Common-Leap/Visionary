@@ -5858,6 +5858,9 @@ pub struct VisionaryApp {
     project_moveset: Option<PathBuf>,
     /// A folder to link once cargo has said what it compiles; nothing in it was found without.
     link_after_cargo: Option<PathBuf>,
+    /// The open project's own folder, a crate cargo had not described yet when the project was
+    /// read with no link: looked at again as the project's moveset once cargo answers.
+    project_crate_after_cargo: Option<PathBuf>,
     /// Costume slots the open project's `romfs/` has files for, by lowercased fighter name.
     /// Recomputed in `reindex_fighters`.
     project_romfs_slots: BTreeMap<String, BTreeSet<u8>>,
@@ -6441,6 +6444,7 @@ impl VisionaryApp {
             project_fighters: BTreeSet::new(),
             project_moveset: None,
             link_after_cargo: None,
+            project_crate_after_cargo: None,
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
             article_catalog: None,
@@ -9340,6 +9344,17 @@ impl VisionaryApp {
         if let Some(root) = self.link_after_cargo.take() {
             self.link_acmd_source(root);
             return;
+        }
+        if let Some(dir) = self.project_crate_after_cargo.take() {
+            let still_open = self.project_workspace().as_deref() == Some(dir.as_path());
+            if still_open
+                && self.project_moveset.is_none()
+                && self.acmd_src.is_none()
+                && crate::project_scope::workspace_moveset(&dir).is_some()
+            {
+                self.link_acmd_source(dir);
+                return;
+            }
         }
         let files = self.acmd_src.as_ref().map(|index| index.files.clone());
         if !self.refresh_linked_acmd_source_index()
@@ -27698,6 +27713,7 @@ impl VisionaryApp {
         self.authored_characters.clear();
         self.project_moveset = None;
         self.link_after_cargo = None;
+        self.project_crate_after_cargo = None;
         self.acmd_src = None;
         self.acmd_src_problem = None;
         self.acmd_src_buffer = None;
@@ -29615,6 +29631,13 @@ impl VisionaryApp {
             crate::project_scope::moveset_on_load(stored, crate::acmd_src::SourceIndex::build);
         self.project_moveset = moveset;
         self.link_after_cargo = None;
+        // A project kept in its moveset's crate is about that crate. Read before cargo has said
+        // how the crate is laid out, its scripts may not have been found: ask again then.
+        self.project_crate_after_cargo = path.parent().map(Path::to_path_buf).filter(|dir| {
+            self.project_moveset.is_none()
+                && dir.join("Cargo.toml").is_file()
+                && crate::cargo_project::is_pending(dir)
+        });
         self.acmd_src = index;
         self.acmd_src_problem = problem;
         self.acmd_src_buffer = None;
