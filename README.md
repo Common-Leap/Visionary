@@ -22,7 +22,9 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 ## Prerequisites
 
 - Rust, through rustup: `rust-toolchain.toml` picks the version (1.97.1)
-- The `cargo-skyline` toolchain for building the in-game plugin
+- The `cargo-skyline` toolchain for building the in-game plugin, and for
+  **Build & Deploy** of a linked moveset (see [Building and deploying your
+  plugin](#building-and-deploying-your-plugin))
 
 Cargo downloads `ssbh_wgpu`, `eff_wgpu`, `effect_library`, and the other Rust
 dependencies automatically during the build.
@@ -359,8 +361,29 @@ The toolbar in the viewport's top-left corner holds the display options:
   first, then a `config.json` share (`share-to-vanilla` or `share-to-added`),
   then the game's file at that path from the vanilla dump. Hover a note to see
   each borrowed file and its source. The move list's animations and motion list
-  are read the same way; when a folder has both `motion_list.yml` and
-  `motion_list.bin`, whichever was written last is read.
+  are read the same way.
+
+### Motion List
+
+**File → Motion list** (ported from SSBH Editor) edits every field of the
+selected fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game
+and other scripts, up to three animations picked from the folder's `.nuanmb`
+files, flags, blend frames, cancel frames and intangibility frames. Motions can
+be added, duplicated, deleted and renamed, and the list saved in either format.
+A list with unsaved edits stays open until you save or discard it, and closing
+Visionary asks first. When a folder has both files, the move list reads
+whichever was written last.
+
+**Save** only ever writes a file of yours. A list in the open project's
+`romfs/` or the linked moveset's `romfs/` is saved in place, unless something
+else changed it on disk since it was opened. A list that is the game's own, or
+an installed mod's, is saved as a new file in the open project's `romfs/` under
+the same game path, where **Export mod** picks it up; the window shows where
+that is before you save. With no project open, use **Save As**. The game dump
+is never written. Saving a `motion_list.yml` rewrites it without its comments,
+and asks before it does. The game reads a motion list when the fighter loads,
+so a saved change shows in game once the mod is installed and the match is
+started again.
 
 ### Fighter list
 
@@ -476,8 +499,9 @@ Real movesets are written in many styles, and Visionary reads them as written.
 The link header shows how many scripts and fighters it found.
 
 - **Cargo decides the crates.** `cargo metadata` says which crates the linked
-  workspace builds and where each crate's root is. When cargo can't be asked,
-  Visionary falls back to looking for crate folders itself.
+  workspace builds, where each crate's root is and where its plugin is built
+  to. When cargo can't be asked, Visionary falls back to looking for crate
+  folders itself.
 - **Only compiled code counts.** Files are followed through the crate's `mod`
   tree from `src/lib.rs` or `src/main.rs`, so a `srcOLD/` backup, an extracted
   release copy, or a vanilla reference dump beside the crate is never mistaken
@@ -585,6 +609,42 @@ cannot be exported under the macro your script used, it says which one and why.
 The generated pane does not need a linked project, and works for any move the
 editor has loaded — including one captured live from the game, which has no
 script file anywhere. That case is the reason it is worth having.
+
+### Building and deploying your plugin
+
+**Build & Deploy** in the link header runs `cargo skyline build --release` on
+the crate the linked source belongs to and copies the resulting
+`lib<name>.nro` to the places you have chosen for that moveset.
+
+The first time, and whenever it finds a place it has not asked about, it lists
+what it found on the emulator SD the game wrote to most recently and asks which
+of them get the plugin on every build:
+
+- copies with the same file name under `ultimate/mods/`, the Skyline plugins
+  folder, or the emulator's LayeredFS `load/` folder;
+- a mod that ships the plugin renamed to `plugin.nro`, recognised by the
+  crate's own source paths compiled into it. This one is a guess, so it starts
+  unticked: two movesets made from one template look alike, and files every
+  template has (`src/lib.rs`, a `mod.rs`) are not counted;
+- smashline's `development.nro`, when the plugin exports smashline's
+  `smashline_install` entry point. Press **L + R + D-pad Up** in the game's
+  menus to reload it without restarting. Any other copy is loaded when the
+  game starts.
+
+Nothing is replaced that you have not said yes to. Your answers are remembered
+per linked project. **Deploy to** lists the chosen places, removes one, and
+adds a mod folder Build & Deploy cannot find on its own.
+
+The build runs in the background and reports on the status line, including the
+first compiler error and its location when it fails. The file a build replaces
+is kept, one copy per place, in Visionary's own data folder under
+`moveset-build/replaced/`, and the full cargo output is written to
+`moveset-build/<plugin name>.log` there. Nothing is left beside the plugin,
+where Skyline would load it as a second plugin, or in your repository.
+
+This builds *your moveset's* plugin. Visionary's own in-game plugin is built
+separately (see [In-game plugin](#in-game-plugin)), and edits to Visionary do
+not require rebuilding it unless the plugin's sources changed.
 
 ### Checking the generated code
 
@@ -1128,3 +1188,18 @@ emulator SD directory. Save your work before testing it in-game.
 Preview snapshots are immutable and old generations are reclaimed after the
 plugin acknowledges retirement. Staging stops if its SD cache reaches the safety
 limit; stop the game before manually clearing that cache.
+
+## Additional tools
+
+`src/moveset_survey.rs` is an ignored test that runs the source indexer and
+parsers over a folder of moveset projects and reports, per project, the
+fighters and scripts found, conflicts, and the most common lines left untyped.
+Use it to check a change against real projects:
+
+```bash
+VISIONARY_MOVESETS="/path/to/Movesets" cargo test --bin visionary moveset_survey -- --ignored --nocapture
+```
+
+`VISIONARY_SURVEY_ONLY=<folder name>` limits it to one project, and
+`VISIONARY_SURVEY_PLAN=1` also prints the Build & Deploy plan each project would
+use (without building or copying anything).

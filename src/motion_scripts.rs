@@ -438,6 +438,106 @@ mod tests {
         assert!(!register_if_unguessable("attack_air_n", "attackairn"));
     }
 
+    /// Against a real moveset: every motion in its list should get a name, and the custom ones
+    /// their real scripts. `VISIONARY_MOD_ROMFS` = the mod's romfs, `VISIONARY_MOD_FIGHTER` =
+    /// `pacman/c40`-style fighter + slot, optional `VISIONARY_MOD_SRC` = its Rust source root.
+    #[test]
+    fn a_real_moveset_names_its_custom_motions() {
+        let (Some(romfs), Some(fighter)) = (
+            std::env::var_os("VISIONARY_MOD_ROMFS").map(PathBuf::from),
+            std::env::var("VISIONARY_MOD_FIGHTER").ok(),
+        ) else {
+            eprintln!("skipped: set VISIONARY_MOD_ROMFS and VISIONARY_MOD_FIGHTER");
+            return;
+        };
+        let (name, slot) = fighter.split_once('/').expect("fighter/slot");
+        let list = motion_lib::open(
+            romfs
+                .join("fighter")
+                .join(name)
+                .join("motion/body")
+                .join(slot)
+                .join("motion_list.bin"),
+        )
+        .expect("motion list");
+        let mut sources = Vec::new();
+        if let Some(src) = std::env::var_os("VISIONARY_MOD_SRC") {
+            fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if path.extension().is_some_and(|e| e == "rs") {
+                        out.push(path);
+                    }
+                }
+            }
+            walk(Path::new(&src), &mut sources);
+        }
+        let mut names = moveset_names(&sources, &[romfs.clone()]);
+        let labels =
+            std::fs::read_to_string(dirs::cache_dir().unwrap().join("visionary/ParamLabels.csv"))
+                .map(|csv| crate::param_labels::parse_csv(&csv))
+                .unwrap_or_default();
+        names.extend(labels);
+        // Animation file names on disk, as the app's own index supplies them.
+        let mut motion_dirs = vec![romfs
+            .join("fighter")
+            .join(name)
+            .join("motion/body")
+            .join(slot)];
+        if let Some(vanilla) = std::env::var_os("VISIONARY_VANILLA_ROOT").map(PathBuf::from) {
+            motion_dirs.push(vanilla.join("fighter").join(name).join("motion/body/c00"));
+        }
+        for dir in &motion_dirs {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let file = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                names.entry(hash40(&file)).or_insert(file);
+            }
+        }
+        if let Ok(yml) = std::fs::read_to_string(motion_dirs[0].join("motion_list.yml")) {
+            names.extend(names_from_motion_list_yml(&yml));
+        }
+        let (mut unnamed, mut registered, mut recovered) = (Vec::new(), Vec::new(), Vec::new());
+        for (hash, motion) in &list.list {
+            let hashes: Vec<u64> = std::iter::once(motion.game_script.0)
+                .chain(motion.scripts.iter().map(|s| s.0))
+                .collect();
+            let animations: Vec<u64> = motion.animations.iter().map(|a| a.name.0).collect();
+            let Some(motion_name) = motion_name(hash.0, &hashes, &animations, &names) else {
+                unnamed.push(format!("{:#x}", hash.0));
+                continue;
+            };
+            if !names.contains_key(&hash.0) {
+                recovered.push(motion_name.clone());
+            }
+            if let Some(suffix) = script_suffix(&motion_name, &hashes, &names) {
+                if register_if_unguessable(&motion_name, &suffix) {
+                    registered.push(format!("{motion_name} -> {suffix}"));
+                }
+            }
+        }
+        let exact = recovered
+            .iter()
+            .filter(|n| list.list.keys().any(|h| h.0 == hash40(n)))
+            .count();
+        eprintln!(
+            "{} motions; recovered {} ({exact} exact), e.g. {:?}; {} unnamed {:?}; registered {:?}",
+            list.list.len(),
+            recovered.len(),
+            &recovered[..recovered.len().min(12)],
+            unnamed.len(),
+            &unnamed[..unnamed.len().min(12)],
+            registered
+        );
+        if name == "pacman" {
+            assert_eq!(
+                registered_suffix("attack_s4_s_reverse").as_deref(),
+                Some("attacks4reverse")
+            );
+        }
+    }
+
     #[test]
     fn a_motion_list_yml_names_motions_and_scripts() {
         let yml = "motion_path: fighter/pacman/motion/body/c00\nlist:\n  attack_s4_s_reverse:\n    game_script: game_attacks4reverse\n    flags:\n      turn: true\n    blend_frames: 0\n    animations:\n      - name: c04attacks4sreverse.nuanmb\n        unk: 0\n    scripts:\n      - expression_attacks4reverse\n      - sound_attacks4reverse\n      - effect_attacks4reverse\n";
