@@ -254,7 +254,7 @@ pub fn list_files(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Split `<root>/fighter/...` into the root and the game path `fighter/...`.
-fn split_root(dir: &Path) -> Option<(PathBuf, String)> {
+pub(crate) fn split_root(dir: &Path) -> Option<(PathBuf, String)> {
     let parts: Vec<_> = dir.components().collect();
     let at = parts.iter().rposition(|part| {
         part.as_os_str()

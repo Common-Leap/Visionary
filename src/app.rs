@@ -5680,6 +5680,15 @@ pub struct VisionaryApp {
     /// Why the open move shows vanilla even though a moveset source is linked.
     acmd_source_note: Option<String>,
     show_acmd_src: bool,
+    /// The Motion List window, and the open list when it has been opened.
+    show_motion_list: bool,
+    motion_list_editor: Option<crate::motion_list_editor::MotionListEditor>,
+    /// `.nuanmb` names in the open list's costume folder, for its animation picker.
+    motion_list_anims: Vec<String>,
+    /// [`Self::motion_list_of`]: the costume folder, the re-index it was looked up at, its answer.
+    motion_list_found: Option<(PathBuf, u64, Result<Option<PathBuf>, String>)>,
+    /// The window may close over the open motion list's unsaved changes: its prompt said so.
+    motion_list_close_ok: bool,
     /// The script currently open in the source editor window.
     acmd_src_buffer: Option<SourceBuffer>,
     acmd_src_view: SourceView,
@@ -6304,6 +6313,11 @@ impl VisionaryApp {
             acmd_src_problem: None,
             acmd_source_note: None,
             show_acmd_src: false,
+            show_motion_list: false,
+            motion_list_editor: None,
+            motion_list_anims: Vec::new(),
+            motion_list_found: None,
+            motion_list_close_ok: false,
             acmd_src_buffer: None,
             acmd_src_view: SourceView::Source,
             eff_editor: crate::eff_editor::EffEditor::default(),
@@ -7684,8 +7698,8 @@ impl VisionaryApp {
         self.state.status = "Loading moves...".to_string();
 
         std::thread::spawn(move || {
-            // The binary or the YAML, whichever was written last, so an edit to the YAML shows
-            // before the next build converts it.
+            // The binary or the YAML, whichever was written last, so an edit made in the Motion
+            // List window (or by hand in the YAML) shows before the next build converts it.
             let Some(mlist) = crate::motion_list::load_current_in(&motion_dir) else {
                 return;
             };
@@ -10322,6 +10336,180 @@ impl VisionaryApp {
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
     /// that script in place, and push editor edits back into it.
+    /// The Motion List window. It follows the selected fighter's costume folder, unless the open
+    /// list has unsaved edits, which keep it open until they are saved or discarded.
+    fn draw_motion_list_window(&mut self, ctx: &egui::Context) {
+        let motion_dir = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|fighter| fighter.motion_dir.clone());
+        let wanted = motion_dir
+            .as_deref()
+            .map(|dir| self.motion_list_of(dir))
+            .unwrap_or(Ok(None));
+        let stale = match (&self.motion_list_editor, &wanted) {
+            (None, Ok(Some(_))) => true,
+            (Some(editor), Ok(Some(path))) => editor.file.path != *path && !editor.file.changed,
+            _ => false,
+        };
+        if stale {
+            if let (Ok(Some(path)), Some(dir)) = (&wanted, motion_dir.as_ref()) {
+                self.open_motion_list(path, dir);
+            }
+        }
+        let Some(editor) = self.motion_list_editor.as_mut() else {
+            let mut open = true;
+            egui::Window::new("Motion List")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(match (&self.motion_list_found, motion_dir) {
+                        (Some((_, _, Err(error))), Some(_)) => error.clone(),
+                        (_, Some(dir)) => {
+                            format!("No motion_list.yml or motion_list.bin in {}", dir.display())
+                        }
+                        (_, None) => "Select a fighter to edit its motion list.".to_string(),
+                    });
+                });
+            self.show_motion_list = open;
+            return;
+        };
+        let response = editor.show(ctx, &self.motion_list_anims);
+        self.show_motion_list = response.open;
+        if response.changed {
+            self.motion_list_close_ok = false;
+            self.apply_motion_list_to_moves();
+        }
+        if let Some(path) = &response.saved {
+            self.state.status = format!("Saved {}", path.display());
+            // A list first saved into the project is a new file of the fighter's: index it.
+            if motion_dir.as_deref() != path.parent() {
+                self.reindex_fighters();
+            }
+            self.motion_list_found = None;
+        }
+        if response.close_app {
+            self.motion_list_close_ok = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The motion list the Motion List window edits for a costume folder, looked up once per
+    /// folder and re-index rather than on every paint. `Err` is why the one there did not open.
+    fn motion_list_of(&mut self, dir: &Path) -> Result<Option<PathBuf>, String> {
+        match &self.motion_list_found {
+            Some((known, rev, found)) if known == dir && *rev == self.index_rev => found.clone(),
+            _ => {
+                let found = Ok(crate::motion_list::editable_in(dir));
+                self.motion_list_found = Some((dir.to_path_buf(), self.index_rev, found.clone()));
+                found
+            }
+        }
+    }
+
+    /// Where Save puts the motion list at `path`, the list of costume folder `dir`: over a file
+    /// of the linked moveset's or the project's own `romfs/`, else as a new file in the project's
+    /// `romfs/` under the same game path. The dump and the Mod Library are never written.
+    fn motion_list_save_place(&self, path: &Path, dir: &Path) -> crate::motion_list::SavePlace {
+        use crate::motion_list::SavePlace;
+        let real = crate::user_files::real_path(path);
+        let under = |roots: &[PathBuf]| {
+            roots
+                .iter()
+                .any(|root| real.starts_with(crate::user_files::real_path(root)))
+        };
+        if under(&self.acmd_romfs_roots())
+            && !under(&self.shared_roots())
+            && !crate::user_files::is_game_file(path)
+        {
+            return SavePlace::Here;
+        }
+        let copy = self.project_romfs().and_then(|romfs| {
+            let (_, game_dir) = crate::costume_files::split_root(dir)?;
+            let folder = game_dir
+                .split('/')
+                .fold(romfs, |folder, part| folder.join(part));
+            Some(folder.join(path.file_name()?))
+        });
+        copy.map_or(SavePlace::Nowhere, SavePlace::Copy)
+    }
+
+    fn open_motion_list(&mut self, path: &Path, dir: &Path) {
+        crate::motion_list::add_known_labels(self.state.labels.iter());
+        let place = self.motion_list_save_place(path, dir);
+        match crate::motion_list::MotionListFile::open(path, place) {
+            Ok(file) => {
+                let mut anims: Vec<String> = crate::costume_files::CostumeFolder::resolve(dir)
+                    .with_extension("nuanmb")
+                    .map(|(name, _)| name.to_string())
+                    .collect();
+                anims.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+                crate::motion_list::add_derived_labels(
+                    &file.mlist,
+                    anims.iter().map(String::as_str),
+                );
+                let mut editor = crate::motion_list_editor::MotionListEditor::new(file);
+                let selected = self
+                    .state
+                    .selected_move
+                    .as_ref()
+                    .map(|entry| crate::motion_list::Hash40(entry.hash))
+                    .filter(|hash| editor.file.mlist.list.contains_key(hash));
+                if let Some(hash) = selected {
+                    editor.select(hash);
+                }
+                self.motion_list_editor = Some(editor);
+                self.motion_list_anims = anims;
+            }
+            Err(error) => {
+                // Remembered, so a list that does not open is not read again on every paint.
+                let said = format!("Could not open {}: {error:#}", path.display());
+                self.motion_list_found =
+                    Some((dir.to_path_buf(), self.index_rev, Err(said.clone())));
+                self.state.status = said;
+            }
+        }
+    }
+
+    /// Carry the open list's cancel frames into the move list, so frame data follows an edit
+    /// at once. Only when the list is the selected fighter's own.
+    fn apply_motion_list_to_moves(&mut self) {
+        let Some(editor) = &self.motion_list_editor else {
+            return;
+        };
+        let current = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .is_some_and(|fighter| editor.file.path.parent() == Some(fighter.motion_dir.as_path()));
+        if !current {
+            return;
+        }
+        let cancel_of = |hash: u64| {
+            editor
+                .file
+                .mlist
+                .list
+                .get(&crate::motion_list::Hash40(hash))
+                .map(|motion| {
+                    motion
+                        .extra
+                        .as_ref()
+                        .map_or(0, |extra| u32::from(extra.cancel_frame))
+                })
+        };
+        for entry in &mut self.move_list {
+            if let Some(cancel) = cancel_of(entry.hash) {
+                entry.cancel_frame = cancel;
+            }
+        }
+        if let Some(entry) = self.state.selected_move.as_mut() {
+            if let Some(cancel) = cancel_of(entry.hash) {
+                entry.cancel_frame = cancel;
+            }
+        }
+    }
+
     fn draw_acmd_source_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_acmd_src;
         let saved = self.window_geometry.get("acmd_source").copied();
@@ -40895,6 +41083,18 @@ impl eframe::App for VisionaryApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
+        // A motion list with unsaved changes holds the close too, and asks in its own window.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.motion_list_close_ok {
+            if let Some(editor) = self
+                .motion_list_editor
+                .as_mut()
+                .filter(|editor| editor.file.changed)
+            {
+                editor.ask_before_close();
+                self.show_motion_list = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
         // Keep the game link alive whenever the app runs — live offsets, hitbox rules,
         // ACMD capture, the reconnect modal, and the Transplant pool all need it, not just
         // the Eff Editor window (which used to be the only thing that started it).
@@ -41147,6 +41347,10 @@ impl eframe::App for VisionaryApp {
             let t = self.perf.start();
             self.draw_acmd_source_window(&ctx);
             self.perf.end("acmd_source_window", t);
+        }
+
+        if self.show_motion_list {
+            self.draw_motion_list_window(&ctx);
         }
 
         if self.article_settings.is_some() {
@@ -41409,6 +41613,12 @@ impl eframe::App for VisionaryApp {
                         self.focus_transplant = true;
                         toggled = true;
                     }
+                    toggled |= ui
+                        .checkbox(&mut self.show_motion_list, "Motion list")
+                        .on_hover_text(
+                            "Edit the selected fighter's motion_list.yml or motion_list.bin: motion kinds, scripts, animations, flags, and cancel and intangibility frames",
+                        )
+                        .changed();
                     let has_log = !self.state.edit_log.is_empty()
                         || self.eff_mods.values().any(|eff| !eff.is_empty())
                         || self.roster.has_edits()

@@ -139,6 +139,48 @@ pub fn write(file: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     stage(file, contents.as_ref())?.commit()
 }
 
+/// Whether `file` is one of the game dump's own files, which nothing here may write.
+pub fn is_game_file(file: &Path) -> bool {
+    let dump = GAME_DUMP.read().ok().and_then(|dump| dump.clone());
+    dump.is_some_and(|dump| in_game_dump(&real_path_of_new(file), &dump))
+}
+
+/// [`real_path`] for a file that may not be there yet: its folder's links are followed.
+fn real_path_of_new(file: &Path) -> PathBuf {
+    if file.exists() {
+        return real_path(file);
+    }
+    let mut missing = Vec::new();
+    let mut folder = file;
+    while !folder.exists() {
+        let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) else {
+            return file.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        folder = parent;
+    }
+    missing
+        .iter()
+        .rev()
+        .fold(real_path(folder), |path, name| path.join(name))
+}
+
+/// Write `contents` to `file` whole, making its folder: a new file, or over one the user picked.
+/// Never one of the game dump's.
+pub fn write_outside_dump(file: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    if is_game_file(file) {
+        bail!(
+            "{} is in the game dump, which Visionary never changes",
+            file.display()
+        );
+    }
+    if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    write(file, contents)
+}
+
 /// Write every planned file, or none of them. Each must still hold what was read from it, and
 /// none may be one of the game dump's.
 pub fn write_all(rewrites: &[Rewrite]) -> Result<()> {
@@ -235,6 +277,26 @@ mod tests {
 
     fn rewrite(file: &Path, read: &str, write: &str) -> Rewrite {
         Rewrite::text(file, read, write.to_string())
+    }
+
+    /// A file that is not there yet is still found to be the dump's, through a linked folder too.
+    #[test]
+    fn a_new_file_in_the_dump_is_the_dumps() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = real_path(dir.path()).join("dump");
+        std::fs::create_dir_all(dump.join("fighter/mario")).unwrap();
+        let new = dump.join("fighter/mario/motion/body/c00/motion_list.bin");
+        assert!(in_game_dump(&real_path_of_new(&new), &dump));
+        // A project kept inside the folder picked as the dump is the user's.
+        let project = dump.join("my_project/romfs/fighter/mario/motion_list.bin");
+        assert!(!in_game_dump(&real_path_of_new(&project), &dump));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dump.join("fighter"), &link).unwrap();
+            let through = link.join("mario/motion/body/c00/motion_list.bin");
+            assert!(in_game_dump(&real_path_of_new(&through), &dump));
+        }
     }
 
     /// The second file cannot be written, so the first is not left changed.

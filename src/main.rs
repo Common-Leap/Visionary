@@ -44,6 +44,7 @@ mod mod_project;
 mod model_checks;
 mod model_import;
 mod motion_list;
+mod motion_list_editor;
 mod motion_scripts;
 mod move_kinds;
 mod move_nodes;
