@@ -1,6 +1,6 @@
 [package]
 name = "visionary"
-version = "0.4.1"
+version = "0.6.0"
 edition = "2021"
 description = "A desktop editor for Super Smash Bros. Ultimate fighter data"
 
