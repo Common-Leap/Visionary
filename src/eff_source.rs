@@ -232,6 +232,28 @@ pub fn fold(
     }
 }
 
+/// Where the file at `place` is kept as it was (`bytes`) once its edits are written over it. The
+/// edits stay a list of changes to that: one copy for each state of each file, so the edits on
+/// one are never read against another.
+pub fn kept_original(storage: &Path, place: &Path, bytes: &[u8]) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut state);
+    let at = place.to_string_lossy().to_lowercase();
+    let name = place
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "effect.eff".into());
+    storage
+        .join("effect-originals")
+        .join(format!(
+            "{:010x}-{:016x}",
+            hash40::hash40(&at).0,
+            state.finish()
+        ))
+        .join(name)
+}
+
 /// What opening an effect file the user picked means for the edits of its game path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Picked {
@@ -325,6 +347,19 @@ pub fn missing_from(eff: &EffMod, file: &crate::effects::LoadedEffect) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_original_is_one_state_of_one_file() {
+        let storage = Path::new("/cache/visionary");
+        let place = Path::new("/mods/Mine/effect/fighter/mario/ef_mario.eff");
+        let kept = kept_original(storage, place, b"as it was");
+        assert!(kept.starts_with(storage));
+        assert_eq!(kept.file_name(), place.file_name());
+        assert_eq!(kept, kept_original(storage, place, b"as it was"));
+        assert_ne!(kept, kept_original(storage, place, b"as it is now"));
+        let other = Path::new("/mods/Other/effect/fighter/mario/ef_mario.eff");
+        assert_ne!(kept, kept_original(storage, other, b"as it was"));
+    }
 
     const PICKEL: &str = "effect/fighter/pickel/ef_pickel.eff";
     const MARIO: &str = "effect/fighter/mario/ef_mario.eff";

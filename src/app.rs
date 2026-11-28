@@ -6755,6 +6755,16 @@ impl VisionaryApp {
                 self.eff_stand_ins.insert(owner, path.to_path_buf());
                 self.eff_editor.open_as(path, rel);
             }
+            // The edits saved to a file, as Export .eff leaves them: opening it is opening them.
+            Picked::Refused if self.is_export_of(&owner, path) => {
+                self.eff_editor.open_as(&own, rel);
+                self.state.status = format!(
+                    "{} holds the effect edits of {}, which are open",
+                    path.display(),
+                    self.effect_owner_name(&owner)
+                );
+                return false;
+            }
             Picked::Refused => {
                 self.state.status = format!(
                     "Not opened: the effect edits of {} are on {}. Remove them in Tools > Changes \
@@ -6767,6 +6777,21 @@ impl VisionaryApp {
             }
         }
         true
+    }
+
+    /// Whether the file at `path` is `owner`'s effect file with its edits, as an export writes it.
+    fn is_export_of(&self, owner: &str, path: &Path) -> bool {
+        let Some(eff) = self.eff_mods.get(owner) else {
+            return false;
+        };
+        let source = self.resolve_eff_source(&eff.source_rel);
+        let (Ok(bytes), Ok(picked)) = (std::fs::read(source), std::fs::read(path)) else {
+            return false;
+        };
+        let files = self.effect_files();
+        let donor = |rel: &str| files.find(rel);
+        crate::eff_export::rebuild_eff_bytes_resolving(&bytes, eff, &donor)
+            .is_ok_and(|edited| edited == picked)
     }
 
     /// The name effect edits kept under `owner` are shown by.
@@ -14134,15 +14159,36 @@ impl VisionaryApp {
         else {
             return;
         };
-        self.state.status = match self.write_effect_file(&dest) {
-            Ok(()) => format!("Saved {}", dest.display()),
-            Err(e) => format!("Couldn't save the effect file: {e:#}"),
-        };
+        match self.write_effect_file(&dest) {
+            Ok(kept) => {
+                self.state.status = match kept {
+                    Some(kept) => format!(
+                        "Saved {}. The file as it was is kept at {}",
+                        dest.display(),
+                        kept.display()
+                    ),
+                    None => format!("Saved {}", dest.display()),
+                };
+                self.eff_editor
+                    .set_export_note(format!("Saved {}", dest.display()), true);
+            }
+            Err(e) => {
+                let note = format!("Couldn't save the effect file: {e:#}");
+                self.state.status.clone_from(&note);
+                self.eff_editor.set_export_note(note, false);
+            }
+        }
     }
 
     /// Write the effect file open on the Effects page, with its edits, to `dest`.
-    fn write_effect_file(&mut self, dest: &Path) -> anyhow::Result<()> {
+    ///
+    /// The edits stay a list of changes to the file as it was. Written over that file, they
+    /// are kept on a copy of it as it was, which is returned; written where the file's game path
+    /// leads, they stay on the file they were made on.
+    fn write_effect_file(&mut self, dest: &Path) -> anyhow::Result<Option<PathBuf>> {
         use anyhow::Context;
+        let same =
+            |a: &Path, b: &Path| crate::user_files::real_path(a) == crate::user_files::real_path(b);
         self.sync_eff_mods_from_editor();
         let (owner, path) = self
             .effect_editor_draw_path()
@@ -14152,25 +14198,59 @@ impl VisionaryApp {
             .eff_mods
             .get(&owner)
             .filter(|eff| !eff.is_empty() && eff.source_rel.eq_ignore_ascii_case(&rel));
-        let source = eff.map_or(path, |eff| self.resolve_eff_source(&eff.source_rel));
-        // The edits are made on the source: written over it, they would be made twice.
-        if matches!(
-            (std::fs::canonicalize(&source), std::fs::canonicalize(dest)),
-            (Ok(source), Ok(dest)) if source == dest
-        ) {
-            anyhow::bail!("that is the file the edits are made on; choose another place");
-        }
+        let Some(eff) = eff else {
+            // Nothing is edited: the file as it is.
+            if !same(&path, dest) {
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("couldn't read {}", path.display()))?;
+                crate::user_files::write_outside_dump(dest, bytes)?;
+            }
+            return Ok(None);
+        };
+        let source = self.resolve_eff_source(&eff.source_rel);
         let bytes = std::fs::read(&source)
             .with_context(|| format!("couldn't read {}", source.display()))?;
-        let bytes = match eff {
-            Some(eff) => {
-                let files = self.effect_files();
-                let donor = |rel: &str| files.find(rel);
-                crate::eff_export::rebuild_eff_bytes_resolving(&bytes, eff, &donor)?
+        let files = self.effect_files();
+        let donor = |rel: &str| files.find(rel);
+        let edited = crate::eff_export::rebuild_eff_bytes_resolving(&bytes, eff, &donor)?;
+        let recorded = eff.source_path.is_some();
+        let borrows = !eff.transplants.is_empty();
+        let kept = match same(&source, dest) {
+            true => {
+                if crate::user_files::is_game_file(dest) {
+                    anyhow::bail!(
+                        "{} is in the game dump, which Visionary never changes",
+                        dest.display()
+                    );
+                }
+                let storage = crate::scratch_dirs::app_storage_root();
+                let kept = crate::eff_source::kept_original(&storage, dest, &bytes);
+                crate::user_files::write_outside_dump(&kept, &bytes)?;
+                Some(kept)
             }
-            None => bytes,
+            false => None,
         };
-        std::fs::write(dest, bytes).with_context(|| format!("couldn't write {}", dest.display()))
+        crate::user_files::write_outside_dump(dest, edited)?;
+        // The file the edits are on, when writing this one changed which file that is.
+        let moved = !recorded && !same(&self.resolve_eff_source(&rel), &source);
+        let on = kept.clone().or_else(|| moved.then(|| source.clone()));
+        if let (Some(on), Some(eff)) = (on, self.eff_mods.get_mut(&owner)) {
+            eff.source_path = Some(on);
+            self.eff_stand_ins.remove(&owner);
+            self.edit_files = EditFiles::default();
+        }
+        if let Some(kept) = &kept {
+            if borrows {
+                self.eff_editor.set_merged_overlay(&source, None);
+                self.refresh_transplant_preview(&owner);
+            }
+            if self.current_eff_path.as_deref() == self.eff_editor.loaded_path() {
+                self.current_eff_path = Some(kept.clone());
+            }
+            self.eff_editor.open_moved(kept, rel);
+            self.effect_preview_build.built_for = None;
+        }
+        Ok(kept)
     }
 
     /// Start rebuilding the preview's copy of the editor's file after an edit, and collect a

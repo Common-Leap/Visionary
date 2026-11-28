@@ -759,6 +759,9 @@ pub struct EffEditor {
     live_deploy_request: bool,
     /// Set by Export .eff; the app saves the file.
     export_request: bool,
+    /// How the last Export .eff of the open file went, whether it was saved, and when. A save
+    /// is only shown for a moment: an edit made after it is not in the file.
+    export_note: Option<(String, bool, Instant)>,
     /// When the app last serviced a deploy request — drives `REDEPLOY_MIN_GAP_MS`.
     live_deploy_at: Option<Instant>,
     /// True from clicking Send until the app has finished building + sending the carrier.
@@ -927,6 +930,7 @@ impl Default for EffEditor {
             scroll_to_selected: false,
             live_deploy_request: false,
             export_request: false,
+            export_note: None,
             live_deploy_at: None,
             sending: false,
             gen_at_send: 0,
@@ -2817,6 +2821,9 @@ impl EffEditor {
     fn load_eff(&mut self, path: &Path) {
         self.remember_picks();
         self.edit_rev += 1;
+        if self.loaded_rel() != Some(self.game_path_of(path)) {
+            self.export_note = None;
+        }
         // A step holds emitters of the file it was taken in, by position: it is kept with that
         // file and comes back when the file does.
         self.history_close_step();
@@ -2975,6 +2982,26 @@ impl EffEditor {
     pub fn open_as(&mut self, path: &Path, rel: String) {
         self.name_file(path, rel);
         self.queue_load(path);
+    }
+
+    /// Open `to`, which holds what the open file did under another path, as the game's `rel`,
+    /// with the effect, the part and the undo steps that are open now.
+    pub fn open_moved(&mut self, to: &Path, rel: String) {
+        self.remember_picks();
+        self.history_close_step();
+        self.stash_history();
+        if let Some(from) = self.loaded_path.clone() {
+            if let Some(name) = self.entry_picked.get(&from).cloned() {
+                self.entry_picked.insert(to.to_path_buf(), name);
+            }
+            let was = self.loaded_rel().unwrap_or_default();
+            for (file, ..) in &mut self.history_store {
+                if *file == (from.clone(), was.clone()) {
+                    *file = (to.to_path_buf(), rel.clone());
+                }
+            }
+        }
+        self.load_as(to, rel);
     }
 
     /// Open `path` as the game's `rel` because the user picked it, though it is not the file
@@ -4857,6 +4884,22 @@ impl EffEditor {
                 .clicked()
             {
                 self.export_request = true;
+                self.export_note = None;
+            }
+            let shown = std::time::Duration::from_secs(8);
+            if matches!(&self.export_note, Some((_, true, at)) if at.elapsed() >= shown) {
+                self.export_note = None;
+            }
+            if let Some((note, saved, at)) = &self.export_note {
+                let color = match saved {
+                    true => ui.visuals().weak_text_color(),
+                    false => ui.visuals().error_fg_color,
+                };
+                ui.label(egui::RichText::new(note).small().color(color));
+                if *saved {
+                    ui.ctx()
+                        .request_repaint_after(shown.saturating_sub(at.elapsed()));
+                }
             }
         });
     }
@@ -4864,6 +4907,11 @@ impl EffEditor {
     /// Whether the open effect file was asked to be saved to a file of its own.
     pub fn take_export_request(&mut self) -> bool {
         std::mem::take(&mut self.export_request)
+    }
+
+    /// Say beside Export .eff how the export went.
+    pub fn set_export_note(&mut self, note: impl Into<String>, saved: bool) {
+        self.export_note = Some((note.into(), saved, Instant::now()));
     }
 
     /// The ONLY send control, in the header so it is reachable from every panel, with the
